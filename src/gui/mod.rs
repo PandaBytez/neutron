@@ -112,20 +112,8 @@ mod enabled {
         container.append(&status);
         container.append(&scroller);
 
-        // AdwApplicationWindow does not accept a titlebar via
-        // gtk_window_set_titlebar(); the header bar lives inside the content,
-        // stacked above the body by an AdwToolbarView.
-        let toolbar_view = adw::ToolbarView::new();
-        toolbar_view.add_top_bar(&header);
-        toolbar_view.set_content(Some(&container));
-
-        let window = ApplicationWindow::builder()
-            .application(app)
-            .title("WireGuard Manager")
-            .default_width(720)
-            .default_height(420)
-            .content(&toolbar_view)
-            .build();
+        let window = build_main_window(&header, &container);
+        window.set_application(Some(app));
 
         let monitor_child_for_close = monitor_child;
         window.connect_close_request(move |_| {
@@ -137,6 +125,28 @@ mod enabled {
         });
 
         window.present();
+    }
+
+    /// Build the main application window.
+    ///
+    /// `AdwApplicationWindow` aborts if a titlebar is installed via
+    /// `gtk_window_set_titlebar()`. The header bar must therefore live *inside*
+    /// the window content, stacked above the body by an `AdwToolbarView`, which
+    /// is then set as the window content.
+    ///
+    /// The caller associates the window with its [`Application`] (after startup)
+    /// so this stays a pure chrome builder that is cheap to unit test.
+    fn build_main_window(header: &HeaderBar, body: &gtk::Box) -> ApplicationWindow {
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(header);
+        toolbar_view.set_content(Some(body));
+
+        ApplicationWindow::builder()
+            .title("WireGuard Manager")
+            .default_width(720)
+            .default_height(420)
+            .content(&toolbar_view)
+            .build()
     }
 
     fn start_nm_monitor(events: Arc<AtomicU64>) -> Result<Child, String> {
@@ -419,6 +429,30 @@ mod enabled {
                 std::collections::BTreeSet::from(["uuid-1".to_string()])
             );
             let _ = std::fs::remove_file(config_path);
+        }
+
+        #[test]
+        fn main_window_hosts_header_in_toolbar_view() {
+            // Building an AdwApplicationWindow requires GTK; skip cleanly when no
+            // display is available (e.g. headless CI). Where a display exists
+            // this is a regression guard: build_main_window must host the header
+            // bar inside an AdwToolbarView. Reintroducing set_titlebar() on the
+            // AdwApplicationWindow would abort the process here instead.
+            if adw::init().is_err() {
+                eprintln!("skipping main_window test: libadwaita could not initialize");
+                return;
+            }
+
+            let header = HeaderBar::new();
+            let body = gtk::Box::new(Orientation::Vertical, 0);
+
+            let window = build_main_window(&header, &body);
+
+            let content = window.content().expect("window content should be set");
+            assert!(
+                content.downcast_ref::<adw::ToolbarView>().is_some(),
+                "header bar must be hosted in an AdwToolbarView, not via set_titlebar"
+            );
         }
     }
 }
