@@ -190,36 +190,13 @@ mod tests {
     }
 
     #[cfg(not(feature = "gui"))]
-    #[derive(Clone)]
-    struct MockClient;
-
-    #[cfg(not(feature = "gui"))]
-    impl NmClient for MockClient {
-        fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-            Ok(Vec::new())
-        }
-
-        fn connect(&self, _profile_identifier: &str) -> AppResult<()> {
-            Ok(())
-        }
-
-        fn disconnect_active(&self) -> AppResult<()> {
-            Ok(())
-        }
-
-        fn switch_to(&self, _profile_identifier: &str) -> AppResult<()> {
-            Ok(())
-        }
-    }
-
-    #[cfg(not(feature = "gui"))]
     #[test]
     fn gui_command_returns_feature_unavailable_without_gui_feature() {
         let cli = Cli {
             command: Commands::Gui,
         };
 
-        let result = execute(&MockClient, cli);
+        let result = execute(&crate::testing::MockNmClient::default(), cli);
 
         assert!(matches!(result, Err(AppError::FeatureUnavailable(_))));
     }

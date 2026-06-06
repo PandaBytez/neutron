@@ -340,43 +340,14 @@ mod enabled {
     #[cfg(test)]
     mod tests {
         use crate::config::AppConfig;
-        use crate::error::{AppError, AppResult};
-        use crate::nm::{NmClient, ProfileState, WireguardProfile};
+        use crate::nm::{ProfileState, WireguardProfile};
+        use crate::testing::MockNmClient;
 
         use super::*;
 
-        struct MockClient {
-            profiles: Vec<WireguardProfile>,
-            fail: bool,
-        }
-
-        impl NmClient for MockClient {
-            fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-                if self.fail {
-                    return Err(AppError::NmCommandFailed("simulated".to_string()));
-                }
-                Ok(self.profiles.clone())
-            }
-
-            fn connect(&self, _profile_identifier: &str) -> AppResult<()> {
-                Ok(())
-            }
-
-            fn disconnect_active(&self) -> AppResult<()> {
-                Ok(())
-            }
-
-            fn switch_to(&self, _profile_identifier: &str) -> AppResult<()> {
-                Ok(())
-            }
-        }
-
         #[test]
         fn load_rows_fails_when_nm_fails() {
-            let client = MockClient {
-                profiles: Vec::new(),
-                fail: true,
-            };
+            let client = MockNmClient::failing_list();
 
             let config_path = std::env::temp_dir().join(format!(
                 "wireguard-manager-gui-test-fail-{}.json",
@@ -395,14 +366,11 @@ mod enabled {
 
         #[test]
         fn load_rows_maps_profiles() {
-            let client = MockClient {
-                profiles: vec![WireguardProfile {
-                    name: "wg-us".to_string(),
-                    uuid: "uuid-1".to_string(),
-                    state: ProfileState::Inactive,
-                }],
-                fail: false,
-            };
+            let client = MockNmClient::new(vec![WireguardProfile {
+                name: "wg-us".to_string(),
+                uuid: "uuid-1".to_string(),
+                state: ProfileState::Inactive,
+            }]);
 
             let config_path = std::env::temp_dir().join(format!(
                 "wireguard-manager-gui-test-{}.json",

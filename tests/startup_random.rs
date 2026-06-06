@@ -1,78 +1,13 @@
-use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wireguard_manager::config::{self, AppConfig};
-use wireguard_manager::error::{AppError, AppResult};
-use wireguard_manager::nm::{NmClient, ProfileState, WireguardProfile};
+use wireguard_manager::error::AppError;
+use wireguard_manager::nm::{ProfileState, WireguardProfile};
 use wireguard_manager::service;
-
-struct MockNmClient {
-    profiles: Vec<WireguardProfile>,
-    attempted: RefCell<Vec<String>>,
-    connected: RefCell<Vec<String>>,
-    fail_ids: HashSet<String>,
-}
-
-impl MockNmClient {
-    fn new(profiles: Vec<WireguardProfile>) -> Self {
-        Self {
-            profiles,
-            attempted: RefCell::new(Vec::new()),
-            connected: RefCell::new(Vec::new()),
-            fail_ids: HashSet::new(),
-        }
-    }
-
-    fn with_failures(profiles: Vec<WireguardProfile>, fail_ids: &[&str]) -> Self {
-        Self {
-            profiles,
-            attempted: RefCell::new(Vec::new()),
-            connected: RefCell::new(Vec::new()),
-            fail_ids: fail_ids.iter().map(|id| (*id).to_string()).collect(),
-        }
-    }
-
-    fn connected_profiles(&self) -> Vec<String> {
-        self.connected.borrow().clone()
-    }
-
-    fn attempted_profiles(&self) -> Vec<String> {
-        self.attempted.borrow().clone()
-    }
-}
-
-impl NmClient for MockNmClient {
-    fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-        Ok(self.profiles.clone())
-    }
-
-    fn connect(&self, profile_identifier: &str) -> AppResult<()> {
-        self.attempted
-            .borrow_mut()
-            .push(profile_identifier.to_string());
-        if self.fail_ids.contains(profile_identifier) {
-            return Err(AppError::NmCommandFailed(format!(
-                "simulated failure for {profile_identifier}"
-            )));
-        }
-        self.connected
-            .borrow_mut()
-            .push(profile_identifier.to_string());
-        Ok(())
-    }
-
-    fn disconnect_active(&self) -> AppResult<()> {
-        Ok(())
-    }
-
-    fn switch_to(&self, _profile_identifier: &str) -> AppResult<()> {
-        Ok(())
-    }
-}
+use wireguard_manager::testing::MockNmClient;
 
 #[test]
 fn integration_connects_and_updates_last_profile() {

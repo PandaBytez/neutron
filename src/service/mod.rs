@@ -89,81 +89,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::BTreeSet;
-    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::config::AppConfig;
-    use crate::nm::{NmClient, ProfileState, WireguardProfile};
+    use crate::nm::{ProfileState, WireguardProfile};
+    use crate::testing::MockNmClient;
 
     use super::*;
-
-    struct MockNmClient {
-        profiles: Vec<WireguardProfile>,
-        attempted: RefCell<Vec<String>>,
-        connected: RefCell<Vec<String>>,
-        fail_ids: HashSet<String>,
-    }
-
-    impl MockNmClient {
-        fn new(profiles: Vec<WireguardProfile>) -> Self {
-            Self {
-                profiles,
-                attempted: RefCell::new(Vec::new()),
-                connected: RefCell::new(Vec::new()),
-                fail_ids: HashSet::new(),
-            }
-        }
-
-        fn with_failures(profiles: Vec<WireguardProfile>, fail_ids: &[&str]) -> Self {
-            Self {
-                profiles,
-                attempted: RefCell::new(Vec::new()),
-                connected: RefCell::new(Vec::new()),
-                fail_ids: fail_ids.iter().map(|id| (*id).to_string()).collect(),
-            }
-        }
-
-        fn connected_profiles(&self) -> Vec<String> {
-            self.connected.borrow().clone()
-        }
-
-        fn attempted_profiles(&self) -> Vec<String> {
-            self.attempted.borrow().clone()
-        }
-    }
-
-    impl NmClient for MockNmClient {
-        fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-            Ok(self.profiles.clone())
-        }
-
-        fn connect(&self, profile_identifier: &str) -> AppResult<()> {
-            self.attempted
-                .borrow_mut()
-                .push(profile_identifier.to_string());
-            if self.fail_ids.contains(profile_identifier) {
-                return Err(AppError::NmCommandFailed(format!(
-                    "simulated failure for {profile_identifier}"
-                )));
-            }
-            self.connected
-                .borrow_mut()
-                .push(profile_identifier.to_string());
-            Ok(())
-        }
-
-        fn disconnect_active(&self) -> AppResult<()> {
-            Ok(())
-        }
-
-        fn switch_to(&self, _profile_identifier: &str) -> AppResult<()> {
-            Ok(())
-        }
-    }
 
     #[test]
     fn returns_error_when_profile_already_active() {

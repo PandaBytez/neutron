@@ -71,10 +71,8 @@ pub fn build_rows(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
-    use crate::nm::NmClient;
     use crate::nm::{ProfileState, WireguardProfile};
+    use crate::testing::MockNmClient;
 
     use super::*;
 
@@ -167,47 +165,6 @@ mod tests {
         assert_eq!(actions, vec![RowAction::Connect, RowAction::Switch]);
     }
 
-    struct MockClient {
-        calls: RefCell<Vec<String>>,
-    }
-
-    impl MockClient {
-        fn new() -> Self {
-            Self {
-                calls: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn calls(&self) -> Vec<String> {
-            self.calls.borrow().clone()
-        }
-    }
-
-    impl NmClient for MockClient {
-        fn list_wireguard_profiles(&self) -> crate::error::AppResult<Vec<WireguardProfile>> {
-            Ok(Vec::new())
-        }
-
-        fn connect(&self, profile_identifier: &str) -> crate::error::AppResult<()> {
-            self.calls
-                .borrow_mut()
-                .push(format!("connect:{profile_identifier}"));
-            Ok(())
-        }
-
-        fn disconnect_active(&self) -> crate::error::AppResult<()> {
-            self.calls.borrow_mut().push("disconnect".to_string());
-            Ok(())
-        }
-
-        fn switch_to(&self, profile_identifier: &str) -> crate::error::AppResult<()> {
-            self.calls
-                .borrow_mut()
-                .push(format!("switch:{profile_identifier}"));
-            Ok(())
-        }
-    }
-
     #[test]
     fn execute_action_maps_connect_to_uuid() {
         let row = ProfileListRow {
@@ -217,7 +174,7 @@ mod tests {
             state_label: "inactive",
             eligible: false,
         };
-        let client = MockClient::new();
+        let client = MockNmClient::default();
 
         execute_action(&client, &row, RowAction::Connect).expect("connect should succeed");
 
@@ -233,7 +190,7 @@ mod tests {
             state_label: "inactive",
             eligible: false,
         };
-        let client = MockClient::new();
+        let client = MockNmClient::default();
 
         execute_action(&client, &row, RowAction::Switch).expect("switch should succeed");
 
@@ -249,7 +206,7 @@ mod tests {
             state_label: "active",
             eligible: true,
         };
-        let client = MockClient::new();
+        let client = MockNmClient::default();
 
         execute_action(&client, &row, RowAction::Disconnect).expect("disconnect should succeed");
 
