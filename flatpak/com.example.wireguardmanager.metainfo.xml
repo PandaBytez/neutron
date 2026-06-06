@@ -12,11 +12,6 @@
     </p>
   </description>
   <launchable type="desktop-id">com.example.wireguardmanager.desktop</launchable>
-  <screenshots>
-    <screenshot type="default">
-      <image>https://raw.githubusercontent.com/example/wireguard-manager/main/docs/screenshot-main.png</image>
-    </screenshot>
-  </screenshots>
   <provides>
     <binary>wireguard-manager</binary>
   </provides>

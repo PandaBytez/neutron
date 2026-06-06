@@ -203,13 +203,43 @@ fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String>
     run_command_with_timeout("nmcli", args, timeout)
 }
 
+/// Returns `true` when the process is running inside a Flatpak sandbox.
+///
+/// Flatpak always mounts `/.flatpak-info` inside the sandbox, so its presence
+/// is the canonical way to detect that host tools must be reached through the
+/// session helper rather than executed directly.
+fn running_in_flatpak_sandbox() -> bool {
+    std::path::Path::new("/.flatpak-info").exists()
+}
+
+/// Build a [`Command`] for `program`, transparently routing through
+/// `flatpak-spawn --host` when running inside a Flatpak sandbox.
+///
+/// Host tools such as `nmcli` are not shipped inside the GNOME runtime, so when
+/// sandboxed we ask the Flatpak session helper to run them on the host instead.
+/// Outside a sandbox the program is executed directly.
+pub(crate) fn host_command(program: &str) -> Command {
+    host_command_for(running_in_flatpak_sandbox(), program)
+}
+
+fn host_command_for(in_sandbox: bool, program: &str) -> Command {
+    if in_sandbox {
+        let mut command = Command::new("flatpak-spawn");
+        command.arg("--host").arg(program);
+        command
+    } else {
+        Command::new(program)
+    }
+}
+
 fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> AppResult<String> {
-    let mut child = Command::new(program)
+    let mut command = host_command(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
 
     // Drain stdout/stderr on separate threads so a large amount of output
     // cannot fill the pipe buffers and deadlock the child while we wait.
@@ -379,5 +409,25 @@ mod tests {
             result,
             Err(AppError::NmCommandFailed(message)) if message.contains("exit 1")
         ));
+    }
+
+    #[test]
+    fn sandbox_routes_through_flatpak_spawn() {
+        let command = host_command_for(true, "nmcli");
+
+        assert_eq!(command.get_program(), "flatpak-spawn");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().expect("args should be valid UTF-8"))
+            .collect();
+        assert_eq!(args, ["--host", "nmcli"]);
+    }
+
+    #[test]
+    fn non_sandbox_runs_program_directly() {
+        let command = host_command_for(false, "nmcli");
+
+        assert_eq!(command.get_program(), "nmcli");
+        assert_eq!(command.get_args().count(), 0);
     }
 }

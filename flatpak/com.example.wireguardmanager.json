@@ -1,14 +1,19 @@
 {
   "app-id": "com.example.wireguardmanager",
   "runtime": "org.gnome.Platform",
-  "runtime-version": "47",
+  "runtime-version": "49",
   "sdk": "org.gnome.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
   "command": "wireguard-manager",
   "finish-args": [
     "--share=network",
     "--socket=fallback-x11",
     "--socket=wayland",
     "--share=ipc",
+    "--device=dri",
+    "--talk-name=org.freedesktop.Flatpak",
     "--talk-name=org.freedesktop.NetworkManager",
     "--system-talk-name=org.freedesktop.NetworkManager"
   ],
@@ -16,9 +21,17 @@
     {
       "name": "wireguard-manager",
       "buildsystem": "simple",
+      "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "build-args": [
+          "--share=network"
+        ],
+        "env": {
+          "CARGO_HOME": "/run/build/wireguard-manager/cargo"
+        }
+      },
       "build-commands": [
-        "cargo --offline fetch --manifest-path Cargo.toml",
-        "cargo --offline build --release --features gui",
+        "cargo build --release --features gui",
         "install -Dm755 target/release/wireguard-manager /app/bin/wireguard-manager",
         "install -Dm644 flatpak/com.example.wireguardmanager.desktop /app/share/applications/com.example.wireguardmanager.desktop",
         "install -Dm644 flatpak/com.example.wireguardmanager.metainfo.xml /app/share/metainfo/com.example.wireguardmanager.metainfo.xml"
@@ -26,7 +39,14 @@
       "sources": [
         {
           "type": "dir",
-          "path": ".."
+          "path": "..",
+          "skip": [
+            "target",
+            ".flatpak-builder",
+            "build-dir",
+            ".git",
+            ".idea"
+          ]
         }
       ]
     }

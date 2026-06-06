@@ -2,7 +2,7 @@
 mod enabled {
     use std::cell::RefCell;
     use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +30,12 @@ mod enabled {
             .build();
 
         app.connect_activate(move |app| build_ui(app, client.clone()));
-        app.run();
+
+        // Launch GTK with only the program name. Forwarding the CLI subcommand
+        // (e.g. `gui`) would make GApplication treat it as a file argument and
+        // refuse to start with "This application can not open files".
+        let program = std::env::args().next().unwrap_or_default();
+        app.run_with_args(&[program]);
         Ok(())
     }
 
@@ -129,7 +134,7 @@ mod enabled {
     }
 
     fn start_nm_monitor(events: Arc<AtomicU64>) -> Result<Child, String> {
-        let mut child = Command::new("nmcli")
+        let mut child = crate::nm::host_command("nmcli")
             .arg("monitor")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

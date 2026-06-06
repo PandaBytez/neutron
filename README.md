@@ -79,16 +79,30 @@ cat systemd/README.md
 
 Flatpak packaging scaffold:
 
+The manifest builds against the GNOME 49 runtime and compiles the binary with
+the `rust-stable` SDK extension. Install the dependencies once:
+
 ```bash
-flatpak-builder --user --force-clean build-dir flatpak/com.example.wireguardmanager.json
-flatpak-builder --run build-dir flatpak/com.example.wireguardmanager.json wireguard-manager gui
+flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
+    org.freedesktop.Sdk.Extension.rust-stable
 ```
 
-If `flatpak-builder` is missing, install it first (for example on Fedora:
-`sudo dnf install flatpak-builder`) and rerun the commands above.
+Then build, install, and run it:
 
-The Flatpak manifest currently requests NetworkManager D-Bus access via
-`org.freedesktop.NetworkManager` (session and system bus talk names).
+```bash
+flatpak run org.flatpak.Builder --user --force-clean --install \
+    build-dir flatpak/com.example.wireguardmanager.json
+flatpak run com.example.wireguardmanager gui
+```
+
+(If `flatpak-builder` is installed natively, substitute it for
+`flatpak run org.flatpak.Builder`.)
+
+`nmcli` is not shipped inside the GNOME runtime, so inside the sandbox the app
+transparently runs it on the host through `flatpak-spawn --host`. The manifest
+therefore also requests `--talk-name=org.freedesktop.Flatpak` alongside the
+NetworkManager D-Bus access (`org.freedesktop.NetworkManager`, session and
+system bus talk names).
 
 Quality checks:
 
