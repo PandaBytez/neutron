@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
+mod kill_switch;
+
+pub use kill_switch::KillSwitchState;
+
 /// Maximum time to wait for an `nmcli` invocation before giving up.
 ///
 /// NetworkManager operations are normally fast, but a stuck daemon or hung
@@ -38,6 +42,13 @@ pub trait NmClient {
     fn connect(&self, profile_identifier: &str) -> AppResult<()>;
     fn disconnect_active(&self) -> AppResult<()>;
     fn switch_to(&self, profile_identifier: &str) -> AppResult<()>;
+    /// Report whether the NetworkManager kill-switch routing policy is enforced
+    /// on the identified profile.
+    fn kill_switch_status(&self, profile_identifier: &str) -> AppResult<KillSwitchState>;
+    /// Enable or disable the kill-switch routing policy on the identified
+    /// profile. The change is persisted to the NetworkManager profile and takes
+    /// effect the next time the profile is activated.
+    fn set_kill_switch(&self, profile_identifier: &str, enable: bool) -> AppResult<()>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -115,6 +126,25 @@ impl NmClient for CliNmClient {
         }
 
         run_nmcli(&["connection", "up", &target.uuid])?;
+        Ok(())
+    }
+
+    fn kill_switch_status(&self, profile_identifier: &str) -> AppResult<KillSwitchState> {
+        let profiles = self.list_wireguard_profiles()?;
+        let profile = find_unique_profile_by_identifier(&profiles, profile_identifier)?;
+        let output = run_nmcli_owned(&kill_switch::status_args(&profile.uuid))?;
+        kill_switch::parse_status(&output)
+    }
+
+    fn set_kill_switch(&self, profile_identifier: &str, enable: bool) -> AppResult<()> {
+        let profiles = self.list_wireguard_profiles()?;
+        let profile = find_unique_profile_by_identifier(&profiles, profile_identifier)?;
+        let args = if enable {
+            kill_switch::enable_args(&profile.uuid)
+        } else {
+            kill_switch::disable_args(&profile.uuid)
+        };
+        run_nmcli_owned(&args)?;
         Ok(())
     }
 }
@@ -197,6 +227,13 @@ fn parse_nmcli_fields(line: &str) -> Vec<String> {
 
 fn run_nmcli(args: &[&str]) -> AppResult<String> {
     run_nmcli_with_timeout(args, NMCLI_TIMEOUT)
+}
+
+/// Convenience wrapper around [`run_nmcli`] for dynamically built argument
+/// lists (such as the kill-switch `connection modify` commands).
+fn run_nmcli_owned(args: &[String]) -> AppResult<String> {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_nmcli(&arg_refs)
 }
 
 fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String> {

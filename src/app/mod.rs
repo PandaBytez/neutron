@@ -33,6 +33,10 @@ enum Commands {
         command: EligibleCommands,
     },
     StartupRandom,
+    KillSwitch {
+        #[command(subcommand)]
+        command: KillSwitchCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -40,6 +44,13 @@ enum EligibleCommands {
     List,
     Add { profile: String },
     Remove { profile: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum KillSwitchCommands {
+    Status { profile: String },
+    Enable { profile: String },
+    Disable { profile: String },
 }
 
 pub fn run<C: NmClient + Clone + Send + 'static>(client: &C) -> AppResult<()> {
@@ -75,6 +86,7 @@ fn execute<C: NmClient + Clone + Send + 'static>(client: &C, cli: Cli) -> AppRes
             Ok(())
         }
         Commands::Eligible { command } => handle_eligible_command(client, command),
+        Commands::KillSwitch { command } => handle_kill_switch_command(client, command),
     }
 }
 
@@ -124,6 +136,30 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
                     "profile is not eligible: {profile_id}"
                 )));
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_kill_switch_command<C: NmClient>(
+    client: &C,
+    command: KillSwitchCommands,
+) -> AppResult<()> {
+    match command {
+        KillSwitchCommands::Status { profile } => {
+            let state = client.kill_switch_status(&profile)?;
+            println!("Kill switch for {profile}: {}", state.label());
+        }
+        KillSwitchCommands::Enable { profile } => {
+            client.set_kill_switch(&profile, true)?;
+            println!(
+                "Kill switch enabled for {profile} (applies on next connect; full-tunnel profiles only)."
+            );
+        }
+        KillSwitchCommands::Disable { profile } => {
+            client.set_kill_switch(&profile, false)?;
+            println!("Kill switch disabled for {profile} (applies on next connect).");
         }
     }
 
@@ -199,5 +235,37 @@ mod tests {
         let result = execute(&crate::testing::MockNmClient::default(), cli);
 
         assert!(matches!(result, Err(AppError::FeatureUnavailable(_))));
+    }
+
+    #[test]
+    fn kill_switch_enable_invokes_client() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let cli = Cli {
+            command: Commands::KillSwitch {
+                command: KillSwitchCommands::Enable {
+                    profile: "uuid-1".to_string(),
+                },
+            },
+        };
+
+        execute(&client, cli).expect("enable should succeed");
+
+        assert_eq!(client.kill_switch_calls(), vec!["kill-switch:uuid-1:on"]);
+    }
+
+    #[test]
+    fn kill_switch_disable_invokes_client() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let cli = Cli {
+            command: Commands::KillSwitch {
+                command: KillSwitchCommands::Disable {
+                    profile: "uuid-1".to_string(),
+                },
+            },
+        };
+
+        execute(&client, cli).expect("disable should succeed");
+
+        assert_eq!(client.kill_switch_calls(), vec!["kill-switch:uuid-1:off"]);
     }
 }

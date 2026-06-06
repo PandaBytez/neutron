@@ -15,7 +15,7 @@ NetworkManager.
 - Mark profiles as eligible for random startup selection.
 - Pick one random eligible profile once per boot.
 - Optional provider config import workflow (later).
-- Kill-switch oriented policy UX (later).
+- Kill-switch policy per profile (NetworkManager-native routing).
 
 ## Non-goals (for now)
 
@@ -32,7 +32,7 @@ NetworkManager.
 
 ## Project status
 
-MVP CLI is implemented for core NetworkManager profile workflows and startup random selection logic. GTK/libadwaita desktop UI now includes profile listing, refresh, action buttons, and startup-eligibility toggles.
+MVP CLI is implemented for core NetworkManager profile workflows and startup random selection logic. GTK/libadwaita desktop UI now includes profile listing, refresh, action buttons, startup-eligibility toggles, and a per-profile kill-switch toggle.
 
 ## Development (initial)
 
@@ -63,11 +63,17 @@ cargo run -- eligible remove <profile-name>
 
 # run one-shot startup random selection manually
 cargo run -- startup-random
+
+# inspect or toggle the per-profile kill switch
+# (profile can be a UUID or unique profile name)
+cargo run -- kill-switch status <profile-name>
+cargo run -- kill-switch enable <profile-name>
+cargo run -- kill-switch disable <profile-name>
 ```
 
 `list` output now includes eligibility status from config (`eligible` or `not-eligible`).
 
-GUI currently renders profile rows with active/inactive + eligibility labels, per-row action buttons (`Connect`, `Switch`, `Disconnect`) wired to NetworkManager operations, and startup-eligibility toggles backed by config; the list auto-refreshes after each change and also reacts to NetworkManager monitor events. NetworkManager calls run on a background thread so the UI stays responsive while `nmcli` works, action buttons disable until the operation finishes, and the `nmcli monitor` child process is terminated when the window closes.
+GUI currently renders profile rows with active/inactive + eligibility labels, per-row action buttons (`Connect`, `Switch`, `Disconnect`) wired to NetworkManager operations, startup-eligibility toggles backed by config, and a per-profile kill-switch toggle; the list auto-refreshes after each change and also reacts to NetworkManager monitor events. NetworkManager calls run on a background thread so the UI stays responsive while `nmcli` works, action buttons disable until the operation finishes, and the `nmcli monitor` child process is terminated when the window closes.
 
 `eligible add` reports when a profile is already eligible, and `eligible remove` returns a clear error when a profile is not currently eligible.
 
@@ -139,6 +145,14 @@ cargo test --all-features
 - All `nmcli` invocations run with a 30-second timeout and surface the command
   exit code on failure, so a stuck NetworkManager call cannot hang the CLI or GUI
   indefinitely.
+- The kill switch is NetworkManager-native: enabling it forces the WireGuard
+  connection's automatic default-route policy routing on (`wireguard.ip4/ip6-auto-default-route`)
+  and gives the tunnel exclusive DNS priority. NetworkManager then installs the
+  same `fwmark` + `suppress_prefixlength 0` policy rules as `wg-quick`, so while
+  the tunnel is active all non-tunnel traffic is dropped instead of leaking to
+  the physical default route. It applies the next time the profile is activated
+  and is effective for full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0`
+  allowed IPs). No firewall rules or privileged helper are involved.
 
 ## Roadmap summary
 

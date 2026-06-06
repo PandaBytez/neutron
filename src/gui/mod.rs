@@ -178,6 +178,14 @@ mod enabled {
         Ok(child)
     }
 
+    /// A profile row enriched with the data the GUI needs beyond the shared
+    /// [`profile_list::ProfileListRow`] -- currently whether the NetworkManager
+    /// kill switch is enforced on the profile.
+    struct DisplayRow {
+        row: profile_list::ProfileListRow,
+        kill_switch: bool,
+    }
+
     /// Reload the profile list. The blocking NetworkManager/config work runs on
     /// the Gio thread pool so the GTK main thread (and thus the UI) never blocks
     /// on `nmcli`. Widget creation happens back on the main thread once the data
@@ -215,7 +223,7 @@ mod enabled {
         });
     }
 
-    fn load_rows(client: &impl NmClient) -> Result<Vec<profile_list::ProfileListRow>, String> {
+    fn load_rows(client: &impl NmClient) -> Result<Vec<DisplayRow>, String> {
         let config_path = config::default_config_path().map_err(|error| error.to_string())?;
         load_rows_with_path(client, &config_path)
     }
@@ -223,16 +231,27 @@ mod enabled {
     fn load_rows_with_path(
         client: &impl NmClient,
         config_path: &std::path::Path,
-    ) -> Result<Vec<profile_list::ProfileListRow>, String> {
+    ) -> Result<Vec<DisplayRow>, String> {
         let profiles = client
             .list_wireguard_profiles()
             .map_err(|error| error.to_string())?;
         let app_cfg = config::load(config_path).map_err(|error| error.to_string())?;
 
-        Ok(profile_list::build_rows(
-            &profiles,
-            &app_cfg.eligible_profile_ids,
-        ))
+        let rows = profile_list::build_rows(&profiles, &app_cfg.eligible_profile_ids);
+
+        // Query each profile's kill-switch state. This runs on the Gio thread
+        // pool (off the GTK main thread); a failed query is treated as "off"
+        // rather than failing the whole refresh.
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let kill_switch = client
+                    .kill_switch_status(&row.uuid)
+                    .map(|state| state.is_enabled())
+                    .unwrap_or(false);
+                DisplayRow { row, kill_switch }
+            })
+            .collect())
     }
 
     fn set_eligibility_for_profile(profile_id: &str, eligible: bool) -> Result<bool, String> {
@@ -259,13 +278,14 @@ mod enabled {
 
     fn build_profile_row<C>(
         client: &C,
-        row: &profile_list::ProfileListRow,
+        display: &DisplayRow,
         list: &gtk::ListBox,
         status: &gtk::Label,
     ) -> gtk::ListBoxRow
     where
         C: NmClient + Clone + Send + 'static,
     {
+        let row = &display.row;
         let container = gtk::Box::new(Orientation::Horizontal, 12);
 
         let details = gtk::Label::new(Some(&profile_list::format_cli_row(row)));
@@ -295,6 +315,65 @@ mod enabled {
                         ));
                     }
                 }
+            });
+        }
+
+        // Toggling the kill switch rewrites NetworkManager profile properties
+        // via `nmcli`, so run it off the GTK main thread (like the action
+        // buttons) to keep the UI responsive.
+        let kill_switch_toggle = gtk::CheckButton::with_label("Kill switch");
+        kill_switch_toggle.set_active(display.kill_switch);
+        {
+            let client = client.clone();
+            let row = row.clone();
+            let list = list.clone();
+            let status = status.clone();
+            kill_switch_toggle.connect_toggled(move |toggle| {
+                let enable = toggle.is_active();
+                toggle.set_sensitive(false);
+                status.set_label(&format!(
+                    "{} kill switch for '{}'\u{2026}",
+                    if enable { "Enabling" } else { "Disabling" },
+                    row.name
+                ));
+
+                let toggle = toggle.clone();
+                let client = client.clone();
+                let row = row.clone();
+                let list = list.clone();
+                let status = status.clone();
+                glib::spawn_future_local(async move {
+                    let task_client = client.clone();
+                    let task_uuid = row.uuid.clone();
+                    let outcome = gio::spawn_blocking(move || {
+                        task_client.set_kill_switch(&task_uuid, enable)
+                    })
+                    .await;
+
+                    toggle.set_sensitive(true);
+                    match outcome {
+                        Ok(Ok(())) => {
+                            status.set_label(&format!(
+                                "Kill switch {} for '{}'. Applies on next connect.",
+                                if enable { "enabled" } else { "disabled" },
+                                row.name
+                            ));
+                            refresh_profile_list(&client, &list, &status);
+                        }
+                        Ok(Err(error)) => {
+                            status.set_label(&format!(
+                                "Failed to update kill switch for '{}': {error}",
+                                row.name
+                            ));
+                        }
+                        Err(_) => {
+                            status.set_label(&format!(
+                                "Failed to update kill switch for '{}': background task panicked",
+                                row.name
+                            ));
+                        }
+                    }
+                });
             });
         }
 
@@ -351,6 +430,7 @@ mod enabled {
 
         container.append(&details);
         container.append(&eligibility_toggle);
+        container.append(&kill_switch_toggle);
         container.append(&actions);
 
         let list_row = gtk::ListBoxRow::new();

@@ -6,11 +6,11 @@
 //! in-crate unit tests. Everything here is `pub`, so it never triggers
 //! dead-code warnings in normal builds.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{AppError, AppResult};
-use crate::nm::{NmClient, WireguardProfile};
+use crate::nm::{KillSwitchState, NmClient, WireguardProfile};
 
 /// A configurable in-memory [`NmClient`] for tests.
 ///
@@ -26,6 +26,8 @@ pub struct MockNmClient {
     calls: Arc<Mutex<Vec<String>>>,
     attempted: Arc<Mutex<Vec<String>>>,
     connected: Arc<Mutex<Vec<String>>>,
+    kill_switch_calls: Arc<Mutex<Vec<String>>>,
+    kill_switch_states: Arc<Mutex<HashMap<String, KillSwitchState>>>,
 }
 
 impl MockNmClient {
@@ -69,6 +71,15 @@ impl MockNmClient {
     /// Profile ids that `connect` reported as successfully connected.
     pub fn connected_profiles(&self) -> Vec<String> {
         self.connected.lock().expect("mock mutex poisoned").clone()
+    }
+
+    /// Kill-switch toggles in invocation order, formatted as
+    /// `kill-switch:<id>:on` or `kill-switch:<id>:off`.
+    pub fn kill_switch_calls(&self) -> Vec<String> {
+        self.kill_switch_calls
+            .lock()
+            .expect("mock mutex poisoned")
+            .clone()
     }
 }
 
@@ -116,6 +127,36 @@ impl NmClient for MockNmClient {
             .lock()
             .expect("mock mutex poisoned")
             .push(format!("switch:{profile_identifier}"));
+        Ok(())
+    }
+
+    fn kill_switch_status(&self, profile_identifier: &str) -> AppResult<KillSwitchState> {
+        Ok(self
+            .kill_switch_states
+            .lock()
+            .expect("mock mutex poisoned")
+            .get(profile_identifier)
+            .copied()
+            .unwrap_or(KillSwitchState::Disabled))
+    }
+
+    fn set_kill_switch(&self, profile_identifier: &str, enable: bool) -> AppResult<()> {
+        self.kill_switch_calls
+            .lock()
+            .expect("mock mutex poisoned")
+            .push(format!(
+                "kill-switch:{profile_identifier}:{}",
+                if enable { "on" } else { "off" }
+            ));
+        let state = if enable {
+            KillSwitchState::Enabled
+        } else {
+            KillSwitchState::Disabled
+        };
+        self.kill_switch_states
+            .lock()
+            .expect("mock mutex poisoned")
+            .insert(profile_identifier.to_string(), state);
         Ok(())
     }
 }
