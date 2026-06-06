@@ -1,0 +1,152 @@
+use std::collections::BTreeSet;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{AppError, AppResult};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppConfig {
+    #[serde(default, alias = "eligible_profiles")]
+    pub eligible_profile_ids: BTreeSet<String>,
+    #[serde(default, alias = "last_random_profile")]
+    pub last_random_profile_id: Option<String>,
+}
+
+pub fn load(path: &Path) -> AppResult<AppConfig> {
+    if !path.exists() {
+        return Ok(AppConfig::default());
+    }
+
+    let data = fs::read_to_string(path)?;
+    let parsed = serde_json::from_str::<AppConfig>(&data)?;
+    Ok(parsed)
+}
+
+pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(config)?;
+    write_atomically(path, &body)?;
+    Ok(())
+}
+
+fn write_atomically(path: &Path, body: &str) -> io::Result<()> {
+    write_atomically_with(path, body, |src, dst| fs::rename(src, dst))
+}
+
+fn write_atomically_with<F>(path: &Path, body: &str, rename_fn: F) -> io::Result<()>
+where
+    F: Fn(&Path, &Path) -> io::Result<()>,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = temporary_path(path);
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    {
+        use std::io::Write;
+        let mut tmp_file = options.open(&tmp_path)?;
+        tmp_file.write_all(body.as_bytes())?;
+    }
+
+    match rename_fn(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            fs::copy(&tmp_path, path)?;
+            fs::remove_file(&tmp_path)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(error)
+        }
+    }
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    PathBuf::from(format!("{}.tmp.{stamp}", path.display()))
+}
+
+pub fn default_config_path() -> AppResult<PathBuf> {
+    let base = dirs::config_dir().ok_or_else(|| {
+        AppError::Config("could not determine configuration directory".to_string())
+    })?;
+    Ok(base.join("wireguard-manager").join("config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn write_atomically_falls_back_when_rename_crosses_devices() {
+        let path = unique_path("cross-device");
+
+        write_atomically_with(&path, "payload", |_src, _dst| {
+            Err(io::Error::new(io::ErrorKind::CrossesDevices, "simulated"))
+        })
+        .expect("fallback copy should succeed");
+
+        let content = fs::read_to_string(&path).expect("file should be written");
+        assert_eq!(content, "payload");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn write_atomically_cleans_temporary_file_on_rename_error() {
+        let path = unique_path("rename-error");
+
+        let result = write_atomically_with(&path, "payload", |_src, _dst| {
+            Err(io::Error::other("simulated rename failure"))
+        });
+
+        assert!(result.is_err());
+
+        let parent = path.parent().expect("path should have parent");
+        let tmp_prefix = format!("{}.tmp.", path.display());
+        let leftover = fs::read_dir(parent)
+            .expect("parent dir should be readable")
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().to_string_lossy().starts_with(&tmp_prefix));
+        assert!(!leftover, "temporary file should be cleaned up");
+
+        cleanup(&path);
+    }
+
+    fn unique_path(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("wireguard-manager-config-unit-{label}-{suffix}"))
+            .join("config.json")
+    }
+
+    fn cleanup(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+}

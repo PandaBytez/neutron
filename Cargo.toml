@@ -1,0 +1,21 @@
+[package]
+name = "wireguard-manager"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[features]
+default = []
+gui = ["dep:gtk", "dep:adw"]
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.7", optional = true }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+gtk = { package = "gtk4", version = "0.9", optional = true }
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

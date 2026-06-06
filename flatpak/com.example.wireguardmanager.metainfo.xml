@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.example.wireguardmanager</id>
+  <name>WireGuard Manager</name>
+  <summary>Manage WireGuard connections with NetworkManager</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      WireGuard Manager is a provider-agnostic desktop tool for managing
+      WireGuard profiles through NetworkManager.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.example.wireguardmanager.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/example/wireguard-manager/main/docs/screenshot-main.png</image>
+    </screenshot>
+  </screenshots>
+  <provides>
+    <binary>wireguard-manager</binary>
+  </provides>
+</component>

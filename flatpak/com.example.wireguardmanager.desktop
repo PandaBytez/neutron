@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=WireGuard Manager
+Comment=Manage WireGuard profiles with NetworkManager
+Exec=wireguard-manager gui
+Terminal=false
+Categories=Network;
+StartupNotify=true

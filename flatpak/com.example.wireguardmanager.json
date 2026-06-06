@@ -1,0 +1,34 @@
+{
+  "app-id": "com.example.wireguardmanager",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "47",
+  "sdk": "org.gnome.Sdk",
+  "command": "wireguard-manager",
+  "finish-args": [
+    "--share=network",
+    "--socket=fallback-x11",
+    "--socket=wayland",
+    "--share=ipc",
+    "--talk-name=org.freedesktop.NetworkManager",
+    "--system-talk-name=org.freedesktop.NetworkManager"
+  ],
+  "modules": [
+    {
+      "name": "wireguard-manager",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo --offline fetch --manifest-path Cargo.toml",
+        "cargo --offline build --release --features gui",
+        "install -Dm755 target/release/wireguard-manager /app/bin/wireguard-manager",
+        "install -Dm644 flatpak/com.example.wireguardmanager.desktop /app/share/applications/com.example.wireguardmanager.desktop",
+        "install -Dm644 flatpak/com.example.wireguardmanager.metainfo.xml /app/share/metainfo/com.example.wireguardmanager.metainfo.xml"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": ".."
+        }
+      ]
+    }
+  ]
+}
