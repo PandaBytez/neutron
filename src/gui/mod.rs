@@ -26,7 +26,7 @@ mod enabled {
         C: NmClient + Clone + Send + 'static,
     {
         let app = Application::builder()
-            .application_id("com.example.wireguardmanager")
+            .application_id("io.gitlab.zento_vpn_manager.zento")
             .build();
 
         app.connect_activate(move |app| build_ui(app, client.clone()));
@@ -44,7 +44,7 @@ mod enabled {
         C: NmClient + Clone + Send + 'static,
     {
         let header = HeaderBar::builder()
-            .title_widget(&gtk::Label::new(Some("WireGuard Manager")))
+            .title_widget(&gtk::Label::new(Some("Zento")))
             .build();
 
         let status = gtk::Label::new(None);
@@ -142,7 +142,7 @@ mod enabled {
         toolbar_view.set_content(Some(body));
 
         ApplicationWindow::builder()
-            .title("WireGuard Manager")
+            .title("Zento")
             .default_width(720)
             .default_height(420)
             .content(&toolbar_view)

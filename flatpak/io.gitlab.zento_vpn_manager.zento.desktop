@@ -1,8 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=WireGuard Manager
-Comment=Manage WireGuard profiles with NetworkManager
+Name=Zento
+Comment=Manage VPN connections with NetworkManager
 Exec=wireguard-manager gui
+Icon=io.gitlab.zento_vpn_manager.zento
 Terminal=false
 Categories=Network;
 StartupNotify=true

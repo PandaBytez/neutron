@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.gitlab.zento_vpn_manager.zento</id>
+  <name>Zento</name>
+  <summary>Manage VPN connections with NetworkManager</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.gitlab.zento_vpn_manager">
+    <name>Zento VPN Manager</name>
+  </developer>
+  <description>
+    <p>
+      Zento is a provider-agnostic desktop tool for managing VPN connections
+      through NetworkManager. It currently supports WireGuard profiles, with
+      additional protocols planned.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Connect, disconnect, and switch between WireGuard profiles</li>
+      <li>Select a random profile once per boot from an eligible pool</li>
+      <li>Enable a NetworkManager-native kill switch per profile</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.gitlab.zento_vpn_manager.zento.desktop</launchable>
+  <url type="homepage">https://gitlab.com/zento-vpn-manager/zento</url>
+  <url type="bugtracker">https://gitlab.com/zento-vpn-manager/zento/-/issues</url>
+  <url type="vcs-browser">https://gitlab.com/zento-vpn-manager/zento</url>
+  <content_rating type="oars-1.1" />
+  <provides>
+    <binary>wireguard-manager</binary>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-06-07">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

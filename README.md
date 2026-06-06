@@ -1,6 +1,7 @@
 # wireguard-manager
 
 A desktop WireGuard manager for Linux built in Rust, using NetworkManager as backend.
+Packaged as the Flatpak **Zento** (`io.gitlab.zento_vpn_manager.zento`).
 
 ## Why this project
 
@@ -83,8 +84,9 @@ Install the optional user service for startup-random automation:
 cat systemd/README.md
 ```
 
-Flatpak packaging scaffold:
+Flatpak packaging:
 
+The app ships as the Flatpak **Zento** (app-id `io.gitlab.zento_vpn_manager.zento`).
 The manifest builds against the GNOME 49 runtime and compiles the binary with
 the `rust-stable` SDK extension. Install the dependencies once:
 
@@ -97,12 +99,22 @@ Then build, install, and run it:
 
 ```bash
 flatpak run org.flatpak.Builder --user --force-clean --install \
-    build-dir flatpak/com.example.wireguardmanager.json
-flatpak run com.example.wireguardmanager gui
+    build-dir flatpak/io.gitlab.zento_vpn_manager.zento.json
+flatpak run io.gitlab.zento_vpn_manager.zento gui
 ```
 
 (If `flatpak-builder` is installed natively, substitute it for
 `flatpak run org.flatpak.Builder`.)
+
+The build is **network-isolated**: all crates are vendored through
+`flatpak/cargo-sources.json` and `cargo` runs `--offline`, so no dependencies
+are fetched during the build sandbox (a Flathub requirement). Regenerate that
+file whenever `Cargo.lock` changes:
+
+```bash
+flatpak run --command=flatpak-cargo-generator org.flatpak.Builder \
+    Cargo.lock -o flatpak/cargo-sources.json
+```
 
 `nmcli` is not shipped inside the GNOME runtime, so inside the sandbox the app
 transparently runs it on the host through `flatpak-spawn --host`. The manifest
@@ -153,6 +165,11 @@ cargo test --all-features
   the physical default route. It applies the next time the profile is activated
   and is effective for full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0`
   allowed IPs). No firewall rules or privileged helper are involved.
+- Packaging is Flathub-ready: crates are vendored (`flatpak/cargo-sources.json`)
+  for a network-isolated `--offline` build, and the desktop entry and AppStream
+  metainfo validate cleanly (`desktop-file-validate`, `appstreamcli validate`).
+  The user-facing Flatpak is branded **Zento**; the binary/crate is still named
+  `wireguard-manager`.
 
 ## Roadmap summary
 
