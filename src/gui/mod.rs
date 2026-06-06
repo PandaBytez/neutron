@@ -112,14 +112,20 @@ mod enabled {
         container.append(&status);
         container.append(&scroller);
 
+        // AdwApplicationWindow does not accept a titlebar via
+        // gtk_window_set_titlebar(); the header bar lives inside the content,
+        // stacked above the body by an AdwToolbarView.
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header);
+        toolbar_view.set_content(Some(&container));
+
         let window = ApplicationWindow::builder()
             .application(app)
             .title("WireGuard Manager")
             .default_width(720)
             .default_height(420)
-            .content(&container)
+            .content(&toolbar_view)
             .build();
-        window.set_titlebar(Some(&header));
 
         let monitor_child_for_close = monitor_child;
         window.connect_close_request(move |_| {
