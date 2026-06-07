@@ -27,6 +27,15 @@ mod enabled {
         log: gtk::Label,
         vpn_icon: gtk::Image,
         vpn_label: gtk::Label,
+        /// Collapsible "Startup auto-connect" row in the Settings group. Its
+        /// child switches choose which profiles join the boot-time random pool,
+        /// keeping that configuration concern out of the operational rows.
+        eligibility: adw::ExpanderRow,
+        /// The eligibility switches currently shown inside `eligibility`, tracked
+        /// so they can be cleared and rebuilt when the profile set changes
+        /// (`adw::ExpanderRow` offers no clear-all). Shared, so toggle handlers
+        /// can recompute the summary subtitle.
+        eligibility_rows: Rc<RefCell<Vec<adw::SwitchRow>>>,
     }
 
     pub fn run<C>(client: C) -> AppResult<()>
@@ -84,10 +93,17 @@ mod enabled {
         vpn_status_box.append(&vpn_status_icon);
         vpn_status_box.append(&vpn_status_label);
 
+        let eligibility_expander = adw::ExpanderRow::builder()
+            .title("Startup auto-connect")
+            .subtitle("Choose profiles eligible for random selection at boot")
+            .build();
+
         let indicators = StatusIndicators {
             log: status.clone(),
             vpn_icon: vpn_status_icon.clone(),
             vpn_label: vpn_status_label.clone(),
+            eligibility: eligibility_expander.clone(),
+            eligibility_rows: Rc::new(RefCell::new(Vec::new())),
         };
 
         let refresh = gtk::Button::with_label("Refresh");
@@ -184,6 +200,7 @@ mod enabled {
         let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
         settings_group.add(&kill_switch_row);
         settings_group.add(&lockdown_row);
+        settings_group.add(&eligibility_expander);
 
         container.append(&settings_group);
 
@@ -733,6 +750,7 @@ mod enabled {
                             .log
                             .set_label("Profiles loaded from NetworkManager.");
                     }
+                    rebuild_eligibility_rows(&indicators, &rows);
                     let any_active = rows.iter().any(|r| r.is_active);
                     update_vpn_status_widget(
                         any_active,
@@ -805,39 +823,78 @@ mod enabled {
         Ok(changed)
     }
 
-    fn update_profile_eligibility<C>(
-        client: &C,
-        row: &profile_list::ProfileListRow,
-        eligible: bool,
-        list: &gtk::ListBox,
+    fn rebuild_eligibility_rows(
         indicators: &StatusIndicators,
-    ) -> bool
-    where
-        C: NmClient + Clone + Send + 'static,
-    {
-        let success = match set_eligibility_for_profile(&row.uuid, eligible) {
-            Ok(true) => {
-                indicators
-                    .log
-                    .set_label(&format!("Updated eligibility for '{}'.", row.name));
-                true
+        rows: &[profile_list::ProfileListRow],
+    ) {
+        {
+            let mut tracked = indicators.eligibility_rows.borrow_mut();
+            for old in tracked.drain(..) {
+                indicators.eligibility.remove(&old);
             }
-            Ok(false) => {
+            for row in rows {
+                let switch_row = adw::SwitchRow::builder().title(&row.name).build();
+                // Set state before wiring the handler so this programmatic
+                // toggle doesn't fire a spurious config write.
+                switch_row.set_active(row.eligible);
+                {
+                    let indicators = indicators.clone();
+                    let uuid = row.uuid.clone();
+                    let name = row.name.clone();
+                    switch_row.connect_active_notify(move |sw| {
+                        on_eligibility_toggled(&indicators, &uuid, &name, sw.is_active());
+                    });
+                }
+                indicators.eligibility.add_row(&switch_row);
+                tracked.push(switch_row);
+            }
+        }
+        // Nothing to choose from when there are no profiles; disable the toggle
+        // so the empty expander can't be opened.
+        indicators
+            .eligibility
+            .set_enable_expansion(!rows.is_empty());
+        update_eligibility_subtitle(indicators);
+    }
+
+    /// Persist a single profile's startup eligibility and refresh the summary
+    /// subtitle. This only edits `excluded_profile_ids` in the config (no
+    /// NetworkManager work), so it stays synchronous and never touches the
+    /// profile list.
+    fn on_eligibility_toggled(
+        indicators: &StatusIndicators,
+        uuid: &str,
+        name: &str,
+        eligible: bool,
+    ) {
+        match set_eligibility_for_profile(uuid, eligible) {
+            Ok(_) => {
+                let verb = if eligible { "Enabled" } else { "Disabled" };
                 indicators
                     .log
-                    .set_label(&format!("No eligibility change for '{}'.", row.name));
-                false
+                    .set_label(&format!("{verb} startup auto-connect for '{name}'."));
             }
             Err(error) => {
                 indicators.log.set_label(&format!(
-                    "Failed to update eligibility for '{}': {error}",
-                    row.name
+                    "Failed to update startup eligibility for '{name}': {error}"
                 ));
-                false
             }
+        }
+        update_eligibility_subtitle(indicators);
+    }
+
+    /// Summarise how many profiles are eligible for boot-time random selection
+    /// in the expander subtitle, reading the live switch states.
+    fn update_eligibility_subtitle(indicators: &StatusIndicators) {
+        let tracked = indicators.eligibility_rows.borrow();
+        let total = tracked.len();
+        let subtitle = if total == 0 {
+            "No profiles to choose from".to_string()
+        } else {
+            let eligible = tracked.iter().filter(|sw| sw.is_active()).count();
+            format!("{eligible} of {total} eligible for random selection")
         };
-        refresh_profile_list(client, list, indicators);
-        success
+        indicators.eligibility.set_subtitle(&subtitle);
     }
 
     fn build_profile_row<C>(
@@ -857,24 +914,13 @@ mod enabled {
         header_box.set_margin_start(12);
         header_box.set_margin_end(12);
 
-        // Show only the profile name in the GUI row; state is conveyed by the
-        // connection switch and eligibility by its own toggle. The richer
-        // `format_cli_row` output remains for the `list` CLI command.
+        // Show only the profile name in the GUI row; connection state is conveyed
+        // by the switch. Startup eligibility now lives in the Settings expander,
+        // keeping these rows operational. The richer `format_cli_row` output
+        // remains for the `list` CLI command.
         let details = gtk::Label::new(Some(&row.name));
         details.set_xalign(0.0);
         details.set_hexpand(true);
-
-        let eligibility_toggle = gtk::CheckButton::with_label("Startup eligible");
-        eligibility_toggle.set_active(row.eligible);
-        {
-            let client = client.clone();
-            let row = row.clone();
-            let list = list.clone();
-            let indicators = indicators.clone();
-            eligibility_toggle.connect_toggled(move |toggle| {
-                update_profile_eligibility(&client, &row, toggle.is_active(), &list, &indicators);
-            });
-        }
 
         // A single connection switch replaces the old Connect/Switch/Disconnect
         // buttons: flipping it on switches to this profile (deactivating any
@@ -947,7 +993,6 @@ mod enabled {
         }
 
         header_box.append(&details);
-        header_box.append(&eligibility_toggle);
 
         let settings_button = gtk::Button::builder()
             .icon_name("preferences-system-symbolic")
