@@ -15,8 +15,9 @@ NetworkManager.
 - Manual connect/disconnect/switch between profiles.
 - Exclude individual profiles from random startup selection (opt-out: every profile is eligible by default).
 - Pick one random eligible profile once per boot.
-- Optional provider config import workflow (later).
+- Import WireGuard `.conf` profiles through the GUI (provider API import planned later).
 - Global kill-switch policy applied to all profiles (NetworkManager-native routing).
+- Optional always-on lockdown firewall that blocks all non-VPN traffic, even while disconnected.
 
 ## Non-goals (for now)
 
@@ -33,7 +34,7 @@ NetworkManager.
 
 ## Project status
 
-MVP CLI is implemented for core NetworkManager profile workflows and startup random selection logic. GTK/libadwaita desktop UI now includes profile listing, refresh, a per-profile connection toggle, startup-eligibility toggles, and a single global kill-switch toggle. The window remembers its last size between launches.
+MVP CLI is implemented for core NetworkManager profile workflows and startup random selection logic. GTK/libadwaita desktop UI now includes profile listing, refresh, a per-profile connection toggle, startup-eligibility toggles, a single global kill-switch toggle, an always-on lockdown-firewall toggle, and an Import button for adding WireGuard `.conf` profiles. The window remembers its last size between launches.
 
 ## Development (initial)
 
@@ -47,7 +48,7 @@ Current CLI commands:
 # list wireguard profiles and active state
 cargo run -- list
 
-# launch GUI (list + refresh + connection/kill-switch toggles)
+# launch GUI (list + refresh + connection/kill-switch/lockdown toggles + import)
 # (requires GTK/libadwaita dev packages)
 cargo run --features gui -- gui
 
@@ -70,11 +71,17 @@ cargo run -- startup-random
 cargo run -- kill-switch status
 cargo run -- kill-switch enable
 cargo run -- kill-switch disable
+
+# inspect or toggle the always-on lockdown firewall
+# (blocks all non-VPN traffic, even while disconnected; uses pkexec + firewalld)
+cargo run -- lockdown status
+cargo run -- lockdown enable
+cargo run -- lockdown disable
 ```
 
 `list` output now includes eligibility status from config (`eligible` or `not-eligible`). Profiles are eligible by default and become `not-eligible` only once explicitly excluded.
 
-GUI currently renders each profile row with just the profile name, a startup-eligibility toggle (checked by default, since every profile is eligible until excluded), and a per-row connection toggle (a switch that activates the tunnel when turned on and disconnects it when turned off) wired to NetworkManager operations, alongside a single global kill-switch toggle; enabling the global kill switch also raises a desktop notification. The list auto-refreshes after each change and also reacts to NetworkManager monitor events. NetworkManager calls run on a background thread so the UI stays responsive while `nmcli` works, toggles disable until the operation finishes and revert on failure, and the `nmcli monitor` child process is terminated when the window closes, which also persists the current window size.
+GUI currently renders each profile row with just the profile name, a startup-eligibility toggle (checked by default, since every profile is eligible until excluded), and a per-row connection toggle (a switch that activates the tunnel when turned on and disconnects it when turned off) wired to NetworkManager operations, alongside a single global kill-switch toggle and an always-on lockdown-firewall toggle; enabling either the kill switch or lockdown also raises a desktop notification. An Import button opens a file chooser to add a WireGuard `.conf` as a new NetworkManager profile, after which the list refreshes automatically. The list auto-refreshes after each change and also reacts to NetworkManager monitor events. NetworkManager and firewall calls run on a background thread so the UI stays responsive while `nmcli`/`firewall-cmd` work, toggles disable until the operation finishes and revert on failure, and the `nmcli monitor` child process is terminated when the window closes, which also persists the current window size.
 
 `eligible add` clears a profile's exclusion (reporting when it was already eligible), and `eligible remove` excludes a profile from random startup (reporting when it was already excluded).
 
@@ -167,6 +174,23 @@ cargo test --all-features
   default route. It applies the next time a profile is activated and is effective
   for full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0` allowed IPs). No
   firewall rules or privileged helper are involved.
+- Lockdown is an optional always-on firewall that closes the kill switch's one
+  gap: the kill switch only protects traffic *while a tunnel is active*, whereas
+  lockdown blocks all non-VPN traffic even while disconnected and across reboots.
+  It installs permanent `firewalld` direct rules on the OUTPUT chain (both IPv4
+  and IPv6) that allow only loopback, established connections, DNS, the WireGuard
+  tunnel interfaces, and the peer endpoints (so the *encrypted* handshake can
+  still leave); everything else is rejected by a `zento-lockdown`-tagged rule.
+  Because it touches the system firewall, `firewall-cmd` runs through `pkexec`
+  (polkit caches the prompt, so enabling/disabling asks for a password at most
+  once), and the disable path always tears the ruleset down so the user can never
+  be permanently locked out. The pure rule-builders are unit-tested; the
+  privileged `firewall-cmd`/`pkexec` calls need a real firewalld and root, so they
+  are verified by running the binary, not in `cargo test`.
+- Profile import (GUI only) runs `nmcli connection import type wireguard file
+  <path>`, so NetworkManager stays the single source of truth — no local copy of
+  the `.conf` is kept. Inside the Flatpak the chosen file reaches the host `nmcli`
+  through `flatpak-spawn --host`.
 - Packaging is Flathub-ready: crates are vendored (`flatpak/cargo-sources.json`)
   for a network-isolated `--offline` build, and the desktop entry and AppStream
   metainfo validate cleanly (`desktop-file-validate`, `appstreamcli validate`).

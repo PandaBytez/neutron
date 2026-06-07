@@ -20,6 +20,13 @@ pub struct AppConfig {
     /// routing policy is applied to every WireGuard profile (not per-profile).
     #[serde(default)]
     pub kill_switch_enabled: bool,
+    /// Global lockdown intent. When enabled, an always-on firewall blocks all
+    /// traffic except the WireGuard tunnel, its handshake, and DNS -- enforced
+    /// even when no VPN is connected. The firewall rules are the real source of
+    /// truth; this flag only remembers the user's intent so the GUI toggle can
+    /// show the right state without a privileged query at startup.
+    #[serde(default)]
+    pub lockdown_enabled: bool,
     /// Last window width remembered between sessions (`None` until first save).
     #[serde(default)]
     pub window_width: Option<i32>,
@@ -117,6 +124,7 @@ mod tests {
         let path = unique_path("roundtrip");
         let config = AppConfig {
             kill_switch_enabled: true,
+            lockdown_enabled: true,
             window_width: Some(1024),
             window_height: Some(768),
             ..AppConfig::default()
@@ -126,6 +134,7 @@ mod tests {
         let loaded = load(&path).expect("config should load");
 
         assert!(loaded.kill_switch_enabled);
+        assert!(loaded.lockdown_enabled);
         assert_eq!(loaded.window_width, Some(1024));
         assert_eq!(loaded.window_height, Some(768));
         cleanup(&path);
@@ -147,6 +156,7 @@ mod tests {
 
         assert!(loaded.excluded_profile_ids.is_empty());
         assert!(!loaded.kill_switch_enabled);
+        assert!(!loaded.lockdown_enabled);
         assert_eq!(loaded.window_width, None);
         assert_eq!(loaded.window_height, None);
         cleanup(&path);

@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{AppError, AppResult};
-use crate::nm::{NmClient, WireguardProfile};
+use crate::firewall::FirewallClient;
+use crate::nm::{NmClient, WireguardProfile, WireguardTunnel};
 
 /// A configurable in-memory [`NmClient`] for tests.
 ///
@@ -21,13 +22,17 @@ use crate::nm::{NmClient, WireguardProfile};
 #[derive(Clone, Default)]
 pub struct MockNmClient {
     profiles: Vec<WireguardProfile>,
+    tunnels: Vec<WireguardTunnel>,
     fail_list: bool,
     fail_ids: HashSet<String>,
     fail_kill_switch: bool,
+    fail_lockdown: bool,
     calls: Arc<Mutex<Vec<String>>>,
     attempted: Arc<Mutex<Vec<String>>>,
     connected: Arc<Mutex<Vec<String>>>,
     kill_switch_calls: Arc<Mutex<Vec<String>>>,
+    lockdown_calls: Arc<Mutex<Vec<String>>>,
+    imported: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockNmClient {
@@ -66,6 +71,20 @@ impl MockNmClient {
         self
     }
 
+    /// Consume this mock and return one whose `enable_lockdown`/`disable_lockdown`
+    /// fail, to exercise the error path where the firewall rejects the change.
+    /// The attempt is still recorded in [`Self::lockdown_calls`] first.
+    pub fn fail_lockdown(mut self) -> Self {
+        self.fail_lockdown = true;
+        self
+    }
+
+    /// Set the tunnels returned by `wireguard_tunnels`.
+    pub fn with_tunnels(mut self, tunnels: Vec<WireguardTunnel>) -> Self {
+        self.tunnels = tunnels;
+        self
+    }
+
     /// Every operation in invocation order, formatted as `connect:<id>`,
     /// `switch:<id>`, or `disconnect`.
     pub fn calls(&self) -> Vec<String> {
@@ -89,6 +108,20 @@ impl MockNmClient {
             .lock()
             .expect("mock mutex poisoned")
             .clone()
+    }
+
+    /// Lockdown toggles in invocation order, formatted as `lockdown:on` or
+    /// `lockdown:off`.
+    pub fn lockdown_calls(&self) -> Vec<String> {
+        self.lockdown_calls
+            .lock()
+            .expect("mock mutex poisoned")
+            .clone()
+    }
+
+    /// Paths passed to `import_wireguard_profile`, in invocation order.
+    pub fn imported_paths(&self) -> Vec<String> {
+        self.imported.lock().expect("mock mutex poisoned").clone()
     }
 }
 
@@ -152,6 +185,49 @@ impl NmClient for MockNmClient {
             return Err(AppError::NmCommandFailed(
                 "simulated kill-switch failure".to_string(),
             ));
+        }
+
+        Ok(())
+    }
+
+    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
+        if self.fail_list {
+            return Err(AppError::NmCommandFailed("simulated".to_string()));
+        }
+        Ok(self.tunnels.clone())
+    }
+
+    fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
+        self.imported
+            .lock()
+            .expect("mock mutex poisoned")
+            .push(path.display().to_string());
+        Ok(format!("Imported {}", path.display()))
+    }
+}
+
+impl FirewallClient for MockNmClient {
+    fn enable_lockdown(&self, _tunnels: &[WireguardTunnel]) -> AppResult<()> {
+        self.lockdown_calls
+            .lock()
+            .expect("mock mutex poisoned")
+            .push("lockdown:on".to_string());
+
+        if self.fail_lockdown {
+            return Err(AppError::Firewall("simulated lockdown failure".to_string()));
+        }
+
+        Ok(())
+    }
+
+    fn disable_lockdown(&self) -> AppResult<()> {
+        self.lockdown_calls
+            .lock()
+            .expect("mock mutex poisoned")
+            .push("lockdown:off".to_string());
+
+        if self.fail_lockdown {
+            return Err(AppError::Firewall("simulated lockdown failure".to_string()));
         }
 
         Ok(())

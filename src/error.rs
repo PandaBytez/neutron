@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum AppError {
     #[error("network manager command failed: {0}")]
     NmCommandFailed(String),
+    #[error("firewall command failed: {0}")]
+    Firewall(String),
     #[error("failed to parse NetworkManager output: {0}")]
     NmParseFailed(String),
     #[error("wireguard profile not found: {0}")]

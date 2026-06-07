@@ -17,8 +17,10 @@
     <p>Features:</p>
     <ul>
       <li>Connect, disconnect, and switch between WireGuard profiles</li>
+      <li>Import WireGuard configuration files as NetworkManager profiles</li>
       <li>Select a random profile once per boot from an eligible pool</li>
       <li>Enable a global NetworkManager-native kill switch for all profiles</li>
+      <li>Enable an always-on lockdown firewall that blocks all non-VPN traffic, even while disconnected</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.gitlab.zento_vpn_manager.zento.desktop</launchable>

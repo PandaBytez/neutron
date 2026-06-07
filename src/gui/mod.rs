@@ -19,11 +19,12 @@ mod enabled {
     use crate::app::refresh_sync;
     use crate::config;
     use crate::error::AppResult;
+    use crate::firewall::FirewallClient;
     use crate::nm::NmClient;
 
     pub fn run<C>(client: C) -> AppResult<()>
     where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let app = Application::builder()
             .application_id("io.gitlab.zento_vpn_manager.zento")
@@ -41,7 +42,7 @@ mod enabled {
 
     fn build_ui<C>(app: &Application, client: C)
     where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let header = HeaderBar::builder()
             .title_widget(&gtk::Label::new(Some("Zento")))
@@ -107,6 +108,14 @@ mod enabled {
             .build();
 
         let kill_switch_row = build_kill_switch_row(app, &client, &status);
+        let lockdown_row = build_lockdown_row(app, &client, &status);
+        let import = build_import_button(&client, &list, &status);
+
+        // Group the manual actions on one row so they read as a toolbar rather
+        // than a stacked column of full-width buttons.
+        let actions = gtk::Box::new(Orientation::Horizontal, 12);
+        actions.append(&refresh);
+        actions.append(&import);
 
         let container = gtk::Box::new(Orientation::Vertical, 12);
         container.set_margin_top(24);
@@ -114,7 +123,8 @@ mod enabled {
         container.set_margin_start(24);
         container.set_margin_end(24);
         container.append(&kill_switch_row);
-        container.append(&refresh);
+        container.append(&lockdown_row);
+        container.append(&actions);
         container.append(&status);
         container.append(&scroller);
 
@@ -346,6 +356,191 @@ mod enabled {
             "All WireGuard profiles now drop traffic if the tunnel fails. Applies on next connect.",
         ));
         app.send_notification(Some("zento-kill-switch"), &notification);
+    }
+
+    /// Build the global lockdown row: a switch that installs (or removes) the
+    /// always-on firewall blocking every non-VPN packet. Mirrors the kill-switch
+    /// row, but the blocking `pkexec firewall-cmd` work (which may prompt for a
+    /// password) runs off the GTK main thread; the switch is disabled while it
+    /// runs and reverts on failure.
+    fn build_lockdown_row<C>(app: &Application, client: &C, status: &gtk::Label) -> gtk::Box
+    where
+        C: NmClient + FirewallClient + Clone + Send + 'static,
+    {
+        let label = gtk::Label::new(Some("Lockdown (always-on firewall)"));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+
+        let toggle = gtk::Switch::new();
+        toggle.set_valign(gtk::Align::Center);
+        toggle.set_active(load_lockdown_enabled());
+
+        let guard = Rc::new(Cell::new(false));
+        {
+            let app = app.clone();
+            let client = client.clone();
+            let status = status.clone();
+            toggle.connect_state_set(move |toggle, requested| {
+                // Ignore programmatic state changes (e.g. a revert) so they do
+                // not re-trigger the firewall work.
+                if guard.get() {
+                    return glib::Propagation::Proceed;
+                }
+                toggle.set_sensitive(false);
+                status.set_label(&format!(
+                    "{} lockdown firewall\u{2026}",
+                    if requested { "Enabling" } else { "Disabling" }
+                ));
+
+                let app = app.clone();
+                let client = client.clone();
+                let status = status.clone();
+                let toggle = toggle.clone();
+                let guard = guard.clone();
+                glib::spawn_future_local(async move {
+                    let task_client = client.clone();
+                    let outcome =
+                        gio::spawn_blocking(move || apply_global_lockdown(&task_client, requested))
+                            .await;
+
+                    toggle.set_sensitive(true);
+                    match outcome {
+                        Ok(Ok(())) => {
+                            status.set_label(&format!(
+                                "Lockdown firewall {}.",
+                                if requested { "enabled" } else { "disabled" }
+                            ));
+                            if requested {
+                                notify_lockdown_enabled(&app);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            status.set_label(&format!("Failed to update lockdown: {error}"));
+                            revert_switch(&toggle, &guard, !requested);
+                        }
+                        Err(_) => {
+                            status
+                                .set_label("Failed to update lockdown: background task panicked.");
+                            revert_switch(&toggle, &guard, !requested);
+                        }
+                    }
+                });
+
+                glib::Propagation::Proceed
+            });
+        }
+
+        let row = gtk::Box::new(Orientation::Horizontal, 12);
+        row.append(&label);
+        row.append(&toggle);
+        row
+    }
+
+    /// Apply the always-on lockdown firewall and persist the new state to config.
+    /// Runs on the Gio thread pool (off the GTK main thread); errors are
+    /// surfaced as strings for the status label.
+    ///
+    /// Delegates to [`crate::app::set_global_lockdown`] so the
+    /// apply-before-persist ordering lives in exactly one place.
+    fn apply_global_lockdown<C: NmClient + FirewallClient>(
+        client: &C,
+        enable: bool,
+    ) -> Result<(), String> {
+        let path = config::default_config_path().map_err(|error| error.to_string())?;
+        crate::app::set_global_lockdown(client, &path, enable).map_err(|error| error.to_string())
+    }
+
+    /// Read the remembered global lockdown state from config (default off).
+    fn load_lockdown_enabled() -> bool {
+        config::default_config_path()
+            .and_then(|path| config::load(&path))
+            .map(|app_cfg| app_cfg.lockdown_enabled)
+            .unwrap_or(false)
+    }
+
+    /// Send a desktop notification telling the user lockdown is active.
+    fn notify_lockdown_enabled(app: &Application) {
+        let notification = gio::Notification::new("Lockdown enabled");
+        notification.set_body(Some(
+            "All traffic is now blocked except the WireGuard tunnel, its handshake, and DNS \u{2014} even when no VPN is connected.",
+        ));
+        app.send_notification(Some("zento-lockdown"), &notification);
+    }
+
+    /// Build the "Import" button: opens a file chooser and imports the chosen
+    /// WireGuard `.conf` as a new NetworkManager profile. The blocking `nmcli`
+    /// import runs off the GTK main thread; the profile list refreshes on
+    /// success so the new profile appears without a manual Refresh.
+    fn build_import_button<C>(client: &C, list: &gtk::ListBox, status: &gtk::Label) -> gtk::Button
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let button = gtk::Button::with_label("Import\u{2026}");
+        button.set_halign(gtk::Align::Start);
+
+        let client = client.clone();
+        let list = list.clone();
+        let status = status.clone();
+        button.connect_clicked(move |button| {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("WireGuard configuration (*.conf)"));
+            filter.add_pattern("*.conf");
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+
+            let dialog = gtk::FileDialog::builder()
+                .title("Import WireGuard configuration")
+                .modal(true)
+                .filters(&filters)
+                .default_filter(&filter)
+                .build();
+
+            // Parent the modal on the live window so it centers correctly; the
+            // button is realized by click time, so its root is the window.
+            let parent = button.root().and_downcast::<gtk::Window>();
+
+            let client = client.clone();
+            let list = list.clone();
+            let status = status.clone();
+            dialog.open(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+                let file = match result {
+                    Ok(file) => file,
+                    // The user dismissed the chooser; nothing to import.
+                    Err(_) => return,
+                };
+                let Some(path) = file.path() else {
+                    status.set_label("Import failed: the selected file has no local path.");
+                    return;
+                };
+
+                status.set_label(&format!("Importing '{}'\u{2026}", path.display()));
+                let task_client = client.clone();
+                let task_path = path.clone();
+                let client = client.clone();
+                let list = list.clone();
+                let status = status.clone();
+                glib::spawn_future_local(async move {
+                    let outcome = gio::spawn_blocking(move || {
+                        task_client.import_wireguard_profile(&task_path)
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(message)) => {
+                            status.set_label(&message);
+                            refresh_profile_list(&client, &list, &status);
+                        }
+                        Ok(Err(error)) => {
+                            status.set_label(&format!("Import failed: {error}"));
+                        }
+                        Err(_) => {
+                            status.set_label("Import failed: background task panicked.");
+                        }
+                    }
+                });
+            });
+        });
+
+        button
     }
 
     /// Reload the profile list. The blocking NetworkManager/config work runs on

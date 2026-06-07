@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config;
 use crate::error::AppResult;
+use crate::firewall::FirewallClient;
 use crate::nm::{self, NmClient, WireguardProfile};
 use crate::service;
 
@@ -37,6 +38,10 @@ enum Commands {
         #[command(subcommand)]
         command: KillSwitchCommands,
     },
+    Lockdown {
+        #[command(subcommand)]
+        command: LockdownCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -53,12 +58,22 @@ enum KillSwitchCommands {
     Disable,
 }
 
-pub fn run<C: NmClient + Clone + Send + 'static>(client: &C) -> AppResult<()> {
+#[derive(Debug, Subcommand)]
+enum LockdownCommands {
+    Status,
+    Enable,
+    Disable,
+}
+
+pub fn run<C: NmClient + FirewallClient + Clone + Send + 'static>(client: &C) -> AppResult<()> {
     let cli = Cli::parse();
     execute(client, cli)
 }
 
-fn execute<C: NmClient + Clone + Send + 'static>(client: &C, cli: Cli) -> AppResult<()> {
+fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
+    client: &C,
+    cli: Cli,
+) -> AppResult<()> {
     match cli.command {
         Commands::List => {
             let path = config::default_config_path()?;
@@ -87,6 +102,7 @@ fn execute<C: NmClient + Clone + Send + 'static>(client: &C, cli: Cli) -> AppRes
         }
         Commands::Eligible { command } => handle_eligible_command(client, command),
         Commands::KillSwitch { command } => handle_kill_switch_command(client, command),
+        Commands::Lockdown { command } => handle_lockdown_command(client, command),
     }
 }
 
@@ -199,6 +215,68 @@ pub(crate) fn set_global_kill_switch<C: NmClient>(
     client.set_kill_switch_all(enable)?;
     let mut app_cfg = config::load(path)?;
     app_cfg.kill_switch_enabled = enable;
+    config::save(path, &app_cfg)
+}
+
+fn handle_lockdown_command<C: NmClient + FirewallClient>(
+    client: &C,
+    command: LockdownCommands,
+) -> AppResult<()> {
+    let path = config::default_config_path()?;
+    handle_lockdown_command_with_path(client, command, &path)
+}
+
+fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
+    client: &C,
+    command: LockdownCommands,
+    path: &std::path::Path,
+) -> AppResult<()> {
+    match command {
+        LockdownCommands::Status => {
+            let app_cfg = config::load(path)?;
+            let label = if app_cfg.lockdown_enabled {
+                "on"
+            } else {
+                "off"
+            };
+            println!("Lockdown (always-on firewall): {label}");
+        }
+        LockdownCommands::Enable => {
+            set_global_lockdown(client, path, true)?;
+            println!(
+                "Lockdown enabled: all traffic is blocked except the WireGuard tunnel, its handshake, and DNS."
+            );
+        }
+        LockdownCommands::Disable => {
+            set_global_lockdown(client, path, false)?;
+            println!("Lockdown disabled: normal connectivity restored.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply (or remove) the always-on lockdown firewall and persist the new intent.
+///
+/// Like [`set_global_kill_switch`], the firewall is updated *before* the config
+/// is saved, so a failed `firewall-cmd` call (the `?` returns early) leaves the
+/// persisted `lockdown_enabled` flag untouched. Enabling first reads the current
+/// tunnels so their interfaces and endpoints are allowed through; disabling
+/// needs no tunnel data and always tears the ruleset down (the safeguard that
+/// the user can never be permanently locked out).
+pub(crate) fn set_global_lockdown<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    enable: bool,
+) -> AppResult<()> {
+    if enable {
+        let tunnels = client.wireguard_tunnels()?;
+        client.enable_lockdown(&tunnels)?;
+    } else {
+        client.disable_lockdown()?;
+    }
+    let mut app_cfg = config::load(path)?;
+    app_cfg.lockdown_enabled = enable;
     config::save(path, &app_cfg)
 }
 
@@ -414,6 +492,144 @@ mod tests {
             client.kill_switch_calls(),
             vec!["kill-switch-all:on", "kill-switch-all:off"]
         );
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn lockdown_enable_applies_and_persists() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path)
+            .expect("enable should succeed");
+
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
+        let persisted = config::load(&path).expect("config should load");
+        assert!(persisted.lockdown_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn lockdown_disable_applies_and_persists() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+
+        handle_lockdown_command_with_path(&client, LockdownCommands::Disable, &path)
+            .expect("disable should succeed");
+
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:off"]);
+        let persisted = config::load(&path).expect("config should load");
+        assert!(!persisted.lockdown_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn lockdown_status_does_not_change_firewall_or_config() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+
+        handle_lockdown_command_with_path(&client, LockdownCommands::Status, &path)
+            .expect("status should succeed");
+
+        // Status only reports; it must not touch the firewall or the config.
+        assert!(client.lockdown_calls().is_empty());
+        let persisted = config::load(&path).expect("config should load");
+        assert!(persisted.lockdown_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn lockdown_status_defaults_to_off_without_config() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        // No config file: status reads the default (off) instead of erroring,
+        // and still does not invoke the firewall.
+        handle_lockdown_command_with_path(&client, LockdownCommands::Status, &path)
+            .expect("status should succeed with default config");
+
+        assert!(client.lockdown_calls().is_empty());
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn lockdown_enable_does_not_persist_when_firewall_fails() {
+        let client =
+            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_lockdown();
+        let path = unique_test_config_path();
+
+        let result = handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path);
+
+        assert!(matches!(result, Err(AppError::Firewall(_))));
+        // The change was attempted, but because the firewall rejected it the
+        // enabled intent must not be persisted.
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
+        let persisted = config::load(&path).expect("config should load");
+        assert!(!persisted.lockdown_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn lockdown_disable_keeps_previous_state_when_firewall_fails() {
+        let client =
+            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_lockdown();
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+
+        let result = handle_lockdown_command_with_path(&client, LockdownCommands::Disable, &path);
+
+        assert!(matches!(result, Err(AppError::Firewall(_))));
+        // A failed disable must leave the previously-enabled state intact.
+        let persisted = config::load(&path).expect("config should load");
+        assert!(persisted.lockdown_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn lockdown_enable_then_disable_round_trips_state() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path)
+            .expect("enable should succeed");
+        assert!(
+            config::load(&path)
+                .expect("config should load")
+                .lockdown_enabled
+        );
+
+        handle_lockdown_command_with_path(&client, LockdownCommands::Disable, &path)
+            .expect("disable should succeed");
+        assert!(
+            !config::load(&path)
+                .expect("config should load")
+                .lockdown_enabled
+        );
+
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:on", "lockdown:off"]);
         cleanup_test_config(&path);
     }
 

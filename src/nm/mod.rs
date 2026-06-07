@@ -35,6 +35,25 @@ impl WireguardProfile {
     }
 }
 
+/// A peer endpoint (`host:port`) that a WireGuard tunnel connects out to.
+///
+/// Lockdown needs these so the *encrypted* handshake is still allowed to leave
+/// the physical interface while every other non-tunnel packet is blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+/// The lockdown-relevant details of a WireGuard profile: the tunnel interface
+/// (so *decrypted* traffic is allowed once the tunnel is up) and the peer
+/// endpoints (so the handshake can reach the server while locked down).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WireguardTunnel {
+    pub interface: Option<String>,
+    pub endpoints: Vec<Endpoint>,
+}
+
 pub trait NmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>>;
     fn connect(&self, profile_identifier: &str) -> AppResult<()>;
@@ -45,6 +64,14 @@ pub trait NmClient {
     /// all profiles rather than per profile. The change is persisted to each
     /// NetworkManager profile and takes effect the next time it is activated.
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()>;
+    /// Discover the interface name and peer endpoints of every WireGuard
+    /// profile. Used to build the lockdown firewall allow-list so the tunnel
+    /// and its handshake keep working while all other traffic is blocked.
+    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>>;
+    /// Import a WireGuard configuration file as a new NetworkManager profile,
+    /// returning NetworkManager's confirmation message. Keeps NetworkManager the
+    /// single source of truth (no local copy of the config is kept).
+    fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -132,6 +159,100 @@ impl NmClient for CliNmClient {
         }
         Ok(())
     }
+
+    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
+        let profiles = self.list_wireguard_profiles()?;
+        let mut tunnels = Vec::new();
+        for profile in &profiles {
+            // `-g` (get-values) prints only the property value, so no field
+            // prefix has to be stripped.
+            let interface = run_nmcli(&[
+                "-g",
+                "connection.interface-name",
+                "connection",
+                "show",
+                &profile.uuid,
+            ])
+            .map(|value| parse_interface_name(&value))?;
+            let endpoints =
+                run_nmcli(&["-g", "wireguard.peers", "connection", "show", &profile.uuid])
+                    .map(|value| extract_endpoints(&value))?;
+            tunnels.push(WireguardTunnel {
+                interface,
+                endpoints,
+            });
+        }
+        Ok(tunnels)
+    }
+
+    fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| AppError::Config("import path is not valid UTF-8".to_string()))?;
+        run_nmcli(&[
+            "connection",
+            "import",
+            "type",
+            "wireguard",
+            "file",
+            path_str,
+        ])
+    }
+}
+
+/// Interpret a single `nmcli -g connection.interface-name` value, returning
+/// `None` when NetworkManager reports no interface name (empty or `--`).
+fn parse_interface_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "--" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Pull every `endpoint = host:port` out of an `nmcli` `wireguard.peers` value.
+///
+/// The peer description format varies between NetworkManager versions (spacing
+/// around `=`, trailing `,`/`;`), so this scans tolerantly: it finds each
+/// `endpoint` marker, skips an optional `=` and whitespace, then reads the
+/// address token up to the next delimiter.
+fn extract_endpoints(text: &str) -> Vec<Endpoint> {
+    let mut endpoints = Vec::new();
+    for segment in text.split("endpoint").skip(1) {
+        let token: String = segment
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+            .chars()
+            .take_while(|c| !matches!(c, ' ' | '\t' | '\n' | '\r' | ',' | ';'))
+            .collect();
+        if let Some(endpoint) = parse_endpoint(&token) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints
+}
+
+/// Parse a single `host:port` endpoint token, handling bracketed IPv6 literals
+/// (`[::1]:51820`). Returns `None` for malformed tokens or invalid ports.
+fn parse_endpoint(token: &str) -> Option<Endpoint> {
+    let (host, port) = if let Some(rest) = token.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[addr]:port`.
+        let (host, after) = rest.split_once(']')?;
+        let port = after.strip_prefix(':')?;
+        (host, port)
+    } else {
+        // IPv4 or hostname: the port follows the last colon.
+        token.rsplit_once(':')?
+    };
+
+    if host.is_empty() {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    Some(Endpoint {
+        host: host.to_string(),
+        port,
+    })
 }
 
 /// Build the per-profile `nmcli` argument batches that apply (`enable`) or
@@ -414,6 +535,78 @@ mod tests {
         let fields = parse_nmcli_fields(r"value\");
 
         assert_eq!(fields, vec![r"value\".to_string()]);
+    }
+
+    #[test]
+    fn interface_name_treats_empty_and_dash_as_absent() {
+        assert_eq!(parse_interface_name("wg0"), Some("wg0".to_string()));
+        // nmcli prints surrounding whitespace that must be trimmed.
+        assert_eq!(parse_interface_name("  wg0  "), Some("wg0".to_string()));
+        // An empty value or the `--` placeholder means "no interface set".
+        assert_eq!(parse_interface_name(""), None);
+        assert_eq!(parse_interface_name("--"), None);
+    }
+
+    #[test]
+    fn extracts_ipv4_endpoint_from_peer_value() {
+        let endpoints = extract_endpoints("endpoint = 1.2.3.4:51820, allowed-ips = 0.0.0.0/0");
+
+        assert_eq!(
+            endpoints,
+            vec![Endpoint {
+                host: "1.2.3.4".to_string(),
+                port: 51820,
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_multiple_peer_endpoints() {
+        // NetworkManager lists each peer; every `endpoint` marker is collected.
+        let endpoints = extract_endpoints("endpoint=1.2.3.4:51820; endpoint=vpn.example.com:1194;");
+
+        assert_eq!(
+            endpoints,
+            vec![
+                Endpoint {
+                    host: "1.2.3.4".to_string(),
+                    port: 51820,
+                },
+                Endpoint {
+                    host: "vpn.example.com".to_string(),
+                    port: 1194,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_bracketed_ipv6_endpoint() {
+        // Bracketed IPv6 literals must keep the address intact (the port follows
+        // the closing bracket, not the last colon inside the address).
+        let endpoints = extract_endpoints("endpoint = [2001:db8::1]:51820");
+
+        assert_eq!(
+            endpoints,
+            vec![Endpoint {
+                host: "2001:db8::1".to_string(),
+                port: 51820,
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_peers_without_endpoints() {
+        assert!(extract_endpoints("allowed-ips = 0.0.0.0/0").is_empty());
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_malformed_tokens() {
+        // Missing port, empty host, and non-numeric port are all rejected.
+        assert_eq!(parse_endpoint("1.2.3.4"), None);
+        assert_eq!(parse_endpoint(":51820"), None);
+        assert_eq!(parse_endpoint("host:notaport"), None);
+        assert_eq!(parse_endpoint("[2001:db8::1]"), None);
     }
 
     #[test]
