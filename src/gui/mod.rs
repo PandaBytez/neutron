@@ -724,7 +724,11 @@ mod enabled {
             let outcome = gio::spawn_blocking(move || load_rows(&client_for_load)).await;
             match outcome {
                 Ok(Ok(rows)) => {
-                    if is_empty {
+                    if rows.is_empty() {
+                        indicators.log.set_label(
+                            "No WireGuard profiles found. Import a configuration to add one.",
+                        );
+                    } else if is_empty {
                         indicators
                             .log
                             .set_label("Profiles loaded from NetworkManager.");
