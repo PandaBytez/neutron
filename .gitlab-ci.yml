@@ -39,7 +39,7 @@ test:
 
 flatpak:
   stage: build
-  image: 'registry.gitlab.gnome.org/gnome/gnome-runtime-images/rust_bundle:master'
+  image: 'quay.io/gnome_infrastructure/gnome-runtime-images:gnome-49'
   variables:
     MANIFEST_PATH: "flatpak/io.gitlab.zento_vpn_manager.zento.json"
     FLATPAK_MODULE: "zento"
