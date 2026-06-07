@@ -260,6 +260,13 @@ impl NmClient for CliNmClient {
         }
 
         if let Some(uuid) = new_uuid {
+            // `nmcli connection import` auto-activates the freshly imported
+            // WireGuard connection (autoconnect defaults on). That hijacks an
+            // already-active tunnel and flips the new profile's toggle on
+            // without the user asking. Bring it straight back down so importing
+            // only adds the profile; the user activates it explicitly.
+            let _ = run_nmcli(&["connection", "down", uuid.as_str()]);
+
             let comments = extract_interface_comments(path);
             if !comments.is_empty() {
                 if let Ok(config_path) = crate::config::default_config_path() {
