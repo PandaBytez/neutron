@@ -221,6 +221,14 @@ impl NmClient for MockNmClient {
             keepalive: "25".to_string(),
         })
     }
+
+    fn edit_connection(&self, uuid: &str, _is_dark: bool) -> AppResult<()> {
+        self.calls
+            .lock()
+            .expect("mock mutex poisoned")
+            .push(format!("edit:{}", uuid));
+        Ok(())
+    }
 }
 
 impl FirewallClient for MockNmClient {

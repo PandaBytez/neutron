@@ -86,7 +86,9 @@ pub trait NmClient {
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String>;
     /// Get read-only WireGuard diagnostics for a specific profile connection.
     fn get_profile_diagnostics(&self, uuid: &str, is_active: bool)
-    -> AppResult<ProfileDiagnostics>;
+        -> AppResult<ProfileDiagnostics>;
+    /// Open the native NetworkManager connection editor for the specified connection.
+    fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()>;
 }
 
 fn extract_interface_comments(path: &std::path::Path) -> String {
@@ -358,6 +360,35 @@ impl NmClient for CliNmClient {
         }
 
         Ok(diag)
+    }
+
+    fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()> {
+        let mut cmd = if running_in_flatpak_sandbox() {
+            let mut command = std::process::Command::new("flatpak-spawn");
+            command.arg("--host");
+            if is_dark {
+                command.arg("--env=GTK_THEME=Adwaita:dark");
+                command.arg("--env=ADW_DEBUG_COLOR_SCHEME=prefer-dark");
+            } else {
+                command.arg("--env=GTK_THEME=Adwaita:light");
+                command.arg("--env=ADW_DEBUG_COLOR_SCHEME=prefer-light");
+            }
+            command.arg("nm-connection-editor");
+            command
+        } else {
+            let mut command = std::process::Command::new("nm-connection-editor");
+            if is_dark {
+                command.env("GTK_THEME", "Adwaita:dark");
+                command.env("ADW_DEBUG_COLOR_SCHEME", "prefer-dark");
+            } else {
+                command.env("GTK_THEME", "Adwaita:light");
+                command.env("ADW_DEBUG_COLOR_SCHEME", "prefer-light");
+            }
+            command
+        };
+        cmd.arg("-e").arg(uuid);
+        cmd.spawn()?;
+        Ok(())
     }
 }
 
