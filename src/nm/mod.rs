@@ -54,6 +54,18 @@ pub struct WireguardTunnel {
     pub endpoints: Vec<Endpoint>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileDiagnostics {
+    pub interface_name: String,
+    pub public_key: String,
+    pub endpoint: String,
+    pub allowed_ips: String,
+    pub latest_handshake: String,
+    pub transfer_rx: String,
+    pub transfer_tx: String,
+    pub keepalive: String,
+}
+
 pub trait NmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>>;
     fn connect(&self, profile_identifier: &str) -> AppResult<()>;
@@ -72,6 +84,9 @@ pub trait NmClient {
     /// returning NetworkManager's confirmation message. Keeps NetworkManager the
     /// single source of truth (no local copy of the config is kept).
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String>;
+    /// Get read-only WireGuard diagnostics for a specific profile connection.
+    fn get_profile_diagnostics(&self, uuid: &str, is_active: bool)
+    -> AppResult<ProfileDiagnostics>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -197,6 +212,119 @@ impl NmClient for CliNmClient {
             "file",
             path_str,
         ])
+    }
+
+    fn get_profile_diagnostics(
+        &self,
+        uuid: &str,
+        is_active: bool,
+    ) -> AppResult<ProfileDiagnostics> {
+        let nm_output = run_command_with_timeout(
+            "nmcli",
+            &[
+                "-g",
+                "connection.interface-name",
+                "connection",
+                "show",
+                uuid,
+            ],
+            NMCLI_TIMEOUT,
+        )?;
+
+        let interface_name = parse_interface_name(&nm_output).ok_or_else(|| {
+            AppError::NmCommandFailed("No interface name configured for this profile".to_string())
+        })?;
+
+        let mut diag = ProfileDiagnostics {
+            interface_name: interface_name.clone(),
+            public_key: "N/A".to_string(),
+            endpoint: "N/A".to_string(),
+            allowed_ips: "N/A".to_string(),
+            latest_handshake: "N/A".to_string(),
+            transfer_rx: "N/A".to_string(),
+            transfer_tx: "N/A".to_string(),
+            keepalive: "N/A".to_string(),
+        };
+
+        if !is_active {
+            return Ok(diag);
+        }
+
+        let wg_output = run_command_with_timeout(
+            "wg",
+            &["show", &interface_name, "dump"],
+            Duration::from_secs(5),
+        );
+
+        let wg_stdout = match wg_output {
+            Ok(out) => out,
+            Err(_) => return Ok(diag),
+        };
+
+        let mut lines = wg_stdout.lines();
+        if let Some(first_line) = lines.next() {
+            let cols: Vec<&str> = first_line.split('\t').collect();
+            if cols.len() >= 2 {
+                diag.public_key = cols[1].to_string();
+            }
+        }
+        if let Some(second_line) = lines.next() {
+            let cols: Vec<&str> = second_line.split('\t').collect();
+            if cols.len() >= 8 {
+                diag.endpoint = cols[2].to_string();
+                diag.allowed_ips = cols[3].to_string();
+                if let Ok(ts) = cols[4].parse::<u64>() {
+                    if ts > 0 {
+                        diag.latest_handshake = format_handshake_time(ts);
+                    } else {
+                        diag.latest_handshake = "Never".to_string();
+                    }
+                }
+                if let Ok(rx) = cols[5].parse::<u64>() {
+                    diag.transfer_rx = format_bytes(rx);
+                }
+                if let Ok(tx) = cols[6].parse::<u64>() {
+                    diag.transfer_tx = format_bytes(tx);
+                }
+                diag.keepalive = cols[7].to_string();
+            }
+        }
+
+        Ok(diag)
+    }
+}
+
+pub fn format_handshake_time(timestamp: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now >= timestamp {
+        let diff = now - timestamp;
+        if diff < 60 {
+            format!("{}s ago", diff)
+        } else if diff < 3600 {
+            format!("{}m {}s ago", diff / 60, diff % 60)
+        } else {
+            format!("{}h {}m ago", diff / 3600, (diff % 3600) / 60)
+        }
+    } else {
+        "Just now".to_string()
+    }
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.2} GiB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MiB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KiB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -698,5 +826,28 @@ mod tests {
 
         assert_eq!(command.get_program(), "nmcli");
         assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(1536), "1.50 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[test]
+    fn test_format_handshake_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        assert_eq!(format_handshake_time(now), "0s ago");
+        assert_eq!(format_handshake_time(now - 10), "10s ago");
+        assert_eq!(format_handshake_time(now - 65), "1m 5s ago");
+        assert_eq!(format_handshake_time(now - 3665), "1h 1m ago");
+        assert_eq!(format_handshake_time(now + 10), "Just now");
     }
 }

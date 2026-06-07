@@ -111,25 +111,61 @@ mod enabled {
         let lockdown_row = build_lockdown_row(app, &client, &status);
         let import = build_import_button(&client, &list, &status);
 
-        // Group the manual actions on one row so they read as a toolbar rather
-        // than a stacked column of full-width buttons.
-        let actions = gtk::Box::new(Orientation::Horizontal, 12);
-        actions.append(&refresh);
-        actions.append(&import);
-
         let container = gtk::Box::new(Orientation::Vertical, 12);
         container.set_margin_top(24);
         container.set_margin_bottom(24);
         container.set_margin_start(24);
         container.set_margin_end(24);
-        container.append(&kill_switch_row);
-        container.append(&lockdown_row);
-        container.append(&actions);
+
+        let logo = if std::path::Path::new(
+            "/app/share/icons/hicolor/scalable/apps/io.gitlab.zento_vpn_manager.zento.svg",
+        )
+        .exists()
+        {
+            gtk::Image::from_file(
+                "/app/share/icons/hicolor/scalable/apps/io.gitlab.zento_vpn_manager.zento.svg",
+            )
+        } else if std::path::Path::new("flatpak/io.gitlab.zento_vpn_manager.zento.svg").exists() {
+            gtk::Image::from_file("flatpak/io.gitlab.zento_vpn_manager.zento.svg")
+        } else {
+            gtk::Image::from_icon_name("io.gitlab.zento_vpn_manager.zento")
+        };
+        logo.set_pixel_size(96);
+        logo.set_halign(gtk::Align::Center);
+        logo.set_margin_bottom(12);
+        container.append(&logo);
+
+        // Settings Section
+        let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
+        settings_group.add(&kill_switch_row);
+        settings_group.add(&lockdown_row);
+
+        container.append(&settings_group);
+
+        // Profiles Section
+        let profiles_title = gtk::Label::new(None);
+        profiles_title.set_markup("<b>Profiles</b>");
+        profiles_title.set_xalign(0.0);
+        profiles_title.set_hexpand(true);
+
+        let profiles_header = gtk::Box::new(Orientation::Horizontal, 12);
+        profiles_header.set_margin_top(12);
+        profiles_header.set_margin_bottom(4);
+        profiles_header.append(&profiles_title);
+        profiles_header.append(&import);
+        profiles_header.append(&refresh);
+
+        container.append(&profiles_header);
         container.append(&status);
         container.append(&scroller);
 
+        let clamp = adw::Clamp::builder()
+            .maximum_size(500)
+            .child(&container)
+            .build();
+
         let (width, height) = load_window_size();
-        let window = build_main_window(&header, &container, width, height);
+        let window = build_main_window(&header, &clamp.upcast::<gtk::Widget>(), width, height);
         window.set_application(Some(app));
 
         let monitor_child_for_close = monitor_child;
@@ -159,7 +195,7 @@ mod enabled {
     /// window reopens at the size the user last left it.
     fn build_main_window(
         header: &HeaderBar,
-        body: &gtk::Box,
+        body: &gtk::Widget,
         width: i32,
         height: i32,
     ) -> ApplicationWindow {
@@ -248,14 +284,14 @@ mod enabled {
     /// removes) the NetworkManager kill-switch routing policy across *every*
     /// WireGuard profile at once. The blocking `nmcli` work runs off the GTK
     /// main thread; the switch is disabled while it runs and reverts on failure.
-    fn build_kill_switch_row<C>(app: &Application, client: &C, status: &gtk::Label) -> gtk::Box
+    fn build_kill_switch_row<C>(
+        app: &Application,
+        client: &C,
+        status: &gtk::Label,
+    ) -> adw::ActionRow
     where
         C: NmClient + Clone + Send + 'static,
     {
-        let label = gtk::Label::new(Some("Kill switch (all profiles)"));
-        label.set_xalign(0.0);
-        label.set_hexpand(true);
-
         let toggle = gtk::Switch::new();
         toggle.set_valign(gtk::Align::Center);
         toggle.set_active(load_kill_switch_enabled());
@@ -317,9 +353,12 @@ mod enabled {
             });
         }
 
-        let row = gtk::Box::new(Orientation::Horizontal, 12);
-        row.append(&label);
-        row.append(&toggle);
+        let row = adw::ActionRow::builder()
+            .title("Kill Switch")
+            .subtitle("Drop all traffic if any WireGuard profile fails to connect")
+            .build();
+        row.add_suffix(&toggle);
+        row.set_activatable_widget(Some(&toggle));
         row
     }
 
@@ -363,14 +402,10 @@ mod enabled {
     /// row, but the blocking `pkexec firewall-cmd` work (which may prompt for a
     /// password) runs off the GTK main thread; the switch is disabled while it
     /// runs and reverts on failure.
-    fn build_lockdown_row<C>(app: &Application, client: &C, status: &gtk::Label) -> gtk::Box
+    fn build_lockdown_row<C>(app: &Application, client: &C, status: &gtk::Label) -> adw::ActionRow
     where
         C: NmClient + FirewallClient + Clone + Send + 'static,
     {
-        let label = gtk::Label::new(Some("Lockdown (always-on firewall)"));
-        label.set_xalign(0.0);
-        label.set_hexpand(true);
-
         let toggle = gtk::Switch::new();
         toggle.set_valign(gtk::Align::Center);
         toggle.set_active(load_lockdown_enabled());
@@ -430,9 +465,12 @@ mod enabled {
             });
         }
 
-        let row = gtk::Box::new(Orientation::Horizontal, 12);
-        row.append(&label);
-        row.append(&toggle);
+        let row = adw::ActionRow::builder()
+            .title("Lockdown Mode")
+            .subtitle("Strictly block non-VPN packets via system firewall")
+            .build();
+        row.add_suffix(&toggle);
+        row.set_activatable_widget(Some(&toggle));
         row
     }
 
@@ -622,6 +660,37 @@ mod enabled {
         Ok(changed)
     }
 
+    fn update_profile_eligibility<C>(
+        client: &C,
+        row: &profile_list::ProfileListRow,
+        eligible: bool,
+        list: &gtk::ListBox,
+        status: &gtk::Label,
+    ) -> bool
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let success = match set_eligibility_for_profile(&row.uuid, eligible) {
+            Ok(true) => {
+                status.set_label(&format!("Updated eligibility for '{}'.", row.name));
+                true
+            }
+            Ok(false) => {
+                status.set_label(&format!("No eligibility change for '{}'.", row.name));
+                false
+            }
+            Err(error) => {
+                status.set_label(&format!(
+                    "Failed to update eligibility for '{}': {error}",
+                    row.name
+                ));
+                false
+            }
+        };
+        refresh_profile_list(client, list, status);
+        success
+    }
+
     fn build_profile_row<C>(
         client: &C,
         row: &profile_list::ProfileListRow,
@@ -654,21 +723,7 @@ mod enabled {
             let list = list.clone();
             let status = status.clone();
             eligibility_toggle.connect_toggled(move |toggle| {
-                match set_eligibility_for_profile(&row.uuid, toggle.is_active()) {
-                    Ok(true) => {
-                        status.set_label(&format!("Updated eligibility for '{}'.", row.name));
-                        refresh_profile_list(&client, &list, &status);
-                    }
-                    Ok(false) => {
-                        status.set_label(&format!("No eligibility change for '{}'.", row.name));
-                    }
-                    Err(error) => {
-                        status.set_label(&format!(
-                            "Failed to update eligibility for '{}': {error}",
-                            row.name
-                        ));
-                    }
-                }
+                update_profile_eligibility(&client, &row, toggle.is_active(), &list, &status);
             });
         }
 
@@ -755,11 +810,210 @@ mod enabled {
 
         container.append(&details);
         container.append(&eligibility_toggle);
+
+        let settings_button = gtk::Button::builder()
+            .icon_name("preferences-system-symbolic")
+            .css_classes(vec!["flat".to_string()])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Connection options")
+            .build();
+        {
+            let client = client.clone();
+            let row = row.clone();
+            let list = list.clone();
+            let status = status.clone();
+            settings_button.connect_clicked(move |btn| {
+                if let Some(root) = btn.root() {
+                    if let Some(parent_window) = root.downcast_ref::<gtk::Window>() {
+                        show_profile_options_dialog(parent_window, &client, &row, &list, &status);
+                    }
+                }
+            });
+        }
+        container.append(&settings_button);
         container.append(&connection_toggle);
 
         let list_row = gtk::ListBoxRow::new();
         list_row.set_child(Some(&container));
         list_row
+    }
+
+    fn show_profile_options_dialog<C>(
+        parent_window: &gtk::Window,
+        client: &C,
+        row: &profile_list::ProfileListRow,
+        list: &gtk::ListBox,
+        status: &gtk::Label,
+    ) where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let dialog = gtk::Window::builder()
+            .title(&format!("{} Options", row.name))
+            .transient_for(parent_window)
+            .modal(true)
+            .default_width(380)
+            .default_height(350)
+            .build();
+
+        let root_box = gtk::Box::new(Orientation::Vertical, 12);
+        root_box.set_margin_top(16);
+        root_box.set_margin_bottom(16);
+        root_box.set_margin_start(16);
+        root_box.set_margin_end(16);
+
+        let spinner = gtk::Spinner::builder()
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        spinner.start();
+
+        let loading_label = gtk::Label::new(Some("Querying connection details\u{2026}"));
+        loading_label.set_halign(gtk::Align::Center);
+        loading_label.set_valign(gtk::Align::Center);
+
+        let loading_box = gtk::Box::new(Orientation::Vertical, 6);
+        loading_box.set_hexpand(true);
+        loading_box.set_vexpand(true);
+        loading_box.append(&spinner);
+        loading_box.append(&loading_label);
+
+        root_box.append(&loading_box);
+        dialog.set_child(Some(&root_box));
+
+        let client = client.clone();
+        let row = row.clone();
+        let list = list.clone();
+        let status_label = status.clone();
+        let dialog_weak = dialog.downgrade();
+
+        glib::spawn_future_local(async move {
+            let uuid = row.uuid.clone();
+            let is_active = row.is_active;
+
+            let task_client = client.clone();
+            let diagnostics_result =
+                gio::spawn_blocking(move || task_client.get_profile_diagnostics(&uuid, is_active))
+                    .await;
+
+            let Some(_dialog) = dialog_weak.upgrade() else {
+                return;
+            };
+
+            root_box.remove(&loading_box);
+
+            fn add_info_row(group: &adw::PreferencesGroup, title: &str, subtitle: &str) {
+                let row = adw::ActionRow::builder()
+                    .title(title)
+                    .subtitle(subtitle)
+                    .build();
+                group.add(&row);
+            }
+
+            match diagnostics_result {
+                Ok(Ok(diag)) => {
+                    let group = adw::PreferencesGroup::builder()
+                        .title(&format!("{} Connection", row.name))
+                        .build();
+
+                    add_info_row(&group, "Interface", &diag.interface_name);
+
+                    let eligibility_toggle = gtk::Switch::new();
+                    eligibility_toggle.set_valign(gtk::Align::Center);
+                    eligibility_toggle.set_active(row.eligible);
+                    {
+                        let client = client.clone();
+                        let row = row.clone();
+                        let list = list.clone();
+                        let status_label = status_label.clone();
+                        eligibility_toggle.connect_state_set(move |_toggle, requested| {
+                            if update_profile_eligibility(
+                                &client,
+                                &row,
+                                requested,
+                                &list,
+                                &status_label,
+                            ) {
+                                glib::Propagation::Proceed
+                            } else {
+                                glib::Propagation::Stop
+                            }
+                        });
+                    }
+
+                    let eligibility_row = adw::ActionRow::builder()
+                        .title("Startup Eligible")
+                        .subtitle("Select automatically at system boot")
+                        .build();
+                    eligibility_row.add_suffix(&eligibility_toggle);
+                    eligibility_row.set_activatable_widget(Some(&eligibility_toggle));
+                    group.add(&eligibility_row);
+
+                    if is_active {
+                        let copy_button = gtk::Button::builder()
+                            .icon_name("edit-copy-symbolic")
+                            .css_classes(vec!["flat".to_string()])
+                            .valign(gtk::Align::Center)
+                            .tooltip_text("Copy Public Key to clipboard")
+                            .build();
+
+                        let pk = diag.public_key.clone();
+                        copy_button.connect_clicked(move |btn| {
+                            let clipboard = btn.clipboard();
+                            clipboard.set_text(&pk);
+                        });
+
+                        let pk_row = adw::ActionRow::builder()
+                            .title("Public Key")
+                            .subtitle(&diag.public_key)
+                            .build();
+                        pk_row.add_suffix(&copy_button);
+                        group.add(&pk_row);
+
+                        if diag.endpoint != "N/A" {
+                            add_info_row(&group, "Endpoint", &diag.endpoint);
+                        }
+
+                        if diag.allowed_ips != "N/A" {
+                            add_info_row(&group, "Allowed IPs", &diag.allowed_ips);
+                        }
+
+                        if diag.latest_handshake != "N/A" {
+                            add_info_row(&group, "Latest Handshake", &diag.latest_handshake);
+                        }
+
+                        if diag.transfer_rx != "N/A" || diag.transfer_tx != "N/A" {
+                            let rx_tx_subtitle = format!(
+                                "Received: {} | Sent: {}",
+                                diag.transfer_rx, diag.transfer_tx
+                            );
+                            add_info_row(&group, "Data Transferred", &rx_tx_subtitle);
+                        }
+                    } else {
+                        add_info_row(
+                            &group,
+                            "Status",
+                            "Profile is inactive. Connect to view active WireGuard diagnostics.",
+                        );
+                    }
+
+                    root_box.append(&group);
+                }
+                other => {
+                    let error_msg = match other {
+                        Ok(Err(e)) => format!("Error loading diagnostics:\n{e}"),
+                        _ => "Error loading diagnostics:\nBackground task panicked.".to_string(),
+                    };
+                    let error_label = gtk::Label::new(Some(&error_msg));
+                    error_label.set_halign(gtk::Align::Center);
+                    error_label.set_valign(gtk::Align::Center);
+                    root_box.append(&error_label);
+                }
+            }
+        });
+
+        dialog.present();
     }
 
     #[cfg(test)]

@@ -204,6 +204,23 @@ impl NmClient for MockNmClient {
             .push(path.display().to_string());
         Ok(format!("Imported {}", path.display()))
     }
+
+    fn get_profile_diagnostics(
+        &self,
+        _uuid: &str,
+        _is_active: bool,
+    ) -> AppResult<crate::nm::ProfileDiagnostics> {
+        Ok(crate::nm::ProfileDiagnostics {
+            interface_name: "wg0".to_string(),
+            public_key: "mock_public_key_abc123".to_string(),
+            endpoint: "127.0.0.1:51820".to_string(),
+            allowed_ips: "0.0.0.0/0, ::/0".to_string(),
+            latest_handshake: "10s ago".to_string(),
+            transfer_rx: "100.00 KiB".to_string(),
+            transfer_tx: "50.00 KiB".to_string(),
+            keepalive: "25".to_string(),
+        })
+    }
 }
 
 impl FirewallClient for MockNmClient {
