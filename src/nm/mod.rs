@@ -512,12 +512,34 @@ pub(crate) fn host_command(program: &str) -> Command {
 }
 
 fn host_command_for(in_sandbox: bool, program: &str) -> Command {
+    host_command_with_env_for(in_sandbox, program, &[])
+}
+
+/// Like [`host_command`], but also sets environment variables on the host
+/// process.
+///
+/// Inside a Flatpak sandbox the variables cannot be set with [`Command::env`]:
+/// that would only affect `flatpak-spawn` itself, not the host program it
+/// launches. They must instead be forwarded as `--env=KEY=VALUE` arguments,
+/// which the session helper applies to the host process. Outside a sandbox the
+/// variables are set directly on the command.
+pub(crate) fn host_command_with_env(program: &str, envs: &[(&str, &str)]) -> Command {
+    host_command_with_env_for(running_in_flatpak_sandbox(), program, envs)
+}
+
+fn host_command_with_env_for(in_sandbox: bool, program: &str, envs: &[(&str, &str)]) -> Command {
     if in_sandbox {
         let mut command = Command::new("flatpak-spawn");
-        command.arg("--host").arg(program);
+        command.arg("--host");
+        for (key, value) in envs {
+            command.arg(format!("--env={key}={value}"));
+        }
+        command.arg(program);
         command
     } else {
-        Command::new(program)
+        let mut command = Command::new(program);
+        command.envs(envs.iter().copied());
+        command
     }
 }
 
@@ -826,6 +848,36 @@ mod tests {
 
         assert_eq!(command.get_program(), "nmcli");
         assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[test]
+    fn sandbox_forwards_env_as_flatpak_spawn_args() {
+        let command = host_command_with_env_for(true, "pkexec", &[("SHELL", "/bin/sh")]);
+
+        assert_eq!(command.get_program(), "flatpak-spawn");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().expect("args should be valid UTF-8"))
+            .collect();
+        assert_eq!(args, ["--host", "--env=SHELL=/bin/sh", "pkexec"]);
+    }
+
+    #[test]
+    fn non_sandbox_sets_env_on_command() {
+        let command = host_command_with_env_for(false, "pkexec", &[("SHELL", "/bin/sh")]);
+
+        assert_eq!(command.get_program(), "pkexec");
+        assert_eq!(command.get_args().count(), 0);
+        let envs: Vec<_> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_str().expect("env key should be valid UTF-8"),
+                    value.map(|value| value.to_str().expect("env value should be valid UTF-8")),
+                )
+            })
+            .collect();
+        assert_eq!(envs, [("SHELL", Some("/bin/sh"))]);
     }
 
     #[test]
