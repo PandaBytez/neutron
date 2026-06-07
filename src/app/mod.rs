@@ -79,7 +79,11 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
             let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let profiles = client.list_wireguard_profiles()?;
-            let rows = profile_list::build_rows(&profiles, &app_cfg.excluded_profile_ids);
+            let rows = profile_list::build_rows(
+                &profiles,
+                &app_cfg.excluded_profile_ids,
+                &app_cfg.profile_custom_info,
+            );
             for row in rows {
                 println!("{}", profile_list::format_cli_row(&row));
             }

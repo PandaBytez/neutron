@@ -89,6 +89,38 @@ pub trait NmClient {
     -> AppResult<ProfileDiagnostics>;
 }
 
+fn extract_interface_comments(path: &std::path::Path) -> String {
+    use std::io::BufRead;
+    let mut comments = Vec::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        let reader = std::io::BufReader::new(file);
+        let mut in_interface = false;
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let trimmed = l.trim();
+                let lower = trimmed.to_lowercase();
+                if lower.starts_with("[interface]") {
+                    in_interface = true;
+                    continue;
+                }
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    in_interface = false;
+                    continue;
+                }
+                if in_interface {
+                    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+                        let content = trimmed[1..].trim();
+                        if !content.is_empty() {
+                            comments.push(content.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    comments.join("\n")
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CliNmClient;
 
@@ -204,14 +236,42 @@ impl NmClient for CliNmClient {
         let path_str = path
             .to_str()
             .ok_or_else(|| AppError::Config("import path is not valid UTF-8".to_string()))?;
-        run_nmcli(&[
+
+        let before_profiles = self.list_wireguard_profiles().unwrap_or_default();
+        let before_uuids: std::collections::HashSet<String> =
+            before_profiles.into_iter().map(|p| p.uuid).collect();
+
+        let output = run_nmcli(&[
             "connection",
             "import",
             "type",
             "wireguard",
             "file",
             path_str,
-        ])
+        ])?;
+
+        let after_profiles = self.list_wireguard_profiles().unwrap_or_default();
+        let mut new_uuid = None;
+        for p in after_profiles {
+            if !before_uuids.contains(&p.uuid) {
+                new_uuid = Some(p.uuid);
+                break;
+            }
+        }
+
+        if let Some(uuid) = new_uuid {
+            let comments = extract_interface_comments(path);
+            if !comments.is_empty() {
+                if let Ok(config_path) = crate::config::default_config_path() {
+                    if let Ok(mut app_cfg) = crate::config::load(&config_path) {
+                        app_cfg.profile_custom_info.insert(uuid, comments);
+                        let _ = crate::config::save(&config_path, &app_cfg);
+                    }
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     fn get_profile_diagnostics(
@@ -901,5 +961,32 @@ mod tests {
         assert_eq!(format_handshake_time(now - 65), "1m 5s ago");
         assert_eq!(format_handshake_time(now - 3665), "1h 1m ago");
         assert_eq!(format_handshake_time(now + 10), "Just now");
+    }
+
+    #[test]
+    fn test_extract_interface_comments() {
+        use std::fs::File;
+        use std::io::Write;
+        let config_path = std::env::temp_dir().join(format!(
+            "wireguard-manager-comments-test-{}.conf",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let mut file = File::create(&config_path).unwrap();
+        writeln!(file, "[Interface]").unwrap();
+        writeln!(file, "# Bouncing: Enabled").unwrap();
+        writeln!(file, "; NetShield: Block malware").unwrap();
+        writeln!(file, "Address = 10.2.0.2/32").unwrap();
+        writeln!(file, "").unwrap();
+        writeln!(file, "[Peer]").unwrap();
+        writeln!(file, "PublicKey = abc").unwrap();
+        drop(file);
+
+        let comments = extract_interface_comments(&config_path);
+        assert_eq!(comments, "Bouncing: Enabled\nNetShield: Block malware");
+
+        let _ = std::fs::remove_file(config_path);
     }
 }

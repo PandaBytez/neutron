@@ -7,6 +7,7 @@ pub struct ProfileListRow {
     pub is_active: bool,
     pub state_label: &'static str,
     pub eligible: bool,
+    pub custom_info: Option<String>,
 }
 
 pub fn format_cli_row(row: &ProfileListRow) -> String {
@@ -21,6 +22,7 @@ pub fn format_cli_row(row: &ProfileListRow) -> String {
 pub fn build_rows(
     profiles: &[WireguardProfile],
     excluded_profile_ids: &std::collections::BTreeSet<String>,
+    profile_custom_info: &std::collections::BTreeMap<String, String>,
 ) -> Vec<ProfileListRow> {
     let mut rows: Vec<_> = profiles
         .iter()
@@ -34,6 +36,7 @@ pub fn build_rows(
                 "inactive"
             },
             eligible: !excluded_profile_ids.contains(&profile.uuid),
+            custom_info: profile_custom_info.get(&profile.uuid).cloned(),
         })
         .collect();
 
@@ -67,6 +70,7 @@ mod tests {
                 profile("wg-us", "uuid-us", ProfileState::Active),
             ],
             &excluded,
+            &std::collections::BTreeMap::new(),
         );
 
         assert_eq!(rows.len(), 2);
@@ -86,6 +90,7 @@ mod tests {
                 profile("wg-us", "uuid-us", ProfileState::Active),
             ],
             &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
         );
 
         assert!(rows.iter().all(|row| row.eligible));
@@ -99,6 +104,7 @@ mod tests {
                 profile("wg-a", "uuid-a", ProfileState::Inactive),
             ],
             &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new(),
         );
 
         assert_eq!(rows[0].name, "wg-a");
@@ -113,6 +119,7 @@ mod tests {
             is_active: true,
             state_label: "active",
             eligible: true,
+            custom_info: None,
         };
 
         let line = format_cli_row(&row);

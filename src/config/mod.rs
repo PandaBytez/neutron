@@ -33,6 +33,9 @@ pub struct AppConfig {
     /// Last window height remembered between sessions (`None` until first save).
     #[serde(default)]
     pub window_height: Option<i32>,
+    /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
+    #[serde(default)]
+    pub profile_custom_info: std::collections::BTreeMap<String, String>,
 }
 
 pub fn load(path: &Path) -> AppResult<AppConfig> {
