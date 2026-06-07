@@ -568,7 +568,7 @@ mod enabled {
     where
         C: NmClient + Clone + Send + 'static,
     {
-        let button = gtk::Button::with_label("Import\u{2026}");
+        let button = gtk::Button::with_label("Import");
         button.set_halign(gtk::Align::Start);
 
         let client = client.clone();
@@ -586,7 +586,7 @@ mod enabled {
 
     /// Offer the import sources as a GNOME "Add VPN"-style chooser: each source
     /// is a row in a boxed list that opens its guided flow, plus a manual
-    /// file-import row. Mullvad is listed but inert until its flow lands.
+    /// file-import row.
     fn show_provider_chooser<C>(
         parent: Option<&gtk::Window>,
         client: &C,
@@ -635,14 +635,43 @@ mod enabled {
                 if let Some(window) = window.upgrade() {
                     window.close();
                 }
-                show_proton_import_dialog(parent.as_ref(), &client, &list, &indicators);
+                show_guided_import_dialog(
+                    parent.as_ref(),
+                    "Import from ProtonVPN",
+                    PROTON_IMPORT_STEPS,
+                    &client,
+                    &list,
+                    &indicators,
+                );
             });
         }
         providers.append(&proton_row);
 
-        // Listed for discoverability but kept inert until the Mullvad flow lands.
-        let mullvad_row = provider_chooser_row("MullvadVPN", "Coming soon", false);
-        mullvad_row.set_sensitive(false);
+        let mullvad_row = provider_chooser_row(
+            "MullvadVPN",
+            "Download configurations from your Mullvad account",
+            true,
+        );
+        {
+            let window = window.downgrade();
+            let parent = parent.cloned();
+            let client = client.clone();
+            let list = list.clone();
+            let indicators = indicators.clone();
+            mullvad_row.connect_activated(move |_| {
+                if let Some(window) = window.upgrade() {
+                    window.close();
+                }
+                show_guided_import_dialog(
+                    parent.as_ref(),
+                    "Import from MullvadVPN",
+                    MULLVAD_IMPORT_STEPS,
+                    &client,
+                    &list,
+                    &indicators,
+                );
+            });
+        }
         providers.append(&mullvad_row);
 
         let manual_row =
@@ -691,18 +720,42 @@ mod enabled {
         row
     }
 
-    /// ProtonVPN flow: explain how to fetch a WireGuard config from the account
-    /// downloads page (opened via the link), then reuse the manual file picker
-    /// to import the downloaded `.conf` file(s).
-    fn show_proton_import_dialog<C>(
+    /// ProtonVPN guided-import steps (Pango markup; links open via the portal):
+    /// the account downloads generator and the support guide for per-server
+    /// configs.
+    const PROTON_IMPORT_STEPS: &str = "To add a ProtonVPN profile:\n\n\
+        1. Open the WireGuard downloads page and sign in. \
+        <a href=\"https://account.protonvpn.com/downloads#wireguard-configuration\">Downloads page</a>\n\n\
+        2. Create and download a configuration for each server you want. \
+        <a href=\"https://protonvpn.com/support/wireguard-configurations\">Configuration guide</a>\n\n\
+        3. Choose the downloaded <tt>.conf</tt> file(s) below to import them.";
+
+    /// Mullvad guided-import steps. Links: the account configuration generator
+    /// and the WireGuard help index. The wg-quick-specific guide is avoided
+    /// since this app drives connections through NetworkManager, not wg-quick.
+    const MULLVAD_IMPORT_STEPS: &str = "To add a Mullvad VPN profile:\n\n\
+        1. Open the WireGuard configuration page and log in with your account number. \
+        <a href=\"https://mullvad.net/en/account/wireguard-config\">Configuration page</a>\n\n\
+        2. Generate a key, choose your servers, and download the configuration. \
+        Extract the <tt>.zip</tt> if it contains several files. \
+        <a href=\"https://mullvad.net/en/help?Protocol=wireguard\">Mullvad help center</a>\n\n\
+        3. Choose the downloaded <tt>.conf</tt> file(s) below to import them.";
+
+    /// Guided provider import: show provider-specific `instructions` (Pango
+    /// markup, with links routed through the desktop portal), then a "Choose
+    /// files…" action that hands off to the manual file importer. Shared by the
+    /// ProtonVPN and Mullvad flows.
+    fn show_guided_import_dialog<C>(
         parent: Option<&gtk::Window>,
+        heading: &str,
+        instructions: &str,
         client: &C,
         list: &gtk::ListBox,
         indicators: &StatusIndicators,
     ) where
         C: NmClient + Clone + Send + 'static,
     {
-        let dialog = adw::MessageDialog::new(parent, Some("Import from ProtonVPN"), None);
+        let dialog = adw::MessageDialog::new(parent, Some(heading), None);
 
         let body = gtk::Label::builder()
             .use_markup(true)
@@ -710,14 +763,7 @@ mod enabled {
             .xalign(0.0)
             .width_request(440)
             .max_width_chars(60)
-            .label(
-                "To add a ProtonVPN profile:\n\n\
-                 1. Open the WireGuard downloads page and sign in. \
-                 <a href=\"https://account.protonvpn.com/downloads#wireguard-configuration\">Downloads page</a>\n\n\
-                 2. Create and download a configuration for each server you want. \
-                 <a href=\"https://protonvpn.com/support/wireguard-configurations\">Configuration guide</a>\n\n\
-                 3. Choose the downloaded <tt>.conf</tt> file(s) below to import them.",
-            )
+            .label(instructions)
             .build();
         // Route link clicks through gtk::UriLauncher so the URL opens via the
         // desktop portal inside the Flatpak sandbox.
