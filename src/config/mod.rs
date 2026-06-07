@@ -247,8 +247,10 @@ mod tests {
 
     #[test]
     fn forget_profile_only_clears_the_matching_last_random_pointer() {
-        let mut config = AppConfig::default();
-        config.last_random_profile_id = Some("uuid-other".to_string());
+        let mut config = AppConfig {
+            last_random_profile_id: Some("uuid-other".to_string()),
+            ..Default::default()
+        };
 
         // Removing a different profile must leave an unrelated last-random
         // pointer untouched and report no change.

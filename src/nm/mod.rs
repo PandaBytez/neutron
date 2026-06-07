@@ -102,25 +102,21 @@ fn extract_interface_comments(path: &std::path::Path) -> String {
     if let Ok(file) = std::fs::File::open(path) {
         let reader = std::io::BufReader::new(file);
         let mut in_interface = false;
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let trimmed = l.trim();
-                let lower = trimmed.to_lowercase();
-                if lower.starts_with("[interface]") {
-                    in_interface = true;
-                    continue;
-                }
-                if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                    in_interface = false;
-                    continue;
-                }
-                if in_interface {
-                    if trimmed.starts_with('#') || trimmed.starts_with(';') {
-                        let content = trimmed[1..].trim();
-                        if !content.is_empty() {
-                            comments.push(content.to_string());
-                        }
-                    }
+        for l in reader.lines().map_while(Result::ok) {
+            let trimmed = l.trim();
+            let lower = trimmed.to_lowercase();
+            if lower.starts_with("[interface]") {
+                in_interface = true;
+                continue;
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_interface = false;
+                continue;
+            }
+            if in_interface && (trimmed.starts_with('#') || trimmed.starts_with(';')) {
+                let content = trimmed[1..].trim();
+                if !content.is_empty() {
+                    comments.push(content.to_string());
                 }
             }
         }
@@ -275,13 +271,12 @@ impl NmClient for CliNmClient {
             let _ = run_nmcli(&["connection", "down", uuid.as_str()]);
 
             let comments = extract_interface_comments(path);
-            if !comments.is_empty() {
-                if let Ok(config_path) = crate::config::default_config_path() {
-                    if let Ok(mut app_cfg) = crate::config::load(&config_path) {
-                        app_cfg.profile_custom_info.insert(uuid, comments);
-                        let _ = crate::config::save(&config_path, &app_cfg);
-                    }
-                }
+            if !comments.is_empty()
+                && let Ok(config_path) = crate::config::default_config_path()
+                && let Ok(mut app_cfg) = crate::config::load(&config_path)
+            {
+                app_cfg.profile_custom_info.insert(uuid, comments);
+                let _ = crate::config::save(&config_path, &app_cfg);
             }
         }
 
@@ -404,12 +399,12 @@ impl NmClient for CliNmClient {
         // Drop any Zento-side metadata keyed by this UUID so it doesn't linger
         // after the profile is gone. Best-effort: a config failure here must not
         // mask the successful deletion.
-        if let Ok(config_path) = crate::config::default_config_path() {
-            if let Ok(mut app_cfg) = crate::config::load(&config_path) {
-                let changed = crate::config::forget_profile(&mut app_cfg, uuid);
-                if changed {
-                    let _ = crate::config::save(&config_path, &app_cfg);
-                }
+        if let Ok(config_path) = crate::config::default_config_path()
+            && let Ok(mut app_cfg) = crate::config::load(&config_path)
+        {
+            let changed = crate::config::forget_profile(&mut app_cfg, uuid);
+            if changed {
+                let _ = crate::config::save(&config_path, &app_cfg);
             }
         }
 
@@ -1042,7 +1037,7 @@ mod tests {
         writeln!(file, "# Bouncing: Enabled").unwrap();
         writeln!(file, "; NetShield: Block malware").unwrap();
         writeln!(file, "Address = 10.2.0.2/32").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, "[Peer]").unwrap();
         writeln!(file, "PublicKey = abc").unwrap();
         drop(file);
