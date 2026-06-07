@@ -406,12 +406,7 @@ impl NmClient for CliNmClient {
         // mask the successful deletion.
         if let Ok(config_path) = crate::config::default_config_path() {
             if let Ok(mut app_cfg) = crate::config::load(&config_path) {
-                let mut changed = app_cfg.profile_custom_info.remove(uuid).is_some();
-                changed |= app_cfg.excluded_profile_ids.remove(uuid);
-                if app_cfg.last_random_profile_id.as_deref() == Some(uuid) {
-                    app_cfg.last_random_profile_id = None;
-                    changed = true;
-                }
+                let changed = crate::config::forget_profile(&mut app_cfg, uuid);
                 if changed {
                     let _ = crate::config::save(&config_path, &app_cfg);
                 }

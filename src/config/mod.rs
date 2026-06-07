@@ -57,6 +57,21 @@ pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
     Ok(())
 }
 
+/// Drop every piece of Zento-side metadata keyed by `uuid` from the in-memory
+/// config: custom info, exclusion membership, and the last-random pointer.
+///
+/// Returns `true` if anything actually changed, so the caller can skip an
+/// unnecessary save. This is a pure mutation and performs no I/O.
+pub fn forget_profile(config: &mut AppConfig, uuid: &str) -> bool {
+    let mut changed = config.profile_custom_info.remove(uuid).is_some();
+    changed |= config.excluded_profile_ids.remove(uuid);
+    if config.last_random_profile_id.as_deref() == Some(uuid) {
+        config.last_random_profile_id = None;
+        changed = true;
+    }
+    changed
+}
+
 fn write_atomically(path: &Path, body: &str) -> io::Result<()> {
     write_atomically_with(path, body, |src, dst| fs::rename(src, dst))
 }
@@ -198,6 +213,63 @@ mod tests {
         assert!(!leftover, "temporary file should be cleaned up");
 
         cleanup(&path);
+    }
+
+    #[test]
+    fn forget_profile_removes_all_metadata_for_uuid() {
+        let mut config = AppConfig::default();
+        config
+            .profile_custom_info
+            .insert("uuid-1".to_string(), "# notes".to_string());
+        config.excluded_profile_ids.insert("uuid-1".to_string());
+        config.last_random_profile_id = Some("uuid-1".to_string());
+
+        let changed = forget_profile(&mut config, "uuid-1");
+
+        assert!(changed);
+        assert!(config.profile_custom_info.is_empty());
+        assert!(config.excluded_profile_ids.is_empty());
+        assert_eq!(config.last_random_profile_id, None);
+    }
+
+    #[test]
+    fn forget_profile_is_a_noop_for_unknown_uuid() {
+        let mut config = AppConfig::default();
+        config.excluded_profile_ids.insert("uuid-keep".to_string());
+        config.last_random_profile_id = Some("uuid-keep".to_string());
+
+        let changed = forget_profile(&mut config, "uuid-absent");
+
+        assert!(!changed);
+        assert!(config.excluded_profile_ids.contains("uuid-keep"));
+        assert_eq!(config.last_random_profile_id, Some("uuid-keep".to_string()));
+    }
+
+    #[test]
+    fn forget_profile_only_clears_the_matching_last_random_pointer() {
+        let mut config = AppConfig::default();
+        config.last_random_profile_id = Some("uuid-other".to_string());
+
+        // Removing a different profile must leave an unrelated last-random
+        // pointer untouched and report no change.
+        let changed = forget_profile(&mut config, "uuid-1");
+
+        assert!(!changed);
+        assert_eq!(
+            config.last_random_profile_id,
+            Some("uuid-other".to_string())
+        );
+    }
+
+    #[test]
+    fn forget_profile_reports_change_when_only_exclusion_membership_matches() {
+        let mut config = AppConfig::default();
+        config.excluded_profile_ids.insert("uuid-1".to_string());
+
+        let changed = forget_profile(&mut config, "uuid-1");
+
+        assert!(changed);
+        assert!(config.excluded_profile_ids.is_empty());
     }
 
     fn unique_path(label: &str) -> PathBuf {
