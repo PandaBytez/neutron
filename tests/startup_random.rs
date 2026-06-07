@@ -16,8 +16,9 @@ fn integration_connects_and_updates_last_profile() {
     write_config(
         &config_path,
         AppConfig {
-            eligible_profile_ids: BTreeSet::from(["uuid-1".to_string()]),
+            excluded_profile_ids: BTreeSet::new(),
             last_random_profile_id: None,
+            ..AppConfig::default()
         },
     );
 
@@ -41,8 +42,10 @@ fn integration_returns_error_when_nothing_is_eligible() {
     write_config(
         &config_path,
         AppConfig {
-            eligible_profile_ids: BTreeSet::from(["uuid-eu".to_string()]),
+            // Opt-out: excluding the only profile leaves nothing eligible.
+            excluded_profile_ids: BTreeSet::from(["uuid-1".to_string()]),
             last_random_profile_id: None,
+            ..AppConfig::default()
         },
     );
 
@@ -81,11 +84,9 @@ fn integration_retries_all_eligible_profiles_when_connections_fail() {
     write_config(
         &config_path,
         AppConfig {
-            eligible_profile_ids: BTreeSet::from([
-                "uuid-fail".to_string(),
-                "uuid-fail-2".to_string(),
-            ]),
+            excluded_profile_ids: BTreeSet::new(),
             last_random_profile_id: None,
+            ..AppConfig::default()
         },
     );
 

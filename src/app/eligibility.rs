@@ -1,14 +1,20 @@
 use std::collections::BTreeSet;
 
+/// Update a profile's startup eligibility in the opt-out exclusion set.
+///
+/// Callers still think in terms of "eligible": passing `eligible = true` makes
+/// the profile eligible by *removing* it from the exclusion set, while
+/// `eligible = false` excludes it by *inserting* it. Returns whether the set
+/// changed.
 pub fn set_profile_eligible(
-    eligible_profile_ids: &mut BTreeSet<String>,
+    excluded_profile_ids: &mut BTreeSet<String>,
     profile_id: &str,
     eligible: bool,
 ) -> bool {
     if eligible {
-        eligible_profile_ids.insert(profile_id.to_string())
+        excluded_profile_ids.remove(profile_id)
     } else {
-        eligible_profile_ids.remove(profile_id)
+        excluded_profile_ids.insert(profile_id.to_string())
     }
 }
 
@@ -17,45 +23,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adds_profile_when_enabling() {
-        let mut ids = BTreeSet::from(["uuid-1".to_string()]);
+    fn excludes_profile_when_disabling() {
+        let mut excluded = BTreeSet::from(["uuid-1".to_string()]);
 
-        let changed = set_profile_eligible(&mut ids, "uuid-2", true);
+        let changed = set_profile_eligible(&mut excluded, "uuid-2", false);
 
         assert!(changed);
         assert_eq!(
-            ids,
+            excluded,
             BTreeSet::from(["uuid-1".to_string(), "uuid-2".to_string()])
         );
     }
 
     #[test]
-    fn does_not_duplicate_profile_when_enabling_again() {
-        let mut ids = BTreeSet::from(["uuid-1".to_string()]);
+    fn does_not_duplicate_exclusion_when_disabling_again() {
+        let mut excluded = BTreeSet::from(["uuid-1".to_string()]);
 
-        let changed = set_profile_eligible(&mut ids, "uuid-1", true);
+        let changed = set_profile_eligible(&mut excluded, "uuid-1", false);
 
         assert!(!changed);
-        assert_eq!(ids, BTreeSet::from(["uuid-1".to_string()]));
+        assert_eq!(excluded, BTreeSet::from(["uuid-1".to_string()]));
     }
 
     #[test]
-    fn removes_profile_when_disabling() {
-        let mut ids = BTreeSet::from(["uuid-1".to_string(), "uuid-2".to_string()]);
+    fn removes_exclusion_when_enabling() {
+        let mut excluded = BTreeSet::from(["uuid-1".to_string(), "uuid-2".to_string()]);
 
-        let changed = set_profile_eligible(&mut ids, "uuid-1", false);
+        let changed = set_profile_eligible(&mut excluded, "uuid-1", true);
 
         assert!(changed);
-        assert_eq!(ids, BTreeSet::from(["uuid-2".to_string()]));
+        assert_eq!(excluded, BTreeSet::from(["uuid-2".to_string()]));
     }
 
     #[test]
-    fn no_change_when_disabling_missing_profile() {
-        let mut ids = BTreeSet::from(["uuid-2".to_string()]);
+    fn no_change_when_enabling_already_eligible_profile() {
+        let mut excluded = BTreeSet::from(["uuid-2".to_string()]);
 
-        let changed = set_profile_eligible(&mut ids, "uuid-1", false);
+        let changed = set_profile_eligible(&mut excluded, "uuid-1", true);
 
         assert!(!changed);
-        assert_eq!(ids, BTreeSet::from(["uuid-2".to_string()]));
+        assert_eq!(excluded, BTreeSet::from(["uuid-2".to_string()]));
     }
 }

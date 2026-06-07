@@ -42,12 +42,7 @@ where
 
     let mut eligible: Vec<_> = profiles
         .iter()
-        .filter(|profile| {
-            app_cfg
-                .eligible_profile_ids
-                .iter()
-                .any(|id| id == &profile.uuid)
-        })
+        .filter(|profile| !app_cfg.excluded_profile_ids.contains(&profile.uuid))
         .collect();
 
     if eligible.is_empty() {
@@ -121,8 +116,10 @@ mod tests {
         write_config(
             &config_path,
             AppConfig {
-                eligible_profile_ids: BTreeSet::from(["uuid-eu".to_string()]),
+                // Opt-out: excluding the only profile leaves nothing eligible.
+                excluded_profile_ids: BTreeSet::from(["uuid-1".to_string()]),
                 last_random_profile_id: None,
+                ..AppConfig::default()
             },
         );
 
@@ -140,8 +137,9 @@ mod tests {
         write_config(
             &config_path,
             AppConfig {
-                eligible_profile_ids: BTreeSet::from(["uuid-1".to_string()]),
+                excluded_profile_ids: BTreeSet::new(),
                 last_random_profile_id: None,
+                ..AppConfig::default()
             },
         );
 
@@ -168,8 +166,9 @@ mod tests {
         write_config(
             &config_path,
             AppConfig {
-                eligible_profile_ids: BTreeSet::from(["uuid-1".to_string(), "uuid-2".to_string()]),
+                excluded_profile_ids: BTreeSet::new(),
                 last_random_profile_id: Some("uuid-1".to_string()),
+                ..AppConfig::default()
             },
         );
 
@@ -201,8 +200,9 @@ mod tests {
         write_config(
             &config_path,
             AppConfig {
-                eligible_profile_ids: BTreeSet::from(["uuid-1".to_string()]),
+                excluded_profile_ids: BTreeSet::new(),
                 last_random_profile_id: None,
+                ..AppConfig::default()
             },
         );
 
@@ -243,11 +243,9 @@ mod tests {
         write_config(
             &config_path,
             AppConfig {
-                eligible_profile_ids: BTreeSet::from([
-                    "uuid-fail".to_string(),
-                    "uuid-ok".to_string(),
-                ]),
+                excluded_profile_ids: BTreeSet::new(),
                 last_random_profile_id: None,
+                ..AppConfig::default()
             },
         );
 

@@ -18,7 +18,7 @@
     <ul>
       <li>Connect, disconnect, and switch between WireGuard profiles</li>
       <li>Select a random profile once per boot from an eligible pool</li>
-      <li>Enable a NetworkManager-native kill switch per profile</li>
+      <li>Enable a global NetworkManager-native kill switch for all profiles</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.gitlab.zento_vpn_manager.zento.desktop</launchable>

@@ -13,10 +13,10 @@ NetworkManager.
 
 - List NetworkManager WireGuard profiles.
 - Manual connect/disconnect/switch between profiles.
-- Mark profiles as eligible for random startup selection.
+- Exclude individual profiles from random startup selection (opt-out: every profile is eligible by default).
 - Pick one random eligible profile once per boot.
 - Optional provider config import workflow (later).
-- Kill-switch policy per profile (NetworkManager-native routing).
+- Global kill-switch policy applied to all profiles (NetworkManager-native routing).
 
 ## Non-goals (for now)
 
@@ -33,7 +33,7 @@ NetworkManager.
 
 ## Project status
 
-MVP CLI is implemented for core NetworkManager profile workflows and startup random selection logic. GTK/libadwaita desktop UI now includes profile listing, refresh, action buttons, startup-eligibility toggles, and a per-profile kill-switch toggle.
+MVP CLI is implemented for core NetworkManager profile workflows and startup random selection logic. GTK/libadwaita desktop UI now includes profile listing, refresh, a per-profile connection toggle, startup-eligibility toggles, and a single global kill-switch toggle. The window remembers its last size between launches.
 
 ## Development (initial)
 
@@ -47,7 +47,7 @@ Current CLI commands:
 # list wireguard profiles and active state
 cargo run -- list
 
-# launch GUI (list + refresh + action buttons scaffold)
+# launch GUI (list + refresh + connection/kill-switch toggles)
 # (requires GTK/libadwaita dev packages)
 cargo run --features gui -- gui
 
@@ -56,27 +56,27 @@ cargo run -- connect <profile-name>
 cargo run -- disconnect
 cargo run -- switch <profile-name>
 
-# manage random-start eligibility
+# manage random-start eligibility (opt-out: every profile is eligible by default)
 # (profile can be a UUID or unique profile name)
-cargo run -- eligible list
-cargo run -- eligible add <profile-name>
-cargo run -- eligible remove <profile-name>
+cargo run -- eligible list                  # show profiles excluded from random startup
+cargo run -- eligible add <profile-name>    # make a profile eligible again (clear its exclusion)
+cargo run -- eligible remove <profile-name> # exclude a profile from random startup
 
 # run one-shot startup random selection manually
 cargo run -- startup-random
 
-# inspect or toggle the per-profile kill switch
-# (profile can be a UUID or unique profile name)
-cargo run -- kill-switch status <profile-name>
-cargo run -- kill-switch enable <profile-name>
-cargo run -- kill-switch disable <profile-name>
+# inspect or toggle the global kill switch
+# (applies to every WireGuard profile at once)
+cargo run -- kill-switch status
+cargo run -- kill-switch enable
+cargo run -- kill-switch disable
 ```
 
-`list` output now includes eligibility status from config (`eligible` or `not-eligible`).
+`list` output now includes eligibility status from config (`eligible` or `not-eligible`). Profiles are eligible by default and become `not-eligible` only once explicitly excluded.
 
-GUI currently renders profile rows with active/inactive + eligibility labels, per-row action buttons (`Connect`, `Switch`, `Disconnect`) wired to NetworkManager operations, startup-eligibility toggles backed by config, and a per-profile kill-switch toggle; the list auto-refreshes after each change and also reacts to NetworkManager monitor events. NetworkManager calls run on a background thread so the UI stays responsive while `nmcli` works, action buttons disable until the operation finishes, and the `nmcli monitor` child process is terminated when the window closes.
+GUI currently renders each profile row with just the profile name, a startup-eligibility toggle (checked by default, since every profile is eligible until excluded), and a per-row connection toggle (a switch that activates the tunnel when turned on and disconnects it when turned off) wired to NetworkManager operations, alongside a single global kill-switch toggle; enabling the global kill switch also raises a desktop notification. The list auto-refreshes after each change and also reacts to NetworkManager monitor events. NetworkManager calls run on a background thread so the UI stays responsive while `nmcli` works, toggles disable until the operation finishes and revert on failure, and the `nmcli monitor` child process is terminated when the window closes, which also persists the current window size.
 
-`eligible add` reports when a profile is already eligible, and `eligible remove` returns a clear error when a profile is not currently eligible.
+`eligible add` clears a profile's exclusion (reporting when it was already eligible), and `eligible remove` excludes a profile from random startup (reporting when it was already excluded).
 
 Install the optional user service for startup-random automation:
 
@@ -151,20 +151,22 @@ cargo test --all-features
 
 ## Implementation notes
 
-- Application config (eligible-profile pool and last random selection) is written
+- Application config (excluded-profile set and last random selection) is written
   atomically and, on Unix, restricted to owner-only access (`0o600`). No private
   keys or secrets are ever stored here; those remain in NetworkManager.
 - All `nmcli` invocations run with a 30-second timeout and surface the command
   exit code on failure, so a stuck NetworkManager call cannot hang the CLI or GUI
   indefinitely.
-- The kill switch is NetworkManager-native: enabling it forces the WireGuard
-  connection's automatic default-route policy routing on (`wireguard.ip4/ip6-auto-default-route`)
-  and gives the tunnel exclusive DNS priority. NetworkManager then installs the
-  same `fwmark` + `suppress_prefixlength 0` policy rules as `wg-quick`, so while
-  the tunnel is active all non-tunnel traffic is dropped instead of leaking to
-  the physical default route. It applies the next time the profile is activated
-  and is effective for full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0`
-  allowed IPs). No firewall rules or privileged helper are involved.
+- The kill switch is global and NetworkManager-native: it is a single on/off
+  policy, remembered in app config, that is applied to every WireGuard profile.
+  Enabling it forces each WireGuard connection's automatic default-route policy
+  routing on (`wireguard.ip4/ip6-auto-default-route`) and gives the tunnel
+  exclusive DNS priority. NetworkManager then installs the same `fwmark` +
+  `suppress_prefixlength 0` policy rules as `wg-quick`, so while a tunnel is
+  active all non-tunnel traffic is dropped instead of leaking to the physical
+  default route. It applies the next time a profile is activated and is effective
+  for full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0` allowed IPs). No
+  firewall rules or privileged helper are involved.
 - Packaging is Flathub-ready: crates are vendored (`flatpak/cargo-sources.json`)
   for a network-isolated `--offline` build, and the desktop entry and AppStream
   metainfo validate cleanly (`desktop-file-validate`, `appstreamcli validate`).

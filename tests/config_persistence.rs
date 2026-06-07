@@ -12,7 +12,7 @@ fn integration_load_returns_default_when_file_is_missing() {
 
     let loaded = config::load(&config_path).expect("missing config should return defaults");
 
-    assert!(loaded.eligible_profile_ids.is_empty());
+    assert!(loaded.excluded_profile_ids.is_empty());
     assert_eq!(loaded.last_random_profile_id, None);
 }
 
@@ -20,14 +20,15 @@ fn integration_load_returns_default_when_file_is_missing() {
 fn integration_save_creates_parent_directories_and_roundtrips() {
     let config_path = unique_test_config_path();
     let expected = AppConfig {
-        eligible_profile_ids: BTreeSet::from(["uuid-1".to_string(), "uuid-2".to_string()]),
+        excluded_profile_ids: BTreeSet::from(["uuid-1".to_string(), "uuid-2".to_string()]),
         last_random_profile_id: Some("uuid-2".to_string()),
+        ..AppConfig::default()
     };
 
     config::save(&config_path, &expected).expect("save should succeed");
     let loaded = config::load(&config_path).expect("load should succeed");
 
-    assert_eq!(loaded.eligible_profile_ids, expected.eligible_profile_ids);
+    assert_eq!(loaded.excluded_profile_ids, expected.excluded_profile_ids);
     assert_eq!(
         loaded.last_random_profile_id,
         expected.last_random_profile_id
@@ -50,11 +51,14 @@ fn integration_load_returns_error_on_invalid_json() {
 }
 
 #[test]
-fn integration_load_supports_legacy_name_based_fields() {
+fn integration_load_supports_legacy_last_random_profile_alias() {
     let config_path = unique_test_config_path();
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).expect("test config directory should be created");
     }
+    // The pre-rename `last_random_profile` field must still map onto
+    // `last_random_profile_id`. The obsolete opt-in `eligible_profiles` field is
+    // now ignored (opt-out model: every profile is eligible by default).
     fs::write(
         &config_path,
         r#"{"eligible_profiles":["wg-us"],"last_random_profile":"wg-us"}"#,
@@ -63,10 +67,7 @@ fn integration_load_supports_legacy_name_based_fields() {
 
     let loaded = config::load(&config_path).expect("legacy config should deserialize");
 
-    assert_eq!(
-        loaded.eligible_profile_ids,
-        BTreeSet::from(["wg-us".to_string()])
-    );
+    assert!(loaded.excluded_profile_ids.is_empty());
     assert_eq!(loaded.last_random_profile_id.as_deref(), Some("wg-us"));
     cleanup_test_artifacts(&config_path);
 }

@@ -9,8 +9,6 @@ use crate::error::{AppError, AppResult};
 
 mod kill_switch;
 
-pub use kill_switch::KillSwitchState;
-
 /// Maximum time to wait for an `nmcli` invocation before giving up.
 ///
 /// NetworkManager operations are normally fast, but a stuck daemon or hung
@@ -42,13 +40,11 @@ pub trait NmClient {
     fn connect(&self, profile_identifier: &str) -> AppResult<()>;
     fn disconnect_active(&self) -> AppResult<()>;
     fn switch_to(&self, profile_identifier: &str) -> AppResult<()>;
-    /// Report whether the NetworkManager kill-switch routing policy is enforced
-    /// on the identified profile.
-    fn kill_switch_status(&self, profile_identifier: &str) -> AppResult<KillSwitchState>;
-    /// Enable or disable the kill-switch routing policy on the identified
-    /// profile. The change is persisted to the NetworkManager profile and takes
-    /// effect the next time the profile is activated.
-    fn set_kill_switch(&self, profile_identifier: &str, enable: bool) -> AppResult<()>;
+    /// Apply (or remove) the kill-switch routing policy on *every* WireGuard
+    /// profile. The kill switch is a global setting, so this is enforced across
+    /// all profiles rather than per profile. The change is persisted to each
+    /// NetworkManager profile and takes effect the next time it is activated.
+    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -129,24 +125,31 @@ impl NmClient for CliNmClient {
         Ok(())
     }
 
-    fn kill_switch_status(&self, profile_identifier: &str) -> AppResult<KillSwitchState> {
+    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
         let profiles = self.list_wireguard_profiles()?;
-        let profile = find_unique_profile_by_identifier(&profiles, profile_identifier)?;
-        let output = run_nmcli_owned(&kill_switch::status_args(&profile.uuid))?;
-        kill_switch::parse_status(&output)
-    }
-
-    fn set_kill_switch(&self, profile_identifier: &str, enable: bool) -> AppResult<()> {
-        let profiles = self.list_wireguard_profiles()?;
-        let profile = find_unique_profile_by_identifier(&profiles, profile_identifier)?;
-        let args = if enable {
-            kill_switch::enable_args(&profile.uuid)
-        } else {
-            kill_switch::disable_args(&profile.uuid)
-        };
-        run_nmcli_owned(&args)?;
+        for args in kill_switch_arg_batches(&profiles, enable) {
+            run_nmcli_owned(&args)?;
+        }
         Ok(())
     }
+}
+
+/// Build the per-profile `nmcli` argument batches that apply (`enable`) or
+/// remove the kill switch across *every* profile.
+///
+/// Extracted from [`CliNmClient::set_kill_switch_all`] so the "global = every
+/// profile" behavior is unit-testable without invoking `nmcli`.
+fn kill_switch_arg_batches(profiles: &[WireguardProfile], enable: bool) -> Vec<Vec<String>> {
+    profiles
+        .iter()
+        .map(|profile| {
+            if enable {
+                kill_switch::enable_args(&profile.uuid)
+            } else {
+                kill_switch::disable_args(&profile.uuid)
+            }
+        })
+        .collect()
 }
 
 fn find_unique_profile_by_name<'a>(
@@ -411,6 +414,42 @@ mod tests {
         let fields = parse_nmcli_fields(r"value\");
 
         assert_eq!(fields, vec![r"value\".to_string()]);
+    }
+
+    #[test]
+    fn kill_switch_arg_batches_target_every_profile_to_enable() {
+        let profiles = vec![
+            profile("wg-us", "uuid-1"),
+            profile("wg-eu", "uuid-2"),
+            profile("wg-as", "uuid-3"),
+        ];
+
+        let batches = kill_switch_arg_batches(&profiles, true);
+
+        // One batch per profile: the kill switch is global, so every profile is
+        // modified, each targeting its own UUID with the enable arguments.
+        assert_eq!(batches.len(), 3);
+        for (batch, uuid) in batches.iter().zip(["uuid-1", "uuid-2", "uuid-3"]) {
+            assert_eq!(batch, &kill_switch::enable_args(uuid));
+        }
+    }
+
+    #[test]
+    fn kill_switch_arg_batches_target_every_profile_to_disable() {
+        let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-eu", "uuid-2")];
+
+        let batches = kill_switch_arg_batches(&profiles, false);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], kill_switch::disable_args("uuid-1"));
+        assert_eq!(batches[1], kill_switch::disable_args("uuid-2"));
+    }
+
+    #[test]
+    fn kill_switch_arg_batches_is_empty_without_profiles() {
+        // No profiles means no `nmcli` calls at all (rather than an error).
+        assert!(kill_switch_arg_batches(&[], true).is_empty());
+        assert!(kill_switch_arg_batches(&[], false).is_empty());
     }
 
     #[cfg(unix)]

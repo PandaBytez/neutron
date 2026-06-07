@@ -6,11 +6,11 @@
 //! in-crate unit tests. Everything here is `pub`, so it never triggers
 //! dead-code warnings in normal builds.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{AppError, AppResult};
-use crate::nm::{KillSwitchState, NmClient, WireguardProfile};
+use crate::nm::{NmClient, WireguardProfile};
 
 /// A configurable in-memory [`NmClient`] for tests.
 ///
@@ -23,11 +23,11 @@ pub struct MockNmClient {
     profiles: Vec<WireguardProfile>,
     fail_list: bool,
     fail_ids: HashSet<String>,
+    fail_kill_switch: bool,
     calls: Arc<Mutex<Vec<String>>>,
     attempted: Arc<Mutex<Vec<String>>>,
     connected: Arc<Mutex<Vec<String>>>,
     kill_switch_calls: Arc<Mutex<Vec<String>>>,
-    kill_switch_states: Arc<Mutex<HashMap<String, KillSwitchState>>>,
 }
 
 impl MockNmClient {
@@ -57,6 +57,15 @@ impl MockNmClient {
         }
     }
 
+    /// Consume this mock and return one whose `set_kill_switch_all` fails, to
+    /// exercise the error path where NetworkManager rejects the change. The
+    /// attempt is still recorded in [`Self::kill_switch_calls`] before the
+    /// failure is returned.
+    pub fn fail_kill_switch(mut self) -> Self {
+        self.fail_kill_switch = true;
+        self
+    }
+
     /// Every operation in invocation order, formatted as `connect:<id>`,
     /// `switch:<id>`, or `disconnect`.
     pub fn calls(&self) -> Vec<String> {
@@ -73,8 +82,8 @@ impl MockNmClient {
         self.connected.lock().expect("mock mutex poisoned").clone()
     }
 
-    /// Kill-switch toggles in invocation order, formatted as
-    /// `kill-switch:<id>:on` or `kill-switch:<id>:off`.
+    /// Global kill-switch toggles in invocation order, formatted as
+    /// `kill-switch-all:on` or `kill-switch-all:off`.
     pub fn kill_switch_calls(&self) -> Vec<String> {
         self.kill_switch_calls
             .lock()
@@ -130,33 +139,21 @@ impl NmClient for MockNmClient {
         Ok(())
     }
 
-    fn kill_switch_status(&self, profile_identifier: &str) -> AppResult<KillSwitchState> {
-        Ok(self
-            .kill_switch_states
-            .lock()
-            .expect("mock mutex poisoned")
-            .get(profile_identifier)
-            .copied()
-            .unwrap_or(KillSwitchState::Disabled))
-    }
-
-    fn set_kill_switch(&self, profile_identifier: &str, enable: bool) -> AppResult<()> {
+    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
         self.kill_switch_calls
             .lock()
             .expect("mock mutex poisoned")
             .push(format!(
-                "kill-switch:{profile_identifier}:{}",
+                "kill-switch-all:{}",
                 if enable { "on" } else { "off" }
             ));
-        let state = if enable {
-            KillSwitchState::Enabled
-        } else {
-            KillSwitchState::Disabled
-        };
-        self.kill_switch_states
-            .lock()
-            .expect("mock mutex poisoned")
-            .insert(profile_identifier.to_string(), state);
+
+        if self.fail_kill_switch {
+            return Err(AppError::NmCommandFailed(
+                "simulated kill-switch failure".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }

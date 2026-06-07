@@ -1,6 +1,6 @@
 #[cfg(feature = "gui")]
 mod enabled {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Stdio};
     use std::rc::Rc;
@@ -55,6 +55,9 @@ mod enabled {
         list.add_css_class("boxed-list");
 
         let refresh = gtk::Button::with_label("Refresh");
+        // Size the button to its label instead of stretching across the full
+        // window width (a vertical box would otherwise fill the cross axis).
+        refresh.set_halign(gtk::Align::Start);
         {
             let client = client.clone();
             let list = list.clone();
@@ -103,24 +106,30 @@ mod enabled {
             .child(&list)
             .build();
 
+        let kill_switch_row = build_kill_switch_row(app, &client, &status);
+
         let container = gtk::Box::new(Orientation::Vertical, 12);
         container.set_margin_top(24);
         container.set_margin_bottom(24);
         container.set_margin_start(24);
         container.set_margin_end(24);
+        container.append(&kill_switch_row);
         container.append(&refresh);
         container.append(&status);
         container.append(&scroller);
 
-        let window = build_main_window(&header, &container);
+        let (width, height) = load_window_size();
+        let window = build_main_window(&header, &container, width, height);
         window.set_application(Some(app));
 
         let monitor_child_for_close = monitor_child;
-        window.connect_close_request(move |_| {
+        window.connect_close_request(move |window| {
             if let Some(mut child) = monitor_child_for_close.borrow_mut().take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            // Remember the user's last window size for the next launch.
+            save_window_size(window);
             glib::Propagation::Proceed
         });
 
@@ -135,18 +144,65 @@ mod enabled {
     /// is then set as the window content.
     ///
     /// The caller associates the window with its [`Application`] (after startup)
-    /// so this stays a pure chrome builder that is cheap to unit test.
-    fn build_main_window(header: &HeaderBar, body: &gtk::Box) -> ApplicationWindow {
+    /// so this stays a pure chrome builder that is cheap to unit test. The
+    /// initial size is supplied by the caller (restored from config) so the
+    /// window reopens at the size the user last left it.
+    fn build_main_window(
+        header: &HeaderBar,
+        body: &gtk::Box,
+        width: i32,
+        height: i32,
+    ) -> ApplicationWindow {
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(header);
         toolbar_view.set_content(Some(body));
 
         ApplicationWindow::builder()
             .title("Zento")
-            .default_width(720)
-            .default_height(420)
+            .default_width(width)
+            .default_height(height)
             .content(&toolbar_view)
             .build()
+    }
+
+    /// Width used the first time the app runs, before a size is remembered.
+    const DEFAULT_WINDOW_WIDTH: i32 = 720;
+    /// Height used the first time the app runs, before a size is remembered.
+    const DEFAULT_WINDOW_HEIGHT: i32 = 420;
+
+    /// Load the remembered window size from config, falling back to defaults.
+    fn load_window_size() -> (i32, i32) {
+        config::default_config_path()
+            .and_then(|path| config::load(&path))
+            .map(|app_cfg| {
+                (
+                    app_cfg.window_width.unwrap_or(DEFAULT_WINDOW_WIDTH),
+                    app_cfg.window_height.unwrap_or(DEFAULT_WINDOW_HEIGHT),
+                )
+            })
+            .unwrap_or((DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT))
+    }
+
+    /// Persist the current window size so it is restored on the next launch.
+    ///
+    /// In GTK4 the `default-width`/`default-height` properties track the live
+    /// window size while it is not maximized, so they are the correct values to
+    /// remember here. A best-effort save: a config error must not block closing.
+    fn save_window_size(window: &ApplicationWindow) {
+        let width = window.default_width();
+        let height = window.default_height();
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let Ok(path) = config::default_config_path() else {
+            return;
+        };
+        let Ok(mut app_cfg) = config::load(&path) else {
+            return;
+        };
+        app_cfg.window_width = Some(width);
+        app_cfg.window_height = Some(height);
+        let _ = config::save(&path, &app_cfg);
     }
 
     fn start_nm_monitor(events: Arc<AtomicU64>) -> Result<Child, String> {
@@ -178,12 +234,118 @@ mod enabled {
         Ok(child)
     }
 
-    /// A profile row enriched with the data the GUI needs beyond the shared
-    /// [`profile_list::ProfileListRow`] -- currently whether the NetworkManager
-    /// kill switch is enforced on the profile.
-    struct DisplayRow {
-        row: profile_list::ProfileListRow,
-        kill_switch: bool,
+    /// Build the global kill-switch row: a single switch that applies (or
+    /// removes) the NetworkManager kill-switch routing policy across *every*
+    /// WireGuard profile at once. The blocking `nmcli` work runs off the GTK
+    /// main thread; the switch is disabled while it runs and reverts on failure.
+    fn build_kill_switch_row<C>(app: &Application, client: &C, status: &gtk::Label) -> gtk::Box
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let label = gtk::Label::new(Some("Kill switch (all profiles)"));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+
+        let toggle = gtk::Switch::new();
+        toggle.set_valign(gtk::Align::Center);
+        toggle.set_active(load_kill_switch_enabled());
+
+        let guard = Rc::new(Cell::new(false));
+        {
+            let app = app.clone();
+            let client = client.clone();
+            let status = status.clone();
+            toggle.connect_state_set(move |toggle, requested| {
+                // Ignore programmatic state changes (e.g. a revert) so they do
+                // not re-trigger the NetworkManager work.
+                if guard.get() {
+                    return glib::Propagation::Proceed;
+                }
+                toggle.set_sensitive(false);
+                status.set_label(&format!(
+                    "{} kill switch for all profiles\u{2026}",
+                    if requested { "Enabling" } else { "Disabling" }
+                ));
+
+                let app = app.clone();
+                let client = client.clone();
+                let status = status.clone();
+                let toggle = toggle.clone();
+                let guard = guard.clone();
+                glib::spawn_future_local(async move {
+                    let task_client = client.clone();
+                    let outcome = gio::spawn_blocking(move || {
+                        apply_global_kill_switch(&task_client, requested)
+                    })
+                    .await;
+
+                    toggle.set_sensitive(true);
+                    match outcome {
+                        Ok(Ok(())) => {
+                            status.set_label(&format!(
+                                "Kill switch {} for all profiles. Applies on next connect.",
+                                if requested { "enabled" } else { "disabled" }
+                            ));
+                            if requested {
+                                notify_kill_switch_enabled(&app);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            status.set_label(&format!("Failed to update kill switch: {error}"));
+                            revert_switch(&toggle, &guard, !requested);
+                        }
+                        Err(_) => {
+                            status.set_label(
+                                "Failed to update kill switch: background task panicked.",
+                            );
+                            revert_switch(&toggle, &guard, !requested);
+                        }
+                    }
+                });
+
+                glib::Propagation::Proceed
+            });
+        }
+
+        let row = gtk::Box::new(Orientation::Horizontal, 12);
+        row.append(&label);
+        row.append(&toggle);
+        row
+    }
+
+    /// Restore a switch to `active` without re-triggering its async handler.
+    fn revert_switch(toggle: &gtk::Switch, guard: &Rc<Cell<bool>>, active: bool) {
+        guard.set(true);
+        toggle.set_active(active);
+        guard.set(false);
+    }
+
+    /// Apply the global kill switch to every WireGuard profile and persist the
+    /// new state to config. Runs on the Gio thread pool (off the GTK main
+    /// thread); errors are surfaced as strings for the status label.
+    ///
+    /// Delegates to [`crate::app::set_global_kill_switch`] so the
+    /// apply-before-persist ordering lives in exactly one place.
+    fn apply_global_kill_switch<C: NmClient>(client: &C, enable: bool) -> Result<(), String> {
+        let path = config::default_config_path().map_err(|error| error.to_string())?;
+        crate::app::set_global_kill_switch(client, &path, enable).map_err(|error| error.to_string())
+    }
+
+    /// Read the remembered global kill-switch state from config (default off).
+    fn load_kill_switch_enabled() -> bool {
+        config::default_config_path()
+            .and_then(|path| config::load(&path))
+            .map(|app_cfg| app_cfg.kill_switch_enabled)
+            .unwrap_or(false)
+    }
+
+    /// Send a desktop notification telling the user the kill switch is active.
+    fn notify_kill_switch_enabled(app: &Application) {
+        let notification = gio::Notification::new("Kill switch enabled");
+        notification.set_body(Some(
+            "All WireGuard profiles now drop traffic if the tunnel fails. Applies on next connect.",
+        ));
+        app.send_notification(Some("zento-kill-switch"), &notification);
     }
 
     /// Reload the profile list. The blocking NetworkManager/config work runs on
@@ -223,7 +385,7 @@ mod enabled {
         });
     }
 
-    fn load_rows(client: &impl NmClient) -> Result<Vec<DisplayRow>, String> {
+    fn load_rows(client: &impl NmClient) -> Result<Vec<profile_list::ProfileListRow>, String> {
         let config_path = config::default_config_path().map_err(|error| error.to_string())?;
         load_rows_with_path(client, &config_path)
     }
@@ -231,27 +393,16 @@ mod enabled {
     fn load_rows_with_path(
         client: &impl NmClient,
         config_path: &std::path::Path,
-    ) -> Result<Vec<DisplayRow>, String> {
+    ) -> Result<Vec<profile_list::ProfileListRow>, String> {
         let profiles = client
             .list_wireguard_profiles()
             .map_err(|error| error.to_string())?;
         let app_cfg = config::load(config_path).map_err(|error| error.to_string())?;
 
-        let rows = profile_list::build_rows(&profiles, &app_cfg.eligible_profile_ids);
-
-        // Query each profile's kill-switch state. This runs on the Gio thread
-        // pool (off the GTK main thread); a failed query is treated as "off"
-        // rather than failing the whole refresh.
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let kill_switch = client
-                    .kill_switch_status(&row.uuid)
-                    .map(|state| state.is_enabled())
-                    .unwrap_or(false);
-                DisplayRow { row, kill_switch }
-            })
-            .collect())
+        Ok(profile_list::build_rows(
+            &profiles,
+            &app_cfg.excluded_profile_ids,
+        ))
     }
 
     fn set_eligibility_for_profile(profile_id: &str, eligible: bool) -> Result<bool, String> {
@@ -266,7 +417,7 @@ mod enabled {
     ) -> Result<bool, String> {
         let mut app_cfg = config::load(config_path).map_err(|error| error.to_string())?;
         let changed = eligibility::set_profile_eligible(
-            &mut app_cfg.eligible_profile_ids,
+            &mut app_cfg.excluded_profile_ids,
             profile_id,
             eligible,
         );
@@ -278,17 +429,25 @@ mod enabled {
 
     fn build_profile_row<C>(
         client: &C,
-        display: &DisplayRow,
+        row: &profile_list::ProfileListRow,
         list: &gtk::ListBox,
         status: &gtk::Label,
     ) -> gtk::ListBoxRow
     where
         C: NmClient + Clone + Send + 'static,
     {
-        let row = &display.row;
         let container = gtk::Box::new(Orientation::Horizontal, 12);
+        // Inset the row content so fields don't butt up against the
+        // `boxed-list` border drawn around the profile list.
+        container.set_margin_top(8);
+        container.set_margin_bottom(8);
+        container.set_margin_start(12);
+        container.set_margin_end(12);
 
-        let details = gtk::Label::new(Some(&profile_list::format_cli_row(row)));
+        // Show only the profile name in the GUI row; state is conveyed by the
+        // connection switch and eligibility by its own toggle. The richer
+        // `format_cli_row` output remains for the `list` CLI command.
+        let details = gtk::Label::new(Some(&row.name));
         details.set_xalign(0.0);
         details.set_hexpand(true);
 
@@ -318,35 +477,52 @@ mod enabled {
             });
         }
 
-        // Toggling the kill switch rewrites NetworkManager profile properties
-        // via `nmcli`, so run it off the GTK main thread (like the action
-        // buttons) to keep the UI responsive.
-        let kill_switch_toggle = gtk::CheckButton::with_label("Kill switch");
-        kill_switch_toggle.set_active(display.kill_switch);
+        // A single connection switch replaces the old Connect/Switch/Disconnect
+        // buttons: flipping it on switches to this profile (deactivating any
+        // other active tunnel), flipping it off disconnects the active tunnel.
+        // The blocking `nmcli` work runs off the GTK main thread; the switch is
+        // disabled while it runs and reverts to its previous position on failure.
+        let connection_toggle = gtk::Switch::new();
+        connection_toggle.set_valign(gtk::Align::Center);
+        connection_toggle.set_active(row.is_active);
         {
             let client = client.clone();
             let row = row.clone();
             let list = list.clone();
             let status = status.clone();
-            kill_switch_toggle.connect_toggled(move |toggle| {
-                let enable = toggle.is_active();
+            let guard = Rc::new(Cell::new(false));
+            connection_toggle.connect_state_set(move |toggle, requested| {
+                // Ignore programmatic state changes (e.g. a revert) so they do
+                // not re-trigger a connect/disconnect.
+                if guard.get() {
+                    return glib::Propagation::Proceed;
+                }
                 toggle.set_sensitive(false);
                 status.set_label(&format!(
-                    "{} kill switch for '{}'\u{2026}",
-                    if enable { "Enabling" } else { "Disabling" },
+                    "{} '{}'\u{2026}",
+                    if requested {
+                        "Connecting"
+                    } else {
+                        "Disconnecting"
+                    },
                     row.name
                 ));
 
-                let toggle = toggle.clone();
                 let client = client.clone();
                 let row = row.clone();
                 let list = list.clone();
                 let status = status.clone();
+                let toggle = toggle.clone();
+                let guard = guard.clone();
                 glib::spawn_future_local(async move {
                     let task_client = client.clone();
                     let task_uuid = row.uuid.clone();
                     let outcome = gio::spawn_blocking(move || {
-                        task_client.set_kill_switch(&task_uuid, enable)
+                        if requested {
+                            task_client.switch_to(&task_uuid)
+                        } else {
+                            task_client.disconnect_active()
+                        }
                     })
                     .await;
 
@@ -354,84 +530,37 @@ mod enabled {
                     match outcome {
                         Ok(Ok(())) => {
                             status.set_label(&format!(
-                                "Kill switch {} for '{}'. Applies on next connect.",
-                                if enable { "enabled" } else { "disabled" },
+                                "{} '{}'.",
+                                if requested {
+                                    "Connected"
+                                } else {
+                                    "Disconnected"
+                                },
                                 row.name
                             ));
-                            refresh_profile_list(&client, &list, &status);
-                        }
-                        Ok(Err(error)) => {
-                            status.set_label(&format!(
-                                "Failed to update kill switch for '{}': {error}",
-                                row.name
-                            ));
-                        }
-                        Err(_) => {
-                            status.set_label(&format!(
-                                "Failed to update kill switch for '{}': background task panicked",
-                                row.name
-                            ));
-                        }
-                    }
-                });
-            });
-        }
-
-        let actions = gtk::Box::new(Orientation::Horizontal, 6);
-        for action in profile_list::available_actions(row) {
-            let label = match action {
-                profile_list::RowAction::Connect => "Connect",
-                profile_list::RowAction::Switch => "Switch",
-                profile_list::RowAction::Disconnect => "Disconnect",
-            };
-
-            let button = gtk::Button::with_label(label);
-            let client = client.clone();
-            let row = row.clone();
-            let list = list.clone();
-            let status = status.clone();
-            button.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                status.set_label(&format!("Working on '{}'\u{2026}", row.name));
-
-                let button = button.clone();
-                let client = client.clone();
-                let row = row.clone();
-                let list = list.clone();
-                let status = status.clone();
-                glib::spawn_future_local(async move {
-                    let task_client = client.clone();
-                    let task_row = row.clone();
-                    let outcome = gio::spawn_blocking(move || {
-                        profile_list::execute_action(&task_client, &task_row, action)
-                    })
-                    .await;
-
-                    button.set_sensitive(true);
-                    match outcome {
-                        Ok(Ok(())) => {
-                            status.set_label(&format!("Action completed for '{}'.", row.name));
                             refresh_profile_list(&client, &list, &status);
                         }
                         Ok(Err(error)) => {
                             status.set_label(&format!("Action failed for '{}': {error}", row.name));
+                            revert_switch(&toggle, &guard, !requested);
                         }
                         Err(_) => {
                             status.set_label(&format!(
                                 "Action failed for '{}': background task panicked",
                                 row.name
                             ));
+                            revert_switch(&toggle, &guard, !requested);
                         }
                     }
                 });
+
+                glib::Propagation::Proceed
             });
-            actions.append(&button);
         }
 
         container.append(&details);
         container.append(&eligibility_toggle);
-        container.append(&kill_switch_toggle);
-        container.append(&actions);
+        container.append(&connection_toggle);
 
         let list_row = gtk::ListBoxRow::new();
         list_row.set_child(Some(&container));
@@ -489,7 +618,7 @@ mod enabled {
         }
 
         #[test]
-        fn set_eligibility_updates_config() {
+        fn set_eligibility_excludes_and_restores_profile() {
             let config_path = std::env::temp_dir().join(format!(
                 "wireguard-manager-gui-eligibility-{}.json",
                 std::time::SystemTime::now()
@@ -499,15 +628,23 @@ mod enabled {
             ));
             config::save(&config_path, &AppConfig::default()).expect("config should save");
 
+            // Marking a profile ineligible records it in the exclusion set.
+            let changed = set_eligibility_for_profile_with_path(&config_path, "uuid-1", false)
+                .expect("eligibility update should succeed");
+            assert!(changed);
+            let loaded = config::load(&config_path).expect("config should load");
+            assert_eq!(
+                loaded.excluded_profile_ids,
+                std::collections::BTreeSet::from(["uuid-1".to_string()])
+            );
+
+            // Marking it eligible again clears the exclusion (opt-out default).
             let changed = set_eligibility_for_profile_with_path(&config_path, "uuid-1", true)
                 .expect("eligibility update should succeed");
             assert!(changed);
-
             let loaded = config::load(&config_path).expect("config should load");
-            assert_eq!(
-                loaded.eligible_profile_ids,
-                std::collections::BTreeSet::from(["uuid-1".to_string()])
-            );
+            assert!(loaded.excluded_profile_ids.is_empty());
+
             let _ = std::fs::remove_file(config_path);
         }
 
@@ -526,7 +663,7 @@ mod enabled {
             let header = HeaderBar::new();
             let body = gtk::Box::new(Orientation::Vertical, 0);
 
-            let window = build_main_window(&header, &body);
+            let window = build_main_window(&header, &body, 720, 420);
 
             let content = window.content().expect("window content should be set");
             assert!(

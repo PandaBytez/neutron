@@ -5,7 +5,7 @@ pub mod refresh_sync;
 use clap::{Parser, Subcommand};
 
 use crate::config;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::nm::{self, NmClient, WireguardProfile};
 use crate::service;
 
@@ -48,9 +48,9 @@ enum EligibleCommands {
 
 #[derive(Debug, Subcommand)]
 enum KillSwitchCommands {
-    Status { profile: String },
-    Enable { profile: String },
-    Disable { profile: String },
+    Status,
+    Enable,
+    Disable,
 }
 
 pub fn run<C: NmClient + Clone + Send + 'static>(client: &C) -> AppResult<()> {
@@ -64,7 +64,7 @@ fn execute<C: NmClient + Clone + Send + 'static>(client: &C, cli: Cli) -> AppRes
             let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let profiles = client.list_wireguard_profiles()?;
-            let rows = profile_list::build_rows(&profiles, &app_cfg.eligible_profile_ids);
+            let rows = profile_list::build_rows(&profiles, &app_cfg.excluded_profile_ids);
             for row in rows {
                 println!("{}", profile_list::format_cli_row(&row));
             }
@@ -97,44 +97,47 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
 
     match command {
         EligibleCommands::List => {
-            if app_cfg.eligible_profile_ids.is_empty() {
-                println!("No eligible profiles configured.");
+            // Opt-out model: every profile is eligible unless it is in the
+            // exclusion set, so listing the (smaller) excluded set is clearest.
+            if app_cfg.excluded_profile_ids.is_empty() {
+                println!("All profiles are eligible for startup-random (none excluded).");
             } else {
-                for id in &app_cfg.eligible_profile_ids {
+                println!("Profiles excluded from startup-random:");
+                for id in &app_cfg.excluded_profile_ids {
                     if let Some(profile) = profiles.iter().find(|profile| &profile.uuid == id) {
-                        println!("{} ({})", profile.name, profile.uuid);
+                        println!("  {} ({})", profile.name, profile.uuid);
                     } else {
-                        println!("<unknown> ({id})");
+                        println!("  <unknown> ({id})");
                     }
                 }
             }
         }
         EligibleCommands::Add { profile } => {
+            // "Add to eligible" clears any exclusion for the profile.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
             if eligibility::set_profile_eligible(
-                &mut app_cfg.eligible_profile_ids,
+                &mut app_cfg.excluded_profile_ids,
                 &profile_id,
                 true,
             ) {
                 config::save(&path, &app_cfg)?;
-                println!("Eligible profile added: {profile} ({profile_id})");
+                println!("Profile is now eligible for startup-random: {profile} ({profile_id})");
             } else {
                 println!("Profile already eligible: {profile} ({profile_id})");
             }
         }
         EligibleCommands::Remove { profile } => {
+            // "Remove from eligible" excludes the profile from startup-random.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
             if eligibility::set_profile_eligible(
-                &mut app_cfg.eligible_profile_ids,
+                &mut app_cfg.excluded_profile_ids,
                 &profile_id,
                 false,
             ) {
                 config::save(&path, &app_cfg)?;
-                println!("Eligible profile removed: {profile} ({profile_id})");
+                println!("Profile excluded from startup-random: {profile} ({profile_id})");
             } else {
-                return Err(AppError::Config(format!(
-                    "profile is not eligible: {profile_id}"
-                )));
+                println!("Profile already excluded: {profile} ({profile_id})");
             }
         }
     }
@@ -146,24 +149,57 @@ fn handle_kill_switch_command<C: NmClient>(
     client: &C,
     command: KillSwitchCommands,
 ) -> AppResult<()> {
+    let path = config::default_config_path()?;
+    handle_kill_switch_command_with_path(client, command, &path)
+}
+
+fn handle_kill_switch_command_with_path<C: NmClient>(
+    client: &C,
+    command: KillSwitchCommands,
+    path: &std::path::Path,
+) -> AppResult<()> {
     match command {
-        KillSwitchCommands::Status { profile } => {
-            let state = client.kill_switch_status(&profile)?;
-            println!("Kill switch for {profile}: {}", state.label());
+        KillSwitchCommands::Status => {
+            let app_cfg = config::load(path)?;
+            let label = if app_cfg.kill_switch_enabled {
+                "on"
+            } else {
+                "off"
+            };
+            println!("Kill switch (all profiles): {label}");
         }
-        KillSwitchCommands::Enable { profile } => {
-            client.set_kill_switch(&profile, true)?;
+        KillSwitchCommands::Enable => {
+            set_global_kill_switch(client, path, true)?;
             println!(
-                "Kill switch enabled for {profile} (applies on next connect; full-tunnel profiles only)."
+                "Kill switch enabled for all profiles (applies on next connect; full-tunnel profiles only)."
             );
         }
-        KillSwitchCommands::Disable { profile } => {
-            client.set_kill_switch(&profile, false)?;
-            println!("Kill switch disabled for {profile} (applies on next connect).");
+        KillSwitchCommands::Disable => {
+            set_global_kill_switch(client, path, false)?;
+            println!("Kill switch disabled for all profiles (applies on next connect).");
         }
     }
 
     Ok(())
+}
+
+/// Apply the global kill-switch routing policy to every WireGuard profile and
+/// persist the new intent.
+///
+/// NetworkManager is updated *before* the config is saved, so a failed `nmcli`
+/// call (the `?` returns early) leaves the persisted `kill_switch_enabled` flag
+/// untouched. This apply-then-persist ordering is a correctness invariant — see
+/// the `kill_switch_*_when_nm_fails` tests — and is shared by both the CLI
+/// handler and the GUI toggle so it lives in exactly one place.
+pub(crate) fn set_global_kill_switch<C: NmClient>(
+    client: &C,
+    path: &std::path::Path,
+    enable: bool,
+) -> AppResult<()> {
+    client.set_kill_switch_all(enable)?;
+    let mut app_cfg = config::load(path)?;
+    app_cfg.kill_switch_enabled = enable;
+    config::save(path, &app_cfg)
 }
 
 fn resolve_profile_id(
@@ -177,6 +213,7 @@ fn resolve_profile_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AppError;
 
     fn profile(name: &str, uuid: &str) -> WireguardProfile {
         WireguardProfile {
@@ -238,34 +275,161 @@ mod tests {
     }
 
     #[test]
-    fn kill_switch_enable_invokes_client() {
+    fn kill_switch_enable_applies_globally_and_persists() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let cli = Cli {
-            command: Commands::KillSwitch {
-                command: KillSwitchCommands::Enable {
-                    profile: "uuid-1".to_string(),
-                },
-            },
-        };
+        let path = unique_test_config_path();
 
-        execute(&client, cli).expect("enable should succeed");
+        handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path)
+            .expect("enable should succeed");
 
-        assert_eq!(client.kill_switch_calls(), vec!["kill-switch:uuid-1:on"]);
+        assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:on"]);
+        let persisted = config::load(&path).expect("config should load");
+        assert!(persisted.kill_switch_enabled);
+        cleanup_test_config(&path);
     }
 
     #[test]
-    fn kill_switch_disable_invokes_client() {
+    fn kill_switch_disable_applies_globally_and_persists() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let cli = Cli {
-            command: Commands::KillSwitch {
-                command: KillSwitchCommands::Disable {
-                    profile: "uuid-1".to_string(),
-                },
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                kill_switch_enabled: true,
+                ..config::AppConfig::default()
             },
-        };
+        )
+        .expect("config should save");
 
-        execute(&client, cli).expect("disable should succeed");
+        handle_kill_switch_command_with_path(&client, KillSwitchCommands::Disable, &path)
+            .expect("disable should succeed");
 
-        assert_eq!(client.kill_switch_calls(), vec!["kill-switch:uuid-1:off"]);
+        assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:off"]);
+        let persisted = config::load(&path).expect("config should load");
+        assert!(!persisted.kill_switch_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn kill_switch_status_does_not_change_nm_or_config() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                kill_switch_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+
+        handle_kill_switch_command_with_path(&client, KillSwitchCommands::Status, &path)
+            .expect("status should succeed");
+
+        // Status only reports; it must not touch NetworkManager or the config.
+        assert!(client.kill_switch_calls().is_empty());
+        let persisted = config::load(&path).expect("config should load");
+        assert!(persisted.kill_switch_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn kill_switch_status_defaults_to_off_without_config() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        // No config file: status reads the default (off) instead of erroring,
+        // and still does not invoke NetworkManager.
+        handle_kill_switch_command_with_path(&client, KillSwitchCommands::Status, &path)
+            .expect("status should succeed with default config");
+
+        assert!(client.kill_switch_calls().is_empty());
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn kill_switch_enable_does_not_persist_when_nm_fails() {
+        let client =
+            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_kill_switch();
+        let path = unique_test_config_path();
+
+        let result =
+            handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path);
+
+        assert!(matches!(result, Err(AppError::NmCommandFailed(_))));
+        // The change was attempted, but because NetworkManager rejected it the
+        // enabled intent must not be persisted.
+        assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:on"]);
+        let persisted = config::load(&path).expect("config should load");
+        assert!(!persisted.kill_switch_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn kill_switch_disable_keeps_previous_state_when_nm_fails() {
+        let client =
+            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_kill_switch();
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                kill_switch_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+
+        let result =
+            handle_kill_switch_command_with_path(&client, KillSwitchCommands::Disable, &path);
+
+        assert!(matches!(result, Err(AppError::NmCommandFailed(_))));
+        // A failed disable must leave the previously-enabled state intact.
+        let persisted = config::load(&path).expect("config should load");
+        assert!(persisted.kill_switch_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn kill_switch_enable_then_disable_round_trips_state() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path)
+            .expect("enable should succeed");
+        assert!(
+            config::load(&path)
+                .expect("config should load")
+                .kill_switch_enabled
+        );
+
+        handle_kill_switch_command_with_path(&client, KillSwitchCommands::Disable, &path)
+            .expect("disable should succeed");
+        assert!(
+            !config::load(&path)
+                .expect("config should load")
+                .kill_switch_enabled
+        );
+
+        assert_eq!(
+            client.kill_switch_calls(),
+            vec!["kill-switch-all:on", "kill-switch-all:off"]
+        );
+        cleanup_test_config(&path);
+    }
+
+    fn unique_test_config_path() -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("wireguard-manager-app-tests-{suffix}"))
+            .join("config.json")
+    }
+
+    fn cleanup_test_config(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 }

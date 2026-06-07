@@ -9,10 +9,23 @@ use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
-    #[serde(default, alias = "eligible_profiles")]
-    pub eligible_profile_ids: BTreeSet<String>,
+    /// Profiles explicitly excluded from startup-random selection. An empty set
+    /// means every WireGuard profile is eligible (opt-out model): profiles are
+    /// eligible by default and the user toggles individual ones off.
+    #[serde(default)]
+    pub excluded_profile_ids: BTreeSet<String>,
     #[serde(default, alias = "last_random_profile")]
     pub last_random_profile_id: Option<String>,
+    /// Global kill-switch intent. When enabled, the NetworkManager kill-switch
+    /// routing policy is applied to every WireGuard profile (not per-profile).
+    #[serde(default)]
+    pub kill_switch_enabled: bool,
+    /// Last window width remembered between sessions (`None` until first save).
+    #[serde(default)]
+    pub window_width: Option<i32>,
+    /// Last window height remembered between sessions (`None` until first save).
+    #[serde(default)]
+    pub window_height: Option<i32>,
 }
 
 pub fn load(path: &Path) -> AppResult<AppConfig> {
@@ -98,6 +111,46 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn roundtrips_kill_switch_and_window_size() {
+        let path = unique_path("roundtrip");
+        let config = AppConfig {
+            kill_switch_enabled: true,
+            window_width: Some(1024),
+            window_height: Some(768),
+            ..AppConfig::default()
+        };
+
+        save(&path, &config).expect("config should save");
+        let loaded = load(&path).expect("config should load");
+
+        assert!(loaded.kill_switch_enabled);
+        assert_eq!(loaded.window_width, Some(1024));
+        assert_eq!(loaded.window_height, Some(768));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn defaults_new_fields_for_legacy_config_without_them() {
+        let path = unique_path("legacy-defaults");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent dir should be created");
+        }
+        // A pre-opt-out config only carried the old opt-in `eligible_profile_ids`
+        // field. It must load cleanly: the unknown field is ignored and the new
+        // opt-out `excluded_profile_ids` defaults to empty (everything eligible).
+        fs::write(&path, r#"{"eligible_profile_ids":["uuid-1"]}"#)
+            .expect("legacy config should be written");
+
+        let loaded = load(&path).expect("legacy config should load");
+
+        assert!(loaded.excluded_profile_ids.is_empty());
+        assert!(!loaded.kill_switch_enabled);
+        assert_eq!(loaded.window_width, None);
+        assert_eq!(loaded.window_height, None);
+        cleanup(&path);
+    }
 
     #[test]
     fn write_atomically_falls_back_when_rename_crosses_devices() {
