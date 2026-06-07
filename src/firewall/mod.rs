@@ -521,12 +521,16 @@ mod tests {
     fn enable_batches_cover_both_families_and_reload_last() {
         let batches = lockdown_enable_batches(&[]);
 
-        assert!(batches
-            .iter()
-            .any(|batch| batch.contains(&"ipv4".to_string())));
-        assert!(batches
-            .iter()
-            .any(|batch| batch.contains(&"ipv6".to_string())));
+        assert!(
+            batches
+                .iter()
+                .any(|batch| batch.contains(&"ipv4".to_string()))
+        );
+        assert!(
+            batches
+                .iter()
+                .any(|batch| batch.contains(&"ipv6".to_string()))
+        );
         assert_eq!(batches.last().expect("non-empty"), &reload_batch());
     }
 
@@ -539,9 +543,11 @@ mod tests {
         assert!(has_rule(&batches, &["--dport", "53"]));
         // The catch-all reject carries the recognizable marker.
         assert!(has_rule(&batches, &["--comment", LOCKDOWN_MARKER]));
-        assert!(batches
-            .iter()
-            .any(|batch| batch.contains(&"REJECT".to_string())));
+        assert!(
+            batches
+                .iter()
+                .any(|batch| batch.contains(&"REJECT".to_string()))
+        );
     }
 
     #[test]
@@ -558,9 +564,11 @@ mod tests {
 
         assert!(has_rule(&ipv4, &["-d", "1.2.3.4", "--dport", "51820"]));
         // The IPv4 literal must not appear in the IPv6 ruleset.
-        assert!(!ipv6
-            .iter()
-            .any(|batch| batch.contains(&"1.2.3.4".to_string())));
+        assert!(
+            !ipv6
+                .iter()
+                .any(|batch| batch.contains(&"1.2.3.4".to_string()))
+        );
     }
 
     #[test]
@@ -569,9 +577,11 @@ mod tests {
         let ipv6 = lockdown_family_batches("ipv6", &[tunnel("wg0", &[("2001:db8::1", 51820)])]);
 
         assert!(has_rule(&ipv6, &["-d", "2001:db8::1", "--dport", "51820"]));
-        assert!(!ipv4
-            .iter()
-            .any(|batch| batch.contains(&"2001:db8::1".to_string())));
+        assert!(
+            !ipv4
+                .iter()
+                .any(|batch| batch.contains(&"2001:db8::1".to_string()))
+        );
     }
 
     #[test]
@@ -582,9 +592,11 @@ mod tests {
         // Port-only allow (no `-d`) so the resolved address can be either family.
         for family in [&ipv4, &ipv6] {
             assert!(has_rule(family, &["-p", "udp", "--dport", "1194"]));
-            assert!(!family
-                .iter()
-                .any(|batch| batch.contains(&"vpn.example.com".to_string())));
+            assert!(
+                !family
+                    .iter()
+                    .any(|batch| batch.contains(&"vpn.example.com".to_string()))
+            );
         }
     }
 
@@ -655,12 +667,16 @@ mod tests {
 
         // Only the two tagged rules are removed; the foreign `eth0` rule is left.
         assert_eq!(removals.len(), 2);
-        assert!(removals
-            .iter()
-            .all(|batch| batch.contains(&"--remove-rule".to_string())));
-        assert!(!removals
-            .iter()
-            .any(|batch| batch.contains(&"eth0".to_string())));
+        assert!(
+            removals
+                .iter()
+                .all(|batch| batch.contains(&"--remove-rule".to_string()))
+        );
+        assert!(
+            !removals
+                .iter()
+                .any(|batch| batch.contains(&"eth0".to_string()))
+        );
     }
 
     #[test]
@@ -750,9 +766,11 @@ mod tests {
         let removals = parse_marked_removals("ipv4", listing);
 
         assert_eq!(removals.len(), 1);
-        assert!(!removals
-            .iter()
-            .any(|batch| batch.contains(&"other-app".to_string())));
+        assert!(
+            !removals
+                .iter()
+                .any(|batch| batch.contains(&"other-app".to_string()))
+        );
         assert!(removals[0].contains(&LOCKDOWN_MARKER.to_string()));
     }
 

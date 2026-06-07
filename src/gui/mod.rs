@@ -74,7 +74,9 @@ mod enabled {
         list.connect_row_activated(move |_, row_widget| {
             if let Some(child_widget) = row_widget.child() {
                 if let Some(container_box) = child_widget.downcast_ref::<gtk::Box>() {
-                    if let Some(info_box_widget) = container_box.first_child().and_then(|h| h.next_sibling()) {
+                    if let Some(info_box_widget) =
+                        container_box.first_child().and_then(|h| h.next_sibling())
+                    {
                         let visible = info_box_widget.is_visible();
                         info_box_widget.set_visible(!visible);
                     }

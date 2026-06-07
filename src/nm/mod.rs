@@ -86,7 +86,7 @@ pub trait NmClient {
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String>;
     /// Get read-only WireGuard diagnostics for a specific profile connection.
     fn get_profile_diagnostics(&self, uuid: &str, is_active: bool)
-        -> AppResult<ProfileDiagnostics>;
+    -> AppResult<ProfileDiagnostics>;
     /// Open the native NetworkManager connection editor for the specified connection.
     fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()>;
     /// Permanently delete a NetworkManager profile. NetworkManager deactivates
