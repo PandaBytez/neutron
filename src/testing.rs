@@ -229,6 +229,14 @@ impl NmClient for MockNmClient {
             .push(format!("edit:{}", uuid));
         Ok(())
     }
+
+    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
+        self.calls
+            .lock()
+            .expect("mock mutex poisoned")
+            .push(format!("delete:{}", uuid));
+        Ok(())
+    }
 }
 
 impl FirewallClient for MockNmClient {

@@ -89,6 +89,11 @@ pub trait NmClient {
         -> AppResult<ProfileDiagnostics>;
     /// Open the native NetworkManager connection editor for the specified connection.
     fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()>;
+    /// Permanently delete a NetworkManager profile. NetworkManager deactivates
+    /// the connection first if it is currently active. Any Zento-side metadata
+    /// that referenced the profile (provider comments, startup eligibility) is
+    /// cleaned up too so stale entries don't accumulate.
+    fn delete_profile(&self, uuid: &str) -> AppResult<()>;
 }
 
 fn extract_interface_comments(path: &std::path::Path) -> String {
@@ -388,6 +393,31 @@ impl NmClient for CliNmClient {
         };
         cmd.arg("-e").arg(uuid);
         cmd.spawn()?;
+        Ok(())
+    }
+
+    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
+        // NetworkManager deactivates the connection automatically before
+        // removing it, so an active profile can be deleted directly.
+        run_nmcli(&["connection", "delete", uuid])?;
+
+        // Drop any Zento-side metadata keyed by this UUID so it doesn't linger
+        // after the profile is gone. Best-effort: a config failure here must not
+        // mask the successful deletion.
+        if let Ok(config_path) = crate::config::default_config_path() {
+            if let Ok(mut app_cfg) = crate::config::load(&config_path) {
+                let mut changed = app_cfg.profile_custom_info.remove(uuid).is_some();
+                changed |= app_cfg.excluded_profile_ids.remove(uuid);
+                if app_cfg.last_random_profile_id.as_deref() == Some(uuid) {
+                    app_cfg.last_random_profile_id = None;
+                    changed = true;
+                }
+                if changed {
+                    let _ = crate::config::save(&config_path, &app_cfg);
+                }
+            }
+        }
+
         Ok(())
     }
 }

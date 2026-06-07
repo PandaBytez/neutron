@@ -965,8 +965,85 @@ mod enabled {
                 }
             });
         }
+        let remove_button = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .css_classes(vec!["flat".to_string()])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Remove profile")
+            .build();
+        {
+            let client = client.clone();
+            let row = row.clone();
+            let list = list.clone();
+            let indicators = indicators.clone();
+            remove_button.connect_clicked(move |btn| {
+                let parent = btn.root().and_downcast::<gtk::Window>();
+                // Deleting a NetworkManager profile is destructive and
+                // irreversible, so confirm before doing it.
+                let confirm = adw::MessageDialog::new(
+                    parent.as_ref(),
+                    Some("Remove profile?"),
+                    Some(&format!(
+                        "This permanently deletes '{}' from NetworkManager. \
+                         This cannot be undone.",
+                        row.name
+                    )),
+                );
+                confirm.add_response("cancel", "_Cancel");
+                confirm.add_response("delete", "_Delete");
+                confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                confirm.set_default_response(Some("cancel"));
+                confirm.set_close_response("cancel");
+
+                let client = client.clone();
+                let row = row.clone();
+                let list = list.clone();
+                let indicators = indicators.clone();
+                let parent = parent.clone();
+                confirm.connect_response(None, move |_, response| {
+                    if response != "delete" {
+                        return;
+                    }
+                    let client = client.clone();
+                    let row = row.clone();
+                    let list = list.clone();
+                    let indicators = indicators.clone();
+                    let parent = parent.clone();
+                    glib::spawn_future_local(async move {
+                        let task_client = client.clone();
+                        let task_uuid = row.uuid.clone();
+                        let outcome =
+                            gio::spawn_blocking(move || task_client.delete_profile(&task_uuid))
+                                .await;
+                        match outcome {
+                            Ok(Ok(())) => {
+                                refresh_profile_list(&client, &list, &indicators);
+                            }
+                            Ok(Err(error)) => {
+                                show_error_dialog(
+                                    parent.as_ref(),
+                                    &format!("Failed to remove '{}': {error}", row.name),
+                                );
+                            }
+                            Err(_) => {
+                                show_error_dialog(
+                                    parent.as_ref(),
+                                    &format!(
+                                        "Failed to remove '{}': background task panicked",
+                                        row.name
+                                    ),
+                                );
+                            }
+                        }
+                    });
+                });
+                confirm.present();
+            });
+        }
+
         header_box.append(&connection_toggle);
         header_box.append(&settings_button);
+        header_box.append(&remove_button);
 
         let container = gtk::Box::new(Orientation::Vertical, 0);
         container.append(&header_box);
