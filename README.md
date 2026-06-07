@@ -158,6 +158,12 @@ cargo test --all-features
 
 ## Implementation notes
 
+- **Auto-connect compatibility**: NetworkManager's native connection properties,
+  such as automatic connection (`connection.autoconnect` and `connection.autoconnect-priority`),
+  are fully supported. Zento's boot-time random selector service first checks if
+  any WireGuard profile is already active. If NetworkManager has already auto-connected
+  a preferred profile, the randomizer cleanly skips selection, ensuring they complement
+  each other perfectly.
 - Application config (excluded-profile set and last random selection) is written
   atomically and, on Unix, restricted to owner-only access (`0o600`). No private
   keys or secrets are ever stored here; those remain in NetworkManager.
