@@ -581,40 +581,76 @@ mod enabled {
             // Reuse the window to parent any error dialogs raised while handling
             // the chosen file.
             let dialog_parent = parent.clone();
-            dialog.open(parent.as_ref(), gio::Cancellable::NONE, move |result| {
-                let file = match result {
-                    Ok(file) => file,
+            dialog.open_multiple(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+                let files = match result {
+                    Ok(files) => files,
                     // The user dismissed the chooser; nothing to import.
                     Err(_) => return,
                 };
-                let Some(path) = file.path() else {
-                    show_error_dialog(
-                        dialog_parent.as_ref(),
-                        "Import failed: the selected file has no local path.",
-                    );
+
+                // Collect a local path for every chosen file. Files without one
+                // (rare; e.g. a non-local URI) are reported alongside any later
+                // import failures rather than silently skipped.
+                let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                let mut failures: Vec<String> = Vec::new();
+                for index in 0..files.n_items() {
+                    let Some(file) = files.item(index).and_downcast::<gio::File>() else {
+                        continue;
+                    };
+                    match file.path() {
+                        Some(path) => paths.push(path),
+                        None => failures.push(format!(
+                            "{}: file has no local path",
+                            file.basename()
+                                .map(|name| name.display().to_string())
+                                .unwrap_or_else(|| "selected file".to_string())
+                        )),
+                    }
+                }
+
+                if paths.is_empty() {
+                    if !failures.is_empty() {
+                        show_error_dialog(
+                            dialog_parent.as_ref(),
+                            &format!("Import failed:\n{}", failures.join("\n")),
+                        );
+                    }
                     return;
-                };
+                }
 
                 let task_client = client.clone();
-                let task_path = path.clone();
                 let client = client.clone();
                 let list = list.clone();
                 let indicators = indicators.clone();
                 let dialog_parent = dialog_parent.clone();
                 glib::spawn_future_local(async move {
+                    // Import sequentially on a worker thread, collecting a
+                    // message for each file that fails so one bad config does not
+                    // abort the rest of the batch.
                     let outcome = gio::spawn_blocking(move || {
-                        task_client.import_wireguard_profile(&task_path)
+                        let mut errors = Vec::new();
+                        for path in &paths {
+                            if let Err(error) = task_client.import_wireguard_profile(path) {
+                                errors.push(format!("{}: {error}", path.display()));
+                            }
+                        }
+                        errors
                     })
                     .await;
+
+                    // Refresh once: even a partly failed batch may have added
+                    // some profiles.
+                    refresh_profile_list(&client, &list, &indicators);
+
                     match outcome {
-                        Ok(Ok(_)) => {
-                            refresh_profile_list(&client, &list, &indicators);
-                        }
-                        Ok(Err(error)) => {
-                            show_error_dialog(
-                                dialog_parent.as_ref(),
-                                &format!("Import failed: {error}"),
-                            );
+                        Ok(import_errors) => {
+                            failures.extend(import_errors);
+                            if !failures.is_empty() {
+                                show_error_dialog(
+                                    dialog_parent.as_ref(),
+                                    &format!("Some imports failed:\n{}", failures.join("\n")),
+                                );
+                            }
                         }
                         Err(_) => {
                             show_error_dialog(
