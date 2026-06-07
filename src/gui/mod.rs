@@ -575,112 +575,290 @@ mod enabled {
         let list = list.clone();
         let indicators = indicators.clone();
         button.connect_clicked(move |button| {
-            let filter = gtk::FileFilter::new();
-            filter.set_name(Some("WireGuard configuration (*.conf)"));
-            filter.add_pattern("*.conf");
-            let filters = gio::ListStore::new::<gtk::FileFilter>();
-            filters.append(&filter);
-
-            let dialog = gtk::FileDialog::builder()
-                .title("Import WireGuard configuration")
-                .modal(true)
-                .filters(&filters)
-                .default_filter(&filter)
-                .build();
-
-            // Parent the modal on the live window so it centers correctly; the
-            // button is realized by click time, so its root is the window.
+            // The button is realized by click time, so its root is the window;
+            // parent the chooser on it so it centers correctly.
             let parent = button.root().and_downcast::<gtk::Window>();
-
-            let client = client.clone();
-            let list = list.clone();
-            let indicators = indicators.clone();
-            // Reuse the window to parent any error dialogs raised while handling
-            // the chosen file.
-            let dialog_parent = parent.clone();
-            dialog.open_multiple(parent.as_ref(), gio::Cancellable::NONE, move |result| {
-                let files = match result {
-                    Ok(files) => files,
-                    // The user dismissed the chooser; nothing to import.
-                    Err(_) => return,
-                };
-
-                // Collect a local path for every chosen file. Files without one
-                // (rare; e.g. a non-local URI) are reported alongside any later
-                // import failures rather than silently skipped.
-                let mut paths: Vec<std::path::PathBuf> = Vec::new();
-                let mut failures: Vec<String> = Vec::new();
-                for index in 0..files.n_items() {
-                    let Some(file) = files.item(index).and_downcast::<gio::File>() else {
-                        continue;
-                    };
-                    match file.path() {
-                        Some(path) => paths.push(path),
-                        None => failures.push(format!(
-                            "{}: file has no local path",
-                            file.basename()
-                                .map(|name| name.display().to_string())
-                                .unwrap_or_else(|| "selected file".to_string())
-                        )),
-                    }
-                }
-
-                if paths.is_empty() {
-                    if !failures.is_empty() {
-                        show_error_dialog(
-                            dialog_parent.as_ref(),
-                            &format!("Import failed:\n{}", failures.join("\n")),
-                        );
-                    }
-                    return;
-                }
-
-                let task_client = client.clone();
-                let client = client.clone();
-                let list = list.clone();
-                let indicators = indicators.clone();
-                let dialog_parent = dialog_parent.clone();
-                glib::spawn_future_local(async move {
-                    // Import sequentially on a worker thread, collecting a
-                    // message for each file that fails so one bad config does not
-                    // abort the rest of the batch.
-                    let outcome = gio::spawn_blocking(move || {
-                        let mut errors = Vec::new();
-                        for path in &paths {
-                            if let Err(error) = task_client.import_wireguard_profile(path) {
-                                errors.push(format!("{}: {error}", path.display()));
-                            }
-                        }
-                        errors
-                    })
-                    .await;
-
-                    // Refresh once: even a partly failed batch may have added
-                    // some profiles.
-                    refresh_profile_list(&client, &list, &indicators);
-
-                    match outcome {
-                        Ok(import_errors) => {
-                            failures.extend(import_errors);
-                            if !failures.is_empty() {
-                                show_error_dialog(
-                                    dialog_parent.as_ref(),
-                                    &format!("Some imports failed:\n{}", failures.join("\n")),
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            show_error_dialog(
-                                dialog_parent.as_ref(),
-                                "Import failed: background task panicked.",
-                            );
-                        }
-                    }
-                });
-            });
+            show_provider_chooser(parent.as_ref(), &client, &list, &indicators);
         });
 
         button
+    }
+
+    /// Offer the import sources as a GNOME "Add VPN"-style chooser: each source
+    /// is a row in a boxed list that opens its guided flow, plus a manual
+    /// file-import row. Mullvad is listed but inert until its flow lands.
+    fn show_provider_chooser<C>(
+        parent: Option<&gtk::Window>,
+        client: &C,
+        list: &gtk::ListBox,
+        indicators: &StatusIndicators,
+    ) where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let window = adw::Window::builder()
+            .modal(true)
+            .title("Import VPN profile")
+            .default_width(400)
+            .build();
+        if let Some(parent) = parent {
+            window.set_transient_for(Some(parent));
+        }
+
+        let header = HeaderBar::new();
+        let cancel = gtk::Button::with_label("Cancel");
+        {
+            let window = window.downgrade();
+            cancel.connect_clicked(move |_| {
+                if let Some(window) = window.upgrade() {
+                    window.close();
+                }
+            });
+        }
+        header.pack_start(&cancel);
+
+        let providers = gtk::ListBox::new();
+        providers.set_selection_mode(gtk::SelectionMode::None);
+        providers.add_css_class("boxed-list");
+
+        let proton_row = provider_chooser_row(
+            "ProtonVPN",
+            "Download configurations from your Proton account",
+            true,
+        );
+        {
+            let window = window.downgrade();
+            let parent = parent.cloned();
+            let client = client.clone();
+            let list = list.clone();
+            let indicators = indicators.clone();
+            proton_row.connect_activated(move |_| {
+                if let Some(window) = window.upgrade() {
+                    window.close();
+                }
+                show_proton_import_dialog(parent.as_ref(), &client, &list, &indicators);
+            });
+        }
+        providers.append(&proton_row);
+
+        // Listed for discoverability but kept inert until the Mullvad flow lands.
+        let mullvad_row = provider_chooser_row("MullvadVPN", "Coming soon", false);
+        mullvad_row.set_sensitive(false);
+        providers.append(&mullvad_row);
+
+        let manual_row =
+            provider_chooser_row("Manual import", "Import a WireGuard .conf file", true);
+        {
+            let window = window.downgrade();
+            let parent = parent.cloned();
+            let client = client.clone();
+            let list = list.clone();
+            let indicators = indicators.clone();
+            manual_row.connect_activated(move |_| {
+                if let Some(window) = window.upgrade() {
+                    window.close();
+                }
+                open_manual_import(parent.as_ref(), &client, &list, &indicators);
+            });
+        }
+        providers.append(&manual_row);
+
+        let content = gtk::Box::new(Orientation::Vertical, 0);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.append(&providers);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        window.set_content(Some(&toolbar));
+        window.present();
+    }
+
+    /// Build one row for the provider chooser: a leading VPN icon, a
+    /// title/subtitle, and—when actionable—a trailing arrow hinting at a flow.
+    fn provider_chooser_row(title: &str, subtitle: &str, activatable: bool) -> adw::ActionRow {
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .activatable(activatable)
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name("network-vpn-symbolic"));
+        if activatable {
+            row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        }
+        row
+    }
+
+    /// ProtonVPN flow: explain how to fetch a WireGuard config from the account
+    /// downloads page (opened via the link), then reuse the manual file picker
+    /// to import the downloaded `.conf` file(s).
+    fn show_proton_import_dialog<C>(
+        parent: Option<&gtk::Window>,
+        client: &C,
+        list: &gtk::ListBox,
+        indicators: &StatusIndicators,
+    ) where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let dialog = adw::MessageDialog::new(parent, Some("Import from ProtonVPN"), None);
+
+        let body = gtk::Label::builder()
+            .use_markup(true)
+            .wrap(true)
+            .xalign(0.0)
+            .width_request(440)
+            .max_width_chars(60)
+            .label(
+                "To add a ProtonVPN profile:\n\n\
+                 1. Open the WireGuard downloads page and sign in. \
+                 <a href=\"https://account.protonvpn.com/downloads#wireguard-configuration\">Downloads page</a>\n\n\
+                 2. Create and download a configuration for each server you want. \
+                 <a href=\"https://protonvpn.com/support/wireguard-configurations\">Configuration guide</a>\n\n\
+                 3. Choose the downloaded <tt>.conf</tt> file(s) below to import them.",
+            )
+            .build();
+        // Route link clicks through gtk::UriLauncher so the URL opens via the
+        // desktop portal inside the Flatpak sandbox.
+        {
+            let parent = parent.cloned();
+            body.connect_activate_link(move |_, uri| {
+                let launcher = gtk::UriLauncher::new(uri);
+                launcher.launch(parent.as_ref(), gio::Cancellable::NONE, |_| {});
+                glib::Propagation::Stop
+            });
+        }
+        dialog.set_extra_child(Some(&body));
+
+        dialog.add_response("cancel", "_Cancel");
+        dialog.add_response("choose", "_Choose files\u{2026}");
+        dialog.set_response_appearance("choose", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("choose"));
+        dialog.set_close_response("cancel");
+
+        let parent = parent.cloned();
+        let client = client.clone();
+        let list = list.clone();
+        let indicators = indicators.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "choose" {
+                open_manual_import(parent.as_ref(), &client, &list, &indicators);
+            }
+        });
+        dialog.present();
+    }
+
+    /// Open the multi-file chooser and import every selected WireGuard config,
+    /// aggregating per-file failures so one bad file doesn't abort the batch.
+    /// Shared by the "Manual import" option and the provider flows.
+    fn open_manual_import<C>(
+        parent: Option<&gtk::Window>,
+        client: &C,
+        list: &gtk::ListBox,
+        indicators: &StatusIndicators,
+    ) where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("WireGuard configuration (*.conf)"));
+        filter.add_pattern("*.conf");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Import WireGuard configuration")
+            .modal(true)
+            .filters(&filters)
+            .default_filter(&filter)
+            .build();
+
+        let client = client.clone();
+        let list = list.clone();
+        let indicators = indicators.clone();
+        // Reuse the window to parent any error dialogs raised while handling
+        // the chosen file.
+        let dialog_parent = parent.cloned();
+        dialog.open_multiple(parent, gio::Cancellable::NONE, move |result| {
+            let files = match result {
+                Ok(files) => files,
+                // The user dismissed the chooser; nothing to import.
+                Err(_) => return,
+            };
+
+            // Collect a local path for every chosen file. Files without one
+            // (rare; e.g. a non-local URI) are reported alongside any later
+            // import failures rather than silently skipped.
+            let mut paths: Vec<std::path::PathBuf> = Vec::new();
+            let mut failures: Vec<String> = Vec::new();
+            for index in 0..files.n_items() {
+                let Some(file) = files.item(index).and_downcast::<gio::File>() else {
+                    continue;
+                };
+                match file.path() {
+                    Some(path) => paths.push(path),
+                    None => failures.push(format!(
+                        "{}: file has no local path",
+                        file.basename()
+                            .map(|name| name.display().to_string())
+                            .unwrap_or_else(|| "selected file".to_string())
+                    )),
+                }
+            }
+
+            if paths.is_empty() {
+                if !failures.is_empty() {
+                    show_error_dialog(
+                        dialog_parent.as_ref(),
+                        &format!("Import failed:\n{}", failures.join("\n")),
+                    );
+                }
+                return;
+            }
+
+            let task_client = client.clone();
+            let client = client.clone();
+            let list = list.clone();
+            let indicators = indicators.clone();
+            let dialog_parent = dialog_parent.clone();
+            glib::spawn_future_local(async move {
+                // Import sequentially on a worker thread, collecting a
+                // message for each file that fails so one bad config does not
+                // abort the rest of the batch.
+                let outcome = gio::spawn_blocking(move || {
+                    let mut errors = Vec::new();
+                    for path in &paths {
+                        if let Err(error) = task_client.import_wireguard_profile(path) {
+                            errors.push(format!("{}: {error}", path.display()));
+                        }
+                    }
+                    errors
+                })
+                .await;
+
+                // Refresh once: even a partly failed batch may have added
+                // some profiles.
+                refresh_profile_list(&client, &list, &indicators);
+
+                match outcome {
+                    Ok(import_errors) => {
+                        failures.extend(import_errors);
+                        if !failures.is_empty() {
+                            show_error_dialog(
+                                dialog_parent.as_ref(),
+                                &format!("Some imports failed:\n{}", failures.join("\n")),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        show_error_dialog(
+                            dialog_parent.as_ref(),
+                            "Import failed: background task panicked.",
+                        );
+                    }
+                }
+            });
+        });
     }
 
     fn update_vpn_status_widget(connected: bool, icon: &gtk::Image, label: &gtk::Label) {
