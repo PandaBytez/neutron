@@ -1,9 +1,15 @@
+use neutron_vpn::app;
+use neutron_vpn::nm::CliNmClient;
 use tracing_subscriber::EnvFilter;
-use wireguard_manager::app;
-use wireguard_manager::nm::CliNmClient;
 
 fn main() {
     init_logging();
+
+    #[cfg(feature = "gui")]
+    {
+        gtk::glib::set_prgname(Some("io.gitlab.neutron_vpn.neutron"));
+        gtk::glib::set_application_name("Neutron VPN");
+    }
 
     let client = CliNmClient;
     if let Err(error) = app::run(&client) {

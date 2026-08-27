@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.gitlab.zento_vpn_manager.zento</id>
-  <name>Zento</name>
+  <id>io.gitlab.neutron_vpn.neutron</id>
+  <name>Neutron VPN</name>
   <summary>Manage VPN connections with NetworkManager</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
-  <developer id="io.gitlab.zento_vpn_manager">
-    <name>Zento VPN Manager</name>
+  <developer id="io.gitlab.neutron_vpn">
+    <name>Neutron VPN</name>
   </developer>
   <description>
     <p>
-      Zento is a provider-agnostic desktop tool for managing VPN connections
+      Neutron VPN is a provider-agnostic desktop tool for managing VPN connections
       through NetworkManager. It currently supports WireGuard profiles, with
       additional protocols planned.
     </p>
@@ -23,27 +23,27 @@
       <li>Enable an always-on lockdown firewall that blocks all non-VPN traffic, even while disconnected</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.gitlab.zento_vpn_manager.zento.desktop</launchable>
-  <url type="homepage">https://gitlab.com/zento-vpn-manager/zento</url>
-  <url type="bugtracker">https://gitlab.com/zento-vpn-manager/zento/-/issues</url>
-  <url type="vcs-browser">https://gitlab.com/zento-vpn-manager/zento</url>
+  <launchable type="desktop-id">io.gitlab.neutron_vpn.neutron.desktop</launchable>
+  <url type="homepage">https://gitlab.com/neutron-vpn/neutron</url>
+  <url type="bugtracker">https://gitlab.com/neutron-vpn/neutron/-/issues</url>
+  <url type="vcs-browser">https://gitlab.com/neutron-vpn/neutron</url>
   <screenshots>
     <screenshot type="default">
-      <image>https://gitlab.com/zento-vpn-manager/zento/-/raw/v0.1.0/screenshots/Main-page.png</image>
+      <image>https://gitlab.com/neutron-vpn/neutron/-/raw/v0.1.0/screenshots/Main-page.png</image>
       <caption>Manage and switch between WireGuard profiles</caption>
     </screenshot>
     <screenshot>
-      <image>https://gitlab.com/zento-vpn-manager/zento/-/raw/v0.1.0/screenshots/Import-page.png</image>
+      <image>https://gitlab.com/neutron-vpn/neutron/-/raw/v0.1.0/screenshots/Import-page.png</image>
       <caption>Import a profile from a provider or a file</caption>
     </screenshot>
     <screenshot>
-      <image>https://gitlab.com/zento-vpn-manager/zento/-/raw/v0.1.0/screenshots/Startup-dropdown.png</image>
+      <image>https://gitlab.com/neutron-vpn/neutron/-/raw/v0.1.0/screenshots/Startup-dropdown.png</image>
       <caption>Choose what connects at startup</caption>
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1" />
   <provides>
-    <binary>wireguard-manager</binary>
+    <binary>neutron-vpn</binary>
   </provides>
   <releases>
     <release version="0.1.0" date="2026-06-07">

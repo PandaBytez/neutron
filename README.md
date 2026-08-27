@@ -1,7 +1,7 @@
-# wireguard-manager
+# Neutron VPN
 
 A desktop WireGuard manager for Linux built in Rust, using NetworkManager as backend.
-Packaged as the Flatpak **Zento** (`io.gitlab.zento_vpn_manager.zento`).
+Branded as **Neutron VPN** (`io.gitlab.neutron_vpn.neutron`), packaged and distributed as an **AppImage**.
 
 ## Why this project
 
@@ -30,7 +30,7 @@ NetworkManager.
 - Language: Rust
 - Desktop stack: GTK4/libadwaita
 - Backend: NetworkManager (D-Bus/libnm)
-- Packaging target: Flatpak / Flathub
+- Packaging target: AppImage
 
 ## Project status
 
@@ -91,43 +91,19 @@ Install the optional user service for startup-random automation:
 cat systemd/README.md
 ```
 
-Flatpak packaging:
+AppImage packaging:
 
-The app ships as the Flatpak **Zento** (app-id `io.gitlab.zento_vpn_manager.zento`).
-The manifest builds against the GNOME 49 runtime and compiles the binary with
-the `rust-stable` SDK extension. Install the dependencies once:
+To build the standalone AppImage:
 
 ```bash
-flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
-    org.freedesktop.Sdk.Extension.rust-stable
+./appimage/build-appimage.sh
 ```
 
-Then build, install, and run it:
+This compiles the release binary and packages it into `Neutron-VPN-<arch>.AppImage`. You can then run it directly:
 
 ```bash
-flatpak run org.flatpak.Builder --user --force-clean --install \
-    build-dir flatpak/io.gitlab.zento_vpn_manager.zento.json
-flatpak run io.gitlab.zento_vpn_manager.zento gui
+./Neutron-VPN-x86_64.AppImage
 ```
-
-(If `flatpak-builder` is installed natively, substitute it for
-`flatpak run org.flatpak.Builder`.)
-
-The build is **network-isolated**: all crates are vendored through
-`flatpak/cargo-sources.json` and `cargo` runs `--offline`, so no dependencies
-are fetched during the build sandbox (a Flathub requirement). Regenerate that
-file whenever `Cargo.lock` changes:
-
-```bash
-flatpak run --command=flatpak-cargo-generator org.flatpak.Builder \
-    Cargo.lock -o flatpak/cargo-sources.json
-```
-
-`nmcli` is not shipped inside the GNOME runtime, so inside the sandbox the app
-transparently runs it on the host through `flatpak-spawn --host`. The manifest
-therefore also requests `--talk-name=org.freedesktop.Flatpak` alongside the
-NetworkManager D-Bus access (`org.freedesktop.NetworkManager`, session and
-system bus talk names).
 
 Quality checks:
 
@@ -160,7 +136,7 @@ cargo test --all-features
 
 - **Auto-connect compatibility**: NetworkManager's native connection properties,
   such as automatic connection (`connection.autoconnect` and `connection.autoconnect-priority`),
-  are fully supported. Zento's boot-time random selector service first checks if
+  are fully supported. Neutron's boot-time random selector service first checks if
   any WireGuard profile is already active. If NetworkManager has already auto-connected
   a preferred profile, the randomizer cleanly skips selection, ensuring they complement
   each other perfectly.
@@ -186,7 +162,7 @@ cargo test --all-features
   It installs permanent `firewalld` direct rules on the OUTPUT chain (both IPv4
   and IPv6) that allow only loopback, established connections, DNS, the WireGuard
   tunnel interfaces, and the peer endpoints (so the *encrypted* handshake can
-  still leave); everything else is rejected by a `zento-lockdown`-tagged rule.
+  still leave); everything else is rejected by a `neutron-lockdown`-tagged rule.
   Because it touches the system firewall, `firewall-cmd` runs through `pkexec`
   (polkit caches the prompt, so enabling/disabling asks for a password at most
   once), and the disable path always tears the ruleset down so the user can never
@@ -195,18 +171,15 @@ cargo test --all-features
   are verified by running the binary, not in `cargo test`.
 - Profile import (GUI only) runs `nmcli connection import type wireguard file
   <path>`, so NetworkManager stays the single source of truth — no local copy of
-  the `.conf` is kept. Inside the Flatpak the chosen file reaches the host `nmcli`
-  through `flatpak-spawn --host`.
-- Packaging is Flathub-ready: crates are vendored (`flatpak/cargo-sources.json`)
-  for a network-isolated `--offline` build, and the desktop entry and AppStream
+  the `.conf` is kept.
+- Packaging is AppImage ready, and the desktop entry and AppStream
   metainfo validate cleanly (`desktop-file-validate`, `appstreamcli validate`).
-  The user-facing Flatpak is branded **Zento**; the binary/crate is still named
-  `wireguard-manager`.
+  The application is named **Neutron VPN** (`neutron-vpn`).
 
 ## Roadmap summary
 
 1. MVP core: profile list + manual connect/switch
 2. Random-on-boot selector service (once per boot)
 3. UX hardening and failure recovery
-4. Flatpak packaging and Flathub preparation
+4. AppImage packaging
 5. Advanced features (provider ingestion, kill-switch helper)

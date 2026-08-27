@@ -7,11 +7,48 @@
 //! dead-code warnings in normal builds.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, AppResult};
 use crate::firewall::FirewallClient;
-use crate::nm::{NmClient, WireguardProfile, WireguardTunnel};
+use crate::nm::{NmClient, ProfileState, WireguardProfile, WireguardTunnel};
+
+fn record(log: &Mutex<Vec<String>>, entry: String) {
+    log.lock().expect("mock mutex poisoned").push(entry);
+}
+
+fn snapshot(log: &Mutex<Vec<String>>) -> Vec<String> {
+    log.lock().expect("mock mutex poisoned").clone()
+}
+
+/// Create a unique temporary path for test configuration files.
+pub fn temp_config_path(label: &str) -> PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("neutron-vpn-test-{label}-{suffix}"))
+        .join("config.json")
+}
+
+/// Clean up temporary test configuration directories.
+pub fn remove_temp_config(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+/// Test helper to create a WireguardProfile.
+pub fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile {
+    WireguardProfile {
+        name: name.to_string(),
+        uuid: uuid.to_string(),
+        state,
+    }
+}
 
 /// A configurable in-memory [`NmClient`] for tests.
 ///
@@ -26,11 +63,13 @@ pub struct MockNmClient {
     fail_list: bool,
     fail_ids: HashSet<String>,
     fail_kill_switch: bool,
+    fail_autoconnect: bool,
     fail_lockdown: bool,
     calls: Arc<Mutex<Vec<String>>>,
     attempted: Arc<Mutex<Vec<String>>>,
     connected: Arc<Mutex<Vec<String>>>,
     kill_switch_calls: Arc<Mutex<Vec<String>>>,
+    autoconnect_calls: Arc<Mutex<Vec<String>>>,
     lockdown_calls: Arc<Mutex<Vec<String>>>,
     imported: Arc<Mutex<Vec<String>>>,
 }
@@ -71,6 +110,14 @@ impl MockNmClient {
         self
     }
 
+    /// Consume this mock and return one whose `set_autoconnect_all` fails, to
+    /// exercise the best-effort path where NetworkManager rejects the change.
+    /// The attempt is still recorded in [`Self::autoconnect_calls`] first.
+    pub fn fail_autoconnect(mut self) -> Self {
+        self.fail_autoconnect = true;
+        self
+    }
+
     /// Consume this mock and return one whose `enable_lockdown`/`disable_lockdown`
     /// fail, to exercise the error path where the firewall rejects the change.
     /// The attempt is still recorded in [`Self::lockdown_calls`] first.
@@ -88,40 +135,40 @@ impl MockNmClient {
     /// Every operation in invocation order, formatted as `connect:<id>`,
     /// `switch:<id>`, or `disconnect`.
     pub fn calls(&self) -> Vec<String> {
-        self.calls.lock().expect("mock mutex poisoned").clone()
+        snapshot(&self.calls)
     }
 
     /// Profile ids passed to `connect`, regardless of success.
     pub fn attempted_profiles(&self) -> Vec<String> {
-        self.attempted.lock().expect("mock mutex poisoned").clone()
+        snapshot(&self.attempted)
     }
 
     /// Profile ids that `connect` reported as successfully connected.
     pub fn connected_profiles(&self) -> Vec<String> {
-        self.connected.lock().expect("mock mutex poisoned").clone()
+        snapshot(&self.connected)
     }
 
     /// Global kill-switch toggles in invocation order, formatted as
     /// `kill-switch-all:on` or `kill-switch-all:off`.
     pub fn kill_switch_calls(&self) -> Vec<String> {
-        self.kill_switch_calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .clone()
+        snapshot(&self.kill_switch_calls)
+    }
+
+    /// Global autoconnect toggles in invocation order, formatted as
+    /// `autoconnect-all:on` or `autoconnect-all:off`.
+    pub fn autoconnect_calls(&self) -> Vec<String> {
+        snapshot(&self.autoconnect_calls)
     }
 
     /// Lockdown toggles in invocation order, formatted as `lockdown:on` or
     /// `lockdown:off`.
     pub fn lockdown_calls(&self) -> Vec<String> {
-        self.lockdown_calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .clone()
+        snapshot(&self.lockdown_calls)
     }
 
     /// Paths passed to `import_wireguard_profile`, in invocation order.
     pub fn imported_paths(&self) -> Vec<String> {
-        self.imported.lock().expect("mock mutex poisoned").clone()
+        snapshot(&self.imported)
     }
 }
 
@@ -134,14 +181,8 @@ impl NmClient for MockNmClient {
     }
 
     fn connect(&self, profile_identifier: &str) -> AppResult<()> {
-        self.calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(format!("connect:{profile_identifier}"));
-        self.attempted
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(profile_identifier.to_string());
+        record(&self.calls, format!("connect:{profile_identifier}"));
+        record(&self.attempted, profile_identifier.to_string());
 
         if self.fail_ids.contains(profile_identifier) {
             return Err(AppError::NmCommandFailed(format!(
@@ -149,41 +190,44 @@ impl NmClient for MockNmClient {
             )));
         }
 
-        self.connected
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(profile_identifier.to_string());
+        record(&self.connected, profile_identifier.to_string());
         Ok(())
     }
 
     fn disconnect_active(&self) -> AppResult<()> {
-        self.calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push("disconnect".to_string());
+        record(&self.calls, "disconnect".to_string());
         Ok(())
     }
 
     fn switch_to(&self, profile_identifier: &str) -> AppResult<()> {
-        self.calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(format!("switch:{profile_identifier}"));
+        record(&self.calls, format!("switch:{profile_identifier}"));
         Ok(())
     }
 
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
-        self.kill_switch_calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(format!(
-                "kill-switch-all:{}",
-                if enable { "on" } else { "off" }
-            ));
+        record(
+            &self.kill_switch_calls,
+            format!("kill-switch-all:{}", if enable { "on" } else { "off" }),
+        );
 
         if self.fail_kill_switch {
             return Err(AppError::NmCommandFailed(
                 "simulated kill-switch failure".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
+        record(
+            &self.autoconnect_calls,
+            format!("autoconnect-all:{}", if enable { "on" } else { "off" }),
+        );
+
+        if self.fail_autoconnect {
+            return Err(AppError::NmCommandFailed(
+                "simulated autoconnect failure".to_string(),
             ));
         }
 
@@ -198,10 +242,7 @@ impl NmClient for MockNmClient {
     }
 
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
-        self.imported
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(path.display().to_string());
+        record(&self.imported, path.display().to_string());
         Ok(format!("Imported {}", path.display()))
     }
 
@@ -222,29 +263,24 @@ impl NmClient for MockNmClient {
         })
     }
 
+    fn tunnel_address(&self, _uuid: &str) -> Option<String> {
+        Some("10.2.0.2/32".to_string())
+    }
+
     fn edit_connection(&self, uuid: &str, _is_dark: bool) -> AppResult<()> {
-        self.calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(format!("edit:{}", uuid));
+        record(&self.calls, format!("edit:{}", uuid));
         Ok(())
     }
 
     fn delete_profile(&self, uuid: &str) -> AppResult<()> {
-        self.calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push(format!("delete:{}", uuid));
+        record(&self.calls, format!("delete:{}", uuid));
         Ok(())
     }
 }
 
 impl FirewallClient for MockNmClient {
     fn enable_lockdown(&self, _tunnels: &[WireguardTunnel]) -> AppResult<()> {
-        self.lockdown_calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push("lockdown:on".to_string());
+        record(&self.lockdown_calls, "lockdown:on".to_string());
 
         if self.fail_lockdown {
             return Err(AppError::Firewall("simulated lockdown failure".to_string()));
@@ -254,10 +290,7 @@ impl FirewallClient for MockNmClient {
     }
 
     fn disable_lockdown(&self) -> AppResult<()> {
-        self.lockdown_calls
-            .lock()
-            .expect("mock mutex poisoned")
-            .push("lockdown:off".to_string());
+        record(&self.lockdown_calls, "lockdown:off".to_string());
 
         if self.fail_lockdown {
             return Err(AppError::Firewall("simulated lockdown failure".to_string()));

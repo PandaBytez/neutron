@@ -11,8 +11,8 @@ use crate::nm::{self, NmClient, WireguardProfile};
 use crate::service;
 
 #[derive(Debug, Parser)]
-#[command(name = "wireguard-manager")]
-#[command(about = "WireGuard profile manager via NetworkManager")]
+#[command(name = "neutron-vpn")]
+#[command(about = "Neutron VPN - WireGuard profile manager via NetworkManager")]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -638,18 +638,10 @@ mod tests {
     }
 
     fn unique_test_config_path() -> std::path::PathBuf {
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        std::env::temp_dir()
-            .join(format!("wireguard-manager-app-tests-{suffix}"))
-            .join("config.json")
+        crate::testing::temp_config_path("app")
     }
 
     fn cleanup_test_config(path: &std::path::Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::remove_dir_all(parent);
-        }
+        crate::testing::remove_temp_config(path);
     }
 }

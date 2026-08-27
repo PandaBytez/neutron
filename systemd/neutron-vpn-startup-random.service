@@ -1,0 +1,12 @@
+[Unit]
+Description=Neutron VPN startup random profile selector
+Documentation=https://gitlab.com/neutron-vpn/neutron
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/neutron-vpn startup-random
+
+[Install]
+WantedBy=default.target

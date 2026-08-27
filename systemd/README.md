@@ -14,19 +14,19 @@ This folder contains a one-shot user service that runs the startup random select
 
    ```bash
    mkdir -p "$HOME/.config/systemd/user"
-   cp systemd/wireguard-manager-startup-random.service "$HOME/.config/systemd/user/"
+   cp systemd/neutron-vpn-startup-random.service "$HOME/.config/systemd/user/"
    ```
 
 3. Enable the service:
 
    ```bash
    systemctl --user daemon-reload
-   systemctl --user enable wireguard-manager-startup-random.service
+   systemctl --user enable neutron-vpn-startup-random.service
    ```
 
 4. Optional: test immediately:
 
    ```bash
-   systemctl --user start wireguard-manager-startup-random.service
-   journalctl --user -u wireguard-manager-startup-random.service -n 50 --no-pager
+   systemctl --user start neutron-vpn-startup-random.service
+   journalctl --user -u neutron-vpn-startup-random.service -n 50 --no-pager
    ```

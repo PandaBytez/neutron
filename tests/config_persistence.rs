@@ -1,14 +1,13 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use wireguard_manager::config::{self, AppConfig};
-use wireguard_manager::error::AppError;
+use neutron_vpn::config::{self, AppConfig};
+use neutron_vpn::error::AppError;
+use neutron_vpn::testing;
 
 #[test]
 fn integration_load_returns_default_when_file_is_missing() {
-    let config_path = unique_test_config_path();
+    let config_path = testing::temp_config_path("integration-missing");
 
     let loaded = config::load(&config_path).expect("missing config should return defaults");
 
@@ -18,7 +17,7 @@ fn integration_load_returns_default_when_file_is_missing() {
 
 #[test]
 fn integration_save_creates_parent_directories_and_roundtrips() {
-    let config_path = unique_test_config_path();
+    let config_path = testing::temp_config_path("integration-roundtrip");
     let expected = AppConfig {
         excluded_profile_ids: BTreeSet::from(["uuid-1".to_string(), "uuid-2".to_string()]),
         last_random_profile_id: Some("uuid-2".to_string()),
@@ -33,12 +32,12 @@ fn integration_save_creates_parent_directories_and_roundtrips() {
         loaded.last_random_profile_id,
         expected.last_random_profile_id
     );
-    cleanup_test_artifacts(&config_path);
+    testing::remove_temp_config(&config_path);
 }
 
 #[test]
 fn integration_load_returns_error_on_invalid_json() {
-    let config_path = unique_test_config_path();
+    let config_path = testing::temp_config_path("integration-invalid-json");
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).expect("test config directory should be created");
     }
@@ -47,12 +46,12 @@ fn integration_load_returns_error_on_invalid_json() {
     let result = config::load(&config_path);
 
     assert!(matches!(result, Err(AppError::Serde(_))));
-    cleanup_test_artifacts(&config_path);
+    testing::remove_temp_config(&config_path);
 }
 
 #[test]
 fn integration_load_supports_legacy_last_random_profile_alias() {
-    let config_path = unique_test_config_path();
+    let config_path = testing::temp_config_path("integration-legacy-alias");
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).expect("test config directory should be created");
     }
@@ -69,22 +68,5 @@ fn integration_load_supports_legacy_last_random_profile_alias() {
 
     assert!(loaded.excluded_profile_ids.is_empty());
     assert_eq!(loaded.last_random_profile_id.as_deref(), Some("wg-us"));
-    cleanup_test_artifacts(&config_path);
-}
-
-fn unique_test_config_path() -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    std::env::temp_dir()
-        .join(format!("wireguard-manager-config-tests-{suffix}"))
-        .join("nested")
-        .join("config.json")
-}
-
-fn cleanup_test_artifacts(path: &Path) {
-    if let Some(parent) = path.parent().and_then(|nested| nested.parent()) {
-        let _ = fs::remove_dir_all(parent);
-    }
+    testing::remove_temp_config(&config_path);
 }

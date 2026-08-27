@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Neutron VPN
+Comment=Manage VPN connections with NetworkManager
+Exec=neutron-vpn gui
+Icon=io.gitlab.neutron_vpn.neutron
+Terminal=false
+Categories=Network;
+StartupNotify=true
+StartupWMClass=io.gitlab.neutron_vpn.neutron
+Keywords=vpn;wireguard;network;neutron;

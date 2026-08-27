@@ -49,15 +49,12 @@ pub fn load(path: &Path) -> AppResult<AppConfig> {
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let body = serde_json::to_string_pretty(config)?;
     write_atomically(path, &body)?;
     Ok(())
 }
 
-/// Drop every piece of Zento-side metadata keyed by `uuid` from the in-memory
+/// Drop every piece of Neutron-side metadata keyed by `uuid` from the in-memory
 /// config: custom info, exclusion membership, and the last-random pointer.
 ///
 /// Returns `true` if anything actually changed, so the caller can skip an
@@ -128,13 +125,19 @@ pub fn default_config_path() -> AppResult<PathBuf> {
     let base = dirs::config_dir().ok_or_else(|| {
         AppError::Config("could not determine configuration directory".to_string())
     })?;
-    Ok(base.join("wireguard-manager").join("config.json"))
+    let new_path = base.join("neutron-vpn").join("config.json");
+    if new_path.exists() {
+        return Ok(new_path);
+    }
+    let legacy_path = base.join("wireguard-manager").join("config.json");
+    if legacy_path.exists() {
+        return Ok(legacy_path);
+    }
+    Ok(new_path)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
 
     #[test]
@@ -275,18 +278,10 @@ mod tests {
     }
 
     fn unique_path(label: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        std::env::temp_dir()
-            .join(format!("wireguard-manager-config-unit-{label}-{suffix}"))
-            .join("config.json")
+        crate::testing::temp_config_path(label)
     }
 
     fn cleanup(path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
+        crate::testing::remove_temp_config(path);
     }
 }
