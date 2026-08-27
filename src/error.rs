@@ -20,6 +20,8 @@ pub enum AppError {
     NoEligibleProfile,
     #[error("feature unavailable: {0}")]
     FeatureUnavailable(String),
+    #[error("port forwarding failed: {0}")]
+    PortForward(String),
     #[error("configuration error: {0}")]
     Config(String),
     #[error("io error: {0}")]

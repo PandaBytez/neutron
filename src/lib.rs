@@ -4,5 +4,6 @@ pub mod error;
 pub mod firewall;
 pub mod gui;
 pub mod nm;
+pub mod portforward;
 pub mod service;
 pub mod testing;
