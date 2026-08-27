@@ -1,4 +1,7 @@
 #[cfg(feature = "gui")]
+mod indicator;
+
+#[cfg(feature = "gui")]
 mod enabled {
     use std::cell::{Cell, RefCell};
     use std::io::{BufRead, BufReader};
@@ -11,22 +14,42 @@ mod enabled {
     use adw::prelude::*;
     use adw::{Application, ApplicationWindow, HeaderBar};
     use gtk::Orientation;
+    use gtk::gdk;
     use gtk::gio;
     use gtk::glib;
+    use tracing::debug;
+
+    use super::indicator::{AppIndicator, ICON_CONNECTED, ICON_DISCONNECTED};
 
     use crate::app::eligibility;
     use crate::app::profile_list;
     use crate::app::refresh_sync;
     use crate::config;
-    use crate::error::AppResult;
+    use crate::error::{AppError, AppResult};
     use crate::firewall::FirewallClient;
     use crate::nm::NmClient;
+    use crate::portforward;
+    use crate::service;
 
     #[derive(Clone)]
     struct StatusIndicators {
+        /// Owning application, kept so background refreshes can raise desktop
+        /// notifications without every caller having to thread it through.
+        app: Application,
         log: gtk::Label,
         vpn_icon: gtk::Image,
         vpn_label: gtk::Label,
+        port_box: gtk::Box,
+        port_label: gtk::Label,
+        port_copy_button: gtk::Button,
+        /// Name of the profile currently up, or `None` while disconnected.
+        active_profile: Rc<RefCell<Option<String>>>,
+        /// Forwarded port most recently granted by the tunnel gateway.
+        active_port: Rc<RefCell<Option<u16>>>,
+        /// UUID the current [`Self::active_port`] belongs to, so a switch to a
+        /// different profile discards the previous profile's port instead of
+        /// showing it against the new tunnel.
+        port_profile: Rc<RefCell<Option<String>>>,
         /// Collapsible "Startup auto-connect" row in the Settings group. Its
         /// child switches choose which profiles join the boot-time random pool,
         /// keeping that configuration concern out of the operational rows.
@@ -36,14 +59,28 @@ mod enabled {
         /// (`adw::ExpanderRow` offers no clear-all). Shared, so toggle handlers
         /// can recompute the summary subtitle.
         eligibility_rows: Rc<RefCell<Vec<adw::SwitchRow>>>,
+        /// Background system tray / AppIndicator status handler.
+        indicator: Rc<RefCell<Option<AppIndicator>>>,
     }
 
     pub fn run<C>(client: C) -> AppResult<()>
     where
         C: NmClient + FirewallClient + Clone + Send + 'static,
     {
+        // Clear NetworkManager's autoconnect flag on every profile at startup,
+        // not just inside the startup-random selector. The selector only runs
+        // from the optional systemd unit, which nothing installs automatically;
+        // without this, profiles keep NM's `autoconnect=yes` default and all of
+        // them come up together at the next boot.
+        //
+        // Off the main thread: this is one `nmcli` call per profile and must not
+        // delay the first frame. It only rewrites persisted settings, never
+        // activation state, so it cannot race the UI.
+        let normalize_client = client.clone();
+        std::thread::spawn(move || service::normalize_autoconnect(&normalize_client));
+
         let app = Application::builder()
-            .application_id("io.gitlab.zento_vpn_manager.zento")
+            .application_id("io.gitlab.neutron_vpn.neutron")
             .build();
 
         app.connect_activate(move |app| build_ui(app, client.clone()));
@@ -56,13 +93,270 @@ mod enabled {
         Ok(())
     }
 
+    /// Install the icon and desktop entry into the user's data directory so the
+    /// GNOME Shell dock can resolve an icon for the running window.
+    ///
+    /// On Wayland the shell matches a window to a `.desktop` file by its
+    /// `app_id` (which GTK takes from the program name) and by `StartupWMClass`,
+    /// then takes the icon from *that* entry. A window with no matching entry —
+    /// or one matching an entry whose `Icon=` cannot be loaded — renders as a
+    /// blank placeholder even when the app grid shows the icon correctly.
+    fn ensure_desktop_integration() {
+        let Some(data_dir) = dirs::data_dir() else {
+            return;
+        };
+
+        install_theme_icons(&data_dir);
+
+        let apps_dir = data_dir.join("applications");
+        let _ = std::fs::create_dir_all(&apps_dir);
+
+        let exec_cmd = if let Ok(appimage) = std::env::var("APPIMAGE") {
+            format!("\"{appimage}\" gui")
+        } else if let Ok(exe) = std::env::current_exe() {
+            format!("\"{}\" gui", exe.display())
+        } else {
+            "neutron-vpn gui".to_string()
+        };
+        let desktop_content = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Neutron VPN\n\
+             Comment=Manage VPN connections with NetworkManager\n\
+             Exec={exec_cmd}\n\
+             Icon={APP_ID}\n\
+             Terminal=false\n\
+             Categories=Network;\n\
+             StartupNotify=true\n\
+             StartupWMClass={APP_ID}\n\
+             Keywords=vpn;wireguard;network;neutron;\n"
+        );
+        let _ = std::fs::write(apps_dir.join(format!("{APP_ID}.desktop")), &desktop_content);
+        // Older builds also wrote a duplicate entry under the binary name. Two
+        // entries claiming the same StartupWMClass make the shell's match
+        // ambiguous, so drop the stale one.
+        let _ = std::fs::remove_file(apps_dir.join("neutron-vpn.desktop"));
+
+        repair_competing_desktop_entries(&apps_dir);
+        refresh_desktop_caches(&data_dir, &apps_dir);
+    }
+
+    /// Write the app icon into the user icon theme at every size the shell asks
+    /// for. The scalable SVG alone is not always enough: some shell and dock
+    /// code paths only look for rasterised sizes.
+    fn install_theme_icons(data_dir: &std::path::Path) {
+        let svg = include_str!("../../resources/io.gitlab.neutron_vpn.neutron.svg");
+        let scalable = data_dir.join("icons/hicolor/scalable/apps");
+        if std::fs::create_dir_all(&scalable).is_ok() {
+            let _ = std::fs::write(scalable.join(format!("{APP_ID}.svg")), svg);
+        }
+
+        const PNGS: [(&str, &[u8]); 8] = [
+            ("16x16", include_bytes!("../../resources/icons/16x16.png")),
+            ("24x24", include_bytes!("../../resources/icons/24x24.png")),
+            ("32x32", include_bytes!("../../resources/icons/32x32.png")),
+            ("48x48", include_bytes!("../../resources/icons/48x48.png")),
+            ("64x64", include_bytes!("../../resources/icons/64x64.png")),
+            (
+                "128x128",
+                include_bytes!("../../resources/icons/128x128.png"),
+            ),
+            (
+                "256x256",
+                include_bytes!("../../resources/icons/256x256.png"),
+            ),
+            (
+                "512x512",
+                include_bytes!("../../resources/icons/512x512.png"),
+            ),
+        ];
+        for (size, bytes) in PNGS {
+            let dir = data_dir.join(format!("icons/hicolor/{size}/apps"));
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let _ = std::fs::write(dir.join(format!("{APP_ID}.png")), bytes);
+            }
+        }
+
+        install_status_icons(data_dir);
+    }
+
+    /// One tray status icon: the theme name the indicator reports, plus the
+    /// artwork to install under it.
+    struct StatusIcon {
+        name: &'static str,
+        svg: &'static str,
+        pngs: [(&'static str, &'static [u8]); 4],
+    }
+
+    /// Install the green/red shield the tray indicator switches between.
+    ///
+    /// The StatusNotifierItem spec only carries an icon *name*, which the shell
+    /// resolves against its own icon theme, so these have to exist on disk
+    /// before the indicator can reference them.
+    fn install_status_icons(data_dir: &std::path::Path) {
+        const STATUS_ICONS: [StatusIcon; 2] = [
+            StatusIcon {
+                name: ICON_CONNECTED,
+                svg: include_str!("../../resources/status/neutron-vpn-connected.svg"),
+                pngs: [
+                    (
+                        "16x16",
+                        include_bytes!("../../resources/status/connected_16.png"),
+                    ),
+                    (
+                        "24x24",
+                        include_bytes!("../../resources/status/connected_24.png"),
+                    ),
+                    (
+                        "32x32",
+                        include_bytes!("../../resources/status/connected_32.png"),
+                    ),
+                    (
+                        "48x48",
+                        include_bytes!("../../resources/status/connected_48.png"),
+                    ),
+                ],
+            },
+            StatusIcon {
+                name: ICON_DISCONNECTED,
+                svg: include_str!("../../resources/status/neutron-vpn-disconnected.svg"),
+                pngs: [
+                    (
+                        "16x16",
+                        include_bytes!("../../resources/status/disconnected_16.png"),
+                    ),
+                    (
+                        "24x24",
+                        include_bytes!("../../resources/status/disconnected_24.png"),
+                    ),
+                    (
+                        "32x32",
+                        include_bytes!("../../resources/status/disconnected_32.png"),
+                    ),
+                    (
+                        "48x48",
+                        include_bytes!("../../resources/status/disconnected_48.png"),
+                    ),
+                ],
+            },
+        ];
+
+        for icon in STATUS_ICONS {
+            let scalable = data_dir.join("icons/hicolor/scalable/apps");
+            if std::fs::create_dir_all(&scalable).is_ok() {
+                let _ = std::fs::write(scalable.join(format!("{}.svg", icon.name)), icon.svg);
+            }
+            for (size, bytes) in icon.pngs {
+                let dir = data_dir.join(format!("icons/hicolor/{size}/apps"));
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    let _ = std::fs::write(dir.join(format!("{}.png", icon.name)), bytes);
+                }
+            }
+        }
+    }
+
+    /// Point any *other* desktop entry that claims this app's window class at
+    /// the themed icon.
+    ///
+    /// AppImage integrators (Gearlever, appimaged, …) generate their own entry
+    /// for the same binary, copying our `StartupWMClass` but pointing `Icon=` at
+    /// an extension-less file they extracted. When the shell picks that entry
+    /// for the window, the icon fails to load. Rewriting just the `Icon=` line
+    /// makes every candidate resolve to the same working icon, whichever one
+    /// wins the match.
+    fn repair_competing_desktop_entries(apps_dir: &std::path::Path) {
+        let ours = format!("{APP_ID}.desktop");
+        let Ok(entries) = std::fs::read_dir(apps_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop")
+                || path.file_name().and_then(|n| n.to_str()) == Some(ours.as_str())
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !content.contains(&format!("StartupWMClass={APP_ID}")) {
+                continue;
+            }
+
+            let repaired: String = content
+                .lines()
+                .map(|line| {
+                    if line.starts_with("Icon=") {
+                        format!("Icon={APP_ID}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let repaired = format!("{repaired}\n");
+
+            if repaired != content {
+                let _ = std::fs::write(&path, repaired);
+            }
+        }
+    }
+
+    /// Nudge the icon and desktop-entry caches so the shell notices the files we
+    /// just wrote instead of serving a stale lookup. All best-effort: the
+    /// helpers are optional and a failure only delays the icon by one login.
+    /// Make sure the shell picks up the entries we just wrote.
+    ///
+    /// The icon cache is deliberately *removed* rather than rebuilt. Once
+    /// `icon-theme.cache` exists, GTK trusts it exclusively for that theme
+    /// directory -- and this process loads the icon theme during GTK init,
+    /// before [`ensure_desktop_integration`] has written anything. A cache
+    /// generated on a previous run therefore hides icons added on this one,
+    /// which is exactly how the tray shields ended up rendering as the
+    /// missing-icon placeholder. With no cache present GTK stats the
+    /// directories and always sees current files.
+    fn refresh_desktop_caches(data_dir: &std::path::Path, apps_dir: &std::path::Path) {
+        let _ = std::fs::remove_file(data_dir.join("icons/hicolor/icon-theme.cache"));
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(apps_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
     fn build_ui<C>(app: &Application, client: C)
     where
         C: NmClient + FirewallClient + Clone + Send + 'static,
     {
+        ensure_desktop_integration();
+
+        if let Some(display) = gdk::Display::default() {
+            let icon_theme = gtk::IconTheme::for_display(&display);
+            if let Some(data_dir) = dirs::data_dir() {
+                icon_theme.add_search_path(data_dir.join("icons"));
+            }
+            if let Ok(appdir) = std::env::var("APPDIR") {
+                icon_theme.add_search_path(format!("{appdir}/usr/share/icons"));
+                icon_theme.add_search_path(format!("{appdir}/usr/share"));
+            }
+            icon_theme.add_search_path("/app/share/icons");
+            icon_theme.add_search_path("resources");
+        }
+        gtk::Window::set_default_icon_name(APP_ID);
+
         let header = HeaderBar::builder()
-            .title_widget(&gtk::Label::new(Some("Zento")))
+            .title_widget(&gtk::Label::new(Some("Neutron VPN")))
             .build();
+
+        let menu = gio::Menu::new();
+        menu.append(Some("Quit Neutron VPN"), Some("app.quit"));
+        let menu_button = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .menu_model(&menu)
+            .tooltip_text("Main Menu")
+            .build();
+        header.pack_end(&menu_button);
 
         let status = gtk::Label::new(None);
         status.set_wrap(true);
@@ -72,21 +366,18 @@ mod enabled {
         list.add_css_class("boxed-list");
 
         list.connect_row_activated(move |_, row_widget| {
-            if let Some(child_widget) = row_widget.child() {
-                if let Some(container_box) = child_widget.downcast_ref::<gtk::Box>() {
-                    if let Some(info_box_widget) =
-                        container_box.first_child().and_then(|h| h.next_sibling())
-                    {
-                        let visible = info_box_widget.is_visible();
-                        info_box_widget.set_visible(!visible);
-                    }
-                }
-            }
+            let Some(container) = row_widget.child().and_downcast::<gtk::Box>() else {
+                return;
+            };
+            let Some(info_box) = container.first_child().and_then(|h| h.next_sibling()) else {
+                return;
+            };
+            info_box.set_visible(!info_box.is_visible());
         });
 
         let vpn_status_box = gtk::Box::new(Orientation::Horizontal, 8);
         vpn_status_box.set_halign(gtk::Align::Center);
-        vpn_status_box.set_margin_bottom(16);
+        vpn_status_box.set_margin_bottom(8);
 
         let vpn_status_icon = gtk::Image::builder().pixel_size(20).build();
         let vpn_status_label = gtk::Label::builder().use_markup(true).build();
@@ -95,17 +386,61 @@ mod enabled {
         vpn_status_box.append(&vpn_status_icon);
         vpn_status_box.append(&vpn_status_label);
 
+        let port_box = gtk::Box::new(Orientation::Horizontal, 6);
+        port_box.set_halign(gtk::Align::Center);
+        port_box.set_margin_bottom(16);
+
+        let port_icon = gtk::Image::builder()
+            .icon_name("network-wired-symbolic")
+            .pixel_size(16)
+            .build();
+        let port_label = gtk::Label::builder().use_markup(true).build();
+        let port_copy_button = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .css_classes(vec!["flat".to_string()])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Copy port to clipboard")
+            .build();
+
+        let active_port_cell: Rc<RefCell<Option<u16>>> = Rc::new(RefCell::new(None));
+        {
+            let port_cell = active_port_cell.clone();
+            let status_log = status.clone();
+            port_copy_button.connect_clicked(move |btn| {
+                if let Some(port) = *port_cell.borrow()
+                    && let Some(display) = gdk::Display::default()
+                {
+                    display.clipboard().set_text(&port.to_string());
+                    status_log.set_label(&format!("Copied port {port} to clipboard."));
+                    btn.set_tooltip_text(Some("Copied!"));
+                }
+            });
+        }
+
+        port_box.append(&port_icon);
+        port_box.append(&port_label);
+        port_box.append(&port_copy_button);
+        port_box.set_visible(false);
+
         let eligibility_expander = adw::ExpanderRow::builder()
             .title("Startup auto-connect")
             .subtitle("Choose profiles eligible for random selection at boot")
             .build();
 
         let indicators = StatusIndicators {
+            app: app.clone(),
             log: status.clone(),
             vpn_icon: vpn_status_icon.clone(),
             vpn_label: vpn_status_label.clone(),
+            port_box: port_box.clone(),
+            port_label: port_label.clone(),
+            port_copy_button: port_copy_button.clone(),
+            active_profile: Rc::new(RefCell::new(None)),
+            active_port: active_port_cell,
+            port_profile: Rc::new(RefCell::new(None)),
             eligibility: eligibility_expander.clone(),
             eligibility_rows: Rc::new(RefCell::new(Vec::new())),
+            indicator: Rc::new(RefCell::new(None)),
         };
 
         let refresh = gtk::Button::with_label("Refresh");
@@ -154,21 +489,6 @@ mod enabled {
 
         refresh_profile_list(&client, &list, &indicators);
 
-        let scroller = gtk::ScrolledWindow::builder()
-            .hexpand(true)
-            // Size the list to its content rather than stretching to the bottom
-            // of the window: `propagate_natural_height` makes the scroller
-            // request the list's natural height (capped by `max_content_height`,
-            // beyond which it scrolls), and leaving `vexpand` off keeps any
-            // leftover space below the list instead of inflating it. A short
-            // list now ends right after the last profile; a constrained window
-            // still shrinks the scroller and scrolls, so nothing is clipped.
-            .vexpand(false)
-            .propagate_natural_height(true)
-            .max_content_height(PROFILE_LIST_MAX_HEIGHT)
-            .child(&list)
-            .build();
-
         let kill_switch_row = build_kill_switch_row(app, &client, &status);
         let lockdown_row = build_lockdown_row(app, &client, &status);
         let import = build_import_button(&client, &list, &indicators);
@@ -179,24 +499,10 @@ mod enabled {
         container.set_margin_start(24);
         container.set_margin_end(24);
 
-        let logo = if std::path::Path::new(
-            "/app/share/icons/hicolor/scalable/apps/io.gitlab.zento_vpn_manager.zento.svg",
-        )
-        .exists()
-        {
-            gtk::Image::from_file(
-                "/app/share/icons/hicolor/scalable/apps/io.gitlab.zento_vpn_manager.zento.svg",
-            )
-        } else if std::path::Path::new("flatpak/io.gitlab.zento_vpn_manager.zento.svg").exists() {
-            gtk::Image::from_file("flatpak/io.gitlab.zento_vpn_manager.zento.svg")
-        } else {
-            gtk::Image::from_icon_name("io.gitlab.zento_vpn_manager.zento")
-        };
-        logo.set_pixel_size(96);
-        logo.set_halign(gtk::Align::Center);
-        logo.set_margin_bottom(12);
+        let logo = build_logo();
         container.append(&logo);
         container.append(&vpn_status_box);
+        container.append(&port_box);
 
         // Settings Section
         let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
@@ -221,26 +527,67 @@ mod enabled {
 
         container.append(&profiles_header);
         container.append(&status);
-        container.append(&scroller);
+        container.append(&list);
 
         let clamp = adw::Clamp::builder()
             .maximum_size(500)
             .child(&container)
             .build();
 
+        // Wrap the main content clamp in a ScrolledWindow so that all elements
+        // (logo, settings expander, profiles) scroll smoothly and naturally when
+        // window dimensions or contents exceed available vertical space.
+        let main_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .hexpand(true)
+            .child(&clamp)
+            .build();
+
         let (width, height) = load_window_size();
-        let window = build_main_window(&header, &clamp.upcast::<gtk::Widget>(), width, height);
+        let window = build_main_window(
+            &header,
+            &main_scroller.upcast::<gtk::Widget>(),
+            width,
+            height,
+        );
         window.set_application(Some(app));
 
-        let monitor_child_for_close = monitor_child;
-        window.connect_close_request(move |window| {
-            if let Some(mut child) = monitor_child_for_close.borrow_mut().take() {
+        // Initialize background AppIndicator / StatusNotifierItem
+        let indicator = AppIndicator::new(app, &window, client.clone());
+        *indicators.indicator.borrow_mut() = Some(indicator);
+
+        let quit_action = gio::SimpleAction::new("quit", None);
+        let monitor_child_quit = monitor_child.clone();
+        let app_weak = app.downgrade();
+        quit_action.connect_activate(move |_, _| {
+            if let Some(mut child) = monitor_child_quit.borrow_mut().take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            if let Some(app) = app_weak.upgrade() {
+                app.quit();
+            }
+            std::process::exit(0);
+        });
+        app.add_action(&quit_action);
+        app.set_accels_for_action("app.quit", &["<Control>q"]);
+
+        let monitor_child_for_shutdown = monitor_child.clone();
+        app.connect_shutdown(move |_| {
+            if let Some(mut child) = monitor_child_for_shutdown.borrow_mut().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        });
+
+        window.connect_close_request(move |window| {
             // Remember the user's last window size for the next launch.
             save_window_size(window);
-            glib::Propagation::Proceed
+            // Hide window instead of exiting so Neutron VPN stays accessible via the AppIndicator in background.
+            window.set_visible(false);
+            glib::Propagation::Stop
         });
 
         window.present();
@@ -268,7 +615,8 @@ mod enabled {
         toolbar_view.set_content(Some(body));
 
         ApplicationWindow::builder()
-            .title("Zento")
+            .title("Neutron VPN")
+            .icon_name("io.gitlab.neutron_vpn.neutron")
             .default_width(width)
             .default_height(height)
             .content(&toolbar_view)
@@ -279,11 +627,6 @@ mod enabled {
     const DEFAULT_WINDOW_WIDTH: i32 = 720;
     /// Height used the first time the app runs, before a size is remembered.
     const DEFAULT_WINDOW_HEIGHT: i32 = 420;
-
-    /// Upper bound (px) on the profile list's natural height. The list grows to
-    /// fit its rows up to this cap; past it the list scrolls instead of pushing
-    /// the rest of the window off-screen.
-    const PROFILE_LIST_MAX_HEIGHT: i32 = 360;
 
     /// Load the remembered window size from config, falling back to defaults.
     fn load_window_size() -> (i32, i32) {
@@ -349,62 +692,87 @@ mod enabled {
         Ok(child)
     }
 
-    /// Build the global kill-switch row: a single switch that applies (or
-    /// removes) the NetworkManager kill-switch routing policy across *every*
-    /// WireGuard profile at once. The blocking `nmcli` work runs off the GTK
-    /// main thread; the switch is disabled while it runs and reverts on failure.
-    fn build_kill_switch_row<C>(
-        app: &Application,
-        client: &C,
+    const APP_ID: &str = "io.gitlab.neutron_vpn.neutron";
+
+    fn build_logo() -> gtk::Image {
+        let icon = format!("{APP_ID}.svg");
+        let mut candidates = Vec::new();
+        if let Ok(appdir) = std::env::var("APPDIR") {
+            candidates.push(format!(
+                "{appdir}/usr/share/icons/hicolor/scalable/apps/{icon}"
+            ));
+            candidates.push(format!("{appdir}/{icon}"));
+        }
+        candidates.push(format!("/app/share/icons/hicolor/scalable/apps/{icon}"));
+        candidates.push(format!("resources/{icon}"));
+
+        let logo = candidates
+            .iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .map(gtk::Image::from_file)
+            .unwrap_or_else(|| gtk::Image::from_icon_name(APP_ID));
+        logo.set_pixel_size(96);
+        logo.set_halign(gtk::Align::Center);
+        logo.set_margin_bottom(12);
+        logo
+    }
+
+    /// Run `work` on the Gio pool, folding a task panic into the same error
+    /// channel as the work's own failure.
+    async fn spawn_blocking_flat<T, E, F>(work: F) -> Result<T, String>
+    where
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        gio::spawn_blocking(move || work().map_err(|e| e.to_string()))
+            .await
+            .unwrap_or_else(|_| Err("background task panicked".to_string()))
+    }
+
+    fn build_toggle_row<F, N>(
         status: &gtk::Label,
+        title: &str,
+        subtitle: &str,
+        error_prefix: &'static str,
+        initial: bool,
+        apply: F,
+        on_enabled: N,
     ) -> adw::ActionRow
     where
-        C: NmClient + Clone + Send + 'static,
+        F: Fn(bool) -> Result<(), String> + Clone + Send + 'static,
+        N: Fn() + Clone + 'static,
     {
         let toggle = gtk::Switch::new();
         toggle.set_valign(gtk::Align::Center);
-        toggle.set_active(load_kill_switch_enabled());
+        toggle.set_active(initial);
 
         let guard = Rc::new(Cell::new(false));
         {
-            let app = app.clone();
-            let client = client.clone();
             let status = status.clone();
             toggle.connect_state_set(move |toggle, requested| {
-                // Ignore programmatic state changes (e.g. a revert) so they do
-                // not re-trigger the NetworkManager work.
                 if guard.get() {
                     return glib::Propagation::Proceed;
                 }
                 toggle.set_sensitive(false);
 
-                let app = app.clone();
-                let client = client.clone();
                 let status = status.clone();
                 let toggle = toggle.clone();
                 let guard = guard.clone();
-                glib::spawn_future_local(async move {
-                    let task_client = client.clone();
-                    let outcome = gio::spawn_blocking(move || {
-                        apply_global_kill_switch(&task_client, requested)
-                    })
-                    .await;
+                let apply = apply.clone();
+                let on_enabled = on_enabled.clone();
 
+                glib::spawn_future_local(async move {
+                    let outcome = spawn_blocking_flat(move || apply(requested)).await;
                     toggle.set_sensitive(true);
                     match outcome {
-                        Ok(Ok(())) => {
+                        Ok(()) => {
                             if requested {
-                                notify_kill_switch_enabled(&app);
+                                on_enabled();
                             }
                         }
-                        Ok(Err(error)) => {
-                            status.set_label(&format!("Failed to update kill switch: {error}"));
-                            revert_switch(&toggle, &guard, !requested);
-                        }
-                        Err(_) => {
-                            status.set_label(
-                                "Failed to update kill switch: background task panicked.",
-                            );
+                        Err(error) => {
+                            status.set_label(&format!("{error_prefix}: {error}"));
                             revert_switch(&toggle, &guard, !requested);
                         }
                     }
@@ -415,12 +783,90 @@ mod enabled {
         }
 
         let row = adw::ActionRow::builder()
-            .title("Kill Switch")
-            .subtitle("Drop all traffic if any WireGuard profile fails to connect")
+            .title(title)
+            .subtitle(subtitle)
             .build();
         row.add_suffix(&toggle);
         row.set_activatable_widget(Some(&toggle));
         row
+    }
+
+    fn load_flag(pick: impl Fn(&config::AppConfig) -> bool) -> bool {
+        config::default_config_path()
+            .and_then(|path| config::load(&path))
+            .map(|app_cfg| pick(&app_cfg))
+            .unwrap_or(false)
+    }
+
+    fn notify(app: &Application, id: &str, title: &str, body: &str) {
+        let notification = gio::Notification::new(title);
+        notification.set_body(Some(body));
+        app.send_notification(Some(id), &notification);
+    }
+
+    /// Warn the user when the tunnel goes down, describing what that leaves
+    /// their traffic protected by.
+    ///
+    /// Neither protection can report the moment it actually drops a packet: the
+    /// kill switch is kernel policy routing and lockdown is a firewalld REJECT
+    /// rule, and both discard silently with no signal to observe. The tunnel
+    /// going down is the observable event that changes protection, so that is
+    /// what is reported -- and it is the state the user needs to act on:
+    ///
+    /// * lockdown on -> everything is blocked until the VPN is back;
+    /// * kill switch only -> nothing is blocked any more, because it protects
+    ///   traffic solely while a tunnel is up.
+    fn notify_tunnel_dropped(indicators: &StatusIndicators) {
+        let lockdown = load_flag(|cfg| cfg.lockdown_enabled);
+        let kill_switch = load_flag(|cfg| cfg.kill_switch_enabled);
+
+        let (title, body) = if lockdown {
+            (
+                "Lockdown is blocking traffic",
+                "The VPN disconnected. Lockdown is blocking all non-VPN traffic until you reconnect.",
+            )
+        } else if kill_switch {
+            (
+                "VPN disconnected — traffic is exposed",
+                "The kill switch only protects traffic while a tunnel is up. Reconnect, or enable Lockdown to block traffic while disconnected.",
+            )
+        } else {
+            return;
+        };
+
+        indicators.log.set_label(body);
+        notify(&indicators.app, "neutron-protection", title, body);
+    }
+
+    /// Build the global kill-switch row: a single switch that applies (or
+    /// removes) the NetworkManager kill-switch routing policy across *every*
+    /// WireGuard profile at once.
+    fn build_kill_switch_row<C>(
+        app: &Application,
+        client: &C,
+        status: &gtk::Label,
+    ) -> adw::ActionRow
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let client = client.clone();
+        let app = app.clone();
+        build_toggle_row(
+            status,
+            "Kill Switch",
+            "Drop all traffic if any WireGuard profile fails to connect",
+            "Failed to update kill switch",
+            load_flag(|c| c.kill_switch_enabled),
+            move |enable| apply_global_kill_switch(&client, enable),
+            move || {
+                notify(
+                    &app,
+                    "neutron-kill-switch",
+                    "Kill switch enabled",
+                    "All WireGuard profiles now drop traffic if the tunnel fails. Applies on next connect.",
+                );
+            },
+        )
     }
 
     /// Restore a switch to `active` without re-triggering its async handler.
@@ -431,131 +877,45 @@ mod enabled {
     }
 
     /// Apply the global kill switch to every WireGuard profile and persist the
-    /// new state to config. Runs on the Gio thread pool (off the GTK main
-    /// thread); errors are surfaced as strings for the status label.
-    ///
-    /// Delegates to [`crate::app::set_global_kill_switch`] so the
-    /// apply-before-persist ordering lives in exactly one place.
+    /// new state to config.
     fn apply_global_kill_switch<C: NmClient>(client: &C, enable: bool) -> Result<(), String> {
         let path = config::default_config_path().map_err(|error| error.to_string())?;
         crate::app::set_global_kill_switch(client, &path, enable).map_err(|error| error.to_string())
     }
 
-    /// Read the remembered global kill-switch state from config (default off).
-    fn load_kill_switch_enabled() -> bool {
-        config::default_config_path()
-            .and_then(|path| config::load(&path))
-            .map(|app_cfg| app_cfg.kill_switch_enabled)
-            .unwrap_or(false)
-    }
-
-    /// Send a desktop notification telling the user the kill switch is active.
-    fn notify_kill_switch_enabled(app: &Application) {
-        let notification = gio::Notification::new("Kill switch enabled");
-        notification.set_body(Some(
-            "All WireGuard profiles now drop traffic if the tunnel fails. Applies on next connect.",
-        ));
-        app.send_notification(Some("zento-kill-switch"), &notification);
-    }
-
     /// Build the global lockdown row: a switch that installs (or removes) the
-    /// always-on firewall blocking every non-VPN packet. Mirrors the kill-switch
-    /// row, but the blocking `pkexec firewall-cmd` work (which may prompt for a
-    /// password) runs off the GTK main thread; the switch is disabled while it
-    /// runs and reverts on failure.
+    /// always-on firewall blocking every non-VPN packet.
     fn build_lockdown_row<C>(app: &Application, client: &C, status: &gtk::Label) -> adw::ActionRow
     where
         C: NmClient + FirewallClient + Clone + Send + 'static,
     {
-        let toggle = gtk::Switch::new();
-        toggle.set_valign(gtk::Align::Center);
-        toggle.set_active(load_lockdown_enabled());
-
-        let guard = Rc::new(Cell::new(false));
-        {
-            let app = app.clone();
-            let client = client.clone();
-            let status = status.clone();
-            toggle.connect_state_set(move |toggle, requested| {
-                // Ignore programmatic state changes (e.g. a revert) so they do
-                // not re-trigger the firewall work.
-                if guard.get() {
-                    return glib::Propagation::Proceed;
-                }
-                toggle.set_sensitive(false);
-
-                let app = app.clone();
-                let client = client.clone();
-                let status = status.clone();
-                let toggle = toggle.clone();
-                let guard = guard.clone();
-                glib::spawn_future_local(async move {
-                    let task_client = client.clone();
-                    let outcome =
-                        gio::spawn_blocking(move || apply_global_lockdown(&task_client, requested))
-                            .await;
-
-                    toggle.set_sensitive(true);
-                    match outcome {
-                        Ok(Ok(())) => {
-                            if requested {
-                                notify_lockdown_enabled(&app);
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            status.set_label(&format!("Failed to update lockdown: {error}"));
-                            revert_switch(&toggle, &guard, !requested);
-                        }
-                        Err(_) => {
-                            status
-                                .set_label("Failed to update lockdown: background task panicked.");
-                            revert_switch(&toggle, &guard, !requested);
-                        }
-                    }
-                });
-
-                glib::Propagation::Proceed
-            });
-        }
-
-        let row = adw::ActionRow::builder()
-            .title("Lockdown Mode")
-            .subtitle("Strictly block non-VPN packets via system firewall (requires root)")
-            .build();
-        row.add_suffix(&toggle);
-        row.set_activatable_widget(Some(&toggle));
-        row
+        let client = client.clone();
+        let app = app.clone();
+        build_toggle_row(
+            status,
+            "Lockdown Mode",
+            "Strictly block non-VPN packets via system firewall (requires root)",
+            "Failed to update lockdown",
+            load_flag(|c| c.lockdown_enabled),
+            move |enable| apply_global_lockdown(&client, enable),
+            move || {
+                notify(
+                    &app,
+                    "neutron-lockdown",
+                    "Lockdown enabled",
+                    "All non-VPN traffic is blocked until lockdown is disabled in settings.",
+                );
+            },
+        )
     }
 
     /// Apply the always-on lockdown firewall and persist the new state to config.
-    /// Runs on the Gio thread pool (off the GTK main thread); errors are
-    /// surfaced as strings for the status label.
-    ///
-    /// Delegates to [`crate::app::set_global_lockdown`] so the
-    /// apply-before-persist ordering lives in exactly one place.
     fn apply_global_lockdown<C: NmClient + FirewallClient>(
         client: &C,
         enable: bool,
     ) -> Result<(), String> {
         let path = config::default_config_path().map_err(|error| error.to_string())?;
         crate::app::set_global_lockdown(client, &path, enable).map_err(|error| error.to_string())
-    }
-
-    /// Read the remembered global lockdown state from config (default off).
-    fn load_lockdown_enabled() -> bool {
-        config::default_config_path()
-            .and_then(|path| config::load(&path))
-            .map(|app_cfg| app_cfg.lockdown_enabled)
-            .unwrap_or(false)
-    }
-
-    /// Send a desktop notification telling the user lockdown is active.
-    fn notify_lockdown_enabled(app: &Application) {
-        let notification = gio::Notification::new("Lockdown enabled");
-        notification.set_body(Some(
-            "All traffic is now blocked except the WireGuard tunnel, its handshake, and DNS \u{2014} even when no VPN is connected.",
-        ));
-        app.send_notification(Some("zento-lockdown"), &notification);
     }
 
     /// Build the "Import" button: opens a file chooser and imports the chosen
@@ -622,76 +982,68 @@ mod enabled {
         providers.set_selection_mode(gtk::SelectionMode::None);
         providers.add_css_class("boxed-list");
 
-        let proton_row = provider_chooser_row(
-            "ProtonVPN",
-            "Download configurations from your Proton account",
-            true,
-        );
-        {
-            let window = window.downgrade();
-            let parent = parent.cloned();
-            let client = client.clone();
-            let list = list.clone();
-            let indicators = indicators.clone();
-            proton_row.connect_activated(move |_| {
-                if let Some(window) = window.upgrade() {
-                    window.close();
-                }
-                show_guided_import_dialog(
-                    parent.as_ref(),
-                    "Import from ProtonVPN",
-                    PROTON_IMPORT_STEPS,
-                    &client,
-                    &list,
-                    &indicators,
-                );
-            });
-        }
-        providers.append(&proton_row);
+        type ImportAction = Box<dyn Fn(Option<&gtk::Window>)>;
+        let entries: [(&str, &str, ImportAction); 3] = [
+            (
+                "ProtonVPN",
+                "Download configurations from your Proton account",
+                {
+                    let client = client.clone();
+                    let list = list.clone();
+                    let indicators = indicators.clone();
+                    Box::new(move |parent| {
+                        show_guided_import_dialog(
+                            parent,
+                            "Import from ProtonVPN",
+                            PROTON_IMPORT_STEPS,
+                            &client,
+                            &list,
+                            &indicators,
+                        );
+                    })
+                },
+            ),
+            (
+                "MullvadVPN",
+                "Download configurations from your Mullvad account",
+                {
+                    let client = client.clone();
+                    let list = list.clone();
+                    let indicators = indicators.clone();
+                    Box::new(move |parent| {
+                        show_guided_import_dialog(
+                            parent,
+                            "Import from MullvadVPN",
+                            MULLVAD_IMPORT_STEPS,
+                            &client,
+                            &list,
+                            &indicators,
+                        );
+                    })
+                },
+            ),
+            ("Manual import", "Import a WireGuard .conf file", {
+                let client = client.clone();
+                let list = list.clone();
+                let indicators = indicators.clone();
+                Box::new(move |parent| {
+                    open_manual_import(parent, &client, &list, &indicators);
+                })
+            }),
+        ];
 
-        let mullvad_row = provider_chooser_row(
-            "MullvadVPN",
-            "Download configurations from your Mullvad account",
-            true,
-        );
-        {
+        for (title, subtitle, action) in entries {
+            let row = provider_chooser_row(title, subtitle, true);
             let window = window.downgrade();
             let parent = parent.cloned();
-            let client = client.clone();
-            let list = list.clone();
-            let indicators = indicators.clone();
-            mullvad_row.connect_activated(move |_| {
-                if let Some(window) = window.upgrade() {
-                    window.close();
+            row.connect_activated(move |_| {
+                if let Some(w) = window.upgrade() {
+                    w.close();
                 }
-                show_guided_import_dialog(
-                    parent.as_ref(),
-                    "Import from MullvadVPN",
-                    MULLVAD_IMPORT_STEPS,
-                    &client,
-                    &list,
-                    &indicators,
-                );
+                action(parent.as_ref());
             });
+            providers.append(&row);
         }
-        providers.append(&mullvad_row);
-
-        let manual_row =
-            provider_chooser_row("Manual import", "Import a WireGuard .conf file", true);
-        {
-            let window = window.downgrade();
-            let parent = parent.cloned();
-            let client = client.clone();
-            let list = list.clone();
-            let indicators = indicators.clone();
-            manual_row.connect_activated(move |_| {
-                if let Some(window) = window.upgrade() {
-                    window.close();
-                }
-                open_manual_import(parent.as_ref(), &client, &list, &indicators);
-            });
-        }
-        providers.append(&manual_row);
 
         let content = gtk::Box::new(Orientation::Vertical, 0);
         content.set_margin_top(12);
@@ -873,14 +1225,14 @@ mod enabled {
                 // Import sequentially on a worker thread, collecting a
                 // message for each file that fails so one bad config does not
                 // abort the rest of the batch.
-                let outcome = gio::spawn_blocking(move || {
+                let outcome = spawn_blocking_flat(move || {
                     let mut errors = Vec::new();
                     for path in &paths {
                         if let Err(error) = task_client.import_wireguard_profile(path) {
                             errors.push(format!("{}: {error}", path.display()));
                         }
                     }
-                    errors
+                    Ok::<Vec<String>, String>(errors)
                 })
                 .await;
 
@@ -898,29 +1250,55 @@ mod enabled {
                             );
                         }
                     }
-                    Err(_) => {
-                        show_error_dialog(
-                            dialog_parent.as_ref(),
-                            "Import failed: background task panicked.",
-                        );
+                    Err(err) => {
+                        show_error_dialog(dialog_parent.as_ref(), &format!("Import failed: {err}"));
                     }
                 }
             });
         });
     }
 
+    /// Absolute path of an installed status shield, if it is on disk.
+    ///
+    /// The in-window banner loads the file directly instead of going through an
+    /// icon-name lookup: this process installs those files itself moments
+    /// earlier, so the path is known exactly, and a themed lookup can still be
+    /// serving a pre-install view of the theme.
+    ///
+    /// The raster copy is used rather than the SVG because the banner draws at a
+    /// fixed 20px, where scalability buys nothing, and decoding an SVG needs an
+    /// image loader (`glycin-svg`/librsvg) that an AppImage cannot assume is
+    /// installed on the host.
+    fn status_icon_path(connected: bool) -> Option<std::path::PathBuf> {
+        let name = if connected {
+            ICON_CONNECTED
+        } else {
+            ICON_DISCONNECTED
+        };
+        let path = dirs::data_dir()?.join(format!("icons/hicolor/48x48/apps/{name}.png"));
+        path.is_file().then_some(path)
+    }
+
+    /// Paint the in-window connection banner, using the same green/red shields
+    /// as the tray so both surfaces read identically at a glance. The shields
+    /// carry their own colour, so no `success`/`error` CSS class is applied.
     fn update_vpn_status_widget(connected: bool, icon: &gtk::Image, label: &gtk::Label) {
+        icon.remove_css_class("success");
+        icon.remove_css_class("error");
+
+        match status_icon_path(connected) {
+            Some(path) => icon.set_from_file(Some(&path)),
+            // Falls back to the theme when the file is not there yet, e.g. the
+            // very first launch on a read-only home.
+            None if connected => icon.set_icon_name(Some(ICON_CONNECTED)),
+            None => icon.set_icon_name(Some(ICON_DISCONNECTED)),
+        }
+
         if connected {
-            icon.set_icon_name(Some("emblem-ok-symbolic"));
-            icon.add_css_class("success");
-            icon.remove_css_class("error");
             label.set_markup(
                 "<span size='large' weight='bold' foreground='#2ec27e'>Connected</span>",
             );
         } else {
-            icon.set_icon_name(Some("window-close-symbolic"));
-            icon.add_css_class("error");
-            icon.remove_css_class("success");
             label.set_markup(
                 "<span size='large' weight='bold' foreground='#e01b24'>Disconnected</span>",
             );
@@ -946,6 +1324,75 @@ mod enabled {
         dialog.present();
     }
 
+    /// Push the stored connection state onto every surface that shows it: the
+    /// status line, the forwarded-port row, and the tray indicator.
+    ///
+    /// The connection state and the forwarded port arrive from two independent
+    /// async sources (the profile reload and the NAT-PMP probe), so both write
+    /// to [`StatusIndicators`] and call this instead of updating widgets
+    /// piecemeal and risking a half-updated view.
+    fn sync_connection_status(indicators: &StatusIndicators) {
+        let profile = indicators.active_profile.borrow().clone();
+        let port = *indicators.active_port.borrow();
+        let connected = profile.is_some();
+
+        update_vpn_status_widget(connected, &indicators.vpn_icon, &indicators.vpn_label);
+
+        match port {
+            Some(port) => {
+                indicators
+                    .port_label
+                    .set_markup(&format!("Forwarded port: <b><tt>{port}</tt></b>"));
+                indicators
+                    .port_copy_button
+                    .set_tooltip_text(Some("Copy port to clipboard"));
+                indicators.port_box.set_visible(true);
+            }
+            // Most servers do not offer port forwarding, so having no port is
+            // the normal case and gets no error styling -- the row just hides.
+            None => indicators.port_box.set_visible(false),
+        }
+
+        if let Some(indicator) = indicators.indicator.borrow().as_ref() {
+            indicator.update_status(connected, profile.as_deref(), port);
+        }
+    }
+
+    /// Ask the tunnel gateway for a forwarded port and show whatever it grants.
+    ///
+    /// This both creates and renews the lease: NAT-PMP treats a repeat request
+    /// for the same mapping as a renewal, so calling it on the renew timer keeps
+    /// the port alive. A failure means the server does not forward ports, which
+    /// is reported by hiding the row rather than as an error.
+    fn refresh_port_forwarding<C>(client: &C, indicators: &StatusIndicators, uuid: String)
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let client = client.clone();
+        let indicators = indicators.clone();
+        glib::spawn_future_local(async move {
+            let outcome = spawn_blocking_flat(move || {
+                let address = client.tunnel_address(&uuid).ok_or_else(|| {
+                    AppError::PortForward("profile has no IPv4 tunnel address".to_string())
+                })?;
+                let gateway = portforward::gateway_for_address(&address).ok_or_else(|| {
+                    AppError::PortForward(format!("no NAT-PMP gateway derivable from {address}"))
+                })?;
+                portforward::request_mapping(gateway)
+            })
+            .await;
+
+            match outcome {
+                Ok(port) => *indicators.active_port.borrow_mut() = Some(port),
+                Err(error) => {
+                    debug!("no forwarded port available: {error}");
+                    *indicators.active_port.borrow_mut() = None;
+                }
+            }
+            sync_connection_status(&indicators);
+        });
+    }
+
     /// Reload the profile list. The blocking NetworkManager/config work runs on
     /// the Gio thread pool so the GTK main thread (and thus the UI) never blocks
     /// on `nmcli`. Widget creation happens back on the main thread once the data
@@ -964,9 +1411,9 @@ mod enabled {
         let list = list.clone();
         let indicators = indicators.clone();
         glib::spawn_future_local(async move {
-            let outcome = gio::spawn_blocking(move || load_rows(&client_for_load)).await;
+            let outcome = spawn_blocking_flat(move || load_rows(&client_for_load)).await;
             match outcome {
-                Ok(Ok(rows)) => {
+                Ok(rows) => {
                     if rows.is_empty() {
                         indicators.log.set_label(
                             "No WireGuard profiles found. Import a configuration to add one.",
@@ -977,12 +1424,28 @@ mod enabled {
                             .set_label("Profiles loaded from NetworkManager.");
                     }
                     rebuild_eligibility_rows(&indicators, &rows);
-                    let any_active = rows.iter().any(|r| r.is_active);
-                    update_vpn_status_widget(
-                        any_active,
-                        &indicators.vpn_icon,
-                        &indicators.vpn_label,
-                    );
+
+                    let active = rows.iter().find(|r| r.is_active);
+                    let was_connected = indicators.active_profile.borrow().is_some();
+                    *indicators.active_profile.borrow_mut() = active.map(|r| r.name.clone());
+                    if was_connected && active.is_none() {
+                        notify_tunnel_dropped(&indicators);
+                    }
+
+                    // A port belongs to the tunnel that was granted it, so drop
+                    // it whenever the active profile changes (including on
+                    // disconnect) rather than showing a stale port.
+                    let active_uuid = active.map(|r| r.uuid.clone());
+                    if *indicators.port_profile.borrow() != active_uuid {
+                        *indicators.port_profile.borrow_mut() = active_uuid.clone();
+                        *indicators.active_port.borrow_mut() = None;
+                    }
+                    sync_connection_status(&indicators);
+
+                    if let Some(uuid) = active_uuid {
+                        refresh_port_forwarding(&client_for_rows, &indicators, uuid);
+                    }
+
                     while let Some(child) = list.first_child() {
                         list.remove(&child);
                     }
@@ -992,15 +1455,10 @@ mod enabled {
                         list.append(&row_widget);
                     }
                 }
-                Ok(Err(error)) => {
+                Err(error) => {
                     indicators
                         .log
                         .set_label(&format!("Failed to load profiles: {error}"));
-                }
-                Err(_) => {
-                    indicators
-                        .log
-                        .set_label("Failed to load profiles: background task panicked.");
                 }
             }
         });
@@ -1123,6 +1581,188 @@ mod enabled {
         indicators.eligibility.set_subtitle(&subtitle);
     }
 
+    fn build_connection_toggle<C>(
+        client: &C,
+        row: &profile_list::ProfileListRow,
+        list: &gtk::ListBox,
+        indicators: &StatusIndicators,
+    ) -> gtk::Switch
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let connection_toggle = gtk::Switch::new();
+        connection_toggle.set_valign(gtk::Align::Center);
+        connection_toggle.set_active(row.is_active);
+
+        let client = client.clone();
+        let row = row.clone();
+        let list = list.clone();
+        let indicators = indicators.clone();
+        let guard = Rc::new(Cell::new(false));
+        connection_toggle.connect_state_set(move |toggle, requested| {
+            if guard.get() {
+                return glib::Propagation::Proceed;
+            }
+            toggle.set_sensitive(false);
+
+            let client = client.clone();
+            let row = row.clone();
+            let list = list.clone();
+            let indicators = indicators.clone();
+            let toggle = toggle.clone();
+            let guard = guard.clone();
+            glib::spawn_future_local(async move {
+                let task_client = client.clone();
+                let task_uuid = row.uuid.clone();
+                let outcome = spawn_blocking_flat(move || {
+                    if requested {
+                        task_client.switch_to(&task_uuid)
+                    } else {
+                        task_client.disconnect_active()
+                    }
+                })
+                .await;
+
+                toggle.set_sensitive(true);
+                let parent = toggle.root().and_downcast::<gtk::Window>();
+                match outcome {
+                    Ok(()) => {
+                        refresh_profile_list(&client, &list, &indicators);
+                    }
+                    Err(error) => {
+                        show_error_dialog(
+                            parent.as_ref(),
+                            &format!("Action failed for '{}': {error}", row.name),
+                        );
+                        revert_switch(&toggle, &guard, !requested);
+                    }
+                }
+            });
+
+            glib::Propagation::Proceed
+        });
+
+        connection_toggle
+    }
+
+    fn build_remove_button<C>(
+        client: &C,
+        row: &profile_list::ProfileListRow,
+        list: &gtk::ListBox,
+        indicators: &StatusIndicators,
+    ) -> gtk::Button
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let remove_button = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .css_classes(vec!["flat".to_string()])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Remove profile")
+            .build();
+
+        let client = client.clone();
+        let row = row.clone();
+        let list = list.clone();
+        let indicators = indicators.clone();
+        remove_button.connect_clicked(move |btn| {
+            let parent = btn.root().and_downcast::<gtk::Window>();
+            let confirm = adw::MessageDialog::new(
+                parent.as_ref(),
+                Some("Remove profile?"),
+                Some(&format!(
+                    "This permanently deletes '{}' from NetworkManager. This cannot be undone.",
+                    row.name
+                )),
+            );
+            confirm.add_response("cancel", "_Cancel");
+            confirm.add_response("delete", "_Delete");
+            confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+            confirm.set_default_response(Some("cancel"));
+            confirm.set_close_response("cancel");
+
+            let client = client.clone();
+            let row = row.clone();
+            let list = list.clone();
+            let indicators = indicators.clone();
+            let parent = parent.clone();
+            confirm.connect_response(None, move |_, response| {
+                if response != "delete" {
+                    return;
+                }
+                let client = client.clone();
+                let row = row.clone();
+                let list = list.clone();
+                let indicators = indicators.clone();
+                let parent = parent.clone();
+                glib::spawn_future_local(async move {
+                    let task_client = client.clone();
+                    let task_uuid = row.uuid.clone();
+                    let outcome =
+                        spawn_blocking_flat(move || task_client.delete_profile(&task_uuid)).await;
+                    match outcome {
+                        Ok(()) => {
+                            // A NAT-PMP lease expires within a minute, so renew it on a timer for as
+                            // long as a profile stays up. Without this the provider reclaims the
+                            // port and the number on screen silently stops working.
+                            {
+                                let client = client.clone();
+                                let indicators = indicators.clone();
+                                glib::timeout_add_local(portforward::RENEW_INTERVAL, move || {
+                                    let active_uuid = indicators.port_profile.borrow().clone();
+                                    if let Some(uuid) = active_uuid {
+                                        refresh_port_forwarding(&client, &indicators, uuid);
+                                    }
+                                    glib::ControlFlow::Continue
+                                });
+                            }
+
+                            refresh_profile_list(&client, &list, &indicators);
+                        }
+                        Err(error) => {
+                            show_error_dialog(
+                                parent.as_ref(),
+                                &format!("Failed to remove '{}': {error}", row.name),
+                            );
+                        }
+                    }
+                });
+            });
+            confirm.present();
+        });
+
+        remove_button
+    }
+
+    fn build_custom_info_box(custom: &str) -> gtk::Box {
+        let info_box = gtk::Box::new(Orientation::Vertical, 4);
+        info_box.set_margin_start(16);
+        info_box.set_margin_end(16);
+        info_box.set_margin_bottom(12);
+
+        let divider = gtk::Separator::new(Orientation::Horizontal);
+        divider.set_margin_bottom(8);
+        info_box.append(&divider);
+
+        let title_label = gtk::Label::builder()
+            .label("<b>Provider Configuration Info:</b>")
+            .use_markup(true)
+            .xalign(0.0)
+            .build();
+        title_label.add_css_class("dim-label");
+        info_box.append(&title_label);
+
+        let info_label = gtk::Label::new(Some(custom));
+        info_label.set_xalign(0.0);
+        info_label.set_wrap(true);
+        info_label.add_css_class("monospace");
+        info_label.set_margin_start(8);
+        info_box.append(&info_label);
+
+        info_box.set_visible(false);
+        info_box
+    }
+
     fn build_profile_row<C>(
         client: &C,
         row: &profile_list::ProfileListRow,
@@ -1133,92 +1773,16 @@ mod enabled {
         C: NmClient + Clone + Send + 'static,
     {
         let header_box = gtk::Box::new(Orientation::Horizontal, 12);
-        // Inset the row content so fields don't butt up against the
-        // `boxed-list` border drawn around the profile list.
         header_box.set_margin_top(8);
         header_box.set_margin_bottom(8);
         header_box.set_margin_start(12);
         header_box.set_margin_end(12);
 
-        // Show only the profile name in the GUI row; connection state is conveyed
-        // by the switch. Startup eligibility now lives in the Settings expander,
-        // keeping these rows operational. The richer `format_cli_row` output
-        // remains for the `list` CLI command.
         let details = gtk::Label::new(Some(&row.name));
         details.set_xalign(0.0);
         details.set_hexpand(true);
 
-        // A single connection switch replaces the old Connect/Switch/Disconnect
-        // buttons: flipping it on switches to this profile (deactivating any
-        // other active tunnel), flipping it off disconnects the active tunnel.
-        // The blocking `nmcli` work runs off the GTK main thread; the switch is
-        // disabled while it runs and reverts to its previous position on failure.
-        let connection_toggle = gtk::Switch::new();
-        connection_toggle.set_valign(gtk::Align::Center);
-        connection_toggle.set_active(row.is_active);
-        {
-            let client = client.clone();
-            let row = row.clone();
-            let list = list.clone();
-            let indicators = indicators.clone();
-            let guard = Rc::new(Cell::new(false));
-            connection_toggle.connect_state_set(move |toggle, requested| {
-                // Ignore programmatic state changes (e.g. a revert) so they do
-                // not re-trigger a connect/disconnect.
-                if guard.get() {
-                    return glib::Propagation::Proceed;
-                }
-                toggle.set_sensitive(false);
-
-                let client = client.clone();
-                let row = row.clone();
-                let list = list.clone();
-                let indicators = indicators.clone();
-                let toggle = toggle.clone();
-                let guard = guard.clone();
-                glib::spawn_future_local(async move {
-                    let task_client = client.clone();
-                    let task_uuid = row.uuid.clone();
-                    let outcome = gio::spawn_blocking(move || {
-                        if requested {
-                            task_client.switch_to(&task_uuid)
-                        } else {
-                            task_client.disconnect_active()
-                        }
-                    })
-                    .await;
-
-                    toggle.set_sensitive(true);
-                    let parent = toggle.root().and_downcast::<gtk::Window>();
-                    match outcome {
-                        Ok(Ok(())) => {
-                            refresh_profile_list(&client, &list, &indicators);
-                        }
-                        Ok(Err(error)) => {
-                            show_error_dialog(
-                                parent.as_ref(),
-                                &format!("Action failed for '{}': {error}", row.name),
-                            );
-                            revert_switch(&toggle, &guard, !requested);
-                        }
-                        Err(_) => {
-                            show_error_dialog(
-                                parent.as_ref(),
-                                &format!(
-                                    "Action failed for '{}': background task panicked",
-                                    row.name
-                                ),
-                            );
-                            revert_switch(&toggle, &guard, !requested);
-                        }
-                    }
-                });
-
-                glib::Propagation::Proceed
-            });
-        }
-
-        header_box.append(&details);
+        let connection_toggle = build_connection_toggle(client, row, list, indicators);
 
         let settings_button = gtk::Button::builder()
             .icon_name("preferences-system-symbolic")
@@ -1240,82 +1804,10 @@ mod enabled {
                 }
             });
         }
-        let remove_button = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .css_classes(vec!["flat".to_string()])
-            .valign(gtk::Align::Center)
-            .tooltip_text("Remove profile")
-            .build();
-        {
-            let client = client.clone();
-            let row = row.clone();
-            let list = list.clone();
-            let indicators = indicators.clone();
-            remove_button.connect_clicked(move |btn| {
-                let parent = btn.root().and_downcast::<gtk::Window>();
-                // Deleting a NetworkManager profile is destructive and
-                // irreversible, so confirm before doing it.
-                let confirm = adw::MessageDialog::new(
-                    parent.as_ref(),
-                    Some("Remove profile?"),
-                    Some(&format!(
-                        "This permanently deletes '{}' from NetworkManager. \
-                         This cannot be undone.",
-                        row.name
-                    )),
-                );
-                confirm.add_response("cancel", "_Cancel");
-                confirm.add_response("delete", "_Delete");
-                confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-                confirm.set_default_response(Some("cancel"));
-                confirm.set_close_response("cancel");
 
-                let client = client.clone();
-                let row = row.clone();
-                let list = list.clone();
-                let indicators = indicators.clone();
-                let parent = parent.clone();
-                confirm.connect_response(None, move |_, response| {
-                    if response != "delete" {
-                        return;
-                    }
-                    let client = client.clone();
-                    let row = row.clone();
-                    let list = list.clone();
-                    let indicators = indicators.clone();
-                    let parent = parent.clone();
-                    glib::spawn_future_local(async move {
-                        let task_client = client.clone();
-                        let task_uuid = row.uuid.clone();
-                        let outcome =
-                            gio::spawn_blocking(move || task_client.delete_profile(&task_uuid))
-                                .await;
-                        match outcome {
-                            Ok(Ok(())) => {
-                                refresh_profile_list(&client, &list, &indicators);
-                            }
-                            Ok(Err(error)) => {
-                                show_error_dialog(
-                                    parent.as_ref(),
-                                    &format!("Failed to remove '{}': {error}", row.name),
-                                );
-                            }
-                            Err(_) => {
-                                show_error_dialog(
-                                    parent.as_ref(),
-                                    &format!(
-                                        "Failed to remove '{}': background task panicked",
-                                        row.name
-                                    ),
-                                );
-                            }
-                        }
-                    });
-                });
-                confirm.present();
-            });
-        }
+        let remove_button = build_remove_button(client, row, list, indicators);
 
+        header_box.append(&details);
         header_box.append(&connection_toggle);
         header_box.append(&settings_button);
         header_box.append(&remove_button);
@@ -1324,32 +1816,7 @@ mod enabled {
         container.append(&header_box);
 
         if let Some(ref custom) = row.custom_info {
-            let info_box = gtk::Box::new(Orientation::Vertical, 4);
-            info_box.set_margin_start(16);
-            info_box.set_margin_end(16);
-            info_box.set_margin_bottom(12);
-
-            let divider = gtk::Separator::new(Orientation::Horizontal);
-            divider.set_margin_bottom(8);
-            info_box.append(&divider);
-
-            let title_label = gtk::Label::builder()
-                .label("<b>Provider Configuration Info:</b>")
-                .use_markup(true)
-                .xalign(0.0)
-                .build();
-            title_label.add_css_class("dim-label");
-            info_box.append(&title_label);
-
-            let info_label = gtk::Label::new(Some(custom));
-            info_label.set_xalign(0.0);
-            info_label.set_wrap(true);
-            info_label.add_css_class("monospace");
-            info_label.set_margin_start(8);
-            info_box.append(&info_label);
-
-            info_box.set_visible(false);
-            container.append(&info_box);
+            container.append(&build_custom_info_box(custom));
         }
 
         let list_row = gtk::ListBoxRow::new();
@@ -1368,20 +1835,13 @@ mod enabled {
         #[test]
         fn load_rows_fails_when_nm_fails() {
             let client = MockNmClient::failing_list();
-
-            let config_path = std::env::temp_dir().join(format!(
-                "wireguard-manager-gui-test-fail-{}.json",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("time should move forward")
-                    .as_nanos()
-            ));
+            let config_path = crate::testing::temp_config_path("gui-fail");
             config::save(&config_path, &AppConfig::default()).expect("config should save");
 
             let result = load_rows_with_path(&client, &config_path);
 
             assert!(result.is_err());
-            let _ = std::fs::remove_file(config_path);
+            crate::testing::remove_temp_config(&config_path);
         }
 
         #[test]
@@ -1392,30 +1852,18 @@ mod enabled {
                 state: ProfileState::Inactive,
             }]);
 
-            let config_path = std::env::temp_dir().join(format!(
-                "wireguard-manager-gui-test-{}.json",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("time should move forward")
-                    .as_nanos()
-            ));
+            let config_path = crate::testing::temp_config_path("gui-load");
             config::save(&config_path, &AppConfig::default()).expect("config should save");
 
             let result = load_rows_with_path(&client, &config_path);
 
             assert!(result.is_ok());
-            let _ = std::fs::remove_file(config_path);
+            crate::testing::remove_temp_config(&config_path);
         }
 
         #[test]
         fn set_eligibility_excludes_and_restores_profile() {
-            let config_path = std::env::temp_dir().join(format!(
-                "wireguard-manager-gui-eligibility-{}.json",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("time should move forward")
-                    .as_nanos()
-            ));
+            let config_path = crate::testing::temp_config_path("gui-eligibility");
             config::save(&config_path, &AppConfig::default()).expect("config should save");
 
             // Marking a profile ineligible records it in the exclusion set.
@@ -1435,7 +1883,7 @@ mod enabled {
             let loaded = config::load(&config_path).expect("config should load");
             assert!(loaded.excluded_profile_ids.is_empty());
 
-            let _ = std::fs::remove_file(config_path);
+            crate::testing::remove_temp_config(&config_path);
         }
 
         #[test]
@@ -1453,7 +1901,7 @@ mod enabled {
             let header = HeaderBar::new();
             let body = gtk::Box::new(Orientation::Vertical, 0);
 
-            let window = build_main_window(&header, &body, 720, 420);
+            let window = build_main_window(&header, body.upcast_ref(), 720, 420);
 
             let content = window.content().expect("window content should be set");
             assert!(

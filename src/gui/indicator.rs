@@ -1,0 +1,639 @@
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use adw::prelude::*;
+use gtk::gdk;
+use gtk::gio;
+use gtk::gio::glib::{self, Variant, VariantTy};
+use tracing::{debug, error, info, warn};
+
+use crate::nm::NmClient;
+
+/// Tray icon shown while a tunnel is up, and its counterpart while none is.
+///
+/// These are shipped by the app rather than taken from the icon theme: the
+/// point is the green/red state colour, and a `-symbolic` theme icon would be
+/// recoloured to the panel foreground and lose exactly that signal. They are
+/// installed into the user icon theme at startup (`install_status_icons`)
+/// because StatusNotifierItem transports only an icon *name*.
+pub const ICON_CONNECTED: &str = "neutron-vpn-connected";
+pub const ICON_DISCONNECTED: &str = "neutron-vpn-disconnected";
+
+/// The tray icon for the current connection state.
+fn status_icon(connected: bool) -> &'static str {
+    if connected {
+        ICON_CONNECTED
+    } else {
+        ICON_DISCONNECTED
+    }
+}
+
+/// Artwork for the tray shields, embedded so the pixmap never depends on what
+/// is installed on disk.
+const CONNECTED_PNG: &[u8] = include_bytes!("../../resources/status/connected_48.png");
+const DISCONNECTED_PNG: &[u8] = include_bytes!("../../resources/status/disconnected_48.png");
+
+/// Convert GDK's premultiplied BGRA bytes into the ARGB32 layout that
+/// StatusNotifierItem specifies (network byte order, so `A R G B` per pixel).
+///
+/// Alpha is un-premultiplied on the way out: the shields are a solid fill with
+/// an antialiased rim, and leaving the edge pixels premultiplied against black
+/// would draw a dark halo around them on light panels.
+fn argb32_from_premultiplied_bgra(bgra: &[u8]) -> Vec<u8> {
+    bgra.chunks_exact(4)
+        .flat_map(|pixel| {
+            let (b, g, r, a) = (pixel[0], pixel[1], pixel[2], pixel[3]);
+            let straight = |channel: u8| match a {
+                0 => 0,
+                _ => ((channel as u32 * 255) / a as u32).min(255) as u8,
+            };
+            [a, straight(r), straight(g), straight(b)]
+        })
+        .collect()
+}
+
+/// Decode one embedded shield into `(width, height, ARGB32 bytes)`.
+///
+/// GDK decodes PNG itself, so this needs no gdk-pixbuf or glycin loader to be
+/// present on the host -- which matters for an AppImage.
+fn decode_pixmap(png: &'static [u8]) -> Option<(i32, i32, Vec<u8>)> {
+    let texture = gdk::Texture::from_bytes(&glib::Bytes::from_static(png)).ok()?;
+    let (width, height) = (texture.width(), texture.height());
+    let stride = width as usize * 4;
+    let mut bgra = vec![0u8; stride * height as usize];
+    texture.download(&mut bgra, stride);
+    Some((width, height, argb32_from_premultiplied_bgra(&bgra)))
+}
+
+/// The `a(iiay)` pixmap the tray falls back to when it cannot resolve
+/// [`status_icon`] from its icon theme.
+///
+/// Supplying this is what makes the indicator independent of icon-theme state:
+/// the host renders these bytes directly. Decoded once per state and cached,
+/// since the property is re-read on every icon change.
+fn icon_pixmap(connected: bool) -> Variant {
+    static CONNECTED: OnceLock<Option<(i32, i32, Vec<u8>)>> = OnceLock::new();
+    static DISCONNECTED: OnceLock<Option<(i32, i32, Vec<u8>)>> = OnceLock::new();
+
+    let cached = if connected {
+        CONNECTED.get_or_init(|| decode_pixmap(CONNECTED_PNG))
+    } else {
+        DISCONNECTED.get_or_init(|| decode_pixmap(DISCONNECTED_PNG))
+    };
+
+    match cached {
+        Some((width, height, data)) => vec![(*width, *height, data.clone())].to_variant(),
+        None => Vec::<(i32, i32, Vec<u8>)>::new().to_variant(),
+    }
+}
+
+const SNI_XML: &str = r#"
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
+    <property name="OverlayIconName" type="s" access="read"/>
+    <property name="OverlayIconPixmap" type="a(iiay)" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
+    <property name="AttentionMovieName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <method name="ContextMenu">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="Activate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="Scroll">
+      <arg name="delta" type="i" direction="in"/>
+      <arg name="orientation" type="s" direction="in"/>
+    </method>
+    <signal name="NewTitle"/>
+    <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
+    <signal name="NewOverlayIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus">
+      <arg name="status" type="s"/>
+    </signal>
+    <signal name="NewMenu"/>
+  </interface>
+</node>
+"#;
+
+const DBUSMENU_XML: &str = r#"
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <method name="GetLayout">
+      <arg name="parentId" type="i" direction="in"/>
+      <arg name="recursionDepth" type="i" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="revision" type="u" direction="out"/>
+      <arg name="layout" type="(ia{sv}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="properties" type="a(ia{sv})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="eventId" type="s" direction="in"/>
+      <arg name="data" type="v" direction="in"/>
+      <arg name="timestamp" type="u" direction="in"/>
+    </method>
+    <method name="AboutToShow">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="needUpdate" type="b" direction="out"/>
+    </method>
+    <signal name="LayoutUpdated">
+      <arg name="revision" type="u"/>
+      <arg name="parent" type="i"/>
+    </signal>
+    <signal name="ItemPropertiesUpdated">
+      <arg name="updatedProps" type="a(ia{sv})"/>
+      <arg name="removedProps" type="a(ias)"/>
+    </signal>
+  </interface>
+</node>
+"#;
+
+/// Assemble one dbusmenu `(ia{sv}av)` layout node.
+///
+/// The tuple is built through [`Variant::tuple_from_iter`] rather than
+/// `(..).to_variant()` on a Rust tuple: the latter routes the already-typed
+/// `a{sv}` properties through `ToVariant for Variant`, which boxes them into a
+/// `v` and makes GNOME Shell reject the reply.
+fn menu_item(id: i32, props: Variant, children: Vec<Variant>) -> Variant {
+    Variant::tuple_from_iter([
+        id.to_variant(),
+        props,
+        Variant::array_from_iter::<Variant>(children),
+    ])
+}
+
+/// Build the `a{sv}` property dictionary for one dbusmenu item id.
+///
+/// The DBusMenu spec types item properties as `a{sv}`, so the dictionary is
+/// finished with [`glib::VariantDict::end`]. Using `to_variant()` here would
+/// instead yield a boxed `v`, which makes GNOME Shell reject the whole
+/// `GetLayout` reply ("Type of return value is incorrect") and render an empty
+/// menu.
+fn get_item_dict(id: i32, is_conn: bool, prof: Option<&str>, port: Option<u16>) -> Option<Variant> {
+    let dict = glib::VariantDict::new(None);
+    match id {
+        0 => {
+            dict.insert("children-display", "submenu");
+            Some(dict.end())
+        }
+        1 => {
+            dict.insert("label", "Show Neutron VPN");
+            dict.insert("enabled", true);
+            dict.insert("visible", true);
+            Some(dict.end())
+        }
+        2 => {
+            let label = if is_conn {
+                if let Some(name) = prof {
+                    format!("Disconnect ({name})")
+                } else {
+                    "Disconnect".to_string()
+                }
+            } else {
+                "Connect".to_string()
+            };
+            dict.insert("label", label.as_str());
+            dict.insert("enabled", true);
+            dict.insert("visible", true);
+            Some(dict.end())
+        }
+        3 => {
+            dict.insert("type", "separator");
+            dict.insert("visible", true);
+            Some(dict.end())
+        }
+        4 => {
+            dict.insert("label", "Quit");
+            dict.insert("enabled", true);
+            dict.insert("visible", true);
+            Some(dict.end())
+        }
+        5 => {
+            if let Some(p) = port {
+                dict.insert("label", format!("Port Forwarding: {p} (Copy)"));
+                dict.insert("enabled", true);
+                dict.insert("visible", true);
+                Some(dict.end())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+pub struct AppIndicator {
+    connection: Option<gio::DBusConnection>,
+    connected: Arc<AtomicBool>,
+    active_profile: Arc<Mutex<Option<String>>>,
+    active_port: Arc<Mutex<Option<u16>>>,
+    menu_revision: Arc<AtomicU32>,
+}
+
+impl AppIndicator {
+    pub fn new<C>(app: &adw::Application, window: &adw::ApplicationWindow, client: C) -> Self
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let connected = Arc::new(AtomicBool::new(false));
+        let active_profile = Arc::new(Mutex::new(None));
+        let active_port = Arc::new(Mutex::new(None));
+        let menu_revision = Arc::new(AtomicU32::new(1));
+
+        let connection = match gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
+            Ok(conn) => Some(conn),
+            Err(err) => {
+                warn!("Could not connect to D-Bus session bus for AppIndicator: {err}");
+                None
+            }
+        };
+
+        let indicator = Self {
+            connection: connection.clone(),
+            connected: connected.clone(),
+            active_profile: active_profile.clone(),
+            active_port: active_port.clone(),
+            menu_revision: menu_revision.clone(),
+        };
+
+        if let Some(conn) = connection {
+            let window_weak = window.downgrade();
+            let app_weak = app.downgrade();
+            let client_clone = client.clone();
+            let connected_for_sni = connected.clone();
+            let active_for_sni = active_profile.clone();
+            let port_for_sni = active_port.clone();
+
+            // 1. Register org.kde.StatusNotifierItem using standard Adwaita icons
+            if let Ok(node_info) = gio::DBusNodeInfo::for_xml(SNI_XML)
+                && let Some(iface_info) = node_info.lookup_interface("org.kde.StatusNotifierItem")
+            {
+                let win_for_activate = window_weak.clone();
+
+                let reg_res = conn
+                    .register_object("/StatusNotifierItem", &iface_info)
+                    .method_call(
+                        move |_conn, _sender, _path, _iface, method, _params, invocation| {
+                            match method {
+                                "Activate" | "SecondaryActivate" | "ContextMenu" => {
+                                    if let Some(win) = win_for_activate.upgrade() {
+                                        win.set_visible(true);
+                                        win.present();
+                                    }
+                                    invocation.return_value(None);
+                                }
+                                "Scroll" => {
+                                    invocation.return_value(None);
+                                }
+                                _ => {
+                                    invocation.return_error(
+                                        gio::DBusError::UnknownMethod,
+                                        "Unknown method",
+                                    );
+                                }
+                            }
+                        },
+                    )
+                    .property(move |_conn, _sender, _path, _iface, property| {
+                        let is_conn = connected_for_sni.load(Ordering::Relaxed);
+                        let profile_name = active_for_sni.lock().unwrap().clone();
+                        let port_opt = *port_for_sni.lock().unwrap();
+                        match property {
+                            "Category" => "ApplicationStatus".to_variant(),
+                            "Id" => "neutron-vpn".to_variant(),
+                            "Title" => "Neutron VPN".to_variant(),
+                            "Status" => "Active".to_variant(),
+                            "WindowId" => 0i32.to_variant(),
+                            "IconThemePath" => "".to_variant(),
+                            "ItemIsMenu" => false.to_variant(),
+                            "Menu" => Variant::parse(None, "objectpath '/MenuBar'").unwrap(),
+                            "IconName" => status_icon(is_conn).to_variant(),
+                            "IconPixmap" => icon_pixmap(is_conn),
+                            "OverlayIconName" => "".to_variant(),
+                            "OverlayIconPixmap" => Vec::<(i32, i32, Vec<u8>)>::new().to_variant(),
+                            "AttentionIconName" => "".to_variant(),
+                            "AttentionIconPixmap" => Vec::<(i32, i32, Vec<u8>)>::new().to_variant(),
+                            "AttentionMovieName" => "".to_variant(),
+                            "ToolTip" => {
+                                let sub = if is_conn {
+                                    let name = profile_name.as_deref().unwrap_or("Connected");
+                                    match port_opt {
+                                        Some(port) => {
+                                            format!("Connected: {name}\nForwarded port: {port}")
+                                        }
+                                        None => format!("Connected: {name}"),
+                                    }
+                                } else {
+                                    "Disconnected".to_string()
+                                };
+                                let empty_pixmap = Vec::<(i32, i32, Vec<u8>)>::new();
+                                (
+                                    status_icon(is_conn),
+                                    empty_pixmap,
+                                    "Neutron VPN",
+                                    sub.as_str(),
+                                )
+                                    .to_variant()
+                            }
+                            _ => "".to_variant(),
+                        }
+                    })
+                    .build();
+
+                if let Err(err) = reg_res {
+                    error!("Failed to register StatusNotifierItem object: {err}");
+                }
+            }
+
+            // 2. Register com.canonical.dbusmenu
+            if let Ok(node_info) = gio::DBusNodeInfo::for_xml(DBUSMENU_XML)
+                && let Some(iface_info) = node_info.lookup_interface("com.canonical.dbusmenu")
+            {
+                let win_for_menu = window_weak.clone();
+                let app_for_menu = app_weak.clone();
+                let client_for_menu = client_clone.clone();
+                let connected_for_menu = connected.clone();
+                let active_for_menu = active_profile.clone();
+                let port_for_menu = active_port.clone();
+                let rev_for_menu = menu_revision.clone();
+
+                let reg_res = conn
+                    .register_object("/MenuBar", &iface_info)
+                    .method_call(
+                        move |_conn, _sender, _path, _iface, method, params, invocation| {
+                            let is_conn = connected_for_menu.load(Ordering::Relaxed);
+                            let prof = active_for_menu.lock().unwrap().clone();
+                            let port_opt = *port_for_menu.lock().unwrap();
+                            let rev = rev_for_menu.load(Ordering::Relaxed);
+
+                            match method {
+                                "GetLayout" => {
+                                    // Menu ids rendered in display order. Item 5
+                                    // (port forwarding) only exists while a port
+                                    // is known, so it is filtered out otherwise.
+                                    let mut children = Vec::new();
+                                    for id in [1i32, 5, 2, 3, 4] {
+                                        let Some(props) =
+                                            get_item_dict(id, is_conn, prof.as_deref(), port_opt)
+                                        else {
+                                            continue;
+                                        };
+                                        let item = menu_item(id, props, Vec::new());
+                                        children.push(Variant::from_variant(&item));
+                                    }
+
+                                    let root_props =
+                                        get_item_dict(0, is_conn, prof.as_deref(), port_opt)
+                                            .expect("root menu item is always present");
+                                    let root = menu_item(0, root_props, children);
+
+                                    let reply = Variant::tuple_from_iter([rev.to_variant(), root]);
+                                    invocation.return_value(Some(&reply));
+                                }
+                                "GetGroupProperties" => {
+                                    let ids_var = params.child_value(0);
+                                    let ids_to_fetch: Vec<i32> = match ids_var.get::<Vec<i32>>() {
+                                        Some(ids) if !ids.is_empty() => ids,
+                                        _ => vec![0, 1, 5, 2, 3, 4],
+                                    };
+
+                                    let mut group_props = Vec::new();
+                                    for id in ids_to_fetch {
+                                        if let Some(props) =
+                                            get_item_dict(id, is_conn, prof.as_deref(), port_opt)
+                                        {
+                                            group_props.push(Variant::tuple_from_iter([
+                                                id.to_variant(),
+                                                props,
+                                            ]));
+                                        }
+                                    }
+                                    let array = Variant::array_from_iter_with_type(
+                                        VariantTy::new("(ia{sv})").expect("valid signature"),
+                                        group_props,
+                                    );
+                                    let reply = Variant::tuple_from_iter([array]);
+                                    invocation.return_value(Some(&reply));
+                                }
+                                "GetProperty" => {
+                                    invocation.return_value(None);
+                                }
+                                "Event" => {
+                                    let id_var = params.child_value(0);
+                                    if let Some(id) = id_var.get::<i32>() {
+                                        match id {
+                                            1 => {
+                                                if let Some(win) = win_for_menu.upgrade() {
+                                                    win.set_visible(true);
+                                                    win.present();
+                                                }
+                                            }
+                                            2 => {
+                                                let client_task = client_for_menu.clone();
+                                                gio::spawn_blocking(move || {
+                                                    if is_conn {
+                                                        let _ = client_task.disconnect_active();
+                                                    } else {
+                                                        let _ = crate::service::run_startup_random(
+                                                            &client_task,
+                                                        );
+                                                    }
+                                                });
+                                            }
+                                            4 => {
+                                                if let Some(win) = win_for_menu.upgrade() {
+                                                    win.destroy();
+                                                }
+                                                if let Some(app) = app_for_menu.upgrade() {
+                                                    app.quit();
+                                                }
+                                            }
+                                            5 => {
+                                                if let Some(port) = port_opt
+                                                    && let Some(display) = gdk::Display::default()
+                                                {
+                                                    display.clipboard().set_text(&port.to_string());
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    invocation.return_value(None);
+                                }
+                                "AboutToShow" => {
+                                    invocation.return_value(Some(&(false,).to_variant()));
+                                }
+                                _ => {
+                                    invocation.return_error(
+                                        gio::DBusError::UnknownMethod,
+                                        "Unknown method",
+                                    );
+                                }
+                            }
+                        },
+                    )
+                    .property(
+                        move |_conn, _sender, _path, _iface, property| match property {
+                            "Version" => 3u32.to_variant(),
+                            "Status" => "normal".to_variant(),
+                            _ => "".to_variant(),
+                        },
+                    )
+                    .build();
+
+                if let Err(err) = reg_res {
+                    error!("Failed to register DBusMenu object: {err}");
+                }
+            }
+
+            // 3. Register with StatusNotifierWatcher (org.kde and org.freedesktop)
+            for watcher_bus in [
+                "org.kde.StatusNotifierWatcher",
+                "org.freedesktop.StatusNotifierWatcher",
+            ] {
+                let conn_watcher = conn.clone();
+                let item_path = "/StatusNotifierItem".to_string();
+                conn_watcher.call(
+                    Some(watcher_bus),
+                    "/StatusNotifierWatcher",
+                    watcher_bus,
+                    "RegisterStatusNotifierItem",
+                    Some(&(item_path,).to_variant()),
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    -1,
+                    gio::Cancellable::NONE,
+                    move |res| {
+                        if let Err(e) = res {
+                            debug!("Could not register with {watcher_bus}: {e}");
+                        } else {
+                            info!("Successfully registered AppIndicator with {watcher_bus}");
+                        }
+                    },
+                );
+            }
+        }
+
+        indicator
+    }
+
+    pub fn update_status(
+        &self,
+        connected: bool,
+        active_profile: Option<&str>,
+        forwarded_port: Option<u16>,
+    ) {
+        self.connected.store(connected, Ordering::Relaxed);
+        *self.active_profile.lock().unwrap() = active_profile.map(|s| s.to_string());
+        *self.active_port.lock().unwrap() = forwarded_port;
+        self.menu_revision.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(conn) = &self.connection {
+            let _ = conn.emit_signal(
+                None,
+                "/StatusNotifierItem",
+                "org.kde.StatusNotifierItem",
+                "NewIcon",
+                None,
+            );
+            let _ = conn.emit_signal(
+                None,
+                "/StatusNotifierItem",
+                "org.kde.StatusNotifierItem",
+                "NewToolTip",
+                None,
+            );
+            let status = if connected { "Active" } else { "Passive" };
+            let _ = conn.emit_signal(
+                None,
+                "/StatusNotifierItem",
+                "org.kde.StatusNotifierItem",
+                "NewStatus",
+                Some(&(status,).to_variant()),
+            );
+            let _ = conn.emit_signal(
+                None,
+                "/MenuBar",
+                "com.canonical.dbusmenu",
+                "LayoutUpdated",
+                Some(&(self.menu_revision.load(Ordering::Relaxed), 0i32).to_variant()),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_bgra_to_network_order_argb() {
+        // One opaque pixel: GDK hands over B,G,R,A and the wire wants A,R,G,B.
+        let bgra = [0x10, 0x20, 0x30, 0xff];
+
+        assert_eq!(
+            argb32_from_premultiplied_bgra(&bgra),
+            vec![0xff, 0x30, 0x20, 0x10]
+        );
+    }
+
+    #[test]
+    fn un_premultiplies_partially_transparent_pixels() {
+        // A 50%-alpha white pixel arrives premultiplied (0x80), and must be
+        // restored to full-intensity white so the antialiased rim of the shield
+        // does not render as a dark halo.
+        let bgra = [0x80, 0x80, 0x80, 0x80];
+
+        assert_eq!(
+            argb32_from_premultiplied_bgra(&bgra),
+            vec![0x80, 0xff, 0xff, 0xff]
+        );
+    }
+
+    #[test]
+    fn leaves_fully_transparent_pixels_black() {
+        // Dividing by a zero alpha must not panic or produce garbage colour.
+        let bgra = [0x00, 0x00, 0x00, 0x00];
+
+        assert_eq!(argb32_from_premultiplied_bgra(&bgra), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn emits_four_bytes_for_every_pixel() {
+        let bgra = [0u8; 4 * 7];
+
+        assert_eq!(argb32_from_premultiplied_bgra(&bgra).len(), 4 * 7);
+    }
+}
