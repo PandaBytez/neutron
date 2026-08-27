@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
+mod autoconnect;
 mod kill_switch;
 
 /// Maximum time to wait for an `nmcli` invocation before giving up.
@@ -66,6 +67,21 @@ pub struct ProfileDiagnostics {
     pub keepalive: String,
 }
 
+impl ProfileDiagnostics {
+    pub fn unavailable(interface_name: String) -> Self {
+        Self {
+            interface_name,
+            public_key: "N/A".to_string(),
+            endpoint: "N/A".to_string(),
+            allowed_ips: "N/A".to_string(),
+            latest_handshake: "N/A".to_string(),
+            transfer_rx: "N/A".to_string(),
+            transfer_tx: "N/A".to_string(),
+            keepalive: "N/A".to_string(),
+        }
+    }
+}
+
 pub trait NmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>>;
     fn connect(&self, profile_identifier: &str) -> AppResult<()>;
@@ -76,6 +92,12 @@ pub trait NmClient {
     /// all profiles rather than per profile. The change is persisted to each
     /// NetworkManager profile and takes effect the next time it is activated.
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()>;
+    /// Set NetworkManager's `connection.autoconnect` property on *every*
+    /// WireGuard profile. The startup-random selector requires autoconnect to be
+    /// disabled so NetworkManager does not activate profiles itself at boot --
+    /// otherwise every profile comes up automatically and the selector is left
+    /// nothing to do. See [`crate::nm::autoconnect`] for the rationale.
+    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()>;
     /// Discover the interface name and peer endpoints of every WireGuard
     /// profile. Used to build the lockdown firewall allow-list so the tunnel
     /// and its handshake keep working while all other traffic is blocked.
@@ -87,10 +109,13 @@ pub trait NmClient {
     /// Get read-only WireGuard diagnostics for a specific profile connection.
     fn get_profile_diagnostics(&self, uuid: &str, is_active: bool)
     -> AppResult<ProfileDiagnostics>;
+    /// The tunnel's local IPv4 address (e.g. `10.2.0.2/32`), used to derive the
+    /// NAT-PMP gateway that hands out a forwarded port.
+    fn tunnel_address(&self, uuid: &str) -> Option<String>;
     /// Open the native NetworkManager connection editor for the specified connection.
     fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()>;
     /// Permanently delete a NetworkManager profile. NetworkManager deactivates
-    /// the connection first if it is currently active. Any Zento-side metadata
+    /// the connection first if it is currently active. Any Neutron-side metadata
     /// that referenced the profile (provider comments, startup eligibility) is
     /// cleaned up too so stale entries don't accumulate.
     fn delete_profile(&self, uuid: &str) -> AppResult<()>;
@@ -210,6 +235,12 @@ impl NmClient for CliNmClient {
         Ok(())
     }
 
+    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
+        let profiles = self.list_wireguard_profiles()?;
+        let batches = autoconnect_arg_batches(&profiles, enable);
+        apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
+    }
+
     fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
         let profiles = self.list_wireguard_profiles()?;
         let mut tunnels = Vec::new();
@@ -270,6 +301,13 @@ impl NmClient for CliNmClient {
             // only adds the profile; the user activates it explicitly.
             let _ = run_nmcli(&["connection", "down", uuid.as_str()]);
 
+            // NetworkManager's `autoconnect=yes` default would also bring this
+            // profile (and every other) up automatically at the next boot,
+            // defeating the startup-random selector. Disable it so activation
+            // stays user- and selector-driven. Best-effort: a failure here must
+            // not fail the import (the selector re-applies this on every run).
+            let _ = run_nmcli_owned(&autoconnect::set_args(uuid.as_str(), false));
+
             let comments = extract_interface_comments(path);
             if !comments.is_empty()
                 && let Ok(config_path) = crate::config::default_config_path()
@@ -288,32 +326,19 @@ impl NmClient for CliNmClient {
         uuid: &str,
         is_active: bool,
     ) -> AppResult<ProfileDiagnostics> {
-        let nm_output = run_command_with_timeout(
-            "nmcli",
-            &[
-                "-g",
-                "connection.interface-name",
-                "connection",
-                "show",
-                uuid,
-            ],
-            NMCLI_TIMEOUT,
-        )?;
+        let nm_output = run_nmcli(&[
+            "-g",
+            "connection.interface-name",
+            "connection",
+            "show",
+            uuid,
+        ])?;
 
         let interface_name = parse_interface_name(&nm_output).ok_or_else(|| {
             AppError::NmCommandFailed("No interface name configured for this profile".to_string())
         })?;
 
-        let mut diag = ProfileDiagnostics {
-            interface_name: interface_name.clone(),
-            public_key: "N/A".to_string(),
-            endpoint: "N/A".to_string(),
-            allowed_ips: "N/A".to_string(),
-            latest_handshake: "N/A".to_string(),
-            transfer_rx: "N/A".to_string(),
-            transfer_tx: "N/A".to_string(),
-            keepalive: "N/A".to_string(),
-        };
+        let mut diag = ProfileDiagnostics::unavailable(interface_name.clone());
 
         if !is_active {
             return Ok(diag);
@@ -362,32 +387,29 @@ impl NmClient for CliNmClient {
         Ok(diag)
     }
 
+    fn tunnel_address(&self, uuid: &str) -> Option<String> {
+        let output = run_nmcli(&["-g", "ipv4.addresses", "connection", "show", uuid]).ok()?;
+        // A profile may carry several addresses; the first is the tunnel host.
+        let first = output.split(',').next()?.trim();
+        if first.is_empty() {
+            return None;
+        }
+        Some(first.to_string())
+    }
+
     fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()> {
-        let mut cmd = if running_in_flatpak_sandbox() {
-            let mut command = std::process::Command::new("flatpak-spawn");
-            command.arg("--host");
-            if is_dark {
-                command.arg("--env=GTK_THEME=Adwaita:dark");
-                command.arg("--env=ADW_DEBUG_COLOR_SCHEME=prefer-dark");
-            } else {
-                command.arg("--env=GTK_THEME=Adwaita:light");
-                command.arg("--env=ADW_DEBUG_COLOR_SCHEME=prefer-light");
-            }
-            command.arg("nm-connection-editor");
-            command
+        let (theme, scheme) = if is_dark {
+            ("Adwaita:dark", "prefer-dark")
         } else {
-            let mut command = std::process::Command::new("nm-connection-editor");
-            if is_dark {
-                command.env("GTK_THEME", "Adwaita:dark");
-                command.env("ADW_DEBUG_COLOR_SCHEME", "prefer-dark");
-            } else {
-                command.env("GTK_THEME", "Adwaita:light");
-                command.env("ADW_DEBUG_COLOR_SCHEME", "prefer-light");
-            }
-            command
+            ("Adwaita:light", "prefer-light")
         };
-        cmd.arg("-e").arg(uuid);
-        cmd.spawn()?;
+        host_command_with_env(
+            "nm-connection-editor",
+            &[("GTK_THEME", theme), ("ADW_DEBUG_COLOR_SCHEME", scheme)],
+        )
+        .arg("-e")
+        .arg(uuid)
+        .spawn()?;
         Ok(())
     }
 
@@ -396,7 +418,7 @@ impl NmClient for CliNmClient {
         // removing it, so an active profile can be deleted directly.
         run_nmcli(&["connection", "delete", uuid])?;
 
-        // Drop any Zento-side metadata keyed by this UUID so it doesn't linger
+        // Drop any Neutron-side metadata keyed by this UUID so it doesn't linger
         // after the profile is gone. Best-effort: a config failure here must not
         // mask the successful deletion.
         if let Ok(config_path) = crate::config::default_config_path()
@@ -509,14 +531,62 @@ fn parse_endpoint(token: &str) -> Option<Endpoint> {
 fn kill_switch_arg_batches(profiles: &[WireguardProfile], enable: bool) -> Vec<Vec<String>> {
     profiles
         .iter()
-        .map(|profile| {
-            if enable {
-                kill_switch::enable_args(&profile.uuid)
-            } else {
-                kill_switch::disable_args(&profile.uuid)
-            }
-        })
+        .map(|profile| kill_switch::set_args(&profile.uuid, enable))
         .collect()
+}
+
+/// Build the per-profile `nmcli` argument batches that set
+/// `connection.autoconnect` across *every* profile.
+///
+/// Extracted from [`CliNmClient::set_autoconnect_all`] so the "global = every
+/// profile" behavior is unit-testable without invoking `nmcli`.
+fn autoconnect_arg_batches(profiles: &[WireguardProfile], enable: bool) -> Vec<Vec<String>> {
+    profiles
+        .iter()
+        .map(|profile| autoconnect::set_args(&profile.uuid, enable))
+        .collect()
+}
+
+/// Run one argument batch per profile, continuing past failures, then report
+/// every failure together.
+///
+/// Aborting on the first error would leave all *later* profiles unmodified. For
+/// `connection.autoconnect` that is the difference between one profile still
+/// autoconnecting and every profile after the failure still autoconnecting --
+/// and each of those activates at the next boot, because WireGuard profiles are
+/// separate interfaces and never compete for a device. Partial success is
+/// strictly better than stopping halfway.
+///
+/// `run` is injected so the continue-on-failure behavior is unit-testable
+/// without invoking `nmcli`.
+fn apply_to_every_profile<F>(
+    profiles: &[WireguardProfile],
+    batches: Vec<Vec<String>>,
+    mut run: F,
+) -> AppResult<()>
+where
+    F: FnMut(&[String]) -> AppResult<()>,
+{
+    let failures: Vec<String> = profiles
+        .iter()
+        .zip(batches)
+        .filter_map(|(profile, args)| {
+            run(&args)
+                .err()
+                .map(|error| format!("{} ({}): {error}", profile.name, profile.uuid))
+        })
+        .collect();
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(AppError::NmCommandFailed(format!(
+        "failed on {} of {} profiles: {}",
+        failures.len(),
+        profiles.len(),
+        failures.join("; ")
+    )))
 }
 
 fn find_unique_profile_by_name<'a>(
@@ -610,54 +680,32 @@ fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String>
     run_command_with_timeout("nmcli", args, timeout)
 }
 
-/// Returns `true` when the process is running inside a Flatpak sandbox.
-///
-/// Flatpak always mounts `/.flatpak-info` inside the sandbox, so its presence
-/// is the canonical way to detect that host tools must be reached through the
-/// session helper rather than executed directly.
-fn running_in_flatpak_sandbox() -> bool {
-    std::path::Path::new("/.flatpak-info").exists()
-}
-
-/// Build a [`Command`] for `program`, transparently routing through
-/// `flatpak-spawn --host` when running inside a Flatpak sandbox.
-///
-/// Host tools such as `nmcli` are not shipped inside the GNOME runtime, so when
-/// sandboxed we ask the Flatpak session helper to run them on the host instead.
-/// Outside a sandbox the program is executed directly.
+/// Build a [`Command`] for `program` to execute on the system.
 pub(crate) fn host_command(program: &str) -> Command {
-    host_command_for(running_in_flatpak_sandbox(), program)
+    Command::new(program)
 }
 
-fn host_command_for(in_sandbox: bool, program: &str) -> Command {
-    host_command_with_env_for(in_sandbox, program, &[])
-}
-
-/// Like [`host_command`], but also sets environment variables on the host
-/// process.
-///
-/// Inside a Flatpak sandbox the variables cannot be set with [`Command::env`]:
-/// that would only affect `flatpak-spawn` itself, not the host program it
-/// launches. They must instead be forwarded as `--env=KEY=VALUE` arguments,
-/// which the session helper applies to the host process. Outside a sandbox the
-/// variables are set directly on the command.
+/// Like [`host_command`], but also sets environment variables on the process.
 pub(crate) fn host_command_with_env(program: &str, envs: &[(&str, &str)]) -> Command {
-    host_command_with_env_for(running_in_flatpak_sandbox(), program, envs)
+    let mut command = Command::new(program);
+    command.envs(envs.iter().copied());
+    command
 }
 
-fn host_command_with_env_for(in_sandbox: bool, program: &str, envs: &[(&str, &str)]) -> Command {
-    if in_sandbox {
-        let mut command = Command::new("flatpak-spawn");
-        command.arg("--host");
-        for (key, value) in envs {
-            command.arg(format!("--env={key}={value}"));
-        }
-        command.arg(program);
-        command
+pub(crate) fn format_command_error(
+    prefix: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> String {
+    let stderr = stderr.trim();
+    let code = status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_string());
+    if stderr.is_empty() {
+        format!("{prefix} (exit {code})")
     } else {
-        let mut command = Command::new(program);
-        command.envs(envs.iter().copied());
-        command
+        format!("{stderr} (exit {code})")
     }
 }
 
@@ -712,16 +760,13 @@ fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> 
     let stderr = stderr_reader.join().unwrap_or_default();
 
     if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-        let code = status
-            .code()
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "terminated by signal".to_string());
-        return Err(AppError::NmCommandFailed(if stderr.is_empty() {
-            format!("{program} {args:?} failed (exit {code})")
-        } else {
-            format!("{stderr} (exit {code})")
-        }));
+        let stderr_str = String::from_utf8_lossy(&stderr);
+        let prefix = format!("{program} {args:?} failed");
+        return Err(AppError::NmCommandFailed(format_command_error(
+            &prefix,
+            status,
+            &stderr_str,
+        )));
     }
 
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
@@ -891,7 +936,7 @@ mod tests {
         // modified, each targeting its own UUID with the enable arguments.
         assert_eq!(batches.len(), 3);
         for (batch, uuid) in batches.iter().zip(["uuid-1", "uuid-2", "uuid-3"]) {
-            assert_eq!(batch, &kill_switch::enable_args(uuid));
+            assert_eq!(batch, &kill_switch::set_args(uuid, true));
         }
     }
 
@@ -902,8 +947,8 @@ mod tests {
         let batches = kill_switch_arg_batches(&profiles, false);
 
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], kill_switch::disable_args("uuid-1"));
-        assert_eq!(batches[1], kill_switch::disable_args("uuid-2"));
+        assert_eq!(batches[0], kill_switch::set_args("uuid-1", false));
+        assert_eq!(batches[1], kill_switch::set_args("uuid-2", false));
     }
 
     #[test]
@@ -911,6 +956,100 @@ mod tests {
         // No profiles means no `nmcli` calls at all (rather than an error).
         assert!(kill_switch_arg_batches(&[], true).is_empty());
         assert!(kill_switch_arg_batches(&[], false).is_empty());
+    }
+
+    #[test]
+    fn autoconnect_arg_batches_target_every_profile_to_disable() {
+        let profiles = vec![
+            profile("wg-us", "uuid-1"),
+            profile("wg-eu", "uuid-2"),
+            profile("wg-as", "uuid-3"),
+        ];
+
+        let batches = autoconnect_arg_batches(&profiles, false);
+
+        // One batch per profile: autoconnect is a global concern, so every
+        // profile is modified, each targeting its own UUID.
+        assert_eq!(batches.len(), 3);
+        for (batch, uuid) in batches.iter().zip(["uuid-1", "uuid-2", "uuid-3"]) {
+            assert_eq!(batch, &autoconnect::set_args(uuid, false));
+        }
+    }
+
+    #[test]
+    fn autoconnect_arg_batches_target_every_profile_to_enable() {
+        let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-eu", "uuid-2")];
+
+        let batches = autoconnect_arg_batches(&profiles, true);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], autoconnect::set_args("uuid-1", true));
+        assert_eq!(batches[1], autoconnect::set_args("uuid-2", true));
+    }
+
+    #[test]
+    fn autoconnect_arg_batches_is_empty_without_profiles() {
+        // No profiles means no `nmcli` calls at all (rather than an error).
+        assert!(autoconnect_arg_batches(&[], true).is_empty());
+        assert!(autoconnect_arg_batches(&[], false).is_empty());
+    }
+
+    #[test]
+    fn apply_to_every_profile_continues_after_a_failure() {
+        // Regression: aborting on the first failure left every later profile on
+        // NetworkManager's `autoconnect=yes` default, so all of them activated
+        // at the next boot.
+        let profiles = vec![
+            profile("wg-us", "uuid-1"),
+            profile("wg-eu", "uuid-2"),
+            profile("wg-jp", "uuid-3"),
+        ];
+        let batches = autoconnect_arg_batches(&profiles, false);
+        let mut attempted = Vec::new();
+
+        let result = apply_to_every_profile(&profiles, batches, |args| {
+            let uuid = args[2].clone();
+            attempted.push(uuid.clone());
+            if uuid == "uuid-1" {
+                return Err(AppError::NmCommandFailed("simulated".to_string()));
+            }
+            Ok(())
+        });
+
+        assert_eq!(attempted, vec!["uuid-1", "uuid-2", "uuid-3"]);
+        assert!(result.is_err(), "the failure must still be reported");
+    }
+
+    #[test]
+    fn apply_to_every_profile_reports_all_failures_with_profile_identity() {
+        let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-eu", "uuid-2")];
+        let batches = autoconnect_arg_batches(&profiles, false);
+
+        let result = apply_to_every_profile(&profiles, batches, |_| {
+            Err(AppError::NmCommandFailed("simulated".to_string()))
+        });
+
+        let Err(AppError::NmCommandFailed(message)) = result else {
+            panic!("expected an aggregated NmCommandFailed error");
+        };
+        assert!(message.contains("2 of 2 profiles"), "got: {message}");
+        assert!(message.contains("wg-us (uuid-1)"), "got: {message}");
+        assert!(message.contains("wg-eu (uuid-2)"), "got: {message}");
+    }
+
+    #[test]
+    fn apply_to_every_profile_is_ok_when_every_batch_succeeds() {
+        let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-eu", "uuid-2")];
+        let batches = autoconnect_arg_batches(&profiles, false);
+        let mut calls = 0;
+
+        let result = apply_to_every_profile(&profiles, batches, |_| {
+            calls += 1;
+            Ok(())
+        });
+
+        assert_eq!(calls, 2);
+        assert!(result.is_ok());
     }
 
     #[cfg(unix)]
@@ -949,40 +1088,16 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_routes_through_flatpak_spawn() {
-        let command = host_command_for(true, "nmcli");
-
-        assert_eq!(command.get_program(), "flatpak-spawn");
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_str().expect("args should be valid UTF-8"))
-            .collect();
-        assert_eq!(args, ["--host", "nmcli"]);
-    }
-
-    #[test]
-    fn non_sandbox_runs_program_directly() {
-        let command = host_command_for(false, "nmcli");
+    fn host_command_creates_command_for_program() {
+        let command = host_command("nmcli");
 
         assert_eq!(command.get_program(), "nmcli");
         assert_eq!(command.get_args().count(), 0);
     }
 
     #[test]
-    fn sandbox_forwards_env_as_flatpak_spawn_args() {
-        let command = host_command_with_env_for(true, "pkexec", &[("SHELL", "/bin/sh")]);
-
-        assert_eq!(command.get_program(), "flatpak-spawn");
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_str().expect("args should be valid UTF-8"))
-            .collect();
-        assert_eq!(args, ["--host", "--env=SHELL=/bin/sh", "pkexec"]);
-    }
-
-    #[test]
-    fn non_sandbox_sets_env_on_command() {
-        let command = host_command_with_env_for(false, "pkexec", &[("SHELL", "/bin/sh")]);
+    fn host_command_with_env_sets_env_on_command() {
+        let command = host_command_with_env("pkexec", &[("SHELL", "/bin/sh")]);
 
         assert_eq!(command.get_program(), "pkexec");
         assert_eq!(command.get_args().count(), 0);
@@ -1026,7 +1141,7 @@ mod tests {
         use std::fs::File;
         use std::io::Write;
         let config_path = std::env::temp_dir().join(format!(
-            "wireguard-manager-comments-test-{}.conf",
+            "neutron-vpn-comments-test-{}.conf",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time should move forward")

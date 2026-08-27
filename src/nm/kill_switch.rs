@@ -27,38 +27,25 @@ const ENABLED_DNS_PRIORITY: &str = "-1500";
 /// Default DNS priority restored when the kill switch is disabled.
 const DEFAULT_DNS_PRIORITY: &str = "0";
 
-/// `nmcli` arguments that enable the kill switch on connection `uuid`.
-pub fn enable_args(uuid: &str) -> Vec<String> {
+/// `nmcli` arguments that set the kill switch on connection `uuid` to enabled or disabled.
+pub fn set_args(uuid: &str, enable: bool) -> Vec<String> {
+    let (auto_route, dns_priority) = if enable {
+        ("yes", ENABLED_DNS_PRIORITY)
+    } else {
+        ("default", DEFAULT_DNS_PRIORITY)
+    };
     vec![
         "connection".to_string(),
         "modify".to_string(),
         uuid.to_string(),
         "wireguard.ip4-auto-default-route".to_string(),
-        "yes".to_string(),
+        auto_route.to_string(),
         "wireguard.ip6-auto-default-route".to_string(),
-        "yes".to_string(),
+        auto_route.to_string(),
         "ipv4.dns-priority".to_string(),
-        ENABLED_DNS_PRIORITY.to_string(),
+        dns_priority.to_string(),
         "ipv6.dns-priority".to_string(),
-        ENABLED_DNS_PRIORITY.to_string(),
-    ]
-}
-
-/// `nmcli` arguments that disable the kill switch, restoring NetworkManager
-/// defaults (automatic default-route handling and default DNS priority).
-pub fn disable_args(uuid: &str) -> Vec<String> {
-    vec![
-        "connection".to_string(),
-        "modify".to_string(),
-        uuid.to_string(),
-        "wireguard.ip4-auto-default-route".to_string(),
-        "default".to_string(),
-        "wireguard.ip6-auto-default-route".to_string(),
-        "default".to_string(),
-        "ipv4.dns-priority".to_string(),
-        DEFAULT_DNS_PRIORITY.to_string(),
-        "ipv6.dns-priority".to_string(),
-        DEFAULT_DNS_PRIORITY.to_string(),
+        dns_priority.to_string(),
     ]
 }
 
@@ -68,7 +55,7 @@ mod tests {
 
     #[test]
     fn enable_args_target_the_uuid_and_force_routing_on() {
-        let args = enable_args("uuid-1");
+        let args = set_args("uuid-1", true);
 
         assert_eq!(args[0], "connection");
         assert_eq!(args[1], "modify");
@@ -97,7 +84,7 @@ mod tests {
 
     #[test]
     fn disable_args_restore_networkmanager_defaults() {
-        let args = disable_args("uuid-1");
+        let args = set_args("uuid-1", false);
 
         assert_eq!(args[2], "uuid-1");
         assert!(window_contains(
@@ -124,8 +111,8 @@ mod tests {
 
     #[test]
     fn enable_and_disable_toggle_the_same_properties() {
-        let enable = enable_args("uuid-1");
-        let disable = disable_args("uuid-1");
+        let enable = set_args("uuid-1", true);
+        let disable = set_args("uuid-1", false);
 
         // Disabling must touch exactly the same properties, in the same order,
         // that enabling sets. Otherwise the kill switch could leave a property

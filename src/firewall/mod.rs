@@ -50,7 +50,7 @@ const FIREWALL_CMD: &str = "firewall-cmd";
 /// Comment tagged onto *every* lockdown rule so our ruleset is recognizable
 /// among any other firewall rules and can be removed surgically at teardown
 /// without disturbing the user's own direct rules.
-const LOCKDOWN_MARKER: &str = "zento-lockdown";
+const LOCKDOWN_MARKER: &str = "neutron-lockdown";
 
 /// The iptables `comment` match that stamps [`LOCKDOWN_MARKER`] onto a rule.
 const MARKER_ARGS: [&str; 4] = ["-m", "comment", "--comment", LOCKDOWN_MARKER];
@@ -99,14 +99,10 @@ impl FirewallClient for crate::nm::CliNmClient {
         // the user is prompted for a password at most once. Reads are
         // unprivileged and never prompt.
         //
-        // The batch first clears any leftover Zento rules (so re-enabling is
+        // The batch first clears any leftover Neutron rules (so re-enabling is
         // idempotent and cannot fail with ALREADY_ENABLED), then installs the
         // new ruleset and reloads.
-        let mut batches = Vec::new();
-        for family in FAMILIES {
-            let listing = read_marked_rules(family)?;
-            batches.extend(parse_marked_removals(family, &listing));
-        }
+        let mut batches = marked_removal_batches()?;
         batches.extend(lockdown_enable_batches(tunnels));
         run_privileged_batches(&batches)
     }
@@ -114,11 +110,7 @@ impl FirewallClient for crate::nm::CliNmClient {
     fn disable_lockdown(&self) -> AppResult<()> {
         // Collect surgical removals from an unprivileged read of each family,
         // then remove them and reload in a single privileged batch (one prompt).
-        let mut batches = Vec::new();
-        for family in FAMILIES {
-            let listing = read_marked_rules(family)?;
-            batches.extend(parse_marked_removals(family, &listing));
-        }
+        let mut batches = marked_removal_batches()?;
         batches.push(reload_batch());
         run_privileged_batches(&batches)?;
 
@@ -207,17 +199,13 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let code = output
-        .status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "terminated by signal".to_string());
-    Err(AppError::Firewall(if stderr.is_empty() {
-        format!("pkexec {FIREWALL_CMD} batch failed (exit {code})")
-    } else {
-        format!("{stderr} (exit {code})")
-    }))
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let prefix = format!("pkexec {FIREWALL_CMD} batch failed");
+    Err(AppError::Firewall(crate::nm::format_command_error(
+        &prefix,
+        output.status,
+        &stderr,
+    )))
 }
 
 /// Render `firewall-cmd` argument batches into a single `/bin/sh` script that
@@ -272,7 +260,7 @@ fn lockdown_enable_batches(tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
     batches
 }
 
-/// Whether `family`'s OUTPUT chain still contains a Zento-tagged rule. Used as a
+/// Whether `family`'s OUTPUT chain still contains a Neutron-tagged rule. Used as a
 /// teardown safety check so we never leave the user locked out. The read is
 /// unprivileged, so this check costs no password prompt.
 fn family_has_marked_rule(family: &str) -> AppResult<bool> {
@@ -286,8 +274,25 @@ fn line_is_marked(line: &str) -> bool {
         .any(|token| token == LOCKDOWN_MARKER)
 }
 
+/// Direct rule argument prefix for permanent OUTPUT chain operations.
+fn direct_args(verb: &str, family: &str) -> Vec<String> {
+    ["--permanent", "--direct", verb, family, "filter", "OUTPUT"]
+        .iter()
+        .map(|a| a.to_string())
+        .collect()
+}
+
+/// Removal batches for every Neutron-tagged rule across all families.
+fn marked_removal_batches() -> AppResult<Vec<Vec<String>>> {
+    let mut batches = Vec::new();
+    for family in FAMILIES {
+        batches.extend(parse_marked_removals(family, &read_marked_rules(family)?));
+    }
+    Ok(batches)
+}
+
 /// Parse `--get-rules` output (a newline-separated list of `<priority> <args>`)
-/// into a `--remove-rule` batch for each Zento-tagged rule. Untagged (foreign)
+/// into a `--remove-rule` batch for each Neutron-tagged rule. Untagged (foreign)
 /// rules are skipped so user-defined direct rules are preserved.
 fn parse_marked_removals(family: &str, listing: &str) -> Vec<Vec<String>> {
     listing
@@ -298,15 +303,8 @@ fn parse_marked_removals(family: &str, listing: &str) -> Vec<Vec<String>> {
             // The first field is the rule priority; the rest are the iptables
             // args, fed back verbatim so `--remove-rule` matches exactly.
             let priority = tokens.next()?;
-            let mut batch = vec![
-                "--permanent".to_string(),
-                "--direct".to_string(),
-                "--remove-rule".to_string(),
-                family.to_string(),
-                "filter".to_string(),
-                "OUTPUT".to_string(),
-                priority.to_string(),
-            ];
+            let mut batch = direct_args("--remove-rule", family);
+            batch.push(priority.to_string());
             batch.extend(tokens.map(|token| token.to_string()));
             Some(batch)
         })
@@ -379,44 +377,16 @@ fn local_network_batches(family: &str) -> Vec<Vec<String>> {
 /// the name can resolve.
 fn endpoint_rule(family: &str, endpoint: &Endpoint) -> Option<Vec<String>> {
     let port = endpoint.port.to_string();
-    match endpoint.host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(_)) if family == "ipv4" => Some(add_rule(
-            family,
-            1,
-            &[
-                "-p",
-                "udp",
-                "-d",
-                &endpoint.host,
-                "--dport",
-                &port,
-                "-j",
-                "ACCEPT",
-            ],
-        )),
-        Ok(IpAddr::V6(_)) if family == "ipv6" => Some(add_rule(
-            family,
-            1,
-            &[
-                "-p",
-                "udp",
-                "-d",
-                &endpoint.host,
-                "--dport",
-                &port,
-                "-j",
-                "ACCEPT",
-            ],
-        )),
-        // IP literal for the other family: nothing to add here.
-        Ok(_) => None,
-        // Hostname: allow the handshake port in every family.
-        Err(_) => Some(add_rule(
-            family,
-            1,
-            &["-p", "udp", "--dport", &port, "-j", "ACCEPT"],
-        )),
-    }
+    let host_args = match endpoint.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) if family != "ipv4" => return None,
+        Ok(IpAddr::V6(_)) if family != "ipv6" => return None,
+        Ok(_) => vec!["-d", endpoint.host.as_str()],
+        Err(_) => Vec::new(),
+    };
+    let mut rule = vec!["-p", "udp"];
+    rule.extend(host_args);
+    rule.extend(["--dport", port.as_str(), "-j", "ACCEPT"]);
+    Some(add_rule(family, 1, &rule))
 }
 
 /// Build a permanent `--direct --add-rule <family> filter OUTPUT <priority>
@@ -427,15 +397,8 @@ fn endpoint_rule(family: &str, endpoint: &Endpoint) -> Option<Vec<String>> {
 /// identifiable and can be removed surgically at teardown without disturbing
 /// foreign direct rules. Each `rule` therefore must end with `-j <target>`.
 fn add_rule(family: &str, priority: u8, rule: &[&str]) -> Vec<String> {
-    let mut batch = vec![
-        "--permanent".to_string(),
-        "--direct".to_string(),
-        "--add-rule".to_string(),
-        family.to_string(),
-        "filter".to_string(),
-        "OUTPUT".to_string(),
-        priority.to_string(),
-    ];
+    let mut batch = direct_args("--add-rule", family);
+    batch.push(priority.to_string());
     let jump_at = rule.len().saturating_sub(2);
     batch.extend(rule[..jump_at].iter().map(|arg| arg.to_string()));
     batch.extend(MARKER_ARGS.iter().map(|arg| arg.to_string()));
@@ -448,17 +411,7 @@ fn add_rule(family: &str, priority: u8, rule: &[&str]) -> Vec<String> {
 /// `--direct` action lockdown issues: it reads the chain so teardown can target
 /// our own rules individually; it never clears the chain wholesale.
 fn get_rules_batch(family: &str) -> Vec<String> {
-    [
-        "--permanent",
-        "--direct",
-        "--get-rules",
-        family,
-        "filter",
-        "OUTPUT",
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect()
+    direct_args("--get-rules", family)
 }
 
 fn reload_batch() -> Vec<String> {
@@ -499,7 +452,8 @@ mod tests {
     /// OUTPUT` (6 tokens). Lets tests feed what we *installed* straight back
     /// into the teardown parser to prove the round-trip.
     fn as_get_rules_line(add_batch: &[String]) -> String {
-        add_batch[6..].join(" ")
+        let prefix_len = direct_args("--add-rule", "ipv4").len();
+        add_batch[prefix_len..].join(" ")
     }
 
     /// The removal batch that must result from tearing down `add_batch`: the
@@ -660,8 +614,8 @@ mod tests {
         // A `--get-rules` listing mixing a user's own rule with two of ours.
         let listing = "\
 0 -o eth0 -j DROP
-0 -o lo -m comment --comment zento-lockdown -j ACCEPT
-10 -m comment --comment zento-lockdown -j REJECT
+0 -o lo -m comment --comment neutron-lockdown -j ACCEPT
+10 -m comment --comment neutron-lockdown -j REJECT
 ";
         let removals = parse_marked_removals("ipv4", listing);
 
@@ -683,7 +637,7 @@ mod tests {
     fn parse_marked_removals_round_trips_priority_and_args() {
         // The removal must mirror `--get-rules` output verbatim: priority slot
         // followed by the exact iptables args, so `--remove-rule` matches.
-        let listing = "10 -m comment --comment zento-lockdown -j REJECT\n";
+        let listing = "10 -m comment --comment neutron-lockdown -j REJECT\n";
 
         let removals = parse_marked_removals("ipv6", listing);
 
@@ -744,14 +698,16 @@ mod tests {
     fn line_is_marked_requires_an_exact_marker_token() {
         // Ours: carries the marker as a standalone token.
         assert!(line_is_marked(
-            "0 -o lo -m comment --comment zento-lockdown -j ACCEPT"
+            "0 -o lo -m comment --comment neutron-lockdown -j ACCEPT"
         ));
         // Foreign with no marker at all.
         assert!(!line_is_marked("0 -o eth0 -j DROP"));
         // A comment that only *contains* the marker as a substring is not ours;
         // matching whole tokens stops us from removing a foreign look-alike.
-        assert!(!line_is_marked("0 --comment zento-lockdown-custom -j DROP"));
-        assert!(!line_is_marked("0 --comment not-zento-lockdown -j DROP"));
+        assert!(!line_is_marked(
+            "0 --comment neutron-lockdown-custom -j DROP"
+        ));
+        assert!(!line_is_marked("0 --comment not-neutron-lockdown -j DROP"));
     }
 
     #[test]
@@ -761,7 +717,7 @@ mod tests {
         // presence of a `--comment`.
         let listing = "\
 0 -o lo -m comment --comment other-app -j ACCEPT
-10 -m comment --comment zento-lockdown -j REJECT
+10 -m comment --comment neutron-lockdown -j REJECT
 ";
         let removals = parse_marked_removals("ipv4", listing);
 
@@ -780,8 +736,8 @@ mod tests {
         // (`--remove-rule`), never the chain-wide `--remove-rules` that would
         // drop foreign rules along with ours.
         let listing = "\
-0 -o lo -m comment --comment zento-lockdown -j ACCEPT
-10 -m comment --comment zento-lockdown -j REJECT
+0 -o lo -m comment --comment neutron-lockdown -j ACCEPT
+10 -m comment --comment neutron-lockdown -j REJECT
 ";
         let removals = parse_marked_removals("ipv4", listing);
 
