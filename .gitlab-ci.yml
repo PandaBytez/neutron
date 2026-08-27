@@ -37,19 +37,22 @@ test:
   script:
     - cargo test --all
 
-flatpak:
+appimage:
   stage: build
-  image: 'quay.io/gnome_infrastructure/gnome-runtime-images:gnome-49'
+  image: ubuntu:24.04
   variables:
-    MANIFEST_PATH: "flatpak/io.gitlab.zento_vpn_manager.zento.json"
-    FLATPAK_MODULE: "zento"
-    APP_ID: "io.gitlab.zento_vpn_manager.zento"
-    BUNDLE: "zento.flatpak"
+    DEBIAN_FRONTEND: noninteractive
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends
+        curl ca-certificates file build-essential pkg-config git
+        libgtk-4-dev libadwaita-1-dev
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    - export PATH="$HOME/.cargo/bin:$PATH"
   script:
-    - flatpak-builder --user --force-clean --repo=repo build-dir ${MANIFEST_PATH}
-    - flatpak build-bundle repo ${BUNDLE} ${APP_ID}
+    - chmod +x appimage/build-appimage.sh
+    - ./appimage/build-appimage.sh
   artifacts:
-    name: "flatpak-bundle"
+    name: "appimage-bundle"
     paths:
-      - ${BUNDLE}
+      - "*.AppImage"
     expire_in: 1 week

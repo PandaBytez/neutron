@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+# Resolve the directory where the AppImage is mounted
+HERE="$(dirname "$(readlink -f "${0}")")"
+export APPDIR="${HERE}"
+export PATH="${APPDIR}/usr/bin:${PATH}"
+export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# Desktop/icon integration into ~/.local/share is done by the binary itself on
+# every GUI launch (see `ensure_desktop_integration`), so it stays in one place
+# and works for a plain `cargo run` too.
+
+# Run the application binary
+# If no arguments are provided, default to launching the GUI
+if [ $# -eq 0 ]; then
+    exec "${APPDIR}/usr/bin/neutron-vpn" gui
+else
+    exec "${APPDIR}/usr/bin/neutron-vpn" "$@"
+fi
+
+# Run the application binary
+# If no arguments are provided, default to launching the GUI
+if [ $# -eq 0 ]; then
+    exec "${APPDIR}/usr/bin/neutron-vpn" gui
+else
+    exec "${APPDIR}/usr/bin/neutron-vpn" "$@"
+fi
