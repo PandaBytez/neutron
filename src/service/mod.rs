@@ -5,7 +5,9 @@ use tracing::warn;
 
 use crate::config;
 use crate::error::{AppError, AppResult};
-use crate::nm::NmClient;
+use crate::nm::{NmClient, WireguardProfile};
+
+pub mod autostart;
 
 pub enum StartupRandomResult {
     Connected(String),
@@ -24,21 +26,23 @@ pub fn run_startup_random_with_path<C: NmClient>(
     run_startup_random_with_selector(client, path, |len| rand::rng().random_range(0..len))
 }
 
-/// Disable NetworkManager's `connection.autoconnect` flag on every WireGuard
-/// profile.
+/// Stop NetworkManager from activating any WireGuard profile on its own.
 ///
-/// NetworkManager defaults the flag to `yes`, and because each WireGuard
-/// profile is its own interface they never compete for a device -- so left
-/// alone, NM activates *every* profile at boot. Neutron owns activation
-/// (explicit user action or the startup-random selector), so the flag must stay
-/// off on all managed profiles.
+/// The app is the single authority on which tunnel is up. NetworkManager
+/// defaults `connection.autoconnect` to `yes`, and because each WireGuard
+/// profile is its own interface they never compete for a device -- left alone,
+/// NM activates *every* profile at boot.
 ///
-/// Best-effort by design: this normalizes shared state that is not the caller's
-/// primary job, so failures are logged instead of propagated. Callers must
-/// still work on a system where the flag could not be cleared.
-pub fn normalize_autoconnect<C: NmClient>(client: &C) {
+/// Selecting a profile by arming one with `autoconnect` was tried and removed:
+/// it made NM a second activation authority that could not see what the app had
+/// already connected, so an armed profile would come up *alongside* the active
+/// one. Activation is now always an explicit `connection up` issued here.
+///
+/// Best-effort: failures are logged, since callers must still work on a system
+/// where the flag could not be cleared.
+fn normalize_autoconnect<C: NmClient>(client: &C) {
     if let Err(error) = client.set_autoconnect_all(false) {
-        warn!("failed to normalize autoconnect settings: {error}");
+        warn!("failed to disable NetworkManager autoconnect: {error}");
     }
 }
 
@@ -56,12 +60,14 @@ where
     let profiles = client.list_wireguard_profiles()?;
 
     // Re-applied on every run so profiles imported out-of-band (via GNOME or
-    // `nmcli`, which default autoconnect to on) are normalized too.
+    // `nmcli`, which default autoconnect to on) cannot bring themselves up.
     normalize_autoconnect(client);
 
     let active_profiles: Vec<_> = profiles.iter().filter(|p| p.is_active()).collect();
 
-    // If exactly one profile is active and it is eligible, leave it untouched.
+    // If exactly one profile is active and it is eligible, leave it untouched:
+    // a tunnel that is already up is a deliberate connection, and replacing it
+    // would drop traffic to prove a point.
     if active_profiles.len() == 1
         && !app_cfg
             .excluded_profile_ids
@@ -82,26 +88,7 @@ where
         }
     }
 
-    let eligible: Vec<_> = profiles
-        .iter()
-        .filter(|profile| !app_cfg.excluded_profile_ids.contains(&profile.uuid))
-        .collect();
-
-    if eligible.is_empty() {
-        return Err(AppError::NoEligibleProfile);
-    }
-
-    // Partition eligible profiles into primary (not used last time) and fallback (used last time).
-    let (mut primary, fallback): (Vec<_>, Vec<_>) = eligible
-        .into_iter()
-        .partition(|p| app_cfg.last_random_profile_id.as_ref() != Some(&p.uuid));
-
-    // Primary candidates in random order, then the fallback (last-used) profiles.
-    let mut candidates = Vec::with_capacity(primary.len() + fallback.len());
-    while !primary.is_empty() {
-        candidates.push(primary.remove(select_index(primary.len())));
-    }
-    candidates.extend(fallback);
+    let candidates = ordered_candidates(&profiles, &app_cfg, &mut select_index)?;
 
     let mut last_connect_error = None;
     for selected in candidates {
@@ -128,6 +115,115 @@ where
     }
 
     Err(last_connect_error.unwrap_or(AppError::NoEligibleProfile))
+}
+
+/// Eligible profiles in the order they should be tried: the ones not used last
+/// time first, in random order, then the last-used profile as a fallback.
+///
+/// Preferring anything over `last_random_profile_id` is what makes the choice
+/// *rotate* between runs instead of landing on the same profile repeatedly.
+///
+/// Returns [`AppError::NoEligibleProfile`] when every profile is excluded.
+fn ordered_candidates<'a, F>(
+    profiles: &'a [WireguardProfile],
+    app_cfg: &config::AppConfig,
+    mut select_index: F,
+) -> AppResult<Vec<&'a WireguardProfile>>
+where
+    F: FnMut(usize) -> usize,
+{
+    let eligible: Vec<_> = profiles
+        .iter()
+        .filter(|profile| !app_cfg.excluded_profile_ids.contains(&profile.uuid))
+        .collect();
+
+    if eligible.is_empty() {
+        return Err(AppError::NoEligibleProfile);
+    }
+
+    let (mut primary, fallback): (Vec<_>, Vec<_>) = eligible
+        .into_iter()
+        .partition(|p| app_cfg.last_random_profile_id.as_ref() != Some(&p.uuid));
+
+    let mut candidates = Vec::with_capacity(primary.len() + fallback.len());
+    while !primary.is_empty() {
+        candidates.push(primary.remove(select_index(primary.len())));
+    }
+    candidates.extend(fallback);
+    Ok(candidates)
+}
+
+/// Turn "connect a random profile at login" on or off, and persist the choice.
+///
+/// Enabling installs the autostart entry that relaunches the app hidden at
+/// login; that launch is what performs the connection. Disabling removes it.
+/// Neither direction disturbs a tunnel that is already up -- an active profile
+/// is a deliberate connection, and toggling a preference is not a request to
+/// drop traffic.
+pub fn set_autoconnect_at_login<C: NmClient>(
+    client: &C,
+    path: &Path,
+    enable: bool,
+) -> AppResult<()> {
+    set_autoconnect_at_login_in(client, path, &autostart::dir()?, enable)
+}
+
+fn set_autoconnect_at_login_in<C: NmClient>(
+    client: &C,
+    path: &Path,
+    autostart_dir: &Path,
+    enable: bool,
+) -> AppResult<()> {
+    // NetworkManager must never activate a profile by itself in either state:
+    // the app is the only thing allowed to decide which tunnel is up.
+    client.set_autoconnect_all(false)?;
+
+    if enable {
+        autostart::install_in(autostart_dir)?;
+    } else {
+        autostart::uninstall_in(autostart_dir)?;
+    }
+
+    // Persist last: the caller reverts its switch when this errors, so saving
+    // before the work could leave the stored state disagreeing with the UI.
+    let mut app_cfg = config::load(path)?;
+    app_cfg.autoconnect_at_boot = enable;
+    config::save(path, &app_cfg)
+}
+
+/// Connect one random eligible profile, if the feature is enabled.
+///
+/// This is the whole auto-connect mechanism: the autostart entry relaunches the
+/// app at login and this runs immediately, issuing a direct `connection up`.
+/// NetworkManager is never asked to choose -- it only ever activates what it is
+/// explicitly told to, which is what keeps the app the single authority over
+/// which tunnel is up.
+///
+/// Does nothing but disable NetworkManager autoconnect when the feature is off,
+/// and leaves an already-connected profile alone.
+///
+/// Returns the name of the profile connected, or `None` when nothing was.
+pub fn startup_connect<C: NmClient>(client: &C, path: &Path) -> AppResult<Option<String>> {
+    let app_cfg = config::load(path)?;
+
+    if !app_cfg.autoconnect_at_boot {
+        normalize_autoconnect(client);
+        return Ok(None);
+    }
+
+    match run_startup_random_with_path(client, path)? {
+        StartupRandomResult::Connected(name) => Ok(Some(name)),
+        StartupRandomResult::SkippedAlreadyActive => Ok(None),
+    }
+}
+
+/// Keep NetworkManager passive without touching connections.
+///
+/// Used on ordinary app starts and after the profile set changes, so a profile
+/// that arrived carrying NetworkManager's `autoconnect=yes` default (a fresh
+/// import, or one added through GNOME Settings) cannot bring itself up.
+pub fn disable_nm_autoconnect<C: NmClient>(client: &C) {
+    normalize_autoconnect(client);
 }
 
 #[cfg(test)]
@@ -300,34 +396,30 @@ mod tests {
         run_startup_random_with_path(&client, &config_path)
             .expect("startup random should select profile");
 
-        // NetworkManager autoconnect is disabled across all profiles so it never
-        // brings them up itself at boot -- the whole point of the selector.
+        // NetworkManager is left unable to activate anything by itself; the
+        // app issued the one activation explicitly.
         assert_eq!(
             client.autoconnect_calls(),
             vec!["autoconnect-all:off".to_string()]
         );
+        assert_eq!(client.connected_profiles(), vec!["uuid-1".to_string()]);
         cleanup_test_artifacts(&config_path);
     }
 
     #[test]
-    fn still_connects_when_disabling_autoconnect_fails() {
-        // Normalizing autoconnect is best-effort: it touches shared state that
-        // is not the selector's primary job, so a rejection from NetworkManager
-        // must not stop the boot-time profile from coming up.
+    fn still_connects_when_arming_fails() {
+        // Arming sets up the *next* boot; it is incidental to connecting now,
+        // so a rejection from NetworkManager must not fail the connection.
         let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)])
             .fail_autoconnect();
         let config_path = unique_test_config_path();
         write_config(&config_path, AppConfig::default());
 
         let selected = run_startup_random_with_path(&client, &config_path)
-            .expect("a failed autoconnect normalization must not abort selection");
+            .expect("a failed arming must not abort selection");
 
         assert!(matches!(selected, StartupRandomResult::Connected(_)));
-        assert_eq!(
-            client.autoconnect_calls(),
-            vec!["autoconnect-all:off".to_string()],
-            "the attempt should still be made"
-        );
+        assert_eq!(client.connected_profiles(), vec!["uuid-1".to_string()]);
         cleanup_test_artifacts(&config_path);
     }
 
@@ -424,9 +516,10 @@ mod tests {
     }
 
     #[test]
-    fn skips_but_still_disables_autoconnect_when_one_active() {
-        // A single active profile is a deliberate connection: leave it alone,
-        // but autoconnect is still normalized so the next boot stays clean.
+    fn skips_the_active_profile_when_one_is_connected() {
+        // A single active profile is a deliberate connection: leave it up.
+        // Autoconnect is still cleared, which is the repair path for a profile
+        // set that carries NetworkManager's `autoconnect=yes` default.
         let client = MockNmClient::new(vec![
             profile("wg-us", "uuid-1", ProfileState::Active),
             profile("wg-eu", "uuid-2", ProfileState::Inactive),
@@ -447,6 +540,130 @@ mod tests {
         // connected.
         assert!(!client.calls().iter().any(|call| call == "disconnect"));
         assert!(client.connected_profiles().is_empty());
+    }
+
+    #[test]
+    fn connect_at_boot_defaults_to_on_for_a_fresh_install() {
+        // No config file at all: the app's headline feature must be active out
+        // of the box rather than silently disabled by a derived `false`.
+        let config_path = unique_test_config_path();
+
+        let app_cfg = config::load(&config_path).expect("a missing config should load defaults");
+
+        assert!(app_cfg.autoconnect_at_boot);
+    }
+
+    #[test]
+    fn startup_connect_connects_one_profile_when_enabled() {
+        // The whole auto-connect mechanism: a direct `connection up`, chosen by
+        // the app. NetworkManager is only told to stop activating things itself.
+        let client = MockNmClient::new(vec![
+            profile("wg-us", "uuid-1", ProfileState::Inactive),
+            profile("wg-eu", "uuid-2", ProfileState::Inactive),
+        ]);
+        let config_path = unique_test_config_path();
+        write_config(&config_path, AppConfig::default());
+
+        let connected = startup_connect(&client, &config_path).expect("startup connect should run");
+
+        assert!(connected.is_some());
+        assert_eq!(
+            client.connected_profiles().len(),
+            1,
+            "exactly one profile may be brought up"
+        );
+        assert_eq!(
+            client.autoconnect_calls(),
+            vec!["autoconnect-all:off".to_string()],
+            "NetworkManager must never activate a profile by itself"
+        );
+        cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn startup_connect_does_nothing_but_disable_autoconnect_when_off() {
+        let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)]);
+        let config_path = unique_test_config_path();
+        write_config(
+            &config_path,
+            AppConfig {
+                autoconnect_at_boot: false,
+                ..AppConfig::default()
+            },
+        );
+
+        let connected = startup_connect(&client, &config_path).expect("startup connect should run");
+
+        assert!(connected.is_none());
+        assert!(
+            client.connected_profiles().is_empty(),
+            "nothing may be connected while the feature is off"
+        );
+        assert_eq!(
+            client.autoconnect_calls(),
+            vec!["autoconnect-all:off".to_string()]
+        );
+        cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn startup_connect_leaves_an_already_connected_profile_alone() {
+        // Relaunching must not drop a tunnel that is already up, and must not
+        // add a second one alongside it.
+        let client = MockNmClient::new(vec![
+            profile("wg-us", "uuid-1", ProfileState::Active),
+            profile("wg-eu", "uuid-2", ProfileState::Inactive),
+        ]);
+        let config_path = unique_test_config_path();
+        write_config(&config_path, AppConfig::default());
+
+        let connected = startup_connect(&client, &config_path).expect("startup connect should run");
+
+        assert!(connected.is_none());
+        assert!(client.connected_profiles().is_empty());
+        assert!(!client.calls().iter().any(|call| call == "disconnect"));
+        cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn toggling_auto_connect_installs_and_removes_the_autostart_entry() {
+        let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)]);
+        let config_path = unique_test_config_path();
+        let autostart_dir = autostart_test_dir();
+        write_config(&config_path, AppConfig::default());
+
+        set_autoconnect_at_login_in(&client, &config_path, &autostart_dir, true)
+            .expect("enabling should succeed");
+        assert!(autostart::is_installed_in(&autostart_dir));
+        assert!(
+            config::load(&config_path)
+                .expect("config should load")
+                .autoconnect_at_boot
+        );
+        // Toggling a preference must not activate or drop a tunnel.
+        assert!(client.connected_profiles().is_empty());
+        assert!(!client.calls().iter().any(|call| call == "disconnect"));
+
+        set_autoconnect_at_login_in(&client, &config_path, &autostart_dir, false)
+            .expect("disabling should succeed");
+        assert!(!autostart::is_installed_in(&autostart_dir));
+        assert!(
+            !config::load(&config_path)
+                .expect("config should load")
+                .autoconnect_at_boot
+        );
+
+        let _ = std::fs::remove_dir_all(&autostart_dir);
+        cleanup_test_artifacts(&config_path);
+    }
+
+    /// A throwaway autostart directory, so these tests never write into the
+    /// real `~/.config/autostart`.
+    fn autostart_test_dir() -> PathBuf {
+        crate::testing::temp_config_path("autostart")
+            .parent()
+            .expect("temp config path always has a parent")
+            .to_path_buf()
     }
 
     fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile {

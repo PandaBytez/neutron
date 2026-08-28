@@ -21,7 +21,13 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     List,
-    Gui,
+    Gui {
+        /// Start in the background with no window, showing only the tray icon.
+        /// Used by the autostart entry: this launch is what connects a random
+        /// eligible profile at login, and it has no reason to steal focus.
+        #[arg(long)]
+        hidden: bool,
+    },
     Connect {
         profile: String,
     },
@@ -89,7 +95,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
             }
             Ok(())
         }
-        Commands::Gui => crate::gui::run(client.clone()),
+        Commands::Gui { hidden } => crate::gui::run(client.clone(), hidden),
         Commands::Connect { profile } => client.connect(&profile),
         Commands::Disconnect => client.disconnect_active(),
         Commands::Switch { profile } => client.switch_to(&profile),
@@ -284,6 +290,29 @@ pub(crate) fn set_global_lockdown<C: NmClient + FirewallClient>(
     config::save(path, &app_cfg)
 }
 
+/// Rebuild the lockdown ruleset from the current profile set, if lockdown is on.
+///
+/// The allow-list pins each profile's interface and peer endpoint, so it is only
+/// correct for the profiles that existed when it was built. A profile added
+/// afterwards gets an interface with no matching rule and is blocked by the
+/// terminal REJECT -- it simply fails to connect, and because new profiles are
+/// eligible by default the startup selector can pick it and silently fall
+/// through to another. Removing a profile leaves a stale rule behind.
+///
+/// Does nothing when lockdown is off, so callers can invoke it unconditionally
+/// after the profile set changes.
+#[cfg(any(test, feature = "gui"))]
+pub(crate) fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+) -> AppResult<()> {
+    if !config::load(path)?.lockdown_enabled {
+        return Ok(());
+    }
+    let tunnels = client.wireguard_tunnels()?;
+    client.enable_lockdown(&tunnels)
+}
+
 fn resolve_profile_id(
     profiles: &[WireguardProfile],
     profile_identifier: &str,
@@ -348,7 +377,7 @@ mod tests {
     #[test]
     fn gui_command_returns_feature_unavailable_without_gui_feature() {
         let cli = Cli {
-            command: Commands::Gui,
+            command: Commands::Gui { hidden: false },
         };
 
         let result = execute(&crate::testing::MockNmClient::default(), cli);
@@ -510,6 +539,42 @@ mod tests {
         assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.lockdown_enabled);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn rebuild_lockdown_reapplies_rules_when_lockdown_is_on() {
+        // A profile imported after lockdown was enabled has no allow-rule and
+        // is blocked by the terminal REJECT, so the ruleset has to be rebuilt
+        // whenever the profile set changes.
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+
+        rebuild_lockdown_if_enabled(&client, &path).expect("rebuild should succeed");
+
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn rebuild_lockdown_does_nothing_when_lockdown_is_off() {
+        // Callers invoke this unconditionally after any profile change, so it
+        // must not install a ruleset the user never asked for.
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+
+        rebuild_lockdown_if_enabled(&client, &path).expect("rebuild should succeed");
+
+        assert!(client.lockdown_calls().is_empty());
         cleanup_test_config(&path);
     }
 

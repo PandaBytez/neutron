@@ -1,11 +1,32 @@
 [Unit]
 Description=Neutron VPN startup random profile selector
 Documentation=https://gitlab.com/neutron-vpn/neutron
-After=network-online.target
-Wants=network-online.target
+
+# OPTIONAL. Boot-time connection does not need this unit: the app arms exactly
+# one profile with `connection.autoconnect`, and NetworkManager brings it up at
+# boot on its own. Install this only to re-randomize at every login rather than
+# every time the app runs.
+#
+# NOTE: no `After=network-online.target`. That target exists only in the system
+# manager, not the per-user one, so ordering against it here is a dangling
+# reference that silently does nothing -- the selector would race WiFi
+# association and fail every candidate. `nm-online` below is the user-session
+# equivalent that actually works.
 
 [Service]
 Type=oneshot
+
+# Block until NetworkManager reports startup connections are settled. Without
+# this the selector runs before WiFi associates and burns through every
+# candidate profile (each `nmcli connection up` waits out its own timeout).
+# `-s` waits for startup completion rather than mere carrier presence.
+# Non-fatal: `-` prefix means a timeout still lets the selector try, since an
+# already-online system reports instantly and a slow one may still succeed.
+ExecStartPre=-/usr/bin/nm-online -s -q --timeout=60
+
+# Set to wherever the binary lives. `%h/.local/bin/neutron-vpn` suits
+# `cargo install --root "$HOME/.local"`; an AppImage install needs its own
+# absolute path (the AppRun entrypoint forwards arguments through).
 ExecStart=%h/.local/bin/neutron-vpn startup-random
 
 [Install]

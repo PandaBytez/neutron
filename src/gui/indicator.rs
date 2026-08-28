@@ -14,18 +14,27 @@ use crate::nm::NmClient;
 /// These are shipped by the app rather than taken from the icon theme: the
 /// point is the green/red state colour, and a `-symbolic` theme icon would be
 /// recoloured to the panel foreground and lose exactly that signal. They are
-/// installed into the user icon theme at startup (`install_status_icons`)
-/// because StatusNotifierItem transports only an icon *name*.
+/// installed into the user icon theme at startup (`install_status_icons`) so
+/// the names resolve for anything that reads the theme. The tray itself sends
+/// the artwork as a pixmap instead -- see `IconName` in the property handler.
 pub const ICON_CONNECTED: &str = "neutron-vpn-connected";
 pub const ICON_DISCONNECTED: &str = "neutron-vpn-disconnected";
 
-/// The tray icon for the current connection state.
-fn status_icon(connected: bool) -> &'static str {
-    if connected {
-        ICON_CONNECTED
-    } else {
-        ICON_DISCONNECTED
-    }
+/// Icon theme base directory advertised to the tray host, i.e. the directory
+/// `install_status_icons` writes into (`~/.local/share/icons`).
+///
+/// `IconName` is resolved by the *host* (GNOME Shell), not by this process, and
+/// the host loaded its icon theme long before this app first ran. Leaving this
+/// empty left the host resolving `neutron-vpn-connected` against whatever it
+/// happened to already know about, which is why the tray fell back to a
+/// placeholder even though the files were installed and resolvable here.
+///
+/// Returns an empty string when the data directory cannot be determined; the
+/// property is optional, and hosts fall back to `IconPixmap`.
+fn icon_theme_path() -> String {
+    dirs::data_dir()
+        .map(|dir| dir.join("icons").to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Artwork for the tray shields, embedded so the pixmap never depends on what
@@ -336,10 +345,18 @@ impl AppIndicator {
                             "Title" => "Neutron VPN".to_variant(),
                             "Status" => "Active".to_variant(),
                             "WindowId" => 0i32.to_variant(),
-                            "IconThemePath" => "".to_variant(),
+                            "IconThemePath" => icon_theme_path().to_variant(),
                             "ItemIsMenu" => false.to_variant(),
                             "Menu" => Variant::parse(None, "objectpath '/MenuBar'").unwrap(),
-                            "IconName" => status_icon(is_conn).to_variant(),
+                            // Deliberately empty so the host uses `IconPixmap`.
+                            // A non-empty `IconName` takes precedence per the
+                            // spec, and GNOME's appindicator support failed to
+                            // resolve ours -- showing a placeholder rather than
+                            // falling back -- even with `IconThemePath` set and
+                            // the icons installed and resolvable by GTK. The
+                            // pixmap is embedded in the binary, so it renders
+                            // without depending on the host's icon theme at all.
+                            "IconName" => "".to_variant(),
                             "IconPixmap" => icon_pixmap(is_conn),
                             "OverlayIconName" => "".to_variant(),
                             "OverlayIconPixmap" => Vec::<(i32, i32, Vec<u8>)>::new().to_variant(),
@@ -359,13 +376,10 @@ impl AppIndicator {
                                     "Disconnected".to_string()
                                 };
                                 let empty_pixmap = Vec::<(i32, i32, Vec<u8>)>::new();
-                                (
-                                    status_icon(is_conn),
-                                    empty_pixmap,
-                                    "Neutron VPN",
-                                    sub.as_str(),
-                                )
-                                    .to_variant()
+                                // Icon name left empty here for the same reason
+                                // as `IconName` above; the tooltip title and
+                                // body carry the state.
+                                ("", empty_pixmap, "Neutron VPN", sub.as_str()).to_variant()
                             }
                             _ => "".to_variant(),
                         }
@@ -597,6 +611,20 @@ impl AppIndicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_theme_path_points_at_the_directory_the_icons_are_installed_into() {
+        // Must match `install_status_icons`, which writes into
+        // `<data_dir>/icons/hicolor/...`. A mismatch here leaves the tray host
+        // unable to resolve the icon name and falling back to a placeholder.
+        let path = icon_theme_path();
+
+        assert!(path.ends_with("icons"), "{path}");
+        assert!(
+            !path.is_empty(),
+            "a data directory should be available in tests"
+        );
+    }
 
     #[test]
     fn converts_bgra_to_network_order_argb() {

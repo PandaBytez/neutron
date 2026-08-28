@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Profiles explicitly excluded from startup-random selection. An empty set
     /// means every WireGuard profile is eligible (opt-out model): profiles are
@@ -33,9 +33,44 @@ pub struct AppConfig {
     /// Last window height remembered between sessions (`None` until first save).
     #[serde(default)]
     pub window_height: Option<i32>,
+    /// Whether a random eligible profile should be connected automatically at
+    /// boot.
+    ///
+    /// When on, exactly one profile carries NetworkManager's
+    /// `connection.autoconnect` so NM brings it up at boot (before login, with
+    /// no helper process), and an autostart entry re-rolls which profile is
+    /// armed at each login. When off, no profile is armed and the autostart
+    /// entry is removed.
+    ///
+    /// Defaults to on: the app's stated purpose is a random profile per boot,
+    /// and a fresh install with no config file should do that.
+    #[serde(default = "default_true")]
+    pub autoconnect_at_boot: bool,
     /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
     #[serde(default)]
     pub profile_custom_info: std::collections::BTreeMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// Hand-written rather than derived: `#[derive(Default)]` would make
+// `autoconnect_at_boot` false, and `load` returns this value when no config file
+// exists -- silently disabling the app's headline feature on a fresh install.
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            excluded_profile_ids: BTreeSet::new(),
+            last_random_profile_id: None,
+            kill_switch_enabled: false,
+            lockdown_enabled: false,
+            window_width: None,
+            window_height: None,
+            autoconnect_at_boot: default_true(),
+            profile_custom_info: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 pub fn load(path: &Path) -> AppResult<AppConfig> {

@@ -63,27 +63,34 @@ mod enabled {
         indicator: Rc<RefCell<Option<AppIndicator>>>,
     }
 
-    pub fn run<C>(client: C) -> AppResult<()>
+    pub fn run<C>(client: C, hidden: bool) -> AppResult<()>
     where
         C: NmClient + FirewallClient + Clone + Send + 'static,
     {
-        // Clear NetworkManager's autoconnect flag on every profile at startup,
-        // not just inside the startup-random selector. The selector only runs
-        // from the optional systemd unit, which nothing installs automatically;
-        // without this, profiles keep NM's `autoconnect=yes` default and all of
-        // them come up together at the next boot.
+        // NetworkManager must never activate a profile on its own -- the app is
+        // the only authority on which tunnel is up. An autostarted launch (the
+        // `--hidden` entry written by the autoconnect toggle) additionally
+        // connects one random eligible profile, which is the whole auto-connect
+        // mechanism. A manual launch deliberately does not: reconnecting a
+        // tunnel the user just disconnected, merely because they opened the
+        // window, would be surprising.
         //
-        // Off the main thread: this is one `nmcli` call per profile and must not
-        // delay the first frame. It only rewrites persisted settings, never
-        // activation state, so it cannot race the UI.
-        let normalize_client = client.clone();
-        std::thread::spawn(move || service::normalize_autoconnect(&normalize_client));
+        // Off the main thread: this shells out to `nmcli` once per profile and
+        // may wait on a handshake, neither of which may block the first frame.
+        let startup_client = client.clone();
+        thread::spawn(move || {
+            if hidden {
+                startup_connect_logged(&startup_client);
+            } else {
+                service::disable_nm_autoconnect(&startup_client);
+            }
+        });
 
         let app = Application::builder()
             .application_id("io.gitlab.neutron_vpn.neutron")
             .build();
 
-        app.connect_activate(move |app| build_ui(app, client.clone()));
+        app.connect_activate(move |app| build_ui(app, client.clone(), hidden));
 
         // Launch GTK with only the program name. Forwarding the CLI subcommand
         // (e.g. `gui`) would make GApplication treat it as a file argument and
@@ -91,6 +98,35 @@ mod enabled {
         let program = std::env::args().next().unwrap_or_default();
         app.run_with_args(&[program]);
         Ok(())
+    }
+
+    /// Re-apply state that depends on which profiles exist, after the set
+    /// changed. Logs rather than propagating: it is incidental to the
+    /// import/delete the user actually asked for.
+    fn profile_set_changed<C>(client: &C)
+    where
+        C: NmClient + FirewallClient,
+    {
+        let outcome = config::default_config_path()
+            .and_then(|path| crate::app::rebuild_lockdown_if_enabled(client, &path));
+        if let Err(error) = outcome {
+            tracing::warn!("failed to rebuild the lockdown allow-list: {error}");
+        }
+    }
+
+    /// Connect one random eligible profile at an autostarted launch, logging
+    /// rather than propagating.
+    ///
+    /// Best-effort by design: nothing is waiting on the result, and a failure
+    /// to auto-connect must not stop the app from starting.
+    fn startup_connect_logged<C: NmClient>(client: &C) {
+        let outcome =
+            config::default_config_path().and_then(|path| service::startup_connect(client, &path));
+        match outcome {
+            Ok(Some(name)) => tracing::info!("auto-connected '{name}' at startup"),
+            Ok(None) => tracing::info!("nothing to auto-connect at startup"),
+            Err(error) => tracing::warn!("failed to auto-connect at startup: {error}"),
+        }
     }
 
     /// Install the icon and desktop entry into the user's data directory so the
@@ -325,7 +361,7 @@ mod enabled {
             .status();
     }
 
-    fn build_ui<C>(app: &Application, client: C)
+    fn build_ui<C>(app: &Application, client: C, hidden: bool)
     where
         C: NmClient + FirewallClient + Clone + Send + 'static,
     {
@@ -491,6 +527,7 @@ mod enabled {
 
         let kill_switch_row = build_kill_switch_row(app, &client, &status);
         let lockdown_row = build_lockdown_row(app, &client, &status);
+        let autoconnect_row = build_autoconnect_row(&client, &status);
         let import = build_import_button(&client, &list, &indicators);
 
         let container = gtk::Box::new(Orientation::Vertical, 12);
@@ -506,6 +543,7 @@ mod enabled {
 
         // Settings Section
         let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
+        settings_group.add(&autoconnect_row);
         settings_group.add(&kill_switch_row);
         settings_group.add(&lockdown_row);
         settings_group.add(&eligibility_expander);
@@ -590,7 +628,13 @@ mod enabled {
             glib::Propagation::Stop
         });
 
-        window.present();
+        // An autostarted launch exists to re-arm the next boot's profile, so it
+        // stays in the tray rather than stealing focus at login. The window is
+        // fully built either way: the tray menu can raise it on demand, exactly
+        // as it does after the user closes it.
+        if !hidden {
+            window.present();
+        }
     }
 
     /// Build the main application window.
@@ -791,11 +835,17 @@ mod enabled {
         row
     }
 
+    /// Read a boolean setting, falling back to [`config::AppConfig::default`]
+    /// when the config cannot be read.
+    ///
+    /// Falling back to the struct default rather than a hardcoded `false`
+    /// matters for settings that default to *on*: a corrupt config would
+    /// otherwise render their switch off and misreport the real state.
     fn load_flag(pick: impl Fn(&config::AppConfig) -> bool) -> bool {
-        config::default_config_path()
+        let app_cfg = config::default_config_path()
             .and_then(|path| config::load(&path))
-            .map(|app_cfg| pick(&app_cfg))
-            .unwrap_or(false)
+            .unwrap_or_default();
+        pick(&app_cfg)
     }
 
     fn notify(app: &Application, id: &str, title: &str, body: &str) {
@@ -869,6 +919,31 @@ mod enabled {
         )
     }
 
+    /// Build the connect-at-boot row: a switch that arms one random eligible
+    /// profile at login, by installing the autostart entry whose hidden launch
+    /// performs the connection.
+    fn build_autoconnect_row<C>(client: &C, status: &gtk::Label) -> adw::ActionRow
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let client = client.clone();
+        build_toggle_row(
+            status,
+            "Auto-Connect at Login",
+            "Connect a random eligible profile when you log in",
+            "Failed to update auto-connect",
+            load_flag(|c| c.autoconnect_at_boot),
+            move |enable| apply_autoconnect_at_login(&client, enable),
+            || {},
+        )
+    }
+
+    /// Toggle login-time auto-connect and persist the new state to config.
+    fn apply_autoconnect_at_login<C: NmClient>(client: &C, enable: bool) -> Result<(), String> {
+        let path = config::default_config_path().map_err(|error| error.to_string())?;
+        service::set_autoconnect_at_login(client, &path, enable).map_err(|error| error.to_string())
+    }
+
     /// Restore a switch to `active` without re-triggering its async handler.
     fn revert_switch(toggle: &gtk::Switch, guard: &Rc<Cell<bool>>, active: bool) {
         guard.set(true);
@@ -928,7 +1003,7 @@ mod enabled {
         indicators: &StatusIndicators,
     ) -> gtk::Button
     where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let button = gtk::Button::with_label("Import");
         button.set_halign(gtk::Align::Start);
@@ -955,7 +1030,7 @@ mod enabled {
         list: &gtk::ListBox,
         indicators: &StatusIndicators,
     ) where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let window = adw::Window::builder()
             .modal(true)
@@ -1107,7 +1182,7 @@ mod enabled {
         list: &gtk::ListBox,
         indicators: &StatusIndicators,
     ) where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let dialog = adw::MessageDialog::new(parent, Some(heading), None);
 
@@ -1158,7 +1233,7 @@ mod enabled {
         list: &gtk::ListBox,
         indicators: &StatusIndicators,
     ) where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let filter = gtk::FileFilter::new();
         filter.set_name(Some("WireGuard configuration (*.conf)"));
@@ -1232,6 +1307,14 @@ mod enabled {
                             errors.push(format!("{}: {error}", path.display()));
                         }
                     }
+                    // Freshly imported profiles default to `autoconnect=yes`.
+                    // Re-arm so exactly one profile is left set to come up at
+                    // the next boot, rather than every profile just imported.
+                    service::disable_nm_autoconnect(&task_client);
+                    // The lockdown allow-list pins each profile's interface
+                    // and endpoint, so a profile added now has no rule and
+                    // would be rejected. Rebuild it against the new set.
+                    profile_set_changed(&task_client);
                     Ok::<Vec<String>, String>(errors)
                 })
                 .await;
@@ -1399,7 +1482,7 @@ mod enabled {
     /// is available.
     fn refresh_profile_list<C>(client: &C, list: &gtk::ListBox, indicators: &StatusIndicators)
     where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let is_empty = list.first_child().is_none();
         if is_empty {
@@ -1588,7 +1671,7 @@ mod enabled {
         indicators: &StatusIndicators,
     ) -> gtk::Switch
     where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let connection_toggle = gtk::Switch::new();
         connection_toggle.set_valign(gtk::Align::Center);
@@ -1652,7 +1735,7 @@ mod enabled {
         indicators: &StatusIndicators,
     ) -> gtk::Button
     where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let remove_button = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
@@ -1698,8 +1781,16 @@ mod enabled {
                 glib::spawn_future_local(async move {
                     let task_client = client.clone();
                     let task_uuid = row.uuid.clone();
-                    let outcome =
-                        spawn_blocking_flat(move || task_client.delete_profile(&task_uuid)).await;
+                    let outcome = spawn_blocking_flat(move || {
+                        task_client.delete_profile(&task_uuid)?;
+                        // Deleting the armed profile would leave nothing set to
+                        // come up at the next boot, so pick a replacement.
+                        service::disable_nm_autoconnect(&task_client);
+                        // Drop the deleted profile's stale allow-rule.
+                        profile_set_changed(&task_client);
+                        Ok::<(), AppError>(())
+                    })
+                    .await;
                     match outcome {
                         Ok(()) => {
                             // A NAT-PMP lease expires within a minute, so renew it on a timer for as
@@ -1770,7 +1861,7 @@ mod enabled {
         indicators: &StatusIndicators,
     ) -> gtk::ListBoxRow
     where
-        C: NmClient + Clone + Send + 'static,
+        C: NmClient + FirewallClient + Clone + Send + 'static,
     {
         let header_box = gtk::Box::new(Orientation::Horizontal, 12);
         header_box.set_margin_top(8);
@@ -1916,7 +2007,7 @@ mod enabled {
 pub use enabled::run;
 
 #[cfg(not(feature = "gui"))]
-pub fn run<C: crate::nm::NmClient>(_client: C) -> crate::error::AppResult<()> {
+pub fn run<C: crate::nm::NmClient>(_client: C, _hidden: bool) -> crate::error::AppResult<()> {
     Err(crate::error::AppError::FeatureUnavailable(
         "GUI feature is disabled. Rebuild with `--features gui`.".to_string(),
     ))
