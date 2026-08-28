@@ -93,10 +93,10 @@ pub trait NmClient {
     /// NetworkManager profile and takes effect the next time it is activated.
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()>;
     /// Set NetworkManager's `connection.autoconnect` property on *every*
-    /// WireGuard profile. The startup-random selector requires autoconnect to be
-    /// disabled so NetworkManager does not activate profiles itself at boot --
-    /// otherwise every profile comes up automatically and the selector is left
-    /// nothing to do. See [`crate::nm::autoconnect`] for the rationale.
+    /// WireGuard profile. Only ever called with `false`: the app issues every
+    /// activation explicitly, so NM must never bring a profile up on its own.
+    /// Left alone, each profile carries NM's `autoconnect=yes` default and they
+    /// all activate together at boot. See [`crate::nm::autoconnect`].
     fn set_autoconnect_all(&self, enable: bool) -> AppResult<()>;
     /// Discover the interface name and peer endpoints of every WireGuard
     /// profile. Used to build the lockdown firewall allow-list so the tunnel
@@ -229,6 +229,11 @@ impl NmClient for CliNmClient {
 
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
         let profiles = self.list_wireguard_profiles()?;
+        // NOTE: unlike `set_autoconnect_all` below, this still aborts on the
+        // first failure, so later profiles keep their previous kill-switch
+        // value while the caller sees a single error. Converting it to
+        // `apply_to_every_profile` is a behavior change to a security-relevant
+        // setting and is deliberately left out of the autoconnect fix.
         for args in kill_switch_arg_batches(&profiles, enable) {
             run_nmcli_owned(&args)?;
         }
@@ -493,11 +498,35 @@ fn extract_endpoints(text: &str) -> Vec<Endpoint> {
             .chars()
             .take_while(|c| !matches!(c, ' ' | '\t' | '\n' | '\r' | ',' | ';'))
             .collect();
-        if let Some(endpoint) = parse_endpoint(&token) {
+        if let Some(endpoint) = parse_endpoint(&unescape_nmcli(&token)) {
             endpoints.push(endpoint);
         }
     }
     endpoints
+}
+
+/// Strip nmcli's backslash escaping from a terse-output field.
+///
+/// `nmcli -g` escapes its separator characters, so a peer endpoint arrives as
+/// `1.2.3.4\:51820`. Left in place, the trailing backslash on the host makes it
+/// fail to parse as an IP address, and the endpoint gets treated as a hostname
+/// -- which the firewall can only allow by destination port, opening UDP/51820
+/// to *every* host instead of pinning the VPN peer.
+fn unescape_nmcli(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // A trailing lone backslash is dropped rather than preserved: it is
+            // malformed input either way, and keeping it would break parsing.
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Parse a single `host:port` endpoint token, handling bracketed IPv6 literals
@@ -550,12 +579,16 @@ fn autoconnect_arg_batches(profiles: &[WireguardProfile], enable: bool) -> Vec<V
 /// Run one argument batch per profile, continuing past failures, then report
 /// every failure together.
 ///
-/// Aborting on the first error would leave all *later* profiles unmodified. For
-/// `connection.autoconnect` that is the difference between one profile still
-/// autoconnecting and every profile after the failure still autoconnecting --
-/// and each of those activates at the next boot, because WireGuard profiles are
-/// separate interfaces and never compete for a device. Partial success is
-/// strictly better than stopping halfway.
+/// These settings are global -- "on" means "on for every profile" -- so a sweep
+/// that aborts on the first error leaves the system silently inconsistent: the
+/// profiles after the failure keep their old value while the caller reports a
+/// single generic error. Applying to all of them and reporting the failures
+/// together is strictly more useful.
+///
+/// `connection.autoconnect` is the motivating case: giving up early leaves every
+/// later profile on NetworkManager's `autoconnect=yes` default, and each of
+/// those activates at the next boot, because WireGuard profiles are separate
+/// interfaces and never compete for a device.
 ///
 /// `run` is injected so the continue-on-failure behavior is unit-testable
 /// without invoking `nmcli`.
@@ -567,6 +600,15 @@ fn apply_to_every_profile<F>(
 where
     F: FnMut(&[String]) -> AppResult<()>,
 {
+    // Callers derive `batches` from `profiles`, so the two are the same length
+    // by construction. `zip` would silently skip the surplus otherwise, and the
+    // "N of M" count below would understate how many profiles went untouched.
+    debug_assert_eq!(
+        profiles.len(),
+        batches.len(),
+        "one argument batch is required per profile"
+    );
+
     let failures: Vec<String> = profiles
         .iter()
         .zip(batches)
@@ -581,8 +623,11 @@ where
         return Ok(());
     }
 
+    // No "failed" prefix here: `AppError::NmCommandFailed` already renders as
+    // "network manager command failed: ...", and each entry carries its own
+    // cause.
     Err(AppError::NmCommandFailed(format!(
-        "failed on {} of {} profiles: {}",
+        "{} of {} profiles rejected the change: {}",
         failures.len(),
         profiles.len(),
         failures.join("; ")
@@ -914,6 +959,40 @@ mod tests {
     }
 
     #[test]
+    fn extracts_nmcli_escaped_ip_endpoint_as_a_pinnable_literal() {
+        // Regression: `nmcli -g` escapes the port separator, so the host kept a
+        // trailing backslash, failed to parse as an IP, and was treated as a
+        // hostname -- which lockdown could only allow by port, opening
+        // UDP/51820 to every host instead of just the VPN peer.
+        let raw = "KEY= allowed-ips=0.0.0.0/0;\\:\\:/0 endpoint=79.127.154.1\\:51820 persistent-keepalive=25";
+
+        let endpoints = extract_endpoints(raw);
+
+        assert_eq!(endpoints.len(), 1, "{endpoints:?}");
+        assert_eq!(endpoints[0].host, "79.127.154.1");
+        assert_eq!(endpoints[0].port, 51820);
+        assert!(
+            endpoints[0].host.parse::<std::net::IpAddr>().is_ok(),
+            "host must parse as an IP so the firewall can pin it"
+        );
+    }
+
+    #[test]
+    fn unescape_nmcli_removes_escapes_and_keeps_plain_text() {
+        assert_eq!(unescape_nmcli("1.2.3.4\\:51820"), "1.2.3.4:51820");
+        assert_eq!(
+            unescape_nmcli("[2001\\:db8\\:\\:1]\\:51820"),
+            "[2001:db8::1]:51820"
+        );
+        assert_eq!(
+            unescape_nmcli("vpn.example.com:1194"),
+            "vpn.example.com:1194"
+        );
+        // A literal backslash arrives doubled.
+        assert_eq!(unescape_nmcli("a\\\\b"), "a\\b");
+    }
+
+    #[test]
     fn parse_endpoint_rejects_malformed_tokens() {
         // Missing port, empty host, and non-numeric port are all rejected.
         assert_eq!(parse_endpoint("1.2.3.4"), None);
@@ -1017,7 +1096,18 @@ mod tests {
         });
 
         assert_eq!(attempted, vec!["uuid-1", "uuid-2", "uuid-3"]);
-        assert!(result.is_err(), "the failure must still be reported");
+
+        let Err(AppError::NmCommandFailed(message)) = result else {
+            panic!("the failure must still be reported");
+        };
+        // Numerator and denominator differ here, so a swapped or off-by-one
+        // count cannot pass.
+        assert!(message.contains("1 of 3"), "got: {message}");
+        assert!(message.contains("wg-us"), "got: {message}");
+        assert!(
+            !message.contains("wg-eu") && !message.contains("wg-jp"),
+            "profiles that succeeded must not be listed: {message}"
+        );
     }
 
     #[test]
