@@ -8,6 +8,7 @@ use crate::error::{AppError, AppResult};
 use crate::nm::{NmClient, WireguardProfile};
 
 pub mod autostart;
+pub mod indicator;
 
 pub enum StartupRandomResult {
     Connected(String),

@@ -56,6 +56,10 @@ enum Commands {
         #[command(subcommand)]
         command: SplitTunnelCommands,
     },
+    /// Run persistent system tray AppIndicator daemon in the background
+    Indicator,
+    /// Run persistent system tray daemon (alias for indicator)
+    Daemon,
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,17 +94,22 @@ enum SplitTunnelCommands {
     Clear,
 }
 
-pub fn run<C: NmClient + FirewallClient + Clone + Send + 'static>(client: &C) -> AppResult<()> {
+pub fn run<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
+    client: &C,
+) -> AppResult<()> {
     let cli = Cli::parse();
     execute(client, cli)
 }
 
-fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
+fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
     cli: Cli,
 ) -> AppResult<()> {
     match cli.command {
         None | Some(Commands::Tui) => crate::tui::run(client.clone()),
+        Some(Commands::Indicator) | Some(Commands::Daemon) => {
+            crate::service::indicator::run_standalone_indicator(client.clone())
+        }
         Some(Commands::Sync) => {
             let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
