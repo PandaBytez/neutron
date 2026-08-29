@@ -16,6 +16,12 @@ where
     C: NmClient + FirewallClient + Clone + Send + 'static,
 {
     match state.modal {
+        ActiveModal::CommandPalette(_) => {
+            handle_command_palette_key(state, client, key)?;
+        }
+        ActiveModal::ThemePicker(_) => {
+            handle_theme_picker_key(state, key)?;
+        }
         ActiveModal::Help => handle_help_key(state, key),
         ActiveModal::ConfirmDelete { ref uuid, .. } => {
             let uuid = uuid.clone();
@@ -36,6 +42,210 @@ fn handle_help_key(state: &mut TuiState, key: KeyEvent) {
     ) {
         state.modal = ActiveModal::None;
     }
+}
+
+fn handle_command_palette_key<C>(state: &mut TuiState, client: &C, key: KeyEvent) -> AppResult<()>
+where
+    C: NmClient + FirewallClient + Clone + Send + 'static,
+{
+    let mut cp = match &state.modal {
+        ActiveModal::CommandPalette(cp) => cp.clone(),
+        _ => return Ok(()),
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            state.modal = ActiveModal::None;
+        }
+        KeyCode::Up => {
+            let filtered_len = cp.filtered_items().len();
+            if filtered_len > 0 {
+                if cp.selected_index == 0 {
+                    cp.selected_index = filtered_len - 1;
+                } else {
+                    cp.selected_index -= 1;
+                }
+            }
+            state.modal = ActiveModal::CommandPalette(cp);
+        }
+        KeyCode::Down => {
+            let filtered_len = cp.filtered_items().len();
+            if filtered_len > 0 {
+                cp.selected_index = (cp.selected_index + 1) % filtered_len;
+            }
+            state.modal = ActiveModal::CommandPalette(cp);
+        }
+        KeyCode::Backspace => {
+            cp.filter.pop();
+            cp.selected_index = 0;
+            state.modal = ActiveModal::CommandPalette(cp);
+        }
+        KeyCode::Char(c) => {
+            cp.filter.push(c);
+            cp.selected_index = 0;
+            state.modal = ActiveModal::CommandPalette(cp);
+        }
+        KeyCode::Enter => {
+            let filtered = cp.filtered_items();
+            if let Some(item) = filtered.get(cp.selected_index) {
+                let action_id = item.id;
+                state.modal = ActiveModal::None;
+                execute_palette_action(state, client, action_id)?;
+            } else {
+                state.modal = ActiveModal::None;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn execute_palette_action<C>(state: &mut TuiState, client: &C, id: &str) -> AppResult<()>
+where
+    C: NmClient + FirewallClient + Clone + Send + 'static,
+{
+    match id {
+        "theme" => {
+            state.modal = ActiveModal::ThemePicker(crate::tui::state::ThemePickerState::default());
+        }
+        "connect" => {
+            if let Some(row) = state.selected_row() {
+                let uuid = row.uuid.clone();
+                let name = row.name.clone();
+                client.switch_to(&uuid)?;
+                state.status_message = format!("Connected '{name}'.");
+                reload_profiles(state, client)?;
+            }
+        }
+        "disconnect" => {
+            client.disconnect_active()?;
+            state.status_message = "Disconnected active VPN.".to_string();
+            reload_profiles(state, client)?;
+        }
+        "switch" => {
+            if let Some(row) = state.selected_row() {
+                let uuid = row.uuid.clone();
+                let name = row.name.clone();
+                client.switch_to(&uuid)?;
+                state.status_message = format!("Switched to '{name}'.");
+                reload_profiles(state, client)?;
+            }
+        }
+        "split_tunnel" => {
+            state.modal =
+                ActiveModal::SplitTunnel(crate::tui::state::SplitTunnelModalState::from_config(
+                    &state.config.global_split_tunnel,
+                ));
+        }
+        "kill_switch" => {
+            let new_kill = !state.config.kill_switch_enabled;
+            crate::app::set_global_kill_switch(client, &state.config_path, new_kill)?;
+            state.config.kill_switch_enabled = new_kill;
+            let verb = if new_kill { "Enabled" } else { "Disabled" };
+            state.status_message = format!("{verb} Kill Switch.");
+        }
+        "lockdown" => {
+            let new_lock = !state.config.lockdown_enabled;
+            crate::app::set_global_lockdown(client, &state.config_path, new_lock)?;
+            state.config.lockdown_enabled = new_lock;
+            let verb = if new_lock { "Enabled" } else { "Disabled" };
+            state.status_message = format!("{verb} Lockdown Mode.");
+        }
+        "autoconnect" => {
+            let new_auto = !state.config.general.autoconnect_at_login;
+            crate::service::set_autoconnect_at_login(client, &state.config_path, new_auto)?;
+            state.config.general.autoconnect_at_login = new_auto;
+            state.config.autoconnect_at_boot = new_auto;
+            let verb = if new_auto { "Enabled" } else { "Disabled" };
+            state.status_message = format!("{verb} Auto-Connect at Login.");
+        }
+        "eligible" => {
+            if let Some(row) = state.selected_row() {
+                let uuid = row.uuid.clone();
+                let name = row.name.clone();
+                let new_eligible = !row.eligible;
+                let mut app_cfg = config::load(&state.config_path)?;
+                let changed = eligibility::set_profile_eligible(
+                    &mut app_cfg.excluded_profile_ids,
+                    &uuid,
+                    new_eligible,
+                );
+                if changed {
+                    config::save(&state.config_path, &app_cfg)?;
+                    state.config = app_cfg;
+                    let verb = if new_eligible { "Eligible" } else { "Excluded" };
+                    state.status_message = format!("{verb} '{name}' for startup pool.");
+                    reload_profiles(state, client)?;
+                }
+            }
+        }
+        "sync" => {
+            let report = sync::sync_profiles_dir(client, &state.config)?;
+            reload_profiles(state, client)?;
+            state.status_message = format!(
+                "Synced drop directory ({} imported).",
+                report.imported.len()
+            );
+        }
+        "delete" => {
+            if let Some(row) = state.selected_row() {
+                state.modal = ActiveModal::ConfirmDelete {
+                    name: row.name.clone(),
+                    uuid: row.uuid.clone(),
+                };
+            }
+        }
+        "help" => {
+            state.modal = ActiveModal::Help;
+        }
+        "quit" => {
+            state.should_quit = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_theme_picker_key(state: &mut TuiState, key: KeyEvent) -> AppResult<()> {
+    let mut tp = match &state.modal {
+        ActiveModal::ThemePicker(tp) => tp.clone(),
+        _ => return Ok(()),
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            state.modal = ActiveModal::None;
+        }
+        KeyCode::Up => {
+            if !tp.themes.is_empty() {
+                if tp.selected_index == 0 {
+                    tp.selected_index = tp.themes.len() - 1;
+                } else {
+                    tp.selected_index -= 1;
+                }
+            }
+            state.modal = ActiveModal::ThemePicker(tp);
+        }
+        KeyCode::Down => {
+            if !tp.themes.is_empty() {
+                tp.selected_index = (tp.selected_index + 1) % tp.themes.len();
+            }
+            state.modal = ActiveModal::ThemePicker(tp);
+        }
+        KeyCode::Enter => {
+            if let Some((preset, label)) = tp.themes.get(tp.selected_index) {
+                state.config.theme.preset = preset.to_string();
+                let _ = config::save(&state.config_path, &state.config);
+                state.theme = crate::tui::theme::Theme::from_config(&state.config.theme);
+                state.status_message = format!("Applied theme: {label}");
+            }
+            state.modal = ActiveModal::None;
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 fn handle_delete_key<C: NmClient>(
@@ -67,6 +277,21 @@ where
     // Global quit
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         state.should_quit = true;
+        return Ok(());
+    }
+
+    // Command Palette (Ctrl+P or :)
+    if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
+        || key.code == KeyCode::Char(':')
+    {
+        state.modal =
+            ActiveModal::CommandPalette(crate::tui::state::CommandPaletteState::default());
+        return Ok(());
+    }
+
+    // Theme Picker (Ctrl+T)
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        state.modal = ActiveModal::ThemePicker(crate::tui::state::ThemePickerState::default());
         return Ok(());
     }
 
@@ -378,16 +603,53 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
         state.selected_index = state.rows.len() - 1;
     }
 
+    // Refresh active profile in cache to capture live transfer/handshake
+    if let Some(active_row) = active {
+        state.profile_cache.remove(&active_row.uuid);
+    }
+
     update_diagnostics(state, client);
     Ok(())
 }
 
-fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
-    if let Some(row) = state.selected_row()
-        && let Ok(diag) = client.get_profile_diagnostics(&row.uuid, row.is_active)
-    {
-        state.selected_diagnostics = Some(diag);
-        return;
+pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
+    let row_info = state.selected_row().map(|r| (r.uuid.clone(), r.is_active));
+    if let Some((uuid, is_active)) = row_info {
+        if let Some(cached) = state.profile_cache.get(&uuid) {
+            state.selected_tunnel_address = cached.tunnel_address.clone();
+            state.selected_tunnel_dns = cached.tunnel_dns.clone();
+            state.selected_gateway = cached.gateway.clone();
+            state.selected_diagnostics = Some(cached.diagnostics.clone());
+        } else {
+            let tunnel_addr = client.tunnel_address(&uuid);
+            let tunnel_dns = client.tunnel_dns(&uuid);
+            let gateway = tunnel_addr
+                .as_deref()
+                .and_then(crate::portforward::gateway_for_address)
+                .map(|ip| ip.to_string());
+            let diag = client
+                .get_profile_diagnostics(&uuid, is_active)
+                .unwrap_or_default();
+
+            state.selected_tunnel_address = tunnel_addr.clone();
+            state.selected_tunnel_dns = tunnel_dns.clone();
+            state.selected_gateway = gateway.clone();
+            state.selected_diagnostics = Some(diag.clone());
+
+            state.profile_cache.insert(
+                uuid,
+                crate::tui::state::CachedProfileInfo {
+                    diagnostics: diag,
+                    tunnel_address: tunnel_addr,
+                    tunnel_dns,
+                    gateway,
+                },
+            );
+        }
+    } else {
+        state.selected_tunnel_address = None;
+        state.selected_tunnel_dns = None;
+        state.selected_gateway = None;
+        state.selected_diagnostics = None;
     }
-    state.selected_diagnostics = None;
 }

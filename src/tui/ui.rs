@@ -1,4 +1,4 @@
-//! Ratatui rendering engine and widget layouts.
+//! Ratatui rendering engine, widget layouts, and Command Palette modals.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -6,17 +6,25 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::config::SplitTunnelMode;
-use crate::tui::state::{ActiveModal, SplitTunnelFocus, SplitTunnelModalState, TuiState};
+use crate::nm::network_info::format_speed;
+use crate::tui::state::{
+    ActiveModal, CommandPaletteState, SplitTunnelFocus, SplitTunnelModalState, ThemePickerState,
+    TuiState,
+};
 
 pub fn render(frame: &mut Frame, state: &TuiState) {
     let size = frame.area();
+    let theme = &state.theme;
 
-    // Overall vertical layout: Header, Body, Footer
+    // Render subtle themed textured backdrop
+    render_backdrop(frame, size, theme);
+
+    // Overall vertical layout: Header (with merged Policies & Speeds), Body (List + Profile Detail), Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Main body
+            Constraint::Length(5), // Header with Status, Bandwidth, Latency & Policies
+            Constraint::Min(10),   // Main body: Left List, Right Full Detail
             Constraint::Length(3), // Footer / Hotkeys
         ])
         .split(size);
@@ -27,6 +35,8 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
 
     // Overlay Modals
     match &state.modal {
+        ActiveModal::CommandPalette(cp) => render_command_palette_modal(frame, size, cp, state),
+        ActiveModal::ThemePicker(tp) => render_theme_picker_modal(frame, size, tp, state),
         ActiveModal::Help => render_help_modal(frame, size, state),
         ActiveModal::SplitTunnel(st) => render_split_tunnel_modal(frame, size, st, state),
         ActiveModal::ConfirmDelete { name, .. } => {
@@ -36,16 +46,32 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
     }
 }
 
+fn render_backdrop(frame: &mut Frame, area: Rect, theme: &crate::tui::theme::Theme) {
+    let mut pattern_lines = Vec::with_capacity(area.height as usize);
+    for y in 0..area.height {
+        let mut row = String::with_capacity(area.width as usize);
+        for x in 0..area.width {
+            if (x + y * 2) % 6 == 0 {
+                row.push('·');
+            } else {
+                row.push(' ');
+            }
+        }
+        pattern_lines.push(Line::styled(row, theme.backdrop_grid));
+    }
+    let backdrop = Paragraph::new(pattern_lines);
+    frame.render_widget(backdrop, area);
+}
+
 fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
+    // Status pill (clean profile name)
     let (status_text, status_style) = if let Some(ref name) = state.active_profile_name {
-        let text = if let Some(port) = state.active_port {
-            format!(" ● Connected: {name} (Port: {port}) ")
-        } else {
-            format!(" ● Connected: {name} ")
-        };
-        (text, theme.status_pill_connected)
+        (
+            format!(" ✔ Connected: {name} "),
+            theme.status_pill_connected,
+        )
     } else {
         (
             " ○ Disconnected ".to_string(),
@@ -56,11 +82,106 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
     let title = Line::from(vec![
         Span::styled(" ⚡ NEUTRON ", theme.header),
         Span::raw("— WireGuard Manager "),
+        Span::styled(format!("[Theme: {}]", state.theme.name), theme.label_dim),
     ]);
 
     let status_badge = Span::styled(status_text, status_style);
 
-    let header_widget = Paragraph::new(Line::from(vec![Span::raw(" "), status_badge])).block(
+    // Dedicated Forwarded Port field (clean text, no background pill)
+    let (port_label, port_val, port_val_style) = if let Some(port) = state.active_port {
+        ("Forwarded Port: ", format!("{port}"), theme.accent)
+    } else if state.active_profile_name.is_some() {
+        ("Forwarded Port: ", "N/A".to_string(), theme.label_dim)
+    } else {
+        ("Forwarded Port: ", "--".to_string(), theme.label_dim)
+    };
+
+    // Latency & Speed counters
+    let latency_text = if let Some(ms) = state.latency_ms {
+        format!("⏱ {ms}ms")
+    } else {
+        "⏱ --ms".to_string()
+    };
+
+    let down_speed = format_speed(state.download_rate);
+    let up_speed = format_speed(state.upload_rate);
+    let speed_text = format!("↓ {down_speed:<9}  ↑ {up_speed}");
+
+    // Line 1: Status badge + Forwarded Port + Latency + Bandwidth rates
+    let line1 = Line::from(vec![
+        Span::raw(" "),
+        status_badge,
+        Span::raw("   "),
+        Span::styled(port_label, theme.label_dim),
+        Span::styled(port_val, port_val_style),
+        Span::raw("   "),
+        Span::styled(latency_text, theme.keybinding),
+        Span::raw("    "),
+        Span::styled(speed_text, theme.accent),
+    ]);
+
+    // Line 2: Public IP & DNS telemetry
+    let ip_text = if let Some(ref ip_info) = state.public_ip_info {
+        ip_info.format_display()
+    } else {
+        "Detecting public IP...".to_string()
+    };
+
+    let mut info_spans = vec![
+        Span::styled(" Public IP: ", theme.label_dim),
+        Span::styled(ip_text, theme.text_primary),
+    ];
+
+    if let Some(ref dns) = state.selected_tunnel_dns {
+        info_spans.push(Span::styled("  •  DNS: ", theme.label_dim));
+        info_spans.push(Span::styled(dns, theme.accent));
+    }
+    let line2 = Line::from(info_spans);
+
+    // Line 3: Merged Policies
+    let auto_mark = if state.config.general.autoconnect_at_login {
+        Span::styled("✔ ", theme.status_connected)
+    } else {
+        Span::styled("· ", theme.label_dim)
+    };
+
+    let kill_mark = if state.config.kill_switch_enabled {
+        Span::styled("✔ ", theme.status_connected)
+    } else {
+        Span::styled("· ", theme.label_dim)
+    };
+
+    let lock_mark = if state.config.lockdown_enabled {
+        Span::styled("✔ ", theme.status_connected)
+    } else {
+        Span::styled("· ", theme.label_dim)
+    };
+
+    let split_mode = state.config.global_split_tunnel.mode;
+    let split_count = state.config.global_split_tunnel.cidrs.len()
+        + state.config.global_split_tunnel.domains.len();
+
+    let split_desc = match split_mode {
+        SplitTunnelMode::Disabled => "Off".to_string(),
+        SplitTunnelMode::Include => format!("Include ({split_count})"),
+        SplitTunnelMode::Exclude => format!("Exclude ({split_count})"),
+    };
+
+    let line3 = Line::from(vec![
+        Span::styled(" Policies: ", theme.label_dim),
+        auto_mark,
+        Span::styled("[a] Auto-Connect", theme.text_primary),
+        Span::raw("   "),
+        kill_mark,
+        Span::styled("[k] Kill-Switch", theme.text_primary),
+        Span::raw("   "),
+        lock_mark,
+        Span::styled("[l] Lockdown", theme.text_primary),
+        Span::raw("   "),
+        Span::styled(format!("[t] Split Tunneling: {split_desc}"), theme.accent),
+    ]);
+
+    let header_widget = Paragraph::new(vec![line1, line2, line3]).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -75,13 +196,13 @@ fn render_body(frame: &mut Frame, area: Rect, state: &TuiState) {
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(45), // Left: Profile List
-            Constraint::Percentage(55), // Right: Telemetry & Security
+            Constraint::Percentage(40), // Left: Profile List
+            Constraint::Percentage(60), // Right: Full Detail & Telemetry Panel
         ])
         .split(area);
 
     render_profile_list(frame, body_chunks[0], state);
-    render_right_panel(frame, body_chunks[1], state);
+    render_telemetry_panel(frame, body_chunks[1], state);
 }
 
 fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -95,9 +216,9 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
             let is_selected = idx == state.selected_index;
 
             let (icon, icon_style) = if row.is_active {
-                ("● ", theme.status_connected)
+                ("✔ ", theme.status_connected)
             } else {
-                ("○ ", theme.inactive_profile)
+                ("· ", theme.inactive_profile)
             };
 
             let prefix = if is_selected { "► " } else { "  " };
@@ -131,7 +252,10 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
 
     let title = Line::from(vec![
         Span::styled(format!(" Profiles ({}) ", state.rows.len()), theme.title),
-        Span::styled(" [↑/↓ Nav] ", theme.keybinding),
+        Span::styled(
+            " [↑/↓ Select, Space Connect, e Auto-pool] ",
+            theme.keybinding,
+        ),
     ]);
 
     let list_widget = List::new(items).block(
@@ -145,48 +269,88 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(list_widget, area);
 }
 
-fn render_right_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(45), // Top: Global Security & Policies
-            Constraint::Percentage(55), // Bottom: Telemetry & Connection Details
-        ])
-        .split(area);
-
-    render_security_panel(frame, right_chunks[0], state);
-    render_telemetry_panel(frame, right_chunks[1], state);
-}
-
 fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
     let content = if let Some(row) = state.selected_row() {
         let mut lines = Vec::new();
 
+        // Section: Overview
         lines.push(Line::from(vec![
-            Span::styled("Selected:    ", theme.label_dim),
+            Span::styled("Profile:       ", theme.label_dim),
             Span::styled(&row.name, theme.title),
-            Span::styled(format!(" ({})", &row.uuid), theme.label_dim),
+            Span::styled(format!("  ({})", &row.uuid), theme.label_dim),
         ]));
 
+        let (status_str, status_style) = if row.is_active {
+            ("✔ Connected (Active Tunnel)", theme.status_connected)
+        } else {
+            ("· Inactive", theme.status_disconnected)
+        };
         lines.push(Line::from(vec![
-            Span::styled("State:       ", theme.label_dim),
-            if row.is_active {
-                Span::styled("Connected", theme.status_connected)
-            } else {
-                Span::styled("Inactive", theme.status_disconnected)
-            },
+            Span::styled("Status:        ", theme.label_dim),
+            Span::styled(status_str, status_style),
         ]));
 
+        let (elig_str, elig_style) = if row.eligible {
+            ("✔ Eligible for Random Startup", theme.status_connected)
+        } else {
+            ("✗ Excluded from Startup Pool", theme.label_dim)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Startup Pool:  ", theme.label_dim),
+            Span::styled(elig_str, elig_style),
+        ]));
+
+        lines.push(Line::raw(""));
+
+        // Section: Network & Routing
+        if row.is_active {
+            if let Some(ref ip_info) = state.public_ip_info {
+                lines.push(Line::from(vec![
+                    Span::styled("Public IP:     ", theme.label_dim),
+                    Span::styled(ip_info.format_display(), theme.text_primary),
+                ]));
+            }
+
+            if let Some(ref addr) = state.selected_tunnel_address {
+                let gw_str = state
+                    .selected_gateway
+                    .as_deref()
+                    .map(|gw| format!("  (Gateway: {gw})"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("Tunnel IP:     ", theme.label_dim),
+                    Span::styled(format!("{addr}{gw_str}"), theme.accent),
+                ]));
+            }
+
+            if let Some(port) = state.active_port {
+                lines.push(Line::from(vec![
+                    Span::styled("NAT-PMP Port:  ", theme.label_dim),
+                    Span::styled(format!("{port} (Leased & Auto-Renewing)"), theme.keybinding),
+                ]));
+            }
+        }
+
+        if let Some(ref dns) = state.selected_tunnel_dns {
+            lines.push(Line::from(vec![
+                Span::styled("DNS Resolver:  ", theme.label_dim),
+                Span::styled(format!("{dns} (VPN Priority -1500)"), theme.text_secondary),
+            ]));
+        }
+
+        lines.push(Line::raw(""));
+
+        // Section: Diagnostics & Link Stats
         if let Some(ref diag) = state.selected_diagnostics {
             lines.push(Line::from(vec![
-                Span::styled("Endpoint:    ", theme.label_dim),
+                Span::styled("Remote Peer:   ", theme.label_dim),
                 Span::styled(&diag.endpoint, theme.text_primary),
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("Transfer:    ", theme.label_dim),
+                Span::styled("Total Data:    ", theme.label_dim),
                 Span::styled(
                     format!("↑ {}  ↓ {}", diag.transfer_tx, diag.transfer_rx),
                     theme.accent,
@@ -194,12 +358,19 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("Handshake:   ", theme.label_dim),
+                Span::styled("Handshake:     ", theme.label_dim),
                 Span::styled(&diag.latest_handshake, theme.text_secondary),
             ]));
 
+            if diag.keepalive != "N/A" && !diag.keepalive.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Keepalive:     ", theme.label_dim),
+                    Span::styled(format!("{}s", diag.keepalive), theme.text_secondary),
+                ]));
+            }
+
             lines.push(Line::from(vec![
-                Span::styled("Allowed IPs: ", theme.label_dim),
+                Span::styled("Allowed IPs:   ", theme.label_dim),
                 Span::styled(&diag.allowed_ips, theme.text_secondary),
             ]));
         }
@@ -207,7 +378,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         if let Some(ref custom) = row.custom_info {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
-                Span::styled("Config Info: ", theme.label_dim),
+                Span::styled("Config Info:   ", theme.label_dim),
                 Span::styled(custom.replace('\n', " | "), theme.text_secondary),
             ]));
         }
@@ -222,78 +393,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme.border)
-            .title(Span::styled(" Connection Telemetry ", theme.title)),
-    );
-
-    frame.render_widget(panel, area);
-}
-
-fn render_security_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let theme = &state.theme;
-
-    let autoconnect_mark = if state.config.general.autoconnect_at_login {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    let kill_switch_mark = if state.config.kill_switch_enabled {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    let lockdown_mark = if state.config.lockdown_enabled {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    let split_mode = state.config.global_split_tunnel.mode;
-    let split_count = state.config.global_split_tunnel.cidrs.len()
-        + state.config.global_split_tunnel.domains.len();
-
-    let split_desc = match split_mode {
-        SplitTunnelMode::Disabled => "Disabled (Full Tunnel)".to_string(),
-        SplitTunnelMode::Include => format!("Include ({split_count} routes)"),
-        SplitTunnelMode::Exclude => format!("Exclude ({split_count} routes)"),
-    };
-
-    let lines = vec![
-        Line::from(vec![Span::styled(
-            format!("{autoconnect_mark} [a] Auto-Connect at Login"),
-            theme.text_primary,
-        )]),
-        Line::from(vec![
-            Span::styled(
-                format!("{kill_switch_mark} [k] Kill Switch "),
-                theme.text_primary,
-            ),
-            Span::styled("(NM Policy Routing)", theme.label_dim),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("{lockdown_mark} [l] Lockdown Mode "),
-                theme.text_primary,
-            ),
-            Span::styled("(Always-On Netfilter)", theme.label_dim),
-        ]),
-        Line::from(vec![
-            Span::styled("    [t] Split Tunneling: ", theme.text_primary),
-            Span::styled(split_desc, theme.accent),
-        ]),
-        Line::from(vec![Span::styled(
-            format!("    [p] Drop Folder: {}", state.config.general.profiles_dir),
-            theme.label_dim,
-        )]),
-    ];
-
-    let panel = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(theme.border)
-            .title(Line::from(vec![
-                Span::styled(" Global Security & Policies ", theme.title),
-                Span::styled(" [a, k, l, t] ", theme.keybinding),
-            ])),
+            .title(Span::styled(" Profile Details & Telemetry ", theme.title)),
     );
 
     frame.render_widget(panel, area);
@@ -310,19 +410,31 @@ fn key_item<'a>(
     ]
 }
 
+fn key_item_accent<'a>(
+    theme: &'a crate::tui::theme::Theme,
+    key: &'a str,
+    label: &'a str,
+) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(format!(" {key} "), theme.key_badge_accent),
+        Span::styled(format!(" {label}  "), theme.title),
+    ]
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
     let mut hotkeys = Vec::new();
+    hotkeys.extend(key_item_accent(theme, "Ctrl+P", "Menu"));
+    hotkeys.extend(key_item_accent(theme, "Ctrl+T", "Theme"));
     hotkeys.extend(key_item(theme, "Space", "Connect/Down"));
     hotkeys.extend(key_item(theme, "s", "Switch"));
-    hotkeys.extend(key_item(theme, "t", "Split"));
-    hotkeys.extend(key_item(theme, "k", "Kill-Switch"));
+    hotkeys.extend(key_item(theme, "e", "Auto-pool"));
+    hotkeys.extend(key_item(theme, "t", "Split Tunneling"));
+    hotkeys.extend(key_item(theme, "k", "KillSwitch"));
     hotkeys.extend(key_item(theme, "l", "Lockdown"));
-    hotkeys.extend(key_item(theme, "a", "Auto-Login"));
-    hotkeys.extend(key_item(theme, "e", "Eligible"));
+    hotkeys.extend(key_item(theme, "a", "AutoLogin"));
     hotkeys.extend(key_item(theme, "r", "Sync"));
-    hotkeys.extend(key_item(theme, "d", "Delete"));
     hotkeys.extend(key_item(theme, "?", "Help"));
     hotkeys.extend(key_item(theme, "q", "Quit"));
 
@@ -361,16 +473,197 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn render_command_palette_modal(
+    frame: &mut Frame,
+    area: Rect,
+    cp: &CommandPaletteState,
+    state: &TuiState,
+) {
+    let theme = &state.theme;
+    let popup_area = centered_rect(65, 50, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Search bar
+            Constraint::Min(4),    // Commands list
+            Constraint::Length(2), // Footer
+        ])
+        .margin(1)
+        .split(popup_area);
+
+    // Search bar
+    let search_bar = Paragraph::new(Line::from(vec![
+        Span::styled(" 🔍 > ", theme.accent),
+        Span::styled(&cp.filter, theme.title),
+        Span::styled("█", theme.accent),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.active_border)
+            .title(" Search Menu / Actions "),
+    );
+    frame.render_widget(search_bar, chunks[0]);
+
+    // Filtered items
+    let filtered = cp.filtered_items();
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let is_sel = idx == cp.selected_index;
+            let mut spans = vec![
+                Span::styled(if is_sel { " ► " } else { "   " }, theme.accent),
+                Span::styled(
+                    item.title,
+                    if is_sel {
+                        theme.title
+                    } else {
+                        theme.text_primary
+                    },
+                ),
+                Span::styled(format!(" — {}", item.description), theme.label_dim),
+            ];
+
+            if let Some(shortcut) = item.shortcut {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(format!(" [{shortcut}] "), theme.key_badge));
+            }
+
+            let mut line = Line::from(spans);
+            if is_sel {
+                line = line.style(theme.selected_item);
+            }
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list_widget = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border)
+            .title(format!(" Actions ({}) ", filtered.len())),
+    );
+    frame.render_widget(list_widget, chunks[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("[↑/↓] ", theme.keybinding),
+        Span::raw("Navigate  "),
+        Span::styled("[Enter] ", theme.keybinding),
+        Span::raw("Run  "),
+        Span::styled("[Esc] ", theme.keybinding),
+        Span::raw("Close"),
+    ]))
+    .alignment(Alignment::Center);
+    frame.render_widget(footer, chunks[2]);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.active_border)
+        .title(Span::styled(" Menu (Ctrl+P) ", theme.header));
+    frame.render_widget(outer, popup_area);
+}
+
+fn render_theme_picker_modal(
+    frame: &mut Frame,
+    area: Rect,
+    tp: &ThemePickerState,
+    state: &TuiState,
+) {
+    let theme = &state.theme;
+    let popup_area = centered_rect(55, 50, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(2)])
+        .margin(1)
+        .split(popup_area);
+
+    let items: Vec<ListItem> = tp
+        .themes
+        .iter()
+        .enumerate()
+        .map(|(idx, (id, label))| {
+            let is_sel = idx == tp.selected_index;
+            let is_active = *id == state.theme.name;
+
+            let mut spans = vec![
+                Span::styled(if is_sel { " ► " } else { "   " }, theme.accent),
+                Span::styled(
+                    *label,
+                    if is_sel {
+                        theme.title
+                    } else {
+                        theme.text_primary
+                    },
+                ),
+            ];
+
+            if is_active {
+                spans.push(Span::styled(" ✔ [ACTIVE]", theme.status_connected));
+            }
+
+            let mut line = Line::from(spans);
+            if is_sel {
+                line = line.style(theme.selected_item);
+            }
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list_widget = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.active_border)
+            .title(" Available Color Palettes "),
+    );
+    frame.render_widget(list_widget, chunks[0]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("[↑/↓] ", theme.keybinding),
+        Span::raw("Select  "),
+        Span::styled("[Enter] ", theme.keybinding),
+        Span::raw("Apply Theme  "),
+        Span::styled("[Esc] ", theme.keybinding),
+        Span::raw("Cancel"),
+    ]))
+    .alignment(Alignment::Center);
+    frame.render_widget(footer, chunks[1]);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.active_border)
+        .title(Span::styled(" 🎨 Select Color Theme ", theme.header));
+    frame.render_widget(outer, popup_area);
+}
+
 fn render_help_modal(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
-    let popup_area = centered_rect(65, 70, area);
+    let popup_area = centered_rect(65, 75, area);
 
     frame.render_widget(Clear, popup_area);
 
     let lines = vec![
+        Line::from(vec![Span::styled("General & Menu", theme.header)]),
+        Line::from(vec![
+            Span::styled("  Ctrl+P / :       ", theme.keybinding),
+            Span::raw("Open Menu"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl+T           ", theme.keybinding),
+            Span::raw("Open Theme Picker"),
+        ]),
+        Line::raw(""),
         Line::from(vec![Span::styled("Navigation & Connections", theme.header)]),
         Line::from(vec![
-            Span::styled("  ↑ / k, ↓ / j     ", theme.keybinding),
+            Span::styled("  ↑ / ↓ (or p / n) ", theme.keybinding),
             Span::raw("Navigate profile list"),
         ]),
         Line::from(vec![
@@ -390,7 +683,7 @@ fn render_help_modal(frame: &mut Frame, area: Rect, state: &TuiState) {
             Span::raw("Delete profile from NetworkManager"),
         ]),
         Line::raw(""),
-        Line::from(vec![Span::styled("Global Controls", theme.header)]),
+        Line::from(vec![Span::styled("Global Security Controls", theme.header)]),
         Line::from(vec![
             Span::styled("  t                ", theme.keybinding),
             Span::raw("Open Split Tunneling manager modal"),

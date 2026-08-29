@@ -7,6 +7,8 @@ use crate::config::ThemeConfig;
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub name: &'static str,
+    pub bg: Color,
+    pub backdrop_grid: Style,
     pub border: Style,
     pub active_border: Style,
     pub title: Style,
@@ -32,11 +34,8 @@ pub struct Theme {
 impl Theme {
     pub fn from_config(config: &ThemeConfig) -> Self {
         let mut theme = match config.preset.to_lowercase().as_str() {
-            "adwaita" => Self::adwaita(),
             "catppuccin" | "catppuccin-mocha" => Self::catppuccin_mocha(),
-            "catppuccin-latte" => Self::catppuccin_latte(),
             "nord" => Self::nord(),
-            "dracula" => Self::dracula(),
             "gruvbox" => Self::gruvbox(),
             "monochrome" | "mono" => Self::monochrome(),
             _ => Self::osaka_jade(),
@@ -64,6 +63,8 @@ impl Theme {
     pub fn osaka_jade() -> Self {
         Self {
             name: "osaka-jade",
+            bg: Color::Rgb(17, 28, 24),
+            backdrop_grid: Style::default().fg(Color::Rgb(25, 42, 36)),
             border: Style::default().fg(Color::Rgb(83, 104, 91)),
             active_border: Style::default()
                 .fg(Color::Rgb(45, 213, 183))
@@ -116,64 +117,11 @@ impl Theme {
         }
     }
 
-    pub fn adwaita() -> Self {
-        Self {
-            name: "adwaita",
-            border: Style::default().fg(Color::Rgb(90, 90, 90)),
-            active_border: Style::default()
-                .fg(Color::Rgb(53, 132, 228))
-                .add_modifier(Modifier::BOLD),
-            title: Style::default()
-                .fg(Color::Rgb(255, 255, 255))
-                .add_modifier(Modifier::BOLD),
-            header: Style::default()
-                .fg(Color::Rgb(53, 132, 228))
-                .add_modifier(Modifier::BOLD),
-            selected_item: Style::default()
-                .bg(Color::Rgb(40, 60, 90))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            active_profile: Style::default()
-                .fg(Color::Rgb(46, 194, 126))
-                .add_modifier(Modifier::BOLD),
-            inactive_profile: Style::default().fg(Color::Rgb(180, 180, 180)),
-            status_connected: Style::default()
-                .fg(Color::Rgb(46, 194, 126))
-                .add_modifier(Modifier::BOLD),
-            status_disconnected: Style::default()
-                .fg(Color::Rgb(224, 27, 36))
-                .add_modifier(Modifier::BOLD),
-            status_pill_connected: Style::default()
-                .bg(Color::Rgb(38, 90, 60))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            status_pill_disconnected: Style::default()
-                .bg(Color::Rgb(100, 30, 30))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            label_dim: Style::default().fg(Color::Rgb(130, 130, 130)),
-            text_primary: Style::default().fg(Color::White),
-            text_secondary: Style::default().fg(Color::Rgb(180, 180, 180)),
-            accent: Style::default().fg(Color::Rgb(53, 132, 228)),
-            warning: Style::default().fg(Color::Rgb(246, 97, 81)),
-            keybinding: Style::default()
-                .fg(Color::Rgb(255, 190, 0))
-                .add_modifier(Modifier::BOLD),
-            key_badge: Style::default()
-                .bg(Color::Rgb(60, 60, 60))
-                .fg(Color::Rgb(255, 190, 0))
-                .add_modifier(Modifier::BOLD),
-            key_badge_accent: Style::default()
-                .bg(Color::Rgb(53, 132, 228))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Rgb(30, 30, 30)),
-        }
-    }
-
     pub fn catppuccin_mocha() -> Self {
         Self {
             name: "catppuccin-mocha",
+            bg: Color::Rgb(30, 30, 46),
+            backdrop_grid: Style::default().fg(Color::Rgb(49, 50, 68)),
             border: Style::default().fg(Color::Rgb(88, 91, 112)),
             active_border: Style::default()
                 .fg(Color::Rgb(203, 166, 247))
@@ -226,64 +174,11 @@ impl Theme {
         }
     }
 
-    pub fn catppuccin_latte() -> Self {
-        Self {
-            name: "catppuccin-latte",
-            border: Style::default().fg(Color::Rgb(172, 176, 190)),
-            active_border: Style::default()
-                .fg(Color::Rgb(136, 57, 239))
-                .add_modifier(Modifier::BOLD),
-            title: Style::default()
-                .fg(Color::Rgb(76, 79, 105))
-                .add_modifier(Modifier::BOLD),
-            header: Style::default()
-                .fg(Color::Rgb(136, 57, 239))
-                .add_modifier(Modifier::BOLD),
-            selected_item: Style::default()
-                .bg(Color::Rgb(204, 208, 218))
-                .fg(Color::Rgb(76, 79, 105))
-                .add_modifier(Modifier::BOLD),
-            active_profile: Style::default()
-                .fg(Color::Rgb(64, 160, 43))
-                .add_modifier(Modifier::BOLD),
-            inactive_profile: Style::default().fg(Color::Rgb(108, 111, 133)),
-            status_connected: Style::default()
-                .fg(Color::Rgb(64, 160, 43))
-                .add_modifier(Modifier::BOLD),
-            status_disconnected: Style::default()
-                .fg(Color::Rgb(210, 15, 57))
-                .add_modifier(Modifier::BOLD),
-            status_pill_connected: Style::default()
-                .bg(Color::Rgb(64, 160, 43))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            status_pill_disconnected: Style::default()
-                .bg(Color::Rgb(210, 15, 57))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            label_dim: Style::default().fg(Color::Rgb(140, 143, 161)),
-            text_primary: Style::default().fg(Color::Rgb(76, 79, 105)),
-            text_secondary: Style::default().fg(Color::Rgb(92, 95, 119)),
-            accent: Style::default().fg(Color::Rgb(30, 102, 245)),
-            warning: Style::default().fg(Color::Rgb(254, 100, 11)),
-            keybinding: Style::default()
-                .fg(Color::Rgb(223, 142, 29))
-                .add_modifier(Modifier::BOLD),
-            key_badge: Style::default()
-                .bg(Color::Rgb(204, 208, 218))
-                .fg(Color::Rgb(223, 142, 29))
-                .add_modifier(Modifier::BOLD),
-            key_badge_accent: Style::default()
-                .bg(Color::Rgb(136, 57, 239))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Rgb(239, 241, 245)),
-        }
-    }
-
     pub fn nord() -> Self {
         Self {
             name: "nord",
+            bg: Color::Rgb(46, 52, 64),
+            backdrop_grid: Style::default().fg(Color::Rgb(59, 66, 82)),
             border: Style::default().fg(Color::Rgb(76, 86, 106)),
             active_border: Style::default()
                 .fg(Color::Rgb(136, 192, 208))
@@ -336,64 +231,11 @@ impl Theme {
         }
     }
 
-    pub fn dracula() -> Self {
-        Self {
-            name: "dracula",
-            border: Style::default().fg(Color::Rgb(98, 114, 164)),
-            active_border: Style::default()
-                .fg(Color::Rgb(189, 147, 249))
-                .add_modifier(Modifier::BOLD),
-            title: Style::default()
-                .fg(Color::Rgb(248, 248, 242))
-                .add_modifier(Modifier::BOLD),
-            header: Style::default()
-                .fg(Color::Rgb(189, 147, 249))
-                .add_modifier(Modifier::BOLD),
-            selected_item: Style::default()
-                .bg(Color::Rgb(68, 71, 90))
-                .fg(Color::Rgb(248, 248, 242))
-                .add_modifier(Modifier::BOLD),
-            active_profile: Style::default()
-                .fg(Color::Rgb(80, 250, 123))
-                .add_modifier(Modifier::BOLD),
-            inactive_profile: Style::default().fg(Color::Rgb(248, 248, 242)),
-            status_connected: Style::default()
-                .fg(Color::Rgb(80, 250, 123))
-                .add_modifier(Modifier::BOLD),
-            status_disconnected: Style::default()
-                .fg(Color::Rgb(255, 85, 85))
-                .add_modifier(Modifier::BOLD),
-            status_pill_connected: Style::default()
-                .bg(Color::Rgb(40, 90, 60))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            status_pill_disconnected: Style::default()
-                .bg(Color::Rgb(100, 30, 40))
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            label_dim: Style::default().fg(Color::Rgb(98, 114, 164)),
-            text_primary: Style::default().fg(Color::Rgb(248, 248, 242)),
-            text_secondary: Style::default().fg(Color::Rgb(139, 233, 253)),
-            accent: Style::default().fg(Color::Rgb(255, 121, 198)),
-            warning: Style::default().fg(Color::Rgb(255, 184, 108)),
-            keybinding: Style::default()
-                .fg(Color::Rgb(241, 250, 140))
-                .add_modifier(Modifier::BOLD),
-            key_badge: Style::default()
-                .bg(Color::Rgb(68, 71, 90))
-                .fg(Color::Rgb(241, 250, 140))
-                .add_modifier(Modifier::BOLD),
-            key_badge_accent: Style::default()
-                .bg(Color::Rgb(189, 147, 249))
-                .fg(Color::Rgb(40, 42, 54))
-                .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Rgb(40, 42, 54)),
-        }
-    }
-
     pub fn gruvbox() -> Self {
         Self {
             name: "gruvbox",
+            bg: Color::Rgb(40, 40, 40),
+            backdrop_grid: Style::default().fg(Color::Rgb(55, 52, 50)),
             border: Style::default().fg(Color::Rgb(124, 111, 100)),
             active_border: Style::default()
                 .fg(Color::Rgb(254, 128, 25))
@@ -449,6 +291,8 @@ impl Theme {
     pub fn monochrome() -> Self {
         Self {
             name: "monochrome",
+            bg: Color::Black,
+            backdrop_grid: Style::default().fg(Color::Rgb(40, 40, 40)),
             border: Style::default().fg(Color::DarkGray),
             active_border: Style::default()
                 .fg(Color::White)
@@ -536,11 +380,8 @@ mod tests {
     #[test]
     fn theme_presets_instantiate() {
         let _ = Theme::osaka_jade();
-        let _ = Theme::adwaita();
         let _ = Theme::catppuccin_mocha();
-        let _ = Theme::catppuccin_latte();
         let _ = Theme::nord();
-        let _ = Theme::dracula();
         let _ = Theme::gruvbox();
         let _ = Theme::monochrome();
     }
