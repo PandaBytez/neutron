@@ -72,16 +72,16 @@ excluded_profiles = [
 # Telemetry polling rate in milliseconds (handshake, transfer counters)
 refresh_interval_ms = 1000
 
-# Built-in theme preset: "adwaita", "osaka-jade", "catppuccin", "nord", "dracula", "gruvbox", "monochrome"
-theme = "adwaita"
+# Built-in theme preset: "osaka-jade" (default), "adwaita", "catppuccin", "nord", "dracula", "gruvbox", "monochrome"
+theme = "osaka-jade"
 
 # Optional custom color overrides (accepts hex #rrggbb or standard color names)
 [tui.colors]
-active_border = "#3584e4"
-status_connected = "#2ec27e"
-status_disconnected = "#e01b24"
-transfer_rx = "#62a0ea"
-transfer_tx = "#ffa348"
+active_border = "#2dd5b7"
+status_connected = "#63b07a"
+status_disconnected = "#ff5345"
+transfer_rx = "#acd4cf"
+transfer_tx = "#e5c736"
 ```
 
 ---
@@ -92,8 +92,8 @@ Neutron features a built-in terminal theme engine with 7 carefully calibrated co
 
 | Theme | Description | Accent Colors | Best For |
 | :--- | :--- | :--- | :--- |
-| **`adwaita` (Default)** | Matches GNOME / Libadwaita dark palette | GNOME Blue, Emerald, Coral | Standard GNOME desktop integration |
-| **`osaka-jade`** | Osaka Jade / Bamboo palette | Jade Cyan, Bamboo Green, Gold | Dark forest green aesthetic |
+| **`osaka-jade` (Default)** | Osaka Jade / Bamboo palette | Jade Cyan, Bamboo Green, Gold | Dark forest green aesthetic |
+| **`adwaita`** | Matches GNOME / Libadwaita dark palette | GNOME Blue, Emerald, Coral | Standard GNOME desktop integration |
 | **`catppuccin`** | Soothing pastel palette (Mocha & Latte) | Mauve, Sapphire, Peach | Modern terminal setups |
 | **`nord`** | Arctic, north-bluish clean palette | Frost Cyan, Polar Night Gray | Minimalist dark setups |
 | **`dracula`** | Famous high-contrast vibrant theme | Gothic Purple, Pink, Green | High-contrast readability |

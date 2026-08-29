@@ -112,7 +112,7 @@ pub struct ThemeConfig {
 }
 
 fn default_theme_preset() -> String {
-    "adwaita".to_string()
+    "osaka-jade".to_string()
 }
 
 impl Default for ThemeConfig {
@@ -362,7 +362,7 @@ mod tests {
         assert!(loaded.excluded_profile_ids.is_empty());
         assert!(!loaded.kill_switch_enabled);
         assert!(!loaded.lockdown_enabled);
-        assert_eq!(loaded.theme.preset, "adwaita");
+        assert_eq!(loaded.theme.preset, "osaka-jade");
         cleanup(&path);
     }
 

@@ -32,14 +32,14 @@ pub struct Theme {
 impl Theme {
     pub fn from_config(config: &ThemeConfig) -> Self {
         let mut theme = match config.preset.to_lowercase().as_str() {
-            "osaka" | "osaka-jade" | "osaka_jade" | "jade" => Self::osaka_jade(),
+            "adwaita" => Self::adwaita(),
             "catppuccin" | "catppuccin-mocha" => Self::catppuccin_mocha(),
             "catppuccin-latte" => Self::catppuccin_latte(),
             "nord" => Self::nord(),
             "dracula" => Self::dracula(),
             "gruvbox" => Self::gruvbox(),
             "monochrome" | "mono" => Self::monochrome(),
-            _ => Self::adwaita(),
+            _ => Self::osaka_jade(),
         };
 
         if let Some(ref hex) = config.active_border
