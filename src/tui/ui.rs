@@ -99,7 +99,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
         )
     };
 
-    let title = Line::from(vec![Span::styled(" ⚡ Status ", theme.header)]);
+    let title = Line::from(vec![Span::styled(" ⚡ Status ", theme.title)]);
 
     let status_badge = Span::styled(status_text, status_style);
 
@@ -409,7 +409,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme.border)
-            .title(Span::styled(" Profile Details & Telemetry ", theme.title)),
+            .title(Span::styled(" Details ", theme.title)),
     );
 
     frame.render_widget(panel, area);
