@@ -12,10 +12,15 @@ BUILD_DIR="${REPO_ROOT}/target/appimage"
 APPDIR="${BUILD_DIR}/AppDir"
 
 echo "==> Building ${APP_NAME} binary (release with gui feature)..."
-if ! cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" --release --features gui 2>/dev/null; then
-    echo "==> Host build failed or missing GTK4/Adwaita libraries. Attempting build via GNOME SDK Flatpak..."
+if pkg-config --exists gtk4 libadwaita-1 2>/dev/null; then
+    cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" --release --features gui
+elif command -v flatpak >/dev/null 2>&1 && flatpak info org.gnome.Sdk//49 >/dev/null 2>&1; then
+    echo "==> Host missing GTK4/Adwaita headers (immutable/atomic host). Building via GNOME SDK container..."
     flatpak run --filesystem=host --env=PATH=/usr/lib/sdk/rust-stable/bin:/usr/bin --command=sh org.gnome.Sdk//49 -c \
         "cargo build --manifest-path=\"${REPO_ROOT}/Cargo.toml\" --release --features gui"
+else
+    echo "==> Building with host toolchain..."
+    cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" --release --features gui
 fi
 
 echo "==> Staging AppDir at ${APPDIR}..."

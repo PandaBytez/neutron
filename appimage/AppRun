@@ -18,11 +18,3 @@ if [ $# -eq 0 ]; then
 else
     exec "${APPDIR}/usr/bin/neutron-vpn" "$@"
 fi
-
-# Run the application binary
-# If no arguments are provided, default to launching the GUI
-if [ $# -eq 0 ]; then
-    exec "${APPDIR}/usr/bin/neutron-vpn" gui
-else
-    exec "${APPDIR}/usr/bin/neutron-vpn" "$@"
-fi
