@@ -67,15 +67,18 @@ gui:
 
 appimage:
   stage: build
-  # Fedora rather than a Debian-family base. Note this raises the AppImage's
-  # minimum glibc from 2.39 (ubuntu:24.04) to 2.42, since an AppImage only runs
-  # on a glibc at least as new as the one it was built against. fedora:43 is the
-  # oldest still-supported Fedora, so it is the least restrictive option here.
-  image: fedora:43
+  # Deliberately an older Debian-family base, not the newest available distro.
+  # An AppImage only runs on a glibc at least as new as the one it was built
+  # against, so the build base sets the minimum glibc of the released artifact.
+  # ubuntu:24.04 (glibc 2.39) keeps both current Ubuntu LTS releases in range;
+  # building on a current Fedora (glibc 2.42+) would drop them.
+  image: ubuntu:24.04
+  variables:
+    DEBIAN_FRONTEND: noninteractive
   before_script:
-    - dnf install -y --setopt=install_weak_deps=False
-        curl ca-certificates file gcc pkgconf-pkg-config git
-        gtk4-devel libadwaita-devel
+    - apt-get update && apt-get install -y --no-install-recommends
+        curl ca-certificates file build-essential pkg-config git
+        libgtk-4-dev libadwaita-1-dev
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
     - export PATH="$HOME/.cargo/bin:$PATH"
   script:
