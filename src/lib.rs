@@ -1,3 +1,6 @@
+pub const APP_ID: &str = "io.gitlab.neutron_vpn.neutron";
+pub const APP_NAME: &str = "Neutron VPN";
+
 pub mod app;
 pub mod config;
 pub mod error;

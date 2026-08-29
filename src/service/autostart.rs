@@ -12,10 +12,13 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
+use crate::{APP_ID, APP_NAME};
 
-/// Basename of the autostart entry. Matches the application ID so desktop
+/// Basename of the autostart entry. Derived from the application ID so desktop
 /// environments associate it with the installed launcher.
-const ENTRY_NAME: &str = "io.gitlab.neutron_vpn.neutron-autostart.desktop";
+fn entry_name() -> String {
+    format!("{APP_ID}-autostart.desktop")
+}
 
 /// Command that relaunches this binary with `args`.
 ///
@@ -46,7 +49,7 @@ pub fn dir() -> AppResult<PathBuf> {
 
 /// Whether the autostart entry exists in `dir`.
 pub fn is_installed_in(dir: &Path) -> bool {
-    dir.join(ENTRY_NAME).exists()
+    dir.join(entry_name()).exists()
 }
 
 /// Write the autostart entry into `dir`, creating it if needed.
@@ -56,7 +59,7 @@ pub fn is_installed_in(dir: &Path) -> bool {
 pub fn install_in(dir: &Path) -> AppResult<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(
-        dir.join(ENTRY_NAME),
+        dir.join(entry_name()),
         entry_contents(&launch_command("gui --hidden")),
     )?;
     Ok(())
@@ -64,7 +67,7 @@ pub fn install_in(dir: &Path) -> AppResult<()> {
 
 /// Remove the autostart entry from `dir`. Succeeds when it is already absent.
 pub fn uninstall_in(dir: &Path) -> AppResult<()> {
-    match std::fs::remove_file(dir.join(ENTRY_NAME)) {
+    match std::fs::remove_file(dir.join(entry_name())) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(AppError::Io(error)),
@@ -82,10 +85,10 @@ fn entry_contents(exec_cmd: &str) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=Neutron VPN\n\
+         Name={APP_NAME}\n\
          Comment=Connect a random WireGuard profile at login\n\
          Exec={exec_cmd}\n\
-         Icon=io.gitlab.neutron_vpn.neutron\n\
+         Icon={APP_ID}\n\
          Terminal=false\n\
          NoDisplay=true\n\
          X-GNOME-Autostart-enabled=true\n"
@@ -150,7 +153,7 @@ mod tests {
 
         install_in(&base).expect("install should create the entry");
         assert!(is_installed_in(&base));
-        let written = std::fs::read_to_string(base.join(ENTRY_NAME)).expect("entry should exist");
+        let written = std::fs::read_to_string(base.join(entry_name())).expect("entry should exist");
         assert!(written.contains("gui --hidden"));
 
         uninstall_in(&base).expect("uninstall should remove the entry");

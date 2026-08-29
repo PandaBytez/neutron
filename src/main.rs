@@ -7,8 +7,8 @@ fn main() {
 
     #[cfg(feature = "gui")]
     {
-        gtk::glib::set_prgname(Some("io.gitlab.neutron_vpn.neutron"));
-        gtk::glib::set_application_name("Neutron VPN");
+        gtk::glib::set_prgname(Some(neutron_vpn::APP_ID));
+        gtk::glib::set_application_name(neutron_vpn::APP_NAME);
     }
 
     let client = CliNmClient;

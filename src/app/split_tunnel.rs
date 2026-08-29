@@ -95,16 +95,14 @@ pub fn add_global_domain<C: NmClient>(
     path: &Path,
     domain: &str,
 ) -> AppResult<SplitTunnelConfig> {
-    let trimmed = domain.trim().to_lowercase();
-    if trimmed.is_empty() {
-        return Err(AppError::Config("domain cannot be empty".to_string()));
-    }
+    let normalized = nm::split_tunnel::normalize_domain(domain)
+        .ok_or_else(|| AppError::Config("domain cannot be empty".to_string()))?;
 
     let app_cfg = config::load(path)?;
     let mut st_cfg = app_cfg.global_split_tunnel;
 
-    if !st_cfg.domains.contains(&trimmed) {
-        st_cfg.domains.push(trimmed);
+    if !st_cfg.domains.contains(&normalized) {
+        st_cfg.domains.push(normalized);
         apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
     }
 
@@ -117,12 +115,14 @@ pub fn remove_global_domain<C: NmClient>(
     path: &Path,
     domain: &str,
 ) -> AppResult<SplitTunnelConfig> {
-    let trimmed = domain.trim().to_lowercase();
+    // An empty domain can never match a stored entry, so normalizing it away to
+    // an empty string is harmless: `retain` below simply removes nothing.
+    let normalized = nm::split_tunnel::normalize_domain(domain).unwrap_or_default();
     let app_cfg = config::load(path)?;
     let mut st_cfg = app_cfg.global_split_tunnel;
 
     let before_len = st_cfg.domains.len();
-    st_cfg.domains.retain(|d| d != &trimmed);
+    st_cfg.domains.retain(|d| d != &normalized);
 
     if st_cfg.domains.len() != before_len {
         apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;

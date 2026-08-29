@@ -44,6 +44,12 @@ pub fn resolve_domain_ips(domain: &str) -> Vec<IpAddr> {
     }
 }
 
+/// Normalize a domain name for storage and comparison, or `None` if it is not usable.
+pub fn normalize_domain(input: &str) -> Option<String> {
+    let trimmed = input.trim().to_lowercase();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// Collect and resolve all configured CIDRs and domain names into partitioned IPv4 and IPv6 route lists.
 pub fn collect_all_routes(cidrs: &[String], domains: &[String]) -> (Vec<String>, Vec<String>) {
     let mut all_targets = cidrs.to_vec();
@@ -162,6 +168,16 @@ pub fn set_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_domain_trims_and_lowercases() {
+        assert_eq!(
+            normalize_domain("  EXAMPLE.COM  "),
+            Some("example.com".to_string())
+        );
+        assert_eq!(normalize_domain(""), None);
+        assert_eq!(normalize_domain("   "), None);
+    }
 
     #[test]
     fn parse_and_normalize_valid_cidrs() {

@@ -37,15 +37,45 @@ test:
   script:
     - cargo test --all
 
+# GUI checks, split out from `clippy`/`test` for two reasons:
+#
+#   * the GTK/libadwaita toolchain pulls in ~300 extra packages, which would
+#     slow down every core check for a feature they do not build;
+#   * this job sets RUSTFLAGS, and Cargo fingerprints artifacts by the flags
+#     they were built with. Sharing `target/` with the core jobs would make the
+#     two sets invalidate each other's cache on every pipeline, so it gets its
+#     own cache key.
+gui:
+  stage: test
+  image: rust:alpine
+  variables:
+    # Alpine ships GTK/libadwaita as shared libraries only, but `rust:alpine`
+    # links musl statically by default. Without this the `gui` feature fails to
+    # link ("cannot find -lgtk-4 ... have you installed the static version?").
+    RUSTFLAGS: "-C target-feature=-crt-static"
+  cache:
+    key: "gui-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cargo/
+      - target/
+  before_script:
+    - apk add --no-cache musl-dev git pkgconfig gtk4.0-dev libadwaita-dev
+    - rustup component add clippy
+  script:
+    - cargo clippy --all-targets --features gui -- -D warnings
+    - cargo test --all --features gui
+
 appimage:
   stage: build
-  image: ubuntu:24.04
-  variables:
-    DEBIAN_FRONTEND: noninteractive
+  # Fedora rather than a Debian-family base. Note this raises the AppImage's
+  # minimum glibc from 2.39 (ubuntu:24.04) to 2.42, since an AppImage only runs
+  # on a glibc at least as new as the one it was built against. fedora:43 is the
+  # oldest still-supported Fedora, so it is the least restrictive option here.
+  image: fedora:43
   before_script:
-    - apt-get update && apt-get install -y --no-install-recommends
-        curl ca-certificates file build-essential pkg-config git
-        libgtk-4-dev libadwaita-1-dev
+    - dnf install -y --setopt=install_weak_deps=False
+        curl ca-certificates file gcc pkgconf-pkg-config git
+        gtk4-devel libadwaita-devel
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
     - export PATH="$HOME/.cargo/bin:$PATH"
   script:
