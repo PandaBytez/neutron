@@ -80,7 +80,10 @@ appimage:
         curl ca-certificates file build-essential pkg-config git
         libgtk-4-dev libadwaita-1-dev
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-    - export PATH="$HOME/.cargo/bin:$PATH"
+    # rustup installs into $CARGO_HOME, which this pipeline points at
+    # ${CI_PROJECT_DIR}/.cargo so the toolchain lands in the cache. Hardcoding
+    # $HOME/.cargo/bin here would miss it entirely ("cargo: command not found").
+    - export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
   script:
     - chmod +x appimage/build-appimage.sh
     - ./appimage/build-appimage.sh
