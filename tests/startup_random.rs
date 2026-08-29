@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use neutron_vpn::config::{self, AppConfig};
-use neutron_vpn::error::AppError;
-use neutron_vpn::nm::ProfileState;
-use neutron_vpn::service;
-use neutron_vpn::testing::{self, MockNmClient};
+use neutron::config::{self, AppConfig};
+use neutron::error::AppError;
+use neutron::nm::ProfileState;
+use neutron::service;
+use neutron::testing::{self, MockNmClient};
 
 #[test]
 fn integration_connects_and_updates_last_profile() {

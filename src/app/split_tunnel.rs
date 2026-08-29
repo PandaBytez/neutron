@@ -162,8 +162,8 @@ pub fn format_global_status(st_cfg: &SplitTunnelConfig) -> String {
     out
 }
 
-/// Format a concise summary subtitle for display in the GUI Settings row.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Format a concise summary subtitle for display in the TUI / status.
+#[allow(dead_code)]
 pub fn format_summary_subtitle(st_cfg: &SplitTunnelConfig) -> String {
     match st_cfg.mode {
         SplitTunnelMode::Disabled => "Disabled (Route all traffic through VPN)".to_string(),

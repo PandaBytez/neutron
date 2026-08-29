@@ -26,8 +26,12 @@ pub enum AppError {
     Config(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
-    #[error("serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    #[error("json serialization error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+    #[error("toml deserialization error: {0}")]
+    TomlDe(#[from] toml::de::Error),
+    #[error("toml serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 }
 
 pub type AppResult<T> = Result<T, AppError>;

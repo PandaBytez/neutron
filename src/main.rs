@@ -1,15 +1,9 @@
-use neutron_vpn::app;
-use neutron_vpn::nm::CliNmClient;
+use neutron::app;
+use neutron::nm::CliNmClient;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
     init_logging();
-
-    #[cfg(feature = "gui")]
-    {
-        gtk::glib::set_prgname(Some(neutron_vpn::APP_ID));
-        gtk::glib::set_application_name(neutron_vpn::APP_NAME);
-    }
 
     let client = CliNmClient;
     if let Err(error) = app::run(&client) {

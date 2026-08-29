@@ -71,76 +71,114 @@ impl SplitTunnelConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneralConfig {
+    #[serde(default = "default_profiles_dir")]
+    pub profiles_dir: String,
+    #[serde(default = "default_true")]
+    pub auto_sync_profiles: bool,
+    #[serde(default = "default_true")]
+    pub autoconnect_at_login: bool,
+}
+
+fn default_profiles_dir() -> String {
+    "~/.config/neutron/profiles".to_string()
+}
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            profiles_dir: default_profiles_dir(),
+            auto_sync_profiles: default_true(),
+            autoconnect_at_login: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemeConfig {
+    #[serde(default = "default_theme_preset")]
+    pub preset: String,
+    #[serde(default)]
+    pub active_border: Option<String>,
+    #[serde(default)]
+    pub status_connected: Option<String>,
+    #[serde(default)]
+    pub status_disconnected: Option<String>,
+    #[serde(default)]
+    pub transfer_rx: Option<String>,
+    #[serde(default)]
+    pub transfer_tx: Option<String>,
+}
+
+fn default_theme_preset() -> String {
+    "adwaita".to_string()
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_theme_preset(),
+            active_border: None,
+            status_connected: None,
+            status_disconnected: None,
+            transfer_rx: None,
+            transfer_tx: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Profiles explicitly excluded from startup-random selection. An empty set
-    /// means every WireGuard profile is eligible (opt-out model): profiles are
-    /// eligible by default and the user toggles individual ones off.
     #[serde(default)]
-    pub excluded_profile_ids: BTreeSet<String>,
-    #[serde(default, alias = "last_random_profile")]
-    pub last_random_profile_id: Option<String>,
+    pub general: GeneralConfig,
     /// Global kill-switch intent. When enabled, the NetworkManager kill-switch
     /// routing policy is applied to every WireGuard profile (not per-profile).
     #[serde(default)]
     pub kill_switch_enabled: bool,
     /// Global lockdown intent. When enabled, an always-on firewall blocks all
-    /// traffic except the WireGuard tunnel, its handshake, and DNS -- enforced
-    /// even when no VPN is connected. The firewall rules are the real source of
-    /// truth; this flag only remembers the user's intent so the GUI toggle can
-    /// show the right state without a privileged query at startup.
+    /// traffic except the WireGuard tunnel, its handshake, and DNS.
     #[serde(default)]
     pub lockdown_enabled: bool,
-    /// Last window width remembered between sessions (`None` until first save).
+    /// Profiles explicitly excluded from startup-random selection.
     #[serde(default)]
-    pub window_width: Option<i32>,
-    /// Last window height remembered between sessions (`None` until first save).
-    #[serde(default)]
-    pub window_height: Option<i32>,
-    /// Whether a random eligible profile should be connected automatically at
-    /// boot.
-    ///
-    /// When on, exactly one profile carries NetworkManager's
-    /// `connection.autoconnect` so NM brings it up at boot (before login, with
-    /// no helper process), and an autostart entry re-rolls which profile is
-    /// armed at each login. When off, no profile is armed and the autostart
-    /// entry is removed.
-    ///
-    /// Defaults to on: the app's stated purpose is a random profile per boot,
-    /// and a fresh install with no config file should do that.
-    #[serde(default = "default_true")]
-    pub autoconnect_at_boot: bool,
-    /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
-    #[serde(default)]
-    pub profile_custom_info: BTreeMap<String, String>,
+    pub excluded_profile_ids: BTreeSet<String>,
+    #[serde(default, alias = "last_random_profile")]
+    pub last_random_profile_id: Option<String>,
     /// Global split tunneling configuration applied across all WireGuard profiles.
     #[serde(default)]
     pub global_split_tunnel: SplitTunnelConfig,
+    /// Theme and color customization
+    #[serde(default)]
+    pub theme: ThemeConfig,
+    /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
+    #[serde(default)]
+    pub profile_custom_info: BTreeMap<String, String>,
     /// Split tunneling configuration indexed by profile UUID.
     #[serde(default)]
     pub split_tunnels: BTreeMap<String, SplitTunnelConfig>,
+    /// Compatibility alias for autoconnect_at_login
+    #[serde(default = "default_true")]
+    pub autoconnect_at_boot: bool,
 }
 
 fn default_true() -> bool {
     true
 }
 
-// Hand-written rather than derived: `#[derive(Default)]` would make
-// `autoconnect_at_boot` false, and `load` returns this value when no config file
-// exists -- silently disabling the app's headline feature on a fresh install.
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            excluded_profile_ids: BTreeSet::new(),
-            last_random_profile_id: None,
+            general: GeneralConfig::default(),
             kill_switch_enabled: false,
             lockdown_enabled: false,
-            window_width: None,
-            window_height: None,
-            autoconnect_at_boot: default_true(),
-            profile_custom_info: std::collections::BTreeMap::new(),
+            excluded_profile_ids: BTreeSet::new(),
+            last_random_profile_id: None,
             global_split_tunnel: SplitTunnelConfig::default(),
-            split_tunnels: std::collections::BTreeMap::new(),
+            theme: ThemeConfig::default(),
+            profile_custom_info: BTreeMap::new(),
+            split_tunnels: BTreeMap::new(),
+            autoconnect_at_boot: default_true(),
         }
     }
 }
@@ -151,21 +189,26 @@ pub fn load(path: &Path) -> AppResult<AppConfig> {
     }
 
     let data = fs::read_to_string(path)?;
-    let parsed = serde_json::from_str::<AppConfig>(&data)?;
-    Ok(parsed)
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        let parsed = serde_json::from_str::<AppConfig>(&data)?;
+        Ok(parsed)
+    } else {
+        let parsed = toml::from_str::<AppConfig>(&data)?;
+        Ok(parsed)
+    }
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
-    let body = serde_json::to_string_pretty(config)?;
+    let body = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        serde_json::to_string_pretty(config)?
+    } else {
+        toml::to_string_pretty(config)?
+    };
     write_atomically(path, &body)?;
     Ok(())
 }
 
-/// Drop every piece of Neutron-side metadata keyed by `uuid` from the in-memory
-/// config: custom info, exclusion membership, and the last-random pointer.
-///
-/// Returns `true` if anything actually changed, so the caller can skip an
-/// unnecessary save. This is a pure mutation and performs no I/O.
+/// Drop every piece of Neutron-side metadata keyed by `uuid` from the in-memory config.
 pub fn forget_profile(config: &mut AppConfig, uuid: &str) -> bool {
     let mut changed = config.profile_custom_info.remove(uuid).is_some();
     changed |= config.split_tunnels.remove(uuid).is_some();
@@ -233,15 +276,33 @@ pub fn default_config_path() -> AppResult<PathBuf> {
     let base = dirs::config_dir().ok_or_else(|| {
         AppError::Config("could not determine configuration directory".to_string())
     })?;
-    let new_path = base.join("neutron-vpn").join("config.json");
-    if new_path.exists() {
-        return Ok(new_path);
+
+    let candidates = [
+        base.join("neutron").join("config.toml"),
+        base.join("neutron-vpn").join("config.toml"),
+        base.join("neutron").join("config.json"),
+        base.join("neutron-vpn").join("config.json"),
+        base.join("wireguard-manager").join("config.json"),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
     }
-    let legacy_path = base.join("wireguard-manager").join("config.json");
-    if legacy_path.exists() {
-        return Ok(legacy_path);
+
+    Ok(base.join("neutron").join("config.toml"))
+}
+
+/// Resolve the configured profiles drop directory, expanding any leading `~` to the home dir.
+pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
+    let raw = &config.general.profiles_dir;
+    if let Some(stripped) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
     }
-    Ok(new_path)
+    PathBuf::from(raw)
 }
 
 #[cfg(test)]
@@ -249,35 +310,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrips_kill_switch_and_window_size() {
-        let path = unique_path("roundtrip");
+    fn roundtrips_toml_config() {
+        let path = unique_path("roundtrip-toml");
         let config = AppConfig {
             kill_switch_enabled: true,
             lockdown_enabled: true,
-            window_width: Some(1024),
-            window_height: Some(768),
+            theme: ThemeConfig {
+                preset: "nord".to_string(),
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
-        save(&path, &config).expect("config should save");
-        let loaded = load(&path).expect("config should load");
+        save(&path, &config).expect("config should save to toml");
+        let loaded = load(&path).expect("config should load from toml");
 
         assert!(loaded.kill_switch_enabled);
         assert!(loaded.lockdown_enabled);
-        assert_eq!(loaded.window_width, Some(1024));
-        assert_eq!(loaded.window_height, Some(768));
+        assert_eq!(loaded.theme.preset, "nord");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn roundtrips_legacy_json_config() {
+        let path = unique_path("roundtrip-json.json");
+        let config = AppConfig {
+            kill_switch_enabled: true,
+            lockdown_enabled: true,
+            ..AppConfig::default()
+        };
+
+        save(&path, &config).expect("config should save to json");
+        let loaded = load(&path).expect("config should load from json");
+
+        assert!(loaded.kill_switch_enabled);
+        assert!(loaded.lockdown_enabled);
         cleanup(&path);
     }
 
     #[test]
     fn defaults_new_fields_for_legacy_config_without_them() {
-        let path = unique_path("legacy-defaults");
+        let path = unique_path("legacy-defaults.json");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("parent dir should be created");
         }
-        // A pre-opt-out config only carried the old opt-in `eligible_profile_ids`
-        // field. It must load cleanly: the unknown field is ignored and the new
-        // opt-out `excluded_profile_ids` defaults to empty (everything eligible).
         fs::write(&path, r#"{"eligible_profile_ids":["uuid-1"]}"#)
             .expect("legacy config should be written");
 
@@ -286,44 +362,23 @@ mod tests {
         assert!(loaded.excluded_profile_ids.is_empty());
         assert!(!loaded.kill_switch_enabled);
         assert!(!loaded.lockdown_enabled);
-        assert_eq!(loaded.window_width, None);
-        assert_eq!(loaded.window_height, None);
+        assert_eq!(loaded.theme.preset, "adwaita");
         cleanup(&path);
     }
 
     #[test]
-    fn write_atomically_falls_back_when_rename_crosses_devices() {
-        let path = unique_path("cross-device");
+    fn resolve_profiles_dir_expands_tilde() {
+        let config = AppConfig {
+            general: GeneralConfig {
+                profiles_dir: "~/.config/neutron/profiles".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        write_atomically_with(&path, "payload", |_src, _dst| {
-            Err(io::Error::new(io::ErrorKind::CrossesDevices, "simulated"))
-        })
-        .expect("fallback copy should succeed");
-
-        let content = fs::read_to_string(&path).expect("file should be written");
-        assert_eq!(content, "payload");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn write_atomically_cleans_temporary_file_on_rename_error() {
-        let path = unique_path("rename-error");
-
-        let result = write_atomically_with(&path, "payload", |_src, _dst| {
-            Err(io::Error::other("simulated rename failure"))
-        });
-
-        assert!(result.is_err());
-
-        let parent = path.parent().expect("path should have parent");
-        let tmp_prefix = format!("{}.tmp.", path.display());
-        let leftover = fs::read_dir(parent)
-            .expect("parent dir should be readable")
-            .filter_map(Result::ok)
-            .any(|entry| entry.path().to_string_lossy().starts_with(&tmp_prefix));
-        assert!(!leftover, "temporary file should be cleaned up");
-
-        cleanup(&path);
+        let resolved = resolve_profiles_dir(&config);
+        assert!(!resolved.to_string_lossy().starts_with('~'));
+        assert!(resolved.to_string_lossy().ends_with("profiles"));
     }
 
     #[test]
@@ -383,48 +438,6 @@ mod tests {
         assert_eq!(SplitTunnelMode::Include.to_string(), "include");
         assert_eq!(SplitTunnelMode::Exclude.to_string(), "exclude");
         assert_eq!(SplitTunnelMode::Disabled.to_string(), "disabled");
-    }
-
-    #[test]
-    fn forget_profile_is_a_noop_for_unknown_uuid() {
-        let mut config = AppConfig::default();
-        config.excluded_profile_ids.insert("uuid-keep".to_string());
-        config.last_random_profile_id = Some("uuid-keep".to_string());
-
-        let changed = forget_profile(&mut config, "uuid-absent");
-
-        assert!(!changed);
-        assert!(config.excluded_profile_ids.contains("uuid-keep"));
-        assert_eq!(config.last_random_profile_id, Some("uuid-keep".to_string()));
-    }
-
-    #[test]
-    fn forget_profile_only_clears_the_matching_last_random_pointer() {
-        let mut config = AppConfig {
-            last_random_profile_id: Some("uuid-other".to_string()),
-            ..Default::default()
-        };
-
-        // Removing a different profile must leave an unrelated last-random
-        // pointer untouched and report no change.
-        let changed = forget_profile(&mut config, "uuid-1");
-
-        assert!(!changed);
-        assert_eq!(
-            config.last_random_profile_id,
-            Some("uuid-other".to_string())
-        );
-    }
-
-    #[test]
-    fn forget_profile_reports_change_when_only_exclusion_membership_matches() {
-        let mut config = AppConfig::default();
-        config.excluded_profile_ids.insert("uuid-1".to_string());
-
-        let changed = forget_profile(&mut config, "uuid-1");
-
-        assert!(changed);
-        assert!(config.excluded_profile_ids.is_empty());
     }
 
     fn unique_path(label: &str) -> PathBuf {

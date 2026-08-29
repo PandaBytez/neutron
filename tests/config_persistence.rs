@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use neutron_vpn::config::{self, AppConfig};
-use neutron_vpn::error::AppError;
-use neutron_vpn::testing;
+use neutron::config::{self, AppConfig};
+use neutron::error::AppError;
+use neutron::testing;
 
 #[test]
 fn integration_load_returns_default_when_file_is_missing() {
@@ -45,7 +45,10 @@ fn integration_load_returns_error_on_invalid_json() {
 
     let result = config::load(&config_path);
 
-    assert!(matches!(result, Err(AppError::Serde(_))));
+    assert!(matches!(
+        result,
+        Err(AppError::TomlDe(_)) | Err(AppError::SerdeJson(_))
+    ));
     testing::remove_temp_config(&config_path);
 }
 

@@ -2,6 +2,7 @@ pub(crate) mod eligibility;
 pub mod profile_list;
 pub mod refresh_sync;
 pub(crate) mod split_tunnel;
+pub mod sync;
 
 use clap::{Parser, Subcommand};
 
@@ -12,43 +13,45 @@ use crate::nm::{self, NmClient, WireguardProfile};
 use crate::service;
 
 #[derive(Debug, Parser)]
-#[command(name = "neutron-vpn")]
-#[command(about = "Neutron VPN - WireGuard profile manager via NetworkManager")]
+#[command(name = "neutron")]
+#[command(about = "Neutron - Fast WireGuard profile manager via NetworkManager")]
 pub struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Launch the interactive Terminal User Interface (TUI)
+    Tui,
+    /// Sync profile drop directory (~/.config/neutron/profiles) with NetworkManager
+    Sync,
+    /// List all WireGuard profiles with active and eligibility status
     List,
-    Gui {
-        /// Start in the background with no window, showing only the tray icon.
-        /// Used by the autostart entry: this launch is what connects a random
-        /// eligible profile at login, and it has no reason to steal focus.
-        #[arg(long)]
-        hidden: bool,
-    },
-    Connect {
-        profile: String,
-    },
+    /// Connect to a WireGuard profile by name or UUID
+    Connect { profile: String },
+    /// Disconnect the currently active WireGuard profile
     Disconnect,
-    Switch {
-        profile: String,
-    },
+    /// Switch active connection to target profile
+    Switch { profile: String },
+    /// Manage startup-random selection eligibility pool
     Eligible {
         #[command(subcommand)]
         command: EligibleCommands,
     },
+    /// Run one-shot random startup profile connection
     StartupRandom,
+    /// Inspect or toggle global kill switch (NetworkManager policy routing)
     KillSwitch {
         #[command(subcommand)]
         command: KillSwitchCommands,
     },
+    /// Inspect or toggle always-on lockdown firewall (Netfilter direct rules)
     Lockdown {
         #[command(subcommand)]
         command: LockdownCommands,
     },
+    /// Inspect or configure global split tunneling (Include / Exclude CIDRs & domains)
     SplitTunnel {
         #[command(subcommand)]
         command: SplitTunnelCommands,
@@ -97,7 +100,30 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
     cli: Cli,
 ) -> AppResult<()> {
     match cli.command {
-        Commands::List => {
+        None | Some(Commands::Tui) => crate::tui::run(client.clone()),
+        Some(Commands::Sync) => {
+            let path = config::default_config_path()?;
+            let app_cfg = config::load(&path)?;
+            let report = sync::sync_profiles_dir(client, &app_cfg)?;
+            if !report.imported.is_empty() {
+                println!(
+                    "Imported {} new profiles: {}",
+                    report.imported.len(),
+                    report.imported.join(", ")
+                );
+            }
+            if report.skipped > 0 {
+                println!("Skipped {} already existing profiles.", report.skipped);
+            }
+            if !report.errors.is_empty() {
+                eprintln!("Errors during sync:\n{}", report.errors.join("\n"));
+            }
+            if report.imported.is_empty() && report.errors.is_empty() {
+                println!("All profiles are up to date.");
+            }
+            Ok(())
+        }
+        Some(Commands::List) => {
             let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let profiles = client.list_wireguard_profiles()?;
@@ -111,11 +137,10 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
             }
             Ok(())
         }
-        Commands::Gui { hidden } => crate::gui::run(client.clone(), hidden),
-        Commands::Connect { profile } => client.connect(&profile),
-        Commands::Disconnect => client.disconnect_active(),
-        Commands::Switch { profile } => client.switch_to(&profile),
-        Commands::StartupRandom => {
+        Some(Commands::Connect { profile }) => client.connect(&profile),
+        Some(Commands::Disconnect) => client.disconnect_active(),
+        Some(Commands::Switch { profile }) => client.switch_to(&profile),
+        Some(Commands::StartupRandom) => {
             match service::run_startup_random(client)? {
                 service::StartupRandomResult::Connected(selected) => {
                     println!("Startup random connected: {selected}");
@@ -126,10 +151,10 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
             }
             Ok(())
         }
-        Commands::Eligible { command } => handle_eligible_command(client, command),
-        Commands::KillSwitch { command } => handle_kill_switch_command(client, command),
-        Commands::Lockdown { command } => handle_lockdown_command(client, command),
-        Commands::SplitTunnel { command } => handle_split_tunnel_command(client, command),
+        Some(Commands::Eligible { command }) => handle_eligible_command(client, command),
+        Some(Commands::KillSwitch { command }) => handle_kill_switch_command(client, command),
+        Some(Commands::Lockdown { command }) => handle_lockdown_command(client, command),
+        Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
     }
 }
 
@@ -373,7 +398,7 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
 ///
 /// Does nothing when lockdown is off, so callers can invoke it unconditionally
 /// after the profile set changes.
-#[cfg(any(test, feature = "gui"))]
+#[cfg(test)]
 pub(crate) fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
     client: &C,
     path: &std::path::Path,
@@ -445,16 +470,14 @@ mod tests {
         assert!(matches!(result, Err(AppError::ProfileNotFound(name)) if name == "wg-eu"));
     }
 
-    #[cfg(not(feature = "gui"))]
     #[test]
-    fn gui_command_returns_feature_unavailable_without_gui_feature() {
+    fn cli_subcommand_routing() {
         let cli = Cli {
-            command: Commands::Gui { hidden: false },
+            command: Some(Commands::List),
         };
-
-        let result = execute(&crate::testing::MockNmClient::default(), cli);
-
-        assert!(matches!(result, Err(AppError::FeatureUnavailable(_))));
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let result = execute(&client, cli);
+        assert!(result.is_ok());
     }
 
     #[test]
