@@ -72,7 +72,7 @@ excluded_profiles = [
 # Telemetry polling rate in milliseconds (handshake, transfer counters)
 refresh_interval_ms = 1000
 
-# Built-in theme preset: "osaka-jade" (default), "adwaita", "catppuccin", "nord", "dracula", "gruvbox", "monochrome"
+# Built-in theme preset: "osaka-jade" (default), "catppuccin", "nord", "gruvbox", "monochrome"
 theme = "osaka-jade"
 
 # Optional custom color overrides (accepts hex #rrggbb or standard color names)
@@ -88,15 +88,13 @@ transfer_tx = "#e5c736"
 
 ## Theming Engine
 
-Neutron features a built-in terminal theme engine with 7 carefully calibrated color palettes:
+Neutron features a built-in terminal theme engine with 5 carefully calibrated color palettes:
 
 | Theme | Description | Accent Colors | Best For |
 | :--- | :--- | :--- | :--- |
 | **`osaka-jade` (Default)** | Osaka Jade / Bamboo palette | Jade Cyan, Bamboo Green, Gold | Dark forest green aesthetic |
-| **`adwaita`** | Matches GNOME / Libadwaita dark palette | GNOME Blue, Emerald, Coral | Standard GNOME desktop integration |
-| **`catppuccin`** | Soothing pastel palette (Mocha & Latte) | Mauve, Sapphire, Peach | Modern terminal setups |
+| **`catppuccin`** | Soothing pastel palette (Mocha) | Mauve, Sapphire, Peach | Modern terminal setups |
 | **`nord`** | Arctic, north-bluish clean palette | Frost Cyan, Polar Night Gray | Minimalist dark setups |
-| **`dracula`** | Famous high-contrast vibrant theme | Gothic Purple, Pink, Green | High-contrast readability |
 | **`gruvbox`** | Retro groove warm earthy palette | Warm Amber, Forest Green | Tiling window managers & vim users |
 | **`monochrome`** | High-compatibility black & white | High-contrast ASCII/ANSI | Minimal TTYs, serial consoles, 16-color terms |
 

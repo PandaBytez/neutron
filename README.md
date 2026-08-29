@@ -48,36 +48,44 @@ Explore detailed architectural and technical documentation in the [`docs/`](docs
 
 ---
 
-## CLI Usage
+## CLI & TUI Usage
 
 ```bash
+# Launch the interactive Terminal User Interface (TUI)
+neutron
+# or
+neutron tui
+
+# Run standalone persistent system tray AppIndicator daemon
+neutron indicator
+
+# Sync profile drop directory (~/.config/neutron/profiles) with NetworkManager
+neutron sync
+
 # List WireGuard profiles and status
-neutron-vpn list
+neutron list
 
 # Connect, disconnect, or switch profiles
-neutron-vpn connect <profile>
-neutron-vpn disconnect
-neutron-vpn switch <profile>
+neutron connect <profile>
+neutron disconnect
+neutron switch <profile>
 
 # Manage startup-random eligibility pool
-neutron-vpn eligible list
-neutron-vpn eligible add <profile>
-neutron-vpn eligible remove <profile>
+neutron eligible list
+neutron eligible add <profile>
+neutron eligible remove <profile>
 
 # Global Split Tunneling
-neutron-vpn split-tunnel status
-neutron-vpn split-tunnel set-mode <include|exclude|disabled>
-neutron-vpn split-tunnel add-cidr 10.0.0.0/8
-neutron-vpn split-tunnel remove-cidr 10.0.0.0/8
-neutron-vpn split-tunnel add-domain internal.corp
-neutron-vpn split-tunnel clear
+neutron split-tunnel status
+neutron split-tunnel set-mode <include|exclude|disabled>
+neutron split-tunnel add-cidr 10.0.0.0/8
+neutron split-tunnel remove-cidr 10.0.0.0/8
+neutron split-tunnel add-domain internal.corp
+neutron split-tunnel clear
 
 # Security Controls
-neutron-vpn kill-switch status|enable|disable
-neutron-vpn lockdown status|enable|disable
-
-# Launch GUI Desktop App
-neutron-vpn gui
+neutron kill-switch status|enable|disable
+neutron lockdown status|enable|disable
 ```
 
 `list` output now includes eligibility status from config (`eligible` or `not-eligible`). Profiles are eligible by default and become `not-eligible` only once explicitly excluded.
