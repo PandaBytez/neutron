@@ -149,13 +149,13 @@ fn render_right_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(55), // Top: Telemetry & Connection Details
-            Constraint::Percentage(45), // Bottom: Global Security & Policies
+            Constraint::Percentage(45), // Top: Global Security & Policies
+            Constraint::Percentage(55), // Bottom: Telemetry & Connection Details
         ])
         .split(area);
 
-    render_telemetry_panel(frame, right_chunks[0], state);
-    render_security_panel(frame, right_chunks[1], state);
+    render_security_panel(frame, right_chunks[0], state);
+    render_telemetry_panel(frame, right_chunks[1], state);
 }
 
 fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
