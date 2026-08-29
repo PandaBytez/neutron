@@ -50,7 +50,7 @@ mod enabled {
         /// different profile discards the previous profile's port instead of
         /// showing it against the new tunnel.
         port_profile: Rc<RefCell<Option<String>>>,
-        /// Collapsible "Startup auto-connect" row in the Settings group. Its
+        /// Collapsible "Eligible Profiles" row in the Settings group. Its
         /// child switches choose which profiles join the boot-time random pool,
         /// keeping that configuration concern out of the operational rows.
         eligibility: adw::ExpanderRow,
@@ -459,8 +459,8 @@ mod enabled {
         port_box.set_visible(false);
 
         let eligibility_expander = adw::ExpanderRow::builder()
-            .title("Startup auto-connect")
-            .subtitle("Choose profiles eligible for random selection at boot")
+            .title("Eligible Profiles")
+            .subtitle("Choose profiles eligible for random selection at login")
             .build();
 
         let indicators = StatusIndicators {
@@ -527,7 +527,8 @@ mod enabled {
 
         let kill_switch_row = build_kill_switch_row(app, &client, &status);
         let lockdown_row = build_lockdown_row(app, &client, &status);
-        let autoconnect_row = build_autoconnect_row(&client, &status);
+        let autoconnect_row = build_autoconnect_row(&client, &status, &indicators);
+        let split_tunnel_row = build_split_tunnel_row(&client, &status);
         let import = build_import_button(&client, &list, &indicators);
 
         let container = gtk::Box::new(Orientation::Vertical, 12);
@@ -544,9 +545,10 @@ mod enabled {
         // Settings Section
         let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
         settings_group.add(&autoconnect_row);
+        settings_group.add(&eligibility_expander);
         settings_group.add(&kill_switch_row);
         settings_group.add(&lockdown_row);
-        settings_group.add(&eligibility_expander);
+        settings_group.add(&split_tunnel_row);
 
         container.append(&settings_group);
 
@@ -781,11 +783,11 @@ mod enabled {
         error_prefix: &'static str,
         initial: bool,
         apply: F,
-        on_enabled: N,
+        on_changed: N,
     ) -> adw::ActionRow
     where
         F: Fn(bool) -> Result<(), String> + Clone + Send + 'static,
-        N: Fn() + Clone + 'static,
+        N: Fn(bool) + Clone + 'static,
     {
         let toggle = gtk::Switch::new();
         toggle.set_valign(gtk::Align::Center);
@@ -804,16 +806,14 @@ mod enabled {
                 let toggle = toggle.clone();
                 let guard = guard.clone();
                 let apply = apply.clone();
-                let on_enabled = on_enabled.clone();
+                let on_changed = on_changed.clone();
 
                 glib::spawn_future_local(async move {
                     let outcome = spawn_blocking_flat(move || apply(requested)).await;
                     toggle.set_sensitive(true);
                     match outcome {
                         Ok(()) => {
-                            if requested {
-                                on_enabled();
-                            }
+                            on_changed(requested);
                         }
                         Err(error) => {
                             status.set_label(&format!("{error_prefix}: {error}"));
@@ -908,13 +908,15 @@ mod enabled {
             "Failed to update kill switch",
             load_flag(|c| c.kill_switch_enabled),
             move |enable| apply_global_kill_switch(&client, enable),
-            move || {
-                notify(
-                    &app,
-                    "neutron-kill-switch",
-                    "Kill switch enabled",
-                    "All WireGuard profiles now drop traffic if the tunnel fails. Applies on next connect.",
-                );
+            move |enabled| {
+                if enabled {
+                    notify(
+                        &app,
+                        "neutron-kill-switch",
+                        "Kill switch enabled",
+                        "All WireGuard profiles now drop traffic if the tunnel fails. Applies on next connect.",
+                    );
+                }
             },
         )
     }
@@ -922,19 +924,44 @@ mod enabled {
     /// Build the connect-at-boot row: a switch that arms one random eligible
     /// profile at login, by installing the autostart entry whose hidden launch
     /// performs the connection.
-    fn build_autoconnect_row<C>(client: &C, status: &gtk::Label) -> adw::ActionRow
+    fn build_autoconnect_row<C>(
+        client: &C,
+        status: &gtk::Label,
+        indicators: &StatusIndicators,
+    ) -> adw::ActionRow
     where
         C: NmClient + Clone + Send + 'static,
     {
         let client = client.clone();
+        let indicators = indicators.clone();
+        let autoconnect_initial = load_flag(|c| c.autoconnect_at_boot);
+
+        indicators.eligibility.set_sensitive(autoconnect_initial);
+        indicators
+            .eligibility
+            .set_enable_expansion(autoconnect_initial);
+        if !autoconnect_initial {
+            indicators.eligibility.set_expanded(false);
+        }
+
         build_toggle_row(
             status,
             "Auto-Connect at Login",
             "Connect a random eligible profile when you log in",
             "Failed to update auto-connect",
-            load_flag(|c| c.autoconnect_at_boot),
+            autoconnect_initial,
             move |enable| apply_autoconnect_at_login(&client, enable),
-            || {},
+            move |enable| {
+                let has_rows = !indicators.eligibility_rows.borrow().is_empty();
+                indicators.eligibility.set_sensitive(enable);
+                indicators
+                    .eligibility
+                    .set_enable_expansion(enable && has_rows);
+                if !enable {
+                    indicators.eligibility.set_expanded(false);
+                }
+                update_eligibility_subtitle(&indicators);
+            },
         )
     }
 
@@ -973,13 +1000,15 @@ mod enabled {
             "Failed to update lockdown",
             load_flag(|c| c.lockdown_enabled),
             move |enable| apply_global_lockdown(&client, enable),
-            move || {
-                notify(
-                    &app,
-                    "neutron-lockdown",
-                    "Lockdown enabled",
-                    "All non-VPN traffic is blocked until lockdown is disabled in settings.",
-                );
+            move |enabled| {
+                if enabled {
+                    notify(
+                        &app,
+                        "neutron-lockdown",
+                        "Lockdown enabled",
+                        "All non-VPN traffic is blocked until lockdown is disabled in settings.",
+                    );
+                }
             },
         )
     }
@@ -991,6 +1020,47 @@ mod enabled {
     ) -> Result<(), String> {
         let path = config::default_config_path().map_err(|error| error.to_string())?;
         crate::app::set_global_lockdown(client, &path, enable).map_err(|error| error.to_string())
+    }
+
+    /// Build the global split-tunneling settings row.
+    fn build_split_tunnel_row<C>(client: &C, status: &gtk::Label) -> adw::ActionRow
+    where
+        C: NmClient + Clone + Send + 'static,
+    {
+        let app_cfg = config::default_config_path()
+            .and_then(|p| config::load(&p))
+            .unwrap_or_default();
+        let subtitle =
+            crate::app::split_tunnel::format_summary_subtitle(&app_cfg.global_split_tunnel);
+
+        let row = adw::ActionRow::builder()
+            .title("Split Tunneling")
+            .subtitle(subtitle)
+            .activatable(true)
+            .build();
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+
+        let client = client.clone();
+        let status = status.clone();
+        let row_weak = row.downgrade();
+
+        row.connect_activated(move |row| {
+            let parent = row.root().and_downcast::<gtk::Window>();
+            let row_for_cb = row_weak.clone();
+            let status_for_cb = status.clone();
+            show_global_split_tunnel_dialog(parent.as_ref(), &client, move |new_cfg| {
+                if let Some(row) = row_for_cb.upgrade() {
+                    let sub = crate::app::split_tunnel::format_summary_subtitle(new_cfg);
+                    row.set_subtitle(&sub);
+                }
+                status_for_cb.set_label(&format!(
+                    "Updated global split tunneling ({}).",
+                    new_cfg.mode
+                ));
+            });
+        });
+
+        row
     }
 
     /// Build the "Import" button: opens a file chooser and imports the chosen
@@ -1222,6 +1292,344 @@ mod enabled {
             }
         });
         dialog.present();
+    }
+
+    /// Open a modal settings dialog to configure Global Split Tunneling rules.
+    fn show_global_split_tunnel_dialog<C, F>(parent: Option<&gtk::Window>, client: &C, on_saved: F)
+    where
+        C: NmClient + Clone + Send + 'static,
+        F: Fn(&crate::config::SplitTunnelConfig) + Clone + 'static,
+    {
+        let window = adw::Window::builder()
+            .modal(true)
+            .title("Global Split Tunneling")
+            .default_width(480)
+            .default_height(560)
+            .build();
+        if let Some(parent) = parent {
+            window.set_transient_for(Some(parent));
+        }
+
+        let header = HeaderBar::new();
+        let cancel = gtk::Button::with_label("Cancel");
+        {
+            let window = window.downgrade();
+            cancel.connect_clicked(move |_| {
+                if let Some(w) = window.upgrade() {
+                    w.close();
+                }
+            });
+        }
+        header.pack_start(&cancel);
+
+        let app_cfg = config::default_config_path()
+            .and_then(|p| config::load(&p))
+            .unwrap_or_default();
+        let initial_st = app_cfg.global_split_tunnel;
+
+        let current_mode = Rc::new(Cell::new(initial_st.mode));
+        let current_cidrs = Rc::new(RefCell::new(initial_st.cidrs));
+        let current_domains = Rc::new(RefCell::new(initial_st.domains));
+
+        let save_button = gtk::Button::builder()
+            .label("Save")
+            .css_classes(vec!["suggested-action".to_string()])
+            .build();
+
+        {
+            let client = client.clone();
+            let on_saved = on_saved.clone();
+            let current_mode = current_mode.clone();
+            let current_cidrs = current_cidrs.clone();
+            let current_domains = current_domains.clone();
+            let window_weak = window.downgrade();
+
+            save_button.connect_clicked(move |btn| {
+                btn.set_sensitive(false);
+                let client = client.clone();
+                let on_saved = on_saved.clone();
+                let window_weak = window_weak.clone();
+                let st_cfg = crate::config::SplitTunnelConfig {
+                    mode: current_mode.get(),
+                    cidrs: current_cidrs.borrow().clone(),
+                    domains: current_domains.borrow().clone(),
+                };
+
+                glib::spawn_future_local(async move {
+                    let task_client = client.clone();
+                    let task_st = st_cfg.clone();
+                    let outcome = spawn_blocking_flat(move || {
+                        let path = config::default_config_path()?;
+                        crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
+                            &task_client,
+                            &path,
+                            &task_st,
+                        )
+                    })
+                    .await;
+
+                    if let Some(window) = window_weak.upgrade() {
+                        match outcome {
+                            Ok(()) => {
+                                on_saved(&st_cfg);
+                                window.close();
+                            }
+                            Err(error) => {
+                                let parent = window.transient_for();
+                                show_error_dialog(
+                                    parent.as_ref(),
+                                    &format!("Failed to save split tunneling: {error}"),
+                                );
+                            }
+                        }
+                    }
+                });
+            });
+        }
+        header.pack_end(&save_button);
+
+        let content = gtk::Box::new(Orientation::Vertical, 16);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        // Mode selector
+        let mode_group = adw::PreferencesGroup::builder()
+            .title("Routing Mode")
+            .description("Choose how traffic routes through this VPN tunnel")
+            .build();
+
+        let mode_model = gtk::StringList::new(&["Disabled", "Include", "Exclude"]);
+        let mode_row = adw::ComboRow::builder()
+            .title("Mode")
+            .model(&mode_model)
+            .build();
+
+        let initial_selected = match initial_st.mode {
+            config::SplitTunnelMode::Disabled => 0,
+            config::SplitTunnelMode::Include => 1,
+            config::SplitTunnelMode::Exclude => 2,
+        };
+        mode_row.set_selected(initial_selected);
+
+        {
+            let current_mode = current_mode.clone();
+            mode_row.connect_selected_notify(move |row| {
+                let mode = match row.selected() {
+                    1 => config::SplitTunnelMode::Include,
+                    2 => config::SplitTunnelMode::Exclude,
+                    _ => config::SplitTunnelMode::Disabled,
+                };
+                current_mode.set(mode);
+            });
+        }
+        mode_group.add(&mode_row);
+        content.append(&mode_group);
+
+        // CIDRs Group
+        let cidr_group = adw::PreferencesGroup::builder()
+            .title("Subnets & IP Addresses")
+            .description("Specific CIDRs or IPs (e.g. 10.0.0.0/8, 192.168.1.50/32)")
+            .build();
+
+        let cidr_list = gtk::ListBox::new();
+        cidr_list.add_css_class("boxed-list");
+        cidr_list.set_selection_mode(gtk::SelectionMode::None);
+
+        let cidr_entry = adw::EntryRow::builder().title("Add CIDR / IP").build();
+        let cidr_add_btn = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .css_classes(vec!["flat".to_string()])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Add CIDR")
+            .build();
+        cidr_entry.add_suffix(&cidr_add_btn);
+
+        type ListRefreshCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+        let refresh_cidr_list: ListRefreshCallback = Rc::new(RefCell::new(None));
+        {
+            let cidr_list = cidr_list.clone();
+            let current_cidrs = current_cidrs.clone();
+            let refresh_slot = refresh_cidr_list.clone();
+            *refresh_cidr_list.borrow_mut() = Some(Box::new(move || {
+                while let Some(child) = cidr_list.first_child() {
+                    cidr_list.remove(&child);
+                }
+                let items = current_cidrs.borrow().clone();
+                for item in items {
+                    let row = adw::ActionRow::builder().title(&item).build();
+                    let del_btn = gtk::Button::builder()
+                        .icon_name("user-trash-symbolic")
+                        .css_classes(vec!["flat".to_string()])
+                        .valign(gtk::Align::Center)
+                        .tooltip_text("Remove route")
+                        .build();
+
+                    let current_cidrs = current_cidrs.clone();
+                    let refresh_slot = refresh_slot.clone();
+                    let item_clone = item.clone();
+                    del_btn.connect_clicked(move |_| {
+                        current_cidrs.borrow_mut().retain(|x| x != &item_clone);
+                        if let Some(ref cb) = *refresh_slot.borrow() {
+                            cb();
+                        }
+                    });
+                    row.add_suffix(&del_btn);
+                    cidr_list.append(&row);
+                }
+            }));
+        }
+
+        if let Some(ref cb) = *refresh_cidr_list.borrow() {
+            cb();
+        }
+
+        {
+            let current_cidrs = current_cidrs.clone();
+            let refresh_cidr_list = refresh_cidr_list.clone();
+            let entry_for_add = cidr_entry.clone();
+            let on_add = move || {
+                let text = entry_for_add.text().to_string();
+                if let Ok((normalized, _)) =
+                    crate::nm::split_tunnel::parse_and_normalize_cidr(&text)
+                {
+                    let mut list = current_cidrs.borrow_mut();
+                    if !list.contains(&normalized) {
+                        list.push(normalized);
+                    }
+                    drop(list);
+                    entry_for_add.set_text("");
+                    if let Some(ref cb) = *refresh_cidr_list.borrow() {
+                        cb();
+                    }
+                }
+            };
+
+            let on_add_rc = Rc::new(on_add);
+            let on_add_btn = on_add_rc.clone();
+            cidr_add_btn.connect_clicked(move |_| {
+                on_add_btn();
+            });
+            let on_add_entry = on_add_rc.clone();
+            cidr_entry.connect_entry_activated(move |_| {
+                on_add_entry();
+            });
+        }
+
+        cidr_group.add(&cidr_entry);
+        cidr_group.add(&cidr_list);
+        content.append(&cidr_group);
+
+        // Domains Group
+        let domain_group = adw::PreferencesGroup::builder()
+            .title("Domain Names")
+            .description("Resolved to IP addresses when connecting (e.g. internal.corp)")
+            .build();
+
+        let domain_list = gtk::ListBox::new();
+        domain_list.add_css_class("boxed-list");
+        domain_list.set_selection_mode(gtk::SelectionMode::None);
+
+        let domain_entry = adw::EntryRow::builder().title("Add Domain").build();
+        let domain_add_btn = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .css_classes(vec!["flat".to_string()])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Add Domain")
+            .build();
+        domain_entry.add_suffix(&domain_add_btn);
+
+        let refresh_domain_list: ListRefreshCallback = Rc::new(RefCell::new(None));
+        {
+            let domain_list = domain_list.clone();
+            let current_domains = current_domains.clone();
+            let refresh_slot = refresh_domain_list.clone();
+            *refresh_domain_list.borrow_mut() = Some(Box::new(move || {
+                while let Some(child) = domain_list.first_child() {
+                    domain_list.remove(&child);
+                }
+                let items = current_domains.borrow().clone();
+                for item in items {
+                    let row = adw::ActionRow::builder().title(&item).build();
+                    let del_btn = gtk::Button::builder()
+                        .icon_name("user-trash-symbolic")
+                        .css_classes(vec!["flat".to_string()])
+                        .valign(gtk::Align::Center)
+                        .tooltip_text("Remove domain")
+                        .build();
+
+                    let current_domains = current_domains.clone();
+                    let refresh_slot = refresh_slot.clone();
+                    let item_clone = item.clone();
+                    del_btn.connect_clicked(move |_| {
+                        current_domains.borrow_mut().retain(|x| x != &item_clone);
+                        if let Some(ref cb) = *refresh_slot.borrow() {
+                            cb();
+                        }
+                    });
+                    row.add_suffix(&del_btn);
+                    domain_list.append(&row);
+                }
+            }));
+        }
+
+        if let Some(ref cb) = *refresh_domain_list.borrow() {
+            cb();
+        }
+
+        {
+            let current_domains = current_domains.clone();
+            let refresh_domain_list = refresh_domain_list.clone();
+            let entry_for_add = domain_entry.clone();
+            let on_add = move || {
+                let text = entry_for_add.text().trim().to_lowercase();
+                if !text.is_empty() {
+                    let mut list = current_domains.borrow_mut();
+                    if !list.contains(&text) {
+                        list.push(text);
+                    }
+                    drop(list);
+                    entry_for_add.set_text("");
+                    if let Some(ref cb) = *refresh_domain_list.borrow() {
+                        cb();
+                    }
+                }
+            };
+
+            let on_add_rc = Rc::new(on_add);
+            let on_add_btn = on_add_rc.clone();
+            domain_add_btn.connect_clicked(move |_| {
+                on_add_btn();
+            });
+            let on_add_entry = on_add_rc.clone();
+            domain_entry.connect_entry_activated(move |_| {
+                on_add_entry();
+            });
+        }
+
+        domain_group.add(&domain_entry);
+        domain_group.add(&domain_list);
+        content.append(&domain_group);
+
+        let clamp = adw::Clamp::builder()
+            .maximum_size(500)
+            .child(&content)
+            .build();
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .hexpand(true)
+            .child(&clamp)
+            .build();
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&scroller));
+        window.set_content(Some(&toolbar));
+        window.present();
     }
 
     /// Open the multi-file chooser and import every selected WireGuard config,
@@ -1616,11 +2024,14 @@ mod enabled {
                 tracked.push(switch_row);
             }
         }
-        // Nothing to choose from when there are no profiles; disable the toggle
-        // so the empty expander can't be opened.
+        let autoconnect_on = load_flag(|c| c.autoconnect_at_boot);
+        indicators.eligibility.set_sensitive(autoconnect_on);
         indicators
             .eligibility
-            .set_enable_expansion(!rows.is_empty());
+            .set_enable_expansion(autoconnect_on && !rows.is_empty());
+        if !autoconnect_on {
+            indicators.eligibility.set_expanded(false);
+        }
         update_eligibility_subtitle(indicators);
     }
 
@@ -1639,11 +2050,11 @@ mod enabled {
                 let verb = if eligible { "Enabled" } else { "Disabled" };
                 indicators
                     .log
-                    .set_label(&format!("{verb} startup auto-connect for '{name}'."));
+                    .set_label(&format!("{verb} random login selection for '{name}'."));
             }
             Err(error) => {
                 indicators.log.set_label(&format!(
-                    "Failed to update startup eligibility for '{name}': {error}"
+                    "Failed to update eligibility for '{name}': {error}"
                 ));
             }
         }
@@ -1653,6 +2064,13 @@ mod enabled {
     /// Summarise how many profiles are eligible for boot-time random selection
     /// in the expander subtitle, reading the live switch states.
     fn update_eligibility_subtitle(indicators: &StatusIndicators) {
+        let autoconnect_on = load_flag(|c| c.autoconnect_at_boot);
+        if !autoconnect_on {
+            indicators
+                .eligibility
+                .set_subtitle("Disabled (Auto-Connect at Login is turned off)");
+            return;
+        }
         let tracked = indicators.eligibility_rows.borrow();
         let total = tracked.len();
         let subtitle = if total == 0 {
