@@ -9,6 +9,7 @@ use crate::error::{AppError, AppResult};
 
 mod autoconnect;
 mod kill_switch;
+pub mod network_info;
 pub mod split_tunnel;
 
 /// Maximum time to wait for an `nmcli` invocation before giving up.
@@ -113,6 +114,8 @@ pub trait NmClient {
     /// The tunnel's local IPv4 address (e.g. `10.2.0.2/32`), used to derive the
     /// NAT-PMP gateway that hands out a forwarded port.
     fn tunnel_address(&self, uuid: &str) -> Option<String>;
+    /// The tunnel's configured DNS servers (e.g. `10.2.0.1`).
+    fn tunnel_dns(&self, uuid: &str) -> Option<String>;
     /// Open the native NetworkManager connection editor for the specified connection.
     fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()>;
     /// Permanently delete a NetworkManager profile. NetworkManager deactivates
@@ -360,61 +363,118 @@ impl NmClient for CliNmClient {
         uuid: &str,
         is_active: bool,
     ) -> AppResult<ProfileDiagnostics> {
-        let nm_output = run_nmcli(&[
-            "-g",
-            "connection.interface-name",
-            "connection",
-            "show",
-            uuid,
-        ])?;
+        let nm_output = run_nmcli(&["-s", "connection", "show", uuid])?;
+        let mut interface_name = String::new();
+        let mut endpoint = String::new();
+        let mut allowed_ips = String::new();
+        let mut keepalive = String::new();
+        let mut public_key = String::new();
 
-        let interface_name = parse_interface_name(&nm_output).ok_or_else(|| {
-            AppError::NmCommandFailed("No interface name configured for this profile".to_string())
-        })?;
-
-        let mut diag = ProfileDiagnostics::unavailable(interface_name.clone());
-
-        if !is_active {
-            return Ok(diag);
-        }
-
-        let wg_output = run_command_with_timeout(
-            "wg",
-            &["show", &interface_name, "dump"],
-            Duration::from_secs(5),
-        );
-
-        let wg_stdout = match wg_output {
-            Ok(out) => out,
-            Err(_) => return Ok(diag),
-        };
-
-        let mut lines = wg_stdout.lines();
-        if let Some(first_line) = lines.next() {
-            let cols: Vec<&str> = first_line.split('\t').collect();
-            if cols.len() >= 2 {
-                diag.public_key = cols[1].to_string();
-            }
-        }
-        if let Some(second_line) = lines.next() {
-            let cols: Vec<&str> = second_line.split('\t').collect();
-            if cols.len() >= 8 {
-                diag.endpoint = cols[2].to_string();
-                diag.allowed_ips = cols[3].to_string();
-                if let Ok(ts) = cols[4].parse::<u64>() {
-                    if ts > 0 {
-                        diag.latest_handshake = format_handshake_time(ts);
-                    } else {
-                        diag.latest_handshake = "Never".to_string();
+        for line in nm_output.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim();
+                let val = v.trim();
+                if key == "connection.interface-name" && val != "--" {
+                    interface_name = val.to_string();
+                } else if key == "wireguard.peers" && val != "--" {
+                    let tokens: Vec<&str> = val.split_whitespace().collect();
+                    if let Some(pk) = tokens.first()
+                        && !pk.contains('=')
+                    {
+                        public_key = pk.to_string();
+                    }
+                    for tok in &tokens {
+                        if let Some(ep) = tok.strip_prefix("endpoint=") {
+                            endpoint = ep.to_string();
+                        } else if let Some(ips) = tok.strip_prefix("allowed-ips=") {
+                            allowed_ips = ips.replace(';', ", ");
+                        } else if let Some(ka) = tok.strip_prefix("persistent-keepalive=") {
+                            keepalive = ka.to_string();
+                        }
                     }
                 }
-                if let Ok(rx) = cols[5].parse::<u64>() {
-                    diag.transfer_rx = format_bytes(rx);
+            }
+        }
+
+        if interface_name.is_empty() {
+            interface_name = uuid.to_string();
+        }
+
+        let mut diag = ProfileDiagnostics {
+            interface_name: interface_name.clone(),
+            public_key: if public_key.is_empty() {
+                "N/A".to_string()
+            } else {
+                public_key
+            },
+            endpoint: if endpoint.is_empty() {
+                "N/A".to_string()
+            } else {
+                endpoint
+            },
+            allowed_ips: if allowed_ips.is_empty() {
+                "0.0.0.0/0, ::/0".to_string()
+            } else {
+                allowed_ips
+            },
+            latest_handshake: if is_active {
+                "Active".to_string()
+            } else {
+                "Inactive (Standby)".to_string()
+            },
+            transfer_rx: "0 B".to_string(),
+            transfer_tx: "0 B".to_string(),
+            keepalive: if keepalive.is_empty() {
+                "N/A".to_string()
+            } else {
+                keepalive
+            },
+        };
+
+        if is_active {
+            if let Ok(wg_stdout) = run_command_with_timeout(
+                "wg",
+                &["show", &interface_name, "dump"],
+                Duration::from_secs(2),
+            ) {
+                let mut lines = wg_stdout.lines();
+                if let Some(first_line) = lines.next() {
+                    let cols: Vec<&str> = first_line.split('\t').collect();
+                    if cols.len() >= 2 && !cols[1].is_empty() {
+                        diag.public_key = cols[1].to_string();
+                    }
                 }
-                if let Ok(tx) = cols[6].parse::<u64>() {
+                if let Some(second_line) = lines.next() {
+                    let cols: Vec<&str> = second_line.split('\t').collect();
+                    if cols.len() >= 8 {
+                        if !cols[2].is_empty() && cols[2] != "(none)" {
+                            diag.endpoint = cols[2].to_string();
+                        }
+                        if !cols[3].is_empty() && cols[3] != "(none)" {
+                            diag.allowed_ips = cols[3].to_string();
+                        }
+                        if let Ok(ts) = cols[4].parse::<u64>()
+                            && ts > 0
+                        {
+                            diag.latest_handshake = format_handshake_time(ts);
+                        }
+                        if let Ok(rx) = cols[5].parse::<u64>() {
+                            diag.transfer_rx = format_bytes(rx);
+                        }
+                        if let Ok(tx) = cols[6].parse::<u64>() {
+                            diag.transfer_tx = format_bytes(tx);
+                        }
+                        if !cols[7].is_empty() && cols[7] != "off" {
+                            diag.keepalive = cols[7].to_string();
+                        }
+                    }
+                }
+            } else {
+                let (rx, tx) = crate::nm::network_info::read_interface_bytes(Some(&interface_name));
+                if rx > 0 || tx > 0 {
+                    diag.transfer_rx = format_bytes(rx);
                     diag.transfer_tx = format_bytes(tx);
                 }
-                diag.keepalive = cols[7].to_string();
             }
         }
 
@@ -429,6 +489,15 @@ impl NmClient for CliNmClient {
             return None;
         }
         Some(first.to_string())
+    }
+
+    fn tunnel_dns(&self, uuid: &str) -> Option<String> {
+        let output = run_nmcli(&["-g", "ipv4.dns", "connection", "show", uuid]).ok()?;
+        let trimmed = output.trim();
+        if trimmed.is_empty() || trimmed == "--" {
+            return None;
+        }
+        Some(trimmed.replace(',', ", "))
     }
 
     fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()> {

@@ -280,6 +280,10 @@ impl NmClient for MockNmClient {
         Some("10.2.0.2/32".to_string())
     }
 
+    fn tunnel_dns(&self, _uuid: &str) -> Option<String> {
+        Some("10.2.0.1".to_string())
+    }
+
     fn edit_connection(&self, uuid: &str, _is_dark: bool) -> AppResult<()> {
         record(&self.calls, format!("edit:{}", uuid));
         Ok(())
