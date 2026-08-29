@@ -558,6 +558,9 @@ impl AppIndicator {
                     },
                 );
             }
+
+            // 4. Register with GNOME Background Apps portal (org.freedesktop.portal.Background)
+            init_background_portal(&conn);
         }
 
         indicator
@@ -589,7 +592,10 @@ impl AppIndicator {
                 "NewToolTip",
                 None,
             );
-            let status = if connected { "Active" } else { "Passive" };
+            // Always advertise "Active" status so the indicator remains visible
+            // in the panel (with the red disconnected shield) even when disconnected,
+            // rather than being hidden by the tray host.
+            let status = "Active";
             let _ = conn.emit_signal(
                 None,
                 "/StatusNotifierItem",
@@ -604,8 +610,105 @@ impl AppIndicator {
                 "LayoutUpdated",
                 Some(&(self.menu_revision.load(Ordering::Relaxed), 0i32).to_variant()),
             );
+
+            // Update status message in GNOME Background Apps Quick Settings
+            let bg_message = if connected {
+                let name = active_profile.unwrap_or("Connected");
+                match forwarded_port {
+                    Some(port) => format!("Connected: {name} (Port: {port})"),
+                    None => format!("Connected: {name}"),
+                }
+            } else {
+                "Disconnected".to_string()
+            };
+            set_background_portal_status(conn, &bg_message);
         }
     }
+}
+
+/// Request background status from XDG Desktop Portal for GNOME Quick Settings Background Apps.
+fn init_background_portal(conn: &gio::DBusConnection) {
+    let reg_options = glib::VariantDict::new(None);
+    let conn_for_req = conn.clone();
+
+    // 1. Register app_id with host portal registry so non-sandboxed / AppImage apps
+    // are recognized by xdg-desktop-portal and permitted to use the Background portal.
+    let reg_params = Variant::tuple_from_iter([
+        "io.gitlab.neutron_vpn.neutron".to_variant(),
+        reg_options.end(),
+    ]);
+
+    conn.call(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.host.portal.Registry",
+        "Register",
+        Some(&reg_params),
+        None,
+        gio::DBusCallFlags::NONE,
+        -1,
+        gio::Cancellable::NONE,
+        move |res| {
+            if let Err(e) = res {
+                debug!("Host portal Registry.Register: {e}");
+            } else {
+                info!("Registered app_id with host portal Registry");
+            }
+
+            // 2. Request background running permission from the portal
+            let options = glib::VariantDict::new(None);
+            options.insert("reason", "Manage WireGuard VPN connections");
+            options.insert("autostart", false);
+            options.insert("dbus-activatable", false);
+
+            let req_params = Variant::tuple_from_iter(["".to_variant(), options.end()]);
+
+            let conn_for_status = conn_for_req.clone();
+            conn_for_req.call(
+                Some("org.freedesktop.portal.Desktop"),
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Background",
+                "RequestBackground",
+                Some(&req_params),
+                None,
+                gio::DBusCallFlags::NONE,
+                -1,
+                gio::Cancellable::NONE,
+                move |res| {
+                    if let Err(e) = res {
+                        debug!("RequestBackground portal call: {e}");
+                    } else {
+                        info!("Successfully registered background portal status");
+                    }
+                    set_background_portal_status(&conn_for_status, "Disconnected");
+                },
+            );
+        },
+    );
+}
+
+/// Set live status text in GNOME Quick Settings Background Apps section.
+fn set_background_portal_status(conn: &gio::DBusConnection, message: &str) {
+    let options = glib::VariantDict::new(None);
+    options.insert("message", message);
+    let params = Variant::tuple_from_iter([options.end()]);
+
+    conn.call(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Background",
+        "SetStatus",
+        Some(&params),
+        None,
+        gio::DBusCallFlags::NONE,
+        -1,
+        gio::Cancellable::NONE,
+        |res| {
+            if let Err(e) = res {
+                debug!("SetStatus background portal call: {e}");
+            }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -663,5 +766,82 @@ mod tests {
         let bgra = [0u8; 4 * 7];
 
         assert_eq!(argb32_from_premultiplied_bgra(&bgra).len(), 4 * 7);
+    }
+
+    #[test]
+    fn test_portal_registration_and_background_apps() {
+        let Ok(conn) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+            eprintln!("No session bus, skipping");
+            return;
+        };
+
+        let reg_options = glib::VariantDict::new(None);
+        let reg_params = Variant::tuple_from_iter([
+            "io.gitlab.neutron_vpn.neutron".to_variant(),
+            reg_options.end(),
+        ]);
+
+        let reg_res = conn.call_sync(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.host.portal.Registry",
+            "Register",
+            Some(&reg_params),
+            None,
+            gio::DBusCallFlags::NONE,
+            -1,
+            gio::Cancellable::NONE,
+        );
+        eprintln!("Register res: {:?}", reg_res);
+
+        let options = glib::VariantDict::new(None);
+        options.insert("reason", "Manage WireGuard VPN connections");
+        options.insert("autostart", false);
+        options.insert("dbus-activatable", false);
+
+        let req_params = Variant::tuple_from_iter(["".to_variant(), options.end()]);
+
+        let req_res = conn.call_sync(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Background",
+            "RequestBackground",
+            Some(&req_params),
+            None,
+            gio::DBusCallFlags::NONE,
+            -1,
+            gio::Cancellable::NONE,
+        );
+        eprintln!("RequestBackground res: {:?}", req_res);
+
+        let status_options = glib::VariantDict::new(None);
+        status_options.insert("message", "Connected: wg-us");
+        let status_params = Variant::tuple_from_iter([status_options.end()]);
+
+        let status_res = conn.call_sync(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Background",
+            "SetStatus",
+            Some(&status_params),
+            None,
+            gio::DBusCallFlags::NONE,
+            -1,
+            gio::Cancellable::NONE,
+        );
+        eprintln!("SetStatus res: {:?}", status_res);
+
+        let bg_apps_res = conn.call_sync(
+            Some("org.freedesktop.background.Monitor"),
+            "/org/freedesktop/background/monitor",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&("org.freedesktop.background.Monitor", "BackgroundApps").to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            -1,
+            gio::Cancellable::NONE,
+        );
+        eprintln!("BackgroundApps in Monitor: {:?}", bg_apps_res);
     }
 }
