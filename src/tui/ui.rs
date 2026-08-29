@@ -57,9 +57,18 @@ fn render_ascii_banner(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
     let ascii_lines = vec![
-        Line::styled(" _  _ ____ _  _ ___ ____ ____ _  _ ", theme.header),
-        Line::styled(" |\\ | |___ |  |  |  |__/ |  | |\\ | ", theme.accent),
-        Line::styled(" | \\| |___ |__|  |  |  \\ |__| | \\| ", theme.header),
+        Line::from(vec![
+            Span::styled(" █\\  █ █▀▀█ █  █ ▀█▀ █▀▀█ █▀▀█ █\\  █", theme.header),
+            Span::styled("░", theme.label_dim),
+        ]),
+        Line::from(vec![
+            Span::styled(" █ \\ █ █▀▀  █  █  █  █▄▄▀ █  █ █ \\ █", theme.accent),
+            Span::styled("░", theme.label_dim),
+        ]),
+        Line::from(vec![
+            Span::styled(" █  \\█ ▀▀▀▀  ▀▀   ▀  ▀  ▀ ▀▀▀▀ █  \\█", theme.header),
+            Span::styled("░", theme.label_dim),
+        ]),
     ];
 
     let banner = Paragraph::new(ascii_lines).alignment(Alignment::Center);
