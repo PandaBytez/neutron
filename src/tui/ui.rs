@@ -433,7 +433,7 @@ fn key_item_accent<'a>(
 ) -> Vec<Span<'a>> {
     vec![
         Span::styled(format!(" {key} "), theme.key_badge_accent),
-        Span::styled(format!(" {label}  "), theme.title),
+        Span::styled(format!(" {label}  "), theme.text_primary),
     ]
 }
 
@@ -462,12 +462,14 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
         ]));
     }
 
-    let footer_widget = Paragraph::new(footer_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(theme.border),
-    );
+    let footer_widget = Paragraph::new(footer_lines)
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(theme.border),
+        );
 
     frame.render_widget(footer_widget, area);
 }
