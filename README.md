@@ -2,7 +2,7 @@
 
 A high-performance WireGuard manager for Linux built in Rust, utilizing NetworkManager as the underlying networking control plane.
 
-Branded as **Neutron VPN** (`io.gitlab.neutron_vpn.neutron`), distributed as an **AppImage**, **Flatpak**, and standalone static binaries.
+Branded as **Neutron VPN** (`io.gitlab.neutron_vpn.neutron`), distributed as an **AppImage**, **Homebrew Formula**, and standalone static binaries.
 
 ---
 

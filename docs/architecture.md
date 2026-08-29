@@ -75,4 +75,4 @@ Neutron VPN is designed with a strictly decoupled architecture where all network
 | **Startup Time** | ~150–300 ms | **< 10 ms** (instantaneous) | **< 2 ms** | 1.5 – 3.0 seconds |
 | **System Dependencies** | GTK4, Libadwaita, Mesa/Wayland | **Zero** (100% static musl) | **Zero** | Node, Chromium, X11/Wayland |
 | **Primary Environments** | GNOME Desktop Workstations | Servers, SSH, Hyprland, Sway, i3 | Automation, Cron, Systemd | Legacy Cross-Platform |
-| **Distribution Channels** | AppImage, Flatpak (Flathub) | Homebrew, Cargo, AUR, Static Musl | Homebrew, System Package | Custom Installers |
+| **Distribution Channels** | AppImage, Distro Packages | Homebrew, Cargo, AUR, Static Musl | Homebrew, System Package | Custom Installers |

@@ -24,7 +24,7 @@ Architecture of global split tunneling, Include vs. Exclude routing modes, CIDR 
 Pure Rust UDP implementation of the NAT-PMP protocol (RFC 6886), tunnel gateway derivation, mapping request framing, lease renewal timers, and clipboard integration.
 
 ### 6. [Packaging & Universal Distribution](packaging-distribution.md)
-Packaging guides and manifests for AppImage, Flatpak (Flathub), Homebrew tap formulas, Arch Linux AUR, and static musl compilation for headless servers.
+Packaging guides and distribution models for AppImage, Homebrew tap formulas, Arch Linux AUR, and static musl compilation for headless servers.
 
 ---
 

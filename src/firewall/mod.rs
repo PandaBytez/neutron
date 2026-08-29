@@ -138,8 +138,7 @@ impl FirewallClient for crate::nm::CliNmClient {
 /// Querying the ruleset does not require root, so this deliberately does **not**
 /// go through `pkexec`: it never triggers a password prompt. That is what lets
 /// enable/disable read the current rules freely and confine privilege to the
-/// single batched write below. Routed through `flatpak-spawn --host` when
-/// sandboxed (see [`crate::nm::host_command`]).
+/// single batched write below (see [`crate::nm::host_command`]).
 fn read_marked_rules(family: &str) -> AppResult<String> {
     let output = crate::nm::host_command(FIREWALL_CMD)
         .args(get_rules_batch(family))

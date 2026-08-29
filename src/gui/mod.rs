@@ -1389,7 +1389,7 @@ mod enabled {
             .label(instructions)
             .build();
         // Route link clicks through gtk::UriLauncher so the URL opens via the
-        // desktop portal inside the Flatpak sandbox.
+        // default system browser.
         {
             let parent = parent.cloned();
             body.connect_activate_link(move |_, uri| {
