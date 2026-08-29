@@ -30,6 +30,7 @@ pub struct Theme {
 impl Theme {
     pub fn from_config(config: &ThemeConfig) -> Self {
         let mut theme = match config.preset.to_lowercase().as_str() {
+            "osaka" | "osaka-jade" | "osaka_jade" | "jade" => Self::osaka_jade(),
             "catppuccin" | "catppuccin-mocha" => Self::catppuccin_mocha(),
             "catppuccin-latte" => Self::catppuccin_latte(),
             "nord" => Self::nord(),
@@ -56,6 +57,53 @@ impl Theme {
         }
 
         theme
+    }
+
+    pub fn osaka_jade() -> Self {
+        Self {
+            name: "osaka-jade",
+            border: Style::default().fg(Color::Rgb(83, 104, 91)),
+            active_border: Style::default()
+                .fg(Color::Rgb(45, 213, 183))
+                .add_modifier(Modifier::BOLD),
+            title: Style::default()
+                .fg(Color::Rgb(246, 245, 221))
+                .add_modifier(Modifier::BOLD),
+            header: Style::default()
+                .fg(Color::Rgb(45, 213, 183))
+                .add_modifier(Modifier::BOLD),
+            selected_item: Style::default()
+                .bg(Color::Rgb(35, 55, 43))
+                .fg(Color::Rgb(246, 245, 221))
+                .add_modifier(Modifier::BOLD),
+            active_profile: Style::default()
+                .fg(Color::Rgb(99, 176, 122))
+                .add_modifier(Modifier::BOLD),
+            inactive_profile: Style::default().fg(Color::Rgb(193, 196, 151)),
+            status_connected: Style::default()
+                .fg(Color::Rgb(99, 176, 122))
+                .add_modifier(Modifier::BOLD),
+            status_disconnected: Style::default()
+                .fg(Color::Rgb(255, 83, 69))
+                .add_modifier(Modifier::BOLD),
+            status_pill_connected: Style::default()
+                .bg(Color::Rgb(35, 55, 43))
+                .fg(Color::Rgb(158, 235, 179))
+                .add_modifier(Modifier::BOLD),
+            status_pill_disconnected: Style::default()
+                .bg(Color::Rgb(62, 36, 34))
+                .fg(Color::Rgb(255, 83, 69))
+                .add_modifier(Modifier::BOLD),
+            label_dim: Style::default().fg(Color::Rgb(83, 104, 91)),
+            text_primary: Style::default().fg(Color::Rgb(193, 196, 151)),
+            text_secondary: Style::default().fg(Color::Rgb(172, 212, 207)),
+            accent: Style::default().fg(Color::Rgb(45, 213, 183)),
+            warning: Style::default().fg(Color::Rgb(229, 199, 54)),
+            keybinding: Style::default()
+                .fg(Color::Rgb(229, 199, 54))
+                .add_modifier(Modifier::BOLD),
+            popup_bg: Style::default().bg(Color::Rgb(17, 28, 24)),
+        }
     }
 
     pub fn adwaita() -> Self {
@@ -421,6 +469,7 @@ mod tests {
 
     #[test]
     fn theme_presets_instantiate() {
+        let _ = Theme::osaka_jade();
         let _ = Theme::adwaita();
         let _ = Theme::catppuccin_mocha();
         let _ = Theme::catppuccin_latte();

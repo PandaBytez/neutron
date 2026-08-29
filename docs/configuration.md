@@ -72,7 +72,7 @@ excluded_profiles = [
 # Telemetry polling rate in milliseconds (handshake, transfer counters)
 refresh_interval_ms = 1000
 
-# Built-in theme preset: "adwaita", "catppuccin", "nord", "dracula", "gruvbox", "monochrome"
+# Built-in theme preset: "adwaita", "osaka-jade", "catppuccin", "nord", "dracula", "gruvbox", "monochrome"
 theme = "adwaita"
 
 # Optional custom color overrides (accepts hex #rrggbb or standard color names)
@@ -88,11 +88,12 @@ transfer_tx = "#ffa348"
 
 ## Theming Engine
 
-Neutron VPN features a built-in terminal theme engine with 6 carefully calibrated color palettes:
+Neutron features a built-in terminal theme engine with 7 carefully calibrated color palettes:
 
 | Theme | Description | Accent Colors | Best For |
 | :--- | :--- | :--- | :--- |
 | **`adwaita` (Default)** | Matches GNOME / Libadwaita dark palette | GNOME Blue, Emerald, Coral | Standard GNOME desktop integration |
+| **`osaka-jade`** | Osaka Jade / Bamboo palette | Jade Cyan, Bamboo Green, Gold | Dark forest green aesthetic |
 | **`catppuccin`** | Soothing pastel palette (Mocha & Latte) | Mauve, Sapphire, Peach | Modern terminal setups |
 | **`nord`** | Arctic, north-bluish clean palette | Frost Cyan, Polar Night Gray | Minimalist dark setups |
 | **`dracula`** | Famous high-contrast vibrant theme | Gothic Purple, Pink, Green | High-contrast readability |
@@ -103,16 +104,16 @@ Neutron VPN features a built-in terminal theme engine with 6 carefully calibrate
 
 ## Managed Profile Drop Directory (`profiles/`)
 
-Neutron VPN manages a dedicated profile drop directory at `~/.config/neutron-vpn/profiles/` (with strict `0700` user-only permissions).
+Neutron manages a dedicated profile drop directory at `~/.config/neutron/profiles/` (with strict `0700` user-only permissions).
 
 ### Workflow:
 1. **Drop / Copy Profiles**: Users can simply copy `.conf` files into the directory:
    ```bash
-   cp ~/Downloads/VPN_configs/*.conf ~/.config/neutron-vpn/profiles/
+   cp ~/Downloads/VPN_configs/*.conf ~/.config/neutron/profiles/
    ```
-2. **Auto-Sync on Launch**: Whenever the TUI or CLI runs, Neutron VPN scans the folder, compares content checksums against NetworkManager, and batch-imports new profiles in milliseconds.
+2. **Auto-Sync on Launch**: Whenever the TUI or CLI runs, Neutron scans the folder, compares content checksums against NetworkManager, and batch-imports new profiles in milliseconds.
 3. **Manual Sync Command**: You can trigger an instant sync via CLI or within the TUI:
    ```bash
-   neutron-vpn sync
+   neutron sync
    ```
-4. **Git/Dotfiles Automation**: The entire `~/.config/neutron-vpn/` folder can be tracked in a private Git repository for instant syncing across multiple machines.
+4. **Git/Dotfiles Automation**: The entire `~/.config/neutron/` folder can be tracked in a private Git repository for instant syncing across multiple machines.
