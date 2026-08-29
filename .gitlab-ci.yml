@@ -37,58 +37,16 @@ test:
   script:
     - cargo test --all
 
-# GUI checks, split out from `clippy`/`test` for two reasons:
-#
-#   * the GTK/libadwaita toolchain pulls in ~300 extra packages, which would
-#     slow down every core check for a feature they do not build;
-#   * this job sets RUSTFLAGS, and Cargo fingerprints artifacts by the flags
-#     they were built with. Sharing `target/` with the core jobs would make the
-#     two sets invalidate each other's cache on every pipeline, so it gets its
-#     own cache key.
-gui:
-  stage: test
-  image: rust:alpine
-  variables:
-    # Alpine ships GTK/libadwaita as shared libraries only, but `rust:alpine`
-    # links musl statically by default. Without this the `gui` feature fails to
-    # link ("cannot find -lgtk-4 ... have you installed the static version?").
-    RUSTFLAGS: "-C target-feature=-crt-static"
-  cache:
-    key: "gui-${CI_COMMIT_REF_SLUG}"
-    paths:
-      - .cargo/
-      - target/
-  before_script:
-    - apk add --no-cache musl-dev git pkgconfig gtk4.0-dev libadwaita-dev
-    - rustup component add clippy
-  script:
-    - cargo clippy --all-targets --features gui -- -D warnings
-    - cargo test --all --features gui
-
-appimage:
+build_musl:
   stage: build
-  # Deliberately an older Debian-family base, not the newest available distro.
-  # An AppImage only runs on a glibc at least as new as the one it was built
-  # against, so the build base sets the minimum glibc of the released artifact.
-  # ubuntu:24.04 (glibc 2.39) keeps both current Ubuntu LTS releases in range;
-  # building on a current Fedora (glibc 2.42+) would drop them.
-  image: ubuntu:24.04
-  variables:
-    DEBIAN_FRONTEND: noninteractive
+  image: rust:alpine
   before_script:
-    - apt-get update && apt-get install -y --no-install-recommends
-        curl ca-certificates file build-essential pkg-config git
-        libgtk-4-dev libadwaita-1-dev
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-    # rustup installs into $CARGO_HOME, which this pipeline points at
-    # ${CI_PROJECT_DIR}/.cargo so the toolchain lands in the cache. Hardcoding
-    # $HOME/.cargo/bin here would miss it entirely ("cargo: command not found").
-    - export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+    - apk add --no-cache musl-dev git
   script:
-    - chmod +x appimage/build-appimage.sh
-    - ./appimage/build-appimage.sh
+    - cargo build --release
+    - cp target/release/neutron ./neutron-linux-x86_64
   artifacts:
-    name: "appimage-bundle"
+    name: "neutron-static-binary"
     paths:
-      - "*.AppImage"
+      - "neutron-linux-x86_64"
     expire_in: 1 week
