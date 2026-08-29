@@ -24,6 +24,8 @@ pub struct Theme {
     pub accent: Style,
     pub warning: Style,
     pub keybinding: Style,
+    pub key_badge: Style,
+    pub key_badge_accent: Style,
     pub popup_bg: Style,
 }
 
@@ -102,6 +104,14 @@ impl Theme {
             keybinding: Style::default()
                 .fg(Color::Rgb(229, 199, 54))
                 .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::Rgb(35, 55, 43))
+                .fg(Color::Rgb(229, 199, 54))
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::Rgb(45, 213, 183))
+                .fg(Color::Rgb(17, 28, 24))
+                .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Rgb(17, 28, 24)),
         }
     }
@@ -148,6 +158,14 @@ impl Theme {
             warning: Style::default().fg(Color::Rgb(246, 97, 81)),
             keybinding: Style::default()
                 .fg(Color::Rgb(255, 190, 0))
+                .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::Rgb(60, 60, 60))
+                .fg(Color::Rgb(255, 190, 0))
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::Rgb(53, 132, 228))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Rgb(30, 30, 30)),
         }
@@ -196,6 +214,14 @@ impl Theme {
             keybinding: Style::default()
                 .fg(Color::Rgb(249, 226, 175))
                 .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::Rgb(69, 71, 90))
+                .fg(Color::Rgb(249, 226, 175))
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::Rgb(203, 166, 247))
+                .fg(Color::Rgb(17, 17, 27))
+                .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Rgb(30, 30, 46)),
         }
     }
@@ -242,6 +268,14 @@ impl Theme {
             warning: Style::default().fg(Color::Rgb(254, 100, 11)),
             keybinding: Style::default()
                 .fg(Color::Rgb(223, 142, 29))
+                .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::Rgb(204, 208, 218))
+                .fg(Color::Rgb(223, 142, 29))
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::Rgb(136, 57, 239))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Rgb(239, 241, 245)),
         }
@@ -290,6 +324,14 @@ impl Theme {
             keybinding: Style::default()
                 .fg(Color::Rgb(235, 203, 139))
                 .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::Rgb(67, 76, 94))
+                .fg(Color::Rgb(235, 203, 139))
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::Rgb(136, 192, 208))
+                .fg(Color::Rgb(46, 52, 64))
+                .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Rgb(46, 52, 64)),
         }
     }
@@ -336,6 +378,14 @@ impl Theme {
             warning: Style::default().fg(Color::Rgb(255, 184, 108)),
             keybinding: Style::default()
                 .fg(Color::Rgb(241, 250, 140))
+                .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::Rgb(68, 71, 90))
+                .fg(Color::Rgb(241, 250, 140))
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::Rgb(189, 147, 249))
+                .fg(Color::Rgb(40, 42, 54))
                 .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Rgb(40, 42, 54)),
         }
@@ -384,6 +434,14 @@ impl Theme {
             keybinding: Style::default()
                 .fg(Color::Rgb(250, 189, 47))
                 .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::Rgb(60, 56, 54))
+                .fg(Color::Rgb(250, 189, 47))
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::Rgb(254, 128, 25))
+                .fg(Color::Rgb(29, 32, 33))
+                .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Rgb(40, 40, 40)),
         }
     }
@@ -427,6 +485,14 @@ impl Theme {
                 .add_modifier(Modifier::UNDERLINED),
             keybinding: Style::default()
                 .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            key_badge: Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            key_badge_accent: Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
             popup_bg: Style::default().bg(Color::Black),
         }

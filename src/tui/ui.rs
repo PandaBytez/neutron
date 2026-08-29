@@ -129,14 +129,17 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
         })
         .collect();
 
-    let title = format!(" Profiles ({}) ", state.rows.len());
+    let title = Line::from(vec![
+        Span::styled(format!(" Profiles ({}) ", state.rows.len()), theme.title),
+        Span::styled(" [↑/↓ Nav] ", theme.keybinding),
+    ]);
 
     let list_widget = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme.active_border)
-            .title(Span::styled(title, theme.title)),
+            .title(title),
     );
 
     frame.render_widget(list_widget, area);
@@ -287,38 +290,48 @@ fn render_security_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme.border)
-            .title(Span::styled(" Global Security & Policies ", theme.title)),
+            .title(Line::from(vec![
+                Span::styled(" Global Security & Policies ", theme.title),
+                Span::styled(" [a, k, l, t] ", theme.keybinding),
+            ])),
     );
 
     frame.render_widget(panel, area);
 }
 
+fn key_item<'a>(
+    theme: &'a crate::tui::theme::Theme,
+    key: &'a str,
+    label: &'a str,
+) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(format!(" {key} "), theme.key_badge),
+        Span::styled(format!(" {label}  "), theme.text_primary),
+    ]
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
-    let hotkeys = Line::from(vec![
-        Span::styled("[Space] ", theme.keybinding),
-        Span::raw("Toggle  "),
-        Span::styled("[s] ", theme.keybinding),
-        Span::raw("Switch  "),
-        Span::styled("[t] ", theme.keybinding),
-        Span::raw("Split Tunnel  "),
-        Span::styled("[e] ", theme.keybinding),
-        Span::raw("Eligible  "),
-        Span::styled("[r] ", theme.keybinding),
-        Span::raw("Sync  "),
-        Span::styled("[?] ", theme.keybinding),
-        Span::raw("Help  "),
-        Span::styled("[q] ", theme.keybinding),
-        Span::raw("Quit"),
-    ]);
+    let mut hotkeys = Vec::new();
+    hotkeys.extend(key_item(theme, "Space", "Connect/Down"));
+    hotkeys.extend(key_item(theme, "s", "Switch"));
+    hotkeys.extend(key_item(theme, "t", "Split"));
+    hotkeys.extend(key_item(theme, "k", "Kill-Switch"));
+    hotkeys.extend(key_item(theme, "l", "Lockdown"));
+    hotkeys.extend(key_item(theme, "a", "Auto-Login"));
+    hotkeys.extend(key_item(theme, "e", "Eligible"));
+    hotkeys.extend(key_item(theme, "r", "Sync"));
+    hotkeys.extend(key_item(theme, "d", "Delete"));
+    hotkeys.extend(key_item(theme, "?", "Help"));
+    hotkeys.extend(key_item(theme, "q", "Quit"));
 
     let log_line = Line::from(vec![
-        Span::styled("Status: ", theme.label_dim),
+        Span::styled(" Status: ", theme.label_dim),
         Span::styled(&state.status_message, theme.title),
     ]);
 
-    let footer_widget = Paragraph::new(vec![log_line, hotkeys]).block(
+    let footer_widget = Paragraph::new(vec![log_line, Line::from(hotkeys)]).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -556,21 +569,16 @@ fn render_split_tunnel_modal(
     frame.render_widget(domain_list_widget, list_chunks[1]);
 
     // Footer instructions
-    let modal_footer = Paragraph::new(Line::from(vec![
-        Span::styled("[Tab] ", theme.keybinding),
-        Span::raw("Focus  "),
-        Span::styled("[1] ", theme.keybinding),
-        Span::raw("Add CIDR  "),
-        Span::styled("[2] ", theme.keybinding),
-        Span::raw("Add Domain  "),
-        Span::styled("[x/Del] ", theme.keybinding),
-        Span::raw("Delete  "),
-        Span::styled("[Ctrl+s] ", theme.keybinding),
-        Span::raw("Save & Apply  "),
-        Span::styled("[Esc] ", theme.keybinding),
-        Span::raw("Cancel"),
-    ]))
-    .alignment(Alignment::Center);
+    let mut modal_keys = Vec::new();
+    modal_keys.extend(key_item(theme, "Tab", "Focus"));
+    modal_keys.extend(key_item(theme, "m", "Mode"));
+    modal_keys.extend(key_item(theme, "1", "Add CIDR"));
+    modal_keys.extend(key_item(theme, "2", "Add Domain"));
+    modal_keys.extend(key_item(theme, "x/Del", "Delete"));
+    modal_keys.extend(key_item(theme, "Ctrl+S", "Save & Apply"));
+    modal_keys.extend(key_item(theme, "Esc", "Cancel"));
+
+    let modal_footer = Paragraph::new(Line::from(modal_keys)).alignment(Alignment::Center);
     frame.render_widget(modal_footer, chunks[3]);
 
     let outer_block = Block::default()
