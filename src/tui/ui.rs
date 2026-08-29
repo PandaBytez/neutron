@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
         .constraints([
             Constraint::Length(5), // Header with Status, Bandwidth, Latency & Policies
             Constraint::Min(10),   // Main body: Left List, Right Full Detail
-            Constraint::Length(3), // Footer / Hotkeys
+            Constraint::Length(4), // Footer / Hotkeys + Status line
         ])
         .split(size);
 
@@ -443,7 +443,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
         Span::styled(&state.status_message, theme.title),
     ]);
 
-    let footer_widget = Paragraph::new(vec![log_line, Line::from(hotkeys)]).block(
+    let footer_widget = Paragraph::new(vec![Line::from(hotkeys), log_line]).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
