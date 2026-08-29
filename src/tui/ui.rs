@@ -19,19 +19,26 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
     // Render subtle themed textured backdrop
     render_backdrop(frame, size, theme);
 
-    // Overall vertical layout: Header (with merged Policies & Speeds), Body (List + Profile Detail), Footer
+    let show_ascii = size.height >= 26;
+    let banner_h = if show_ascii { 3 } else { 0 };
+
+    // Overall vertical layout: ASCII Banner (if height permits), Header, Body, Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // Header with Status, Bandwidth, Latency & Policies
-            Constraint::Min(10),   // Main body: Left List, Right Full Detail
-            Constraint::Length(4), // Footer / Hotkeys + Status line
+            Constraint::Length(banner_h), // Centered ASCII title logo
+            Constraint::Length(5),        // Header with Status, Bandwidth, Latency & Policies
+            Constraint::Min(10),          // Main body: Left List, Right Full Detail
+            Constraint::Length(4),        // Footer / Hotkeys + Status line
         ])
         .split(size);
 
-    render_header(frame, chunks[0], state);
-    render_body(frame, chunks[1], state);
-    render_footer(frame, chunks[2], state);
+    if show_ascii {
+        render_ascii_banner(frame, chunks[0], state);
+    }
+    render_header(frame, chunks[1], state);
+    render_body(frame, chunks[2], state);
+    render_footer(frame, chunks[3], state);
 
     // Overlay Modals
     match &state.modal {
@@ -44,6 +51,19 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
         }
         ActiveModal::None => {}
     }
+}
+
+fn render_ascii_banner(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let theme = &state.theme;
+
+    let ascii_lines = vec![
+        Line::styled(" _  _ ____ _  _ ___ ____ ____ _  _ ", theme.header),
+        Line::styled(" |\\ | |___ |  |  |  |__/ |  | |\\ | ", theme.accent),
+        Line::styled(" | \\| |___ |__|  |  |  \\ |__| | \\| ", theme.header),
+    ];
+
+    let banner = Paragraph::new(ascii_lines).alignment(Alignment::Center);
+    frame.render_widget(banner, area);
 }
 
 fn render_backdrop(frame: &mut Frame, area: Rect, theme: &crate::tui::theme::Theme) {
