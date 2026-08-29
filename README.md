@@ -43,6 +43,7 @@ Explore detailed architectural and technical documentation in the [`docs/`](docs
 - [**Security: Kill Switch & Lockdown Netfilter**](docs/security.md)
 - [**Split Tunneling (IP & Domain Routing)**](docs/split-tunneling.md)
 - [**NAT-PMP Port Forwarding Engine**](docs/port-forwarding.md)
+- [**User Configuration & Theming (`config.toml`)**](docs/configuration.md)
 - [**Packaging & Universal Distribution**](docs/packaging-distribution.md)
 
 ---

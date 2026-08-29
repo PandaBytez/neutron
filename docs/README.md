@@ -23,7 +23,10 @@ Architecture of global split tunneling, Include vs. Exclude routing modes, CIDR 
 ### 5. [NAT-PMP Port Forwarding Engine](port-forwarding.md)
 Pure Rust UDP implementation of the NAT-PMP protocol (RFC 6886), tunnel gateway derivation, mapping request framing, lease renewal timers, and clipboard integration.
 
-### 6. [Packaging & Universal Distribution](packaging-distribution.md)
+### 6. [User Configuration & Theming (`config.toml`)](configuration.md)
+Specification for the human-readable TOML configuration, managed profile drop directory (`profiles/`) auto-sync, built-in themes (Catppuccin, Nord, Dracula, Adwaita), and color customization.
+
+### 7. [Packaging & Universal Distribution](packaging-distribution.md)
 Packaging guides and distribution models for AppImage, Homebrew tap formulas, Arch Linux AUR, and static musl compilation for headless servers.
 
 ---
