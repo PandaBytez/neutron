@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -6,6 +6,70 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitTunnelMode {
+    #[default]
+    Disabled,
+    /// Include mode: VPN only routes specified CIDRs and resolved domain IPs.
+    /// Default internet traffic bypasses the VPN tunnel (`never-default = yes`).
+    Include,
+    /// Exclude mode: VPN routes general traffic, but specified CIDRs and
+    /// resolved domain IPs bypass the VPN tunnel.
+    Exclude,
+}
+
+impl SplitTunnelMode {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, SplitTunnelMode::Disabled)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SplitTunnelMode::Disabled => "disabled",
+            SplitTunnelMode::Include => "include",
+            SplitTunnelMode::Exclude => "exclude",
+        }
+    }
+}
+
+impl std::str::FromStr for SplitTunnelMode {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().trim() {
+            "disabled" | "off" | "none" => Ok(SplitTunnelMode::Disabled),
+            "include" | "only" => Ok(SplitTunnelMode::Include),
+            "exclude" | "bypass" => Ok(SplitTunnelMode::Exclude),
+            other => Err(AppError::Config(format!(
+                "invalid split-tunnel mode '{other}'; expected 'disabled', 'include', or 'exclude'"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for SplitTunnelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SplitTunnelConfig {
+    #[serde(default)]
+    pub mode: SplitTunnelMode,
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+}
+
+impl SplitTunnelConfig {
+    pub fn is_empty(&self) -> bool {
+        self.cidrs.is_empty() && self.domains.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -48,7 +112,13 @@ pub struct AppConfig {
     pub autoconnect_at_boot: bool,
     /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
     #[serde(default)]
-    pub profile_custom_info: std::collections::BTreeMap<String, String>,
+    pub profile_custom_info: BTreeMap<String, String>,
+    /// Global split tunneling configuration applied across all WireGuard profiles.
+    #[serde(default)]
+    pub global_split_tunnel: SplitTunnelConfig,
+    /// Split tunneling configuration indexed by profile UUID.
+    #[serde(default)]
+    pub split_tunnels: BTreeMap<String, SplitTunnelConfig>,
 }
 
 fn default_true() -> bool {
@@ -69,6 +139,8 @@ impl Default for AppConfig {
             window_height: None,
             autoconnect_at_boot: default_true(),
             profile_custom_info: std::collections::BTreeMap::new(),
+            global_split_tunnel: SplitTunnelConfig::default(),
+            split_tunnels: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -96,6 +168,7 @@ pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
 /// unnecessary save. This is a pure mutation and performs no I/O.
 pub fn forget_profile(config: &mut AppConfig, uuid: &str) -> bool {
     let mut changed = config.profile_custom_info.remove(uuid).is_some();
+    changed |= config.split_tunnels.remove(uuid).is_some();
     changed |= config.excluded_profile_ids.remove(uuid);
     if config.last_random_profile_id.as_deref() == Some(uuid) {
         config.last_random_profile_id = None;
@@ -259,6 +332,14 @@ mod tests {
         config
             .profile_custom_info
             .insert("uuid-1".to_string(), "# notes".to_string());
+        config.split_tunnels.insert(
+            "uuid-1".to_string(),
+            SplitTunnelConfig {
+                mode: SplitTunnelMode::Include,
+                cidrs: vec!["10.0.0.0/8".to_string()],
+                domains: vec!["example.com".to_string()],
+            },
+        );
         config.excluded_profile_ids.insert("uuid-1".to_string());
         config.last_random_profile_id = Some("uuid-1".to_string());
 
@@ -266,8 +347,42 @@ mod tests {
 
         assert!(changed);
         assert!(config.profile_custom_info.is_empty());
+        assert!(config.split_tunnels.is_empty());
         assert!(config.excluded_profile_ids.is_empty());
         assert_eq!(config.last_random_profile_id, None);
+    }
+
+    #[test]
+    fn split_tunnel_mode_parsing_and_display() {
+        assert_eq!(
+            "include".parse::<SplitTunnelMode>().unwrap(),
+            SplitTunnelMode::Include
+        );
+        assert_eq!(
+            "exclude".parse::<SplitTunnelMode>().unwrap(),
+            SplitTunnelMode::Exclude
+        );
+        assert_eq!(
+            "disabled".parse::<SplitTunnelMode>().unwrap(),
+            SplitTunnelMode::Disabled
+        );
+        assert_eq!(
+            "off".parse::<SplitTunnelMode>().unwrap(),
+            SplitTunnelMode::Disabled
+        );
+        assert_eq!(
+            "bypass".parse::<SplitTunnelMode>().unwrap(),
+            SplitTunnelMode::Exclude
+        );
+        assert_eq!(
+            "only".parse::<SplitTunnelMode>().unwrap(),
+            SplitTunnelMode::Include
+        );
+        assert!("invalid".parse::<SplitTunnelMode>().is_err());
+
+        assert_eq!(SplitTunnelMode::Include.to_string(), "include");
+        assert_eq!(SplitTunnelMode::Exclude.to_string(), "exclude");
+        assert_eq!(SplitTunnelMode::Disabled.to_string(), "disabled");
     }
 
     #[test]

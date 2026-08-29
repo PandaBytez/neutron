@@ -65,12 +65,14 @@ pub struct MockNmClient {
     fail_kill_switch: bool,
     fail_autoconnect: bool,
     fail_lockdown: bool,
+    fail_split_tunnel: bool,
     calls: Arc<Mutex<Vec<String>>>,
     attempted: Arc<Mutex<Vec<String>>>,
     connected: Arc<Mutex<Vec<String>>>,
     kill_switch_calls: Arc<Mutex<Vec<String>>>,
     autoconnect_calls: Arc<Mutex<Vec<String>>>,
     lockdown_calls: Arc<Mutex<Vec<String>>>,
+    split_tunnel_calls: Arc<Mutex<Vec<String>>>,
     imported: Arc<Mutex<Vec<String>>>,
 }
 
@@ -126,6 +128,12 @@ impl MockNmClient {
         self
     }
 
+    /// Consume this mock and return one whose `apply_split_tunnel` fails.
+    pub fn fail_split_tunnel(mut self) -> Self {
+        self.fail_split_tunnel = true;
+        self
+    }
+
     /// Set the tunnels returned by `wireguard_tunnels`.
     pub fn with_tunnels(mut self, tunnels: Vec<WireguardTunnel>) -> Self {
         self.tunnels = tunnels;
@@ -164,6 +172,11 @@ impl MockNmClient {
     /// `lockdown:off`.
     pub fn lockdown_calls(&self) -> Vec<String> {
         snapshot(&self.lockdown_calls)
+    }
+
+    /// Split tunnel invocations in order, formatted as `split-tunnel:<uuid>:<mode>:<v4_count>:<v6_count>`.
+    pub fn split_tunnel_calls(&self) -> Vec<String> {
+        snapshot(&self.split_tunnel_calls)
     }
 
     /// Paths passed to `import_wireguard_profile`, in invocation order.
@@ -274,6 +287,58 @@ impl NmClient for MockNmClient {
 
     fn delete_profile(&self, uuid: &str) -> AppResult<()> {
         record(&self.calls, format!("delete:{}", uuid));
+        Ok(())
+    }
+
+    fn apply_split_tunnel(
+        &self,
+        uuid: &str,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()> {
+        record(
+            &self.split_tunnel_calls,
+            format!(
+                "split-tunnel:{}:{}:{}:{}",
+                uuid,
+                mode,
+                v4_routes.len(),
+                v6_routes.len()
+            ),
+        );
+
+        if self.fail_split_tunnel {
+            return Err(AppError::NmCommandFailed(
+                "simulated split-tunnel failure".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn apply_split_tunnel_all(
+        &self,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()> {
+        record(
+            &self.split_tunnel_calls,
+            format!(
+                "split-tunnel-all:{}:{}:{}",
+                mode,
+                v4_routes.len(),
+                v6_routes.len()
+            ),
+        );
+
+        if self.fail_split_tunnel {
+            return Err(AppError::NmCommandFailed(
+                "simulated split-tunnel failure".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }

@@ -9,6 +9,7 @@ use crate::error::{AppError, AppResult};
 
 mod autoconnect;
 mod kill_switch;
+pub mod split_tunnel;
 
 /// Maximum time to wait for an `nmcli` invocation before giving up.
 ///
@@ -119,6 +120,21 @@ pub trait NmClient {
     /// that referenced the profile (provider comments, startup eligibility) is
     /// cleaned up too so stale entries don't accumulate.
     fn delete_profile(&self, uuid: &str) -> AppResult<()>;
+    /// Apply split-tunnel routing rules to a NetworkManager profile.
+    fn apply_split_tunnel(
+        &self,
+        uuid: &str,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()>;
+    /// Apply split-tunnel routing rules to *every* WireGuard profile.
+    fn apply_split_tunnel_all(
+        &self,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()>;
 }
 
 fn extract_interface_comments(path: &std::path::Path) -> String {
@@ -314,11 +330,24 @@ impl NmClient for CliNmClient {
             let _ = run_nmcli_owned(&autoconnect::set_args(uuid.as_str(), false));
 
             let comments = extract_interface_comments(path);
-            if !comments.is_empty()
-                && let Ok(config_path) = crate::config::default_config_path()
+            if let Ok(config_path) = crate::config::default_config_path()
                 && let Ok(mut app_cfg) = crate::config::load(&config_path)
             {
-                app_cfg.profile_custom_info.insert(uuid, comments);
+                if !comments.is_empty() {
+                    app_cfg.profile_custom_info.insert(uuid.clone(), comments);
+                }
+                if app_cfg.global_split_tunnel.mode.is_enabled() {
+                    let (v4, v6) = split_tunnel::collect_all_routes(
+                        &app_cfg.global_split_tunnel.cidrs,
+                        &app_cfg.global_split_tunnel.domains,
+                    );
+                    let _ = run_nmcli_owned(&split_tunnel::set_args(
+                        uuid.as_str(),
+                        app_cfg.global_split_tunnel.mode,
+                        &v4,
+                        &v6,
+                    ));
+                }
                 let _ = crate::config::save(&config_path, &app_cfg);
             }
         }
@@ -436,6 +465,29 @@ impl NmClient for CliNmClient {
         }
 
         Ok(())
+    }
+
+    fn apply_split_tunnel(
+        &self,
+        uuid: &str,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()> {
+        let args = split_tunnel::set_args(uuid, mode, v4_routes, v6_routes);
+        run_nmcli_owned(&args)?;
+        Ok(())
+    }
+
+    fn apply_split_tunnel_all(
+        &self,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()> {
+        let profiles = self.list_wireguard_profiles()?;
+        let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
+        apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
     }
 }
 
@@ -573,6 +625,20 @@ fn autoconnect_arg_batches(profiles: &[WireguardProfile], enable: bool) -> Vec<V
     profiles
         .iter()
         .map(|profile| autoconnect::set_args(&profile.uuid, enable))
+        .collect()
+}
+
+/// Build the per-profile `nmcli` argument batches that set split tunneling
+/// configuration across *every* profile.
+fn split_tunnel_arg_batches(
+    profiles: &[WireguardProfile],
+    mode: crate::config::SplitTunnelMode,
+    v4_routes: &[String],
+    v6_routes: &[String],
+) -> Vec<Vec<String>> {
+    profiles
+        .iter()
+        .map(|profile| split_tunnel::set_args(&profile.uuid, mode, v4_routes, v6_routes))
         .collect()
 }
 

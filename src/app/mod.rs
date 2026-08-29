@@ -1,6 +1,7 @@
 pub(crate) mod eligibility;
 pub mod profile_list;
 pub mod refresh_sync;
+pub(crate) mod split_tunnel;
 
 use clap::{Parser, Subcommand};
 
@@ -48,6 +49,10 @@ enum Commands {
         #[command(subcommand)]
         command: LockdownCommands,
     },
+    SplitTunnel {
+        #[command(subcommand)]
+        command: SplitTunnelCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +74,17 @@ enum LockdownCommands {
     Status,
     Enable,
     Disable,
+}
+
+#[derive(Debug, Subcommand)]
+enum SplitTunnelCommands {
+    Status,
+    SetMode { mode: String },
+    AddCidr { cidr: String },
+    RemoveCidr { cidr: String },
+    AddDomain { domain: String },
+    RemoveDomain { domain: String },
+    Clear,
 }
 
 pub fn run<C: NmClient + FirewallClient + Clone + Send + 'static>(client: &C) -> AppResult<()> {
@@ -113,6 +129,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + 'static>(
         Commands::Eligible { command } => handle_eligible_command(client, command),
         Commands::KillSwitch { command } => handle_kill_switch_command(client, command),
         Commands::Lockdown { command } => handle_lockdown_command(client, command),
+        Commands::SplitTunnel { command } => handle_split_tunnel_command(client, command),
     }
 }
 
@@ -288,6 +305,61 @@ pub(crate) fn set_global_lockdown<C: NmClient + FirewallClient>(
     let mut app_cfg = config::load(path)?;
     app_cfg.lockdown_enabled = enable;
     config::save(path, &app_cfg)
+}
+
+fn handle_split_tunnel_command<C: NmClient>(
+    client: &C,
+    command: SplitTunnelCommands,
+) -> AppResult<()> {
+    let path = config::default_config_path()?;
+    handle_split_tunnel_command_with_path(client, command, &path)
+}
+
+fn handle_split_tunnel_command_with_path<C: NmClient>(
+    client: &C,
+    command: SplitTunnelCommands,
+    path: &std::path::Path,
+) -> AppResult<()> {
+    match command {
+        SplitTunnelCommands::Status => {
+            let app_cfg = config::load(path)?;
+            let st_cfg = split_tunnel::get_global_split_tunnel(&app_cfg);
+            println!("{}", split_tunnel::format_global_status(&st_cfg));
+        }
+        SplitTunnelCommands::SetMode { mode } => {
+            let mode = mode.parse::<config::SplitTunnelMode>()?;
+            let st_cfg = split_tunnel::set_global_mode(client, path, mode)?;
+            println!("Global split-tunnel mode set to: {}", st_cfg.mode);
+        }
+        SplitTunnelCommands::AddCidr { cidr } => {
+            let st_cfg = split_tunnel::add_global_cidr(client, path, &cidr)?;
+            println!(
+                "Added CIDR '{}' to global split tunneling (mode: {}).",
+                cidr, st_cfg.mode
+            );
+        }
+        SplitTunnelCommands::RemoveCidr { cidr } => {
+            let _ = split_tunnel::remove_global_cidr(client, path, &cidr)?;
+            println!("Removed CIDR '{}' from global split tunneling.", cidr);
+        }
+        SplitTunnelCommands::AddDomain { domain } => {
+            let st_cfg = split_tunnel::add_global_domain(client, path, &domain)?;
+            println!(
+                "Added domain '{}' to global split tunneling (mode: {}).",
+                domain, st_cfg.mode
+            );
+        }
+        SplitTunnelCommands::RemoveDomain { domain } => {
+            let _ = split_tunnel::remove_global_domain(client, path, &domain)?;
+            println!("Removed domain '{}' from global split tunneling.", domain);
+        }
+        SplitTunnelCommands::Clear => {
+            split_tunnel::clear_global(client, path)?;
+            println!("Cleared global split-tunnel configuration.");
+        }
+    }
+
+    Ok(())
 }
 
 /// Rebuild the lockdown ruleset from the current profile set, if lockdown is on.
@@ -699,6 +771,63 @@ mod tests {
         );
 
         assert_eq!(client.lockdown_calls(), vec!["lockdown:on", "lockdown:off"]);
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn split_tunnel_commands_flow() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        // 1. Set mode to include
+        handle_split_tunnel_command_with_path(
+            &client,
+            SplitTunnelCommands::SetMode {
+                mode: "include".to_string(),
+            },
+            &path,
+        )
+        .expect("set mode should succeed");
+
+        assert_eq!(
+            client.split_tunnel_calls(),
+            vec!["split-tunnel-all:include:0:0"]
+        );
+
+        // 2. Add CIDR
+        handle_split_tunnel_command_with_path(
+            &client,
+            SplitTunnelCommands::AddCidr {
+                cidr: "10.0.0.0/8".to_string(),
+            },
+            &path,
+        )
+        .expect("add cidr should succeed");
+
+        let persisted = config::load(&path).expect("config should load");
+        assert_eq!(
+            persisted.global_split_tunnel.mode,
+            config::SplitTunnelMode::Include
+        );
+        assert_eq!(
+            persisted.global_split_tunnel.cidrs,
+            vec!["10.0.0.0/8".to_string()]
+        );
+
+        // 3. Status check
+        handle_split_tunnel_command_with_path(&client, SplitTunnelCommands::Status, &path)
+            .expect("status check should succeed");
+
+        // 4. Clear
+        handle_split_tunnel_command_with_path(&client, SplitTunnelCommands::Clear, &path)
+            .expect("clear should succeed");
+
+        let persisted = config::load(&path).expect("config should load");
+        assert_eq!(
+            persisted.global_split_tunnel.mode,
+            config::SplitTunnelMode::Disabled
+        );
+
         cleanup_test_config(&path);
     }
 
