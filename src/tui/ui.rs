@@ -99,11 +99,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
         )
     };
 
-    let title = Line::from(vec![
-        Span::styled(" ⚡ NEUTRON ", theme.header),
-        Span::raw("— WireGuard Manager "),
-        Span::styled(format!("[Theme: {}]", state.theme.name), theme.label_dim),
-    ]);
+    let title = Line::from(vec![Span::styled(" ⚡ Status ", theme.header)]);
 
     let status_badge = Span::styled(status_text, status_style);
 
