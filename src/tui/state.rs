@@ -195,7 +195,7 @@ impl TuiState {
             selected_tunnel_address: None,
             selected_tunnel_dns: None,
             selected_gateway: None,
-            status_message: "Ready. Press [?] for keybindings help.".to_string(),
+            status_message: String::new(),
             modal: ActiveModal::None,
             should_quit: false,
             spinner_tick: 0,

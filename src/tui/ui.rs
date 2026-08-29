@@ -458,12 +458,15 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     hotkeys.extend(key_item(theme, "?", "Help"));
     hotkeys.extend(key_item(theme, "q", "Quit"));
 
-    let log_line = Line::from(vec![
-        Span::styled(" Status: ", theme.label_dim),
-        Span::styled(&state.status_message, theme.title),
-    ]);
+    let mut footer_lines = vec![Line::from(hotkeys)];
+    if !state.status_message.is_empty() {
+        footer_lines.push(Line::from(vec![
+            Span::styled(" Status: ", theme.label_dim),
+            Span::styled(&state.status_message, theme.title),
+        ]));
+    }
 
-    let footer_widget = Paragraph::new(vec![Line::from(hotkeys), log_line]).block(
+    let footer_widget = Paragraph::new(footer_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
