@@ -11,21 +11,39 @@ directory replaces it.
 
 ## Tiers
 
-| Tier | Where | Covers | Command |
-| --- | --- | --- | --- |
-| Unit + integration | host | logic, arg builders, TUI state | `cargo test` |
-| System — NetworkManager | container | real profiles, routing, parsers | `./testing/run-container-tests.sh --nm` |
-| System — firewall | container | real firewalld rules, teardown | `./testing/run-container-tests.sh --firewall` |
-| Leak demonstrations | container | open bugs — **expected to fail** | `./testing/run-container-tests.sh --leaks` |
+| Tier | Where | Covers | Preferred Command | Low-Level Shell Script |
+| --- | --- | --- | --- | --- |
+| Unit + integration | host | logic, arg builders, TUI state | `cargo test` / `cargo test-all` | `cargo test` |
+| System — NetworkManager | container | real profiles, routing, parsers | `cargo test-system -- --nm` | `./testing/run-container-tests.sh --nm` |
+| System — firewall | container | real firewalld rules, teardown | `cargo test-system -- --firewall` | `./testing/run-container-tests.sh --firewall` |
+| Leak demonstrations | container | regression guards | `cargo test-leaks` | `./testing/run-container-tests.sh --leaks` |
+
+### Custom Cargo Tasks (`cargo xtask`)
+
+Neutron supports standard Cargo tasks (`xtask`) configured in `.cargo/config.toml` so you do not need to invoke shell scripts directly:
 
 ```sh
-./testing/run-container-tests.sh            # both system tiers
-./testing/run-container-tests.sh --rebuild  # force a fresh image
-./testing/run-container-tests.sh --shell    # interactive shell inside the sandbox
+# Run all system tests in the container sandbox
+cargo test-system
+
+# Run specific tiers
+cargo test-system -- --nm        # NetworkManager system tests
+cargo test-system -- --firewall  # Firewall lockdown system tests
+cargo test-system -- --rebuild   # Force rebuild the container image
+
+# Run leak regression guards
+cargo test-leaks
+
+# Open an interactive shell inside the sandbox container
+cargo xtask container-shell
+
+# Run host tests across all feature gates & strict linter
+cargo test-all
+cargo lint
 ```
 
-Requires `podman`. The first run builds a Fedora image with NetworkManager,
-firewalld, WireGuard tools and the Rust toolchain.
+Requires `podman` (or `docker`). The first run builds the `neutron-sandbox` Fedora image with NetworkManager,
+firewalld, WireGuard tools, and the Rust toolchain.
 
 ## Safety model
 
@@ -91,7 +109,7 @@ BUG-018, BUG-019, and BUG-022 in `BUGS.md` violated. They now pass and serve as
 permanent regression guards:
 
 ```sh
-./testing/run-container-tests.sh --leaks
+cargo test-leaks
 ```
 
 They verify:

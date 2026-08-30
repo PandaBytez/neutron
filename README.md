@@ -151,31 +151,42 @@ This compiles the release binary and packages it into `Neutron-VPN-<arch>.AppIma
 ./Neutron-VPN-x86_64.AppImage
 ```
 
-Quality checks:
+Quality checks & task runner:
 
 ```bash
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
+# Run formatting and strict clippy linting across all features
+cargo lint
+
+# Run all host unit and integration tests across all feature gates
+cargo test-all
+
+# Run standard test suite
 cargo test
 ```
 
-Run only integration tests:
+Containerized System & Leak Tests (requires `podman` or `docker`):
+
+```bash
+# Run system integration tests in isolated container sandbox
+cargo test-system
+
+# Run specific system test suites
+cargo test-system -- --nm        # NetworkManager system tests
+cargo test-system -- --firewall  # Firewall lockdown system tests
+cargo test-system -- --rebuild   # Rebuild container image
+
+# Run leak protection regression tests
+cargo test-leaks
+
+# Open interactive shell in test sandbox
+cargo xtask container-shell
+```
+
+Run specific integration tests on host:
 
 ```bash
 cargo test --test startup_random
-```
-
-Run all tests without optional GUI feature:
-
-```bash
-cargo test
-```
-
-Run checks with optional GUI feature (requires GTK/libadwaita dev packages installed):
-
-```bash
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo test --test active_connection_policies
 ```
 
 ## Implementation notes
