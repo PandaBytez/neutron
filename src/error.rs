@@ -4,8 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("network manager command failed: {0}")]
-    NmCommandFailed(String),
+    #[error("command failed: {0}")]
+    CommandFailed(String),
     #[error("firewall command failed: {0}")]
     Firewall(String),
     #[error("failed to parse NetworkManager output: {0}")]
@@ -16,12 +16,14 @@ pub enum AppError {
     AmbiguousProfileName(String),
     #[error("no active wireguard profile found")]
     NoActiveProfile,
+    #[error("{0}")]
+    TunnelUnhealthy(String),
     #[error("no eligible profile found for random startup")]
     NoEligibleProfile,
-    #[error("feature unavailable: {0}")]
-    FeatureUnavailable(String),
     #[error("port forwarding failed: {0}")]
     PortForward(String),
+    #[error("qbittorrent error: {0}")]
+    QBittorrent(String),
     #[error("configuration error: {0}")]
     Config(String),
     #[error("io error: {0}")]
