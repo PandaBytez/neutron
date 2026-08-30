@@ -82,6 +82,23 @@ status_connected = "#63b07a"
 status_disconnected = "#ff5345"
 transfer_rx = "#acd4cf"
 transfer_tx = "#e5c736"
+
+# ==============================================================================
+# qBittorrent Dynamic Port Forwarding Sync
+# ==============================================================================
+[qbittorrent]
+# Automatically push NAT-PMP leased ports to qBittorrent WebUI on connect/renew
+enabled = false
+
+# WebUI HTTP/HTTPS endpoint URL
+url = "http://127.0.0.1:8080"
+
+# Optional authentication (leave empty if localhost auth bypass is enabled in qBittorrent)
+# username = "admin"
+# password = "your-webui-password"
+
+# Bind qBittorrent network interface to the active WireGuard interface
+bind_interface = false
 ```
 
 ---

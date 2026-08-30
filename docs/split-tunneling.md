@@ -20,8 +20,19 @@ Neutron VPN provides **Global Split Tunneling**, allowing users to specify exact
 
 ### 2. `Exclude` Mode (Bypass VPN for Listed Destinations)
 * **Behavior**: All general traffic routes through the encrypted VPN tunnel, while specified subnets or domains bypass the VPN directly to your local physical gateway.
-* **NetworkManager Mechanism**:
-  `never-default = no` with specific bypass routes prioritized over the default route.
+* **NetworkManager Mechanism**: `never-default = yes` with the **complement** of the listed destinations installed as tunnel routes.
+
+  Adding an excluded range to `ipv4.routes` would route it *into* the tunnel — the opposite of excluding it. There is no "bypass route" to install, because every route on a WireGuard connection points at the WireGuard device. So Neutron inverts the selection instead: it computes every CIDR *except* the listed ones and routes those through the tunnel, leaving the excluded ranges to the physical default route.
+
+  Excluding `10.0.0.0/8` therefore produces:
+  ```bash
+  nmcli connection modify <uuid> \
+      ipv4.never-default yes \
+      ipv6.never-default yes \
+      ipv4.routes "0.0.0.0/5, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, ..." \
+      ipv6.routes "::/0"
+  ```
+  The complement is computed by `nm::split_tunnel::complement_routes`, which recursively splits the address space into the smallest set of aligned CIDRs that covers everything but the exclusions. Excluding nothing yields a full tunnel (`0.0.0.0/0`); excluding `0.0.0.0/0` yields no routes at all.
 * **Use Case**: Privacy browsing with exclusions for local services, banking portals, or gaming servers that block VPN exit nodes.
 
 ### 3. `Disabled` Mode (Standard Full-Tunnel)
@@ -51,21 +62,21 @@ For domain entries (e.g., `internal.corp`, `service.local`):
 ### CLI Commands
 ```bash
 # Check status
-neutron-vpn split-tunnel status
+neutron split-tunnel status
 
 # Set routing mode
-neutron-vpn split-tunnel set-mode include
-neutron-vpn split-tunnel set-mode exclude
-neutron-vpn split-tunnel set-mode disabled
+neutron split-tunnel set-mode include
+neutron split-tunnel set-mode exclude
+neutron split-tunnel set-mode disabled
 
 # Manage CIDRs & Domains
-neutron-vpn split-tunnel add-cidr 10.0.0.0/8
-neutron-vpn split-tunnel remove-cidr 10.0.0.0/8
-neutron-vpn split-tunnel add-domain internal.corp
-neutron-vpn split-tunnel remove-domain internal.corp
+neutron split-tunnel add-cidr 10.0.0.0/8
+neutron split-tunnel remove-cidr 10.0.0.0/8
+neutron split-tunnel add-domain internal.corp
+neutron split-tunnel remove-domain internal.corp
 
 # Clear all rules
-neutron-vpn split-tunnel clear
+neutron split-tunnel clear
 ```
 
 ### GUI Dialog

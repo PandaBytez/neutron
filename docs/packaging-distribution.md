@@ -8,28 +8,13 @@ Neutron VPN is designed for easy distribution across all major Linux packaging e
 
 | Format | Target Platform | Dependencies | Standalone? | Build Command |
 | :--- | :--- | :--- | :---: | :--- |
-| **AppImage** | Universal Linux Desktop | Bundled GTK4/Adwaita | Yes | `./appimage/build-appimage.sh` |
 | **Homebrew** | macOS / Linuxbrew | Zero (Pure Rust TUI/CLI) | Yes | `brew install neutron-vpn` |
 | **Static Musl** | Headless Servers, SSH | Zero (Static musl binary) | Yes | `cargo build --target x86_64-unknown-linux-musl` |
 | **Arch AUR** | Arch Linux, Manjaro | System dependencies | Native | `makepkg -si` |
 
 ---
 
-## 1. AppImage Distribution (Desktop GUI)
-
-The AppImage bundles the release binary, icons, desktop entry, and AppStream metadata into a standalone squashfs executable:
-
-```bash
-# Build release AppImage
-./appimage/build-appimage.sh
-
-# Run
-./Neutron-VPN-x86_64.AppImage
-```
-
----
-
-## 2. Homebrew Tap Formula (`Formula/neutron-vpn.rb`)
+## 1. Homebrew Tap Formula (`Formula/neutron-vpn.rb`)
 
 Sample formula for custom tap (`brew tap deffi/neutron-vpn`):
 
@@ -55,7 +40,7 @@ end
 
 ---
 
-## 3. Static Musl Target (Headless Servers / Homelabs)
+## 2. Static Musl Target (Headless Servers / Homelabs)
 
 Compile a 100% statically-linked executable with no dynamic shared library dependencies:
 
@@ -70,7 +55,7 @@ The resulting binary (`target/x86_64-unknown-linux-musl/release/neutron-vpn`) ru
 
 ---
 
-## 4. Arch Linux AUR Package (`PKGBUILD`)
+## 3. Arch Linux AUR Package (`PKGBUILD`)
 
 Sample `PKGBUILD` for Arch Linux:
 

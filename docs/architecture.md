@@ -48,10 +48,11 @@ Neutron VPN is designed with a strictly decoupled architecture where all network
 - All rules are tagged with a unique comment (`neutron-lockdown`) ensuring surgical removal without modifying user-defined firewall rules.
 - Privilege escalation is consolidated into a single `pkexec /bin/sh` transaction.
 
-### 3. `portforward/` — NAT-PMP Dynamic Port Leasing
+### 3. `portforward/` — NAT-PMP Dynamic Port Leasing & App Integrations
 - Implements RFC 6886 NAT-PMP client directly over `std::net::UdpSocket`.
 - Derives the VPN gateway address from the local tunnel IPv4 address (`10.x.x.x` / `100.x.x.x`).
 - Acquires dynamic UDP/TCP port mappings and schedules automatic lease renewals before expiration.
+- Integrates `portforward::qbittorrent` Web API bridge to automatically synchronize dynamic listening ports to qBittorrent (native, Flatpak, containerized).
 
 ### 4. `config/` — Configuration & State Persistence
 - Manages `AppConfig` serialized as JSON in `~/.config/neutron-vpn/config.json`.
@@ -67,12 +68,12 @@ Neutron VPN is designed with a strictly decoupled architecture where all network
 
 ## Frontend & Resource Comparison Matrix
 
-| Metric | GTK4 / Libadwaita (GUI) | Pure Rust TUI (`ratatui`) | Background Daemon / CLI | Electron / Web VPN Clients |
-| :--- | :---: | :---: | :---: | :---: |
-| **Binary Size** | ~15–30 MB (or AppImage bundle) | **~3–5 MB** (Static musl binary) | **~3 MB** | 150–250 MB |
-| **Active RAM (RSS)** | **~70 – 110 MB** | **~10 – 15 MB** | **~3 – 6 MB** | 250 – 450 MB |
-| **Idle CPU Usage** | 0.1% – 0.5% | **0.0%** (sleeps on `epoll`) | **0.0%** | 0.5% – 2.0% |
-| **Startup Time** | ~150–300 ms | **< 10 ms** (instantaneous) | **< 2 ms** | 1.5 – 3.0 seconds |
-| **System Dependencies** | GTK4, Libadwaita, Mesa/Wayland | **Zero** (100% static musl) | **Zero** | Node, Chromium, X11/Wayland |
-| **Primary Environments** | GNOME Desktop Workstations | Servers, SSH, Hyprland, Sway, i3 | Automation, Cron, Systemd | Legacy Cross-Platform |
-| **Distribution Channels** | AppImage, Distro Packages | Homebrew, Cargo, AUR, Static Musl | Homebrew, System Package | Custom Installers |
+| Metric | GTK4 / Libadwaita (GUI)`UNRELEASED` | Pure Rust TUI (`ratatui`) | Background Daemon / CLI | Electron / Web VPN Clients |
+| :--- |:-----------------------------------:| :---: | :---: | :---: |
+| **Binary Size** |   ~15–30 MB (or AppImage bundle)    | **~3–5 MB** (Static musl binary) | **~3 MB** | 150–250 MB |
+| **Active RAM (RSS)** |          **~70 – 110 MB**           | **~10 – 15 MB** | **~3 – 6 MB** | 250 – 450 MB |
+| **Idle CPU Usage** |             0.1% – 0.5%             | **0.0%** (sleeps on `epoll`) | **0.0%** | 0.5% – 2.0% |
+| **Startup Time** |             ~150–300 ms             | **< 10 ms** (instantaneous) | **< 2 ms** | 1.5 – 3.0 seconds |
+| **System Dependencies** |   GTK4, Libadwaita, Mesa/Wayland    | **Zero** (100% static musl) | **Zero** | Node, Chromium, X11/Wayland |
+| **Primary Environments** |     GNOME Desktop Workstations      | Servers, SSH, Hyprland, Sway, i3 | Automation, Cron, Systemd | Legacy Cross-Platform |
+| **Distribution Channels** |      AppImage, Distro Packages      | Homebrew, Cargo, AUR, Static Musl | Homebrew, System Package | Custom Installers |

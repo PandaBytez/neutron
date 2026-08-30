@@ -50,3 +50,44 @@ Neutron VPN derives the default NAT-PMP gateway IP automatically:
 2. **Periodic Renewal Timer**: A background timer runs at `RENEW_INTERVAL` (every 45 seconds) to refresh the lease with the gateway.
 3. **Profile Switch / Disconnect Cleanup**: When switching profiles or disconnecting, the active port is cleared immediately to prevent displaying stale mappings.
 4. **Clipboard Integration**: A 1-click button in the GUI copies the forwarded port to the system clipboard for easy pasting into BitTorrent or game servers.
+
+---
+
+## qBittorrent Dynamic Port Sync
+
+Neutron can automatically push the dynamic NAT-PMP port to a running **qBittorrent** instance (native package, Flatpak, Docker/Podman container, or headless server) via its official Web API (`/api/v2`).
+
+### Setup Prerequisite (Required in qBittorrent)
+
+Before enabling synchronization, ensure qBittorrent's Web User Interface is enabled:
+
+1. In qBittorrent, open **Tools** $\rightarrow$ **Options** $\rightarrow$ **Web UI** (or **Preferences** $\rightarrow$ **Web UI**).
+2. Check **"Web User Interface (Remote control)"** (default port: `8080`).
+3. *(Recommended)* Under **Authentication**, check **"Bypass authentication for clients on localhost"**.
+   - If localhost authentication bypass is not enabled, configure your WebUI username and password in Neutron via `neutron qbit config --username <user> --password <pass>`.
+
+### Compatibility (Flatpak, Native, Containers)
+
+- **Flatpak (`org.qbittorrent.qBittorrent`)**: Fully compatible. Because Flatpak packages share the host network stack (`--share=network`), the WebUI is reached at `http://127.0.0.1:8080`, and updated listening ports apply directly to the host socket.
+- **Native Package**: Fully compatible.
+- **Docker / Podman / Remote WebUI**: Fully compatible by configuring the target URL (e.g. `neutron qbit config --url http://192.168.1.50:8080`).
+
+### CLI Management
+
+```bash
+# Check status and test WebUI connectivity
+neutron qbit status
+
+# Test WebUI credentials and fetch current listening port
+neutron qbit test
+
+# Immediately forward the active VPN port to qBittorrent
+neutron qbit sync
+
+# Enable / disable automated background port synchronization
+neutron qbit enable
+neutron qbit disable
+
+# Configure WebUI parameters & optional interface binding
+neutron qbit config --url http://127.0.0.1:8080 --bind true
+```

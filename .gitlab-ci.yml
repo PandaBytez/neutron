@@ -28,6 +28,8 @@ clippy:
     - rustup component add clippy
   script:
     - cargo clippy --all-targets -- -D warnings
+    # Optional features must stay lint-clean too, or they rot while disabled.
+    - cargo clippy --all-targets --features qbittorrent -- -D warnings
 
 test:
   stage: test
@@ -36,6 +38,40 @@ test:
     - apk add --no-cache musl-dev git
   script:
     - cargo test --all
+    - cargo test --all --features qbittorrent
+
+# System tests: the real CliNmClient and FirewallClient against real
+# NetworkManager and firewalld. These are what cover the gap that every leak in
+# BUGS.md lived in -- a mock can prove our argument builders are self-consistent,
+# but not that NetworkManager accepts, stores and reports back what we send.
+#
+# Needs a privileged container for CAP_NET_ADMIN (WireGuard links, netfilter).
+# Netfilter and routing are per network namespace, so this is confined to the
+# job's own container -- see testing/README.md for the isolation evidence.
+system_tests:
+  stage: test
+  image: quay.io/podman/stable
+  # Not all runners allow privileged containers; keep the pipeline informative
+  # rather than blocked if this one does not.
+  allow_failure: true
+  before_script:
+    - podman --version
+  script:
+    - ./testing/run-container-tests.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Demonstrates the open leaks documented in BUGS.md. Expected to fail until they
+# are fixed, so it never blocks the pipeline -- its value is the rule evidence in
+# the job log.
+leak_report:
+  stage: test
+  image: quay.io/podman/stable
+  allow_failure: true
+  when: manual
+  script:
+    - ./testing/run-container-tests.sh --leaks
 
 build_musl:
   stage: build

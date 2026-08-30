@@ -12,7 +12,7 @@ Branded as **Neutron VPN** (`io.gitlab.neutron_vpn.neutron`), distributed as an 
 - **Connection Management**: Instant manual connect, disconnect, and switch between WireGuard profiles.
 - **Random Profile on Boot**: Automatically picks and connects a random eligible profile at login/boot, avoiding immediate repeats.
 - **Global Split Tunneling**: Route only specific subnets/domains through the VPN (*Include mode*) or bypass the VPN for selected traffic (*Exclude mode*) using NetworkManager policy routing.
-- **Dynamic NAT-PMP Port Forwarding**: Automatic gateway discovery, port lease requests, periodic background renewals, and 1-click clipboard copying.
+- **Dynamic NAT-PMP Port Forwarding & qBittorrent Sync**: Automatic gateway discovery, port lease requests, periodic background renewals, and seamless automatic port synchronization with **qBittorrent** (native, Flatpak, and containers) via its local Web API.
 - **NetworkManager-Native Kill Switch**: Strict routing table isolation (`fwmark` + `suppress_prefixlength 0`) with negative DNS priorities to eliminate DNS and routing leaks.
 - **Always-On Lockdown Firewall**: Permanent `firewalld` Netfilter rules via `pkexec` blocking all physical traffic while disconnected, leaving only encrypted handshakes and local LAN traffic reachable.
 - **Multi-File Profile Import**: Import `.conf` files in batches directly into NetworkManager with automated validation and error aggregation.
@@ -86,7 +86,44 @@ neutron split-tunnel clear
 # Security Controls
 neutron kill-switch status|enable|disable
 neutron lockdown status|enable|disable
+
+# qBittorrent Dynamic Port Sync
+# (Prerequisite: Enable Web UI in qBittorrent Options -> Web UI)
+neutron qbit status
+neutron qbit test
+neutron qbit sync
+neutron qbit enable
+neutron qbit disable
+neutron qbit config --url http://127.0.0.1:8080 --bind true
 ```
+
+### TUI keybindings
+
+Every action below is also reachable from the command palette (`Ctrl+P` or `:`),
+which searches by name — the palette and the keys dispatch the same
+implementation, so they can never drift apart.
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` (or `p` / `n`) | Move through the profile list |
+| `Space` / `Enter` | Connect the selected profile, or disconnect it if active |
+| `s` | Switch to the selected profile |
+| `e` | **Exclude the selected profile from the auto-connect pool** (press again to put it back) |
+| `a` | Toggle auto-connect at login |
+| `t` | Open the split tunneling manager |
+| `k` | Toggle the kill switch |
+| `l` | Toggle lockdown (always-on firewall) |
+| `r` | Sync the profile drop directory |
+| `d` / `Delete` | Delete the selected profile |
+| `Ctrl+P` / `:` | Command palette |
+| `Ctrl+T` | Theme picker |
+| `?` / `h` | Keybinding help |
+| `q` / `Esc` | Quit |
+
+`e` controls which profiles the random login selector may pick. Profiles are in
+the pool by default; excluding one records its UUID in `excluded_profile_ids`
+and the selector then skips it. Excluded profiles are marked
+`[EXCLUDED FROM POOL]` in the list and can still be connected manually.
 
 `list` output now includes eligibility status from config (`eligible` or `not-eligible`). Profiles are eligible by default and become `not-eligible` only once explicitly excluded.
 
