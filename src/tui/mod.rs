@@ -7,6 +7,7 @@ pub mod ui;
 
 use std::io::stdout;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -119,8 +120,10 @@ where
     // NetworkManager monitor event counter
     let monitor_events = Arc::new(AtomicU64::new(0));
     let monitor_events_clone = monitor_events.clone();
+    let monitor_child: MonitorChild = Arc::new(Mutex::new(None));
+    let monitor_child_for_thread = monitor_child.clone();
     let _monitor_thread = thread::spawn(move || {
-        start_nm_monitor_loop(monitor_events_clone);
+        start_nm_monitor_loop(monitor_events_clone, monitor_child_for_thread);
     });
 
     // The loop body is wrapped so the terminal is restored on *every* exit
@@ -138,8 +141,29 @@ where
         &monitor_events,
     );
 
+    stop_nm_monitor(&monitor_child);
     restore_terminal(&mut terminal);
     outcome
+}
+
+/// The `nmcli monitor` child, shared so the main thread can stop it on exit.
+type MonitorChild = Arc<Mutex<Option<std::process::Child>>>;
+
+/// Kill the `nmcli monitor` child and reap it.
+///
+/// The monitor is a separate process, not just a thread, so letting the reader
+/// thread end does not stop it: it keeps running with a closed pipe. Every TUI
+/// session used to leave one behind, so a few launches accumulated a handful of
+/// orphaned `nmcli monitor` processes that outlived the app indefinitely.
+fn stop_nm_monitor(child: &MonitorChild) {
+    if let Ok(mut slot) = child.lock()
+        && let Some(mut child) = slot.take()
+    {
+        let _ = child.kill();
+        // Reaped rather than just killed, so the process does not linger as a
+        // zombie for as long as the parent lives.
+        let _ = child.wait();
+    }
 }
 
 /// Restore the terminal to a usable state. Best-effort and infallible: this
@@ -220,7 +244,7 @@ where
     Ok(())
 }
 
-fn start_nm_monitor_loop(events: Arc<AtomicU64>) {
+fn start_nm_monitor_loop(events: Arc<AtomicU64>, slot: MonitorChild) {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
@@ -238,6 +262,12 @@ fn start_nm_monitor_loop(events: Arc<AtomicU64>) {
     let Some(stdout) = child.stdout.take() else {
         return;
     };
+
+    // Hand the child to the main thread so it can be killed on exit. This
+    // thread only owns the pipe from here on.
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(child);
+    }
 
     let reader = BufReader::new(stdout);
     for line in reader.lines().map_while(Result::ok) {
