@@ -1,6 +1,7 @@
 stages:
   - test
   - build
+  - deploy
 
 variables:
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
@@ -86,3 +87,18 @@ build_musl:
     paths:
       - "neutron-linux-x86_64"
     expire_in: 1 week
+
+# Publish mdBook documentation to GitLab Pages
+pages:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl tar gzip
+    - curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /usr/local/bin
+  script:
+    - mdbook build
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

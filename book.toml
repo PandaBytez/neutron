@@ -1,0 +1,17 @@
+[book]
+title = "Neutron VPN Documentation"
+authors = ["Neutron Team"]
+description = "Technical documentation for Neutron VPN WireGuard Manager"
+language = "en"
+multilingual = false
+src = "docs"
+
+[build]
+build-dir = "public"
+
+[output.html]
+git-repository-url = "https://gitlab.com/neutron0/neutron"
+edit-url-template = "https://gitlab.com/neutron0/neutron/-/edit/main/docs/{path}"
+default-theme = "rust"
+preferred-dark-theme = "navy"
+site-url = "/neutron/"

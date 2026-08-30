@@ -16,6 +16,7 @@ fn main() {
         "test-leaks" | "leak-tests" => run_leak_tests(&workspace_root, &args[1..]),
         "container-shell" | "shell" => run_container_shell(&workspace_root, &args[1..]),
         "build-image" => build_container_image(&workspace_root, true),
+        "docs" | "build-docs" => build_docs(&workspace_root, &args[1..]),
         "lint" => run_linter(&workspace_root),
         "help" | "--help" | "-h" => {
             print_help();
@@ -43,17 +44,20 @@ fn print_help() {
           test-leaks, leak-tests      Run leak protection tests inside a Podman container\n  \
           container-shell, shell      Drop into an interactive shell inside the test container\n  \
           build-image                 Build/rebuild the neutron-sandbox container image\n  \
+          docs, build-docs            Build mdBook documentation for GitLab Pages\n  \
           lint                        Run cargo fmt and clippy with strict warnings\n\n\
         OPTIONS:\n  \
           --host-only                 Run only host tests (skip container)\n  \
           --nm                        Run only NetworkManager system tests\n  \
           --firewall                  Run only Firewall lockdown system tests\n  \
           --rebuild                   Force rebuild the container image before running\n  \
-          --filter <pattern>          Run specific tests matching pattern\n\n\
+          --filter <pattern>          Run specific tests matching pattern\n  \
+          --serve                     Serve mdBook documentation locally\n\n\
         CARGO SHORTCUT ALIASES:\n  \
           cargo test-all              Execute entire test suite (host + container)\n  \
           cargo test-system           Run system tests in container\n  \
           cargo test-leaks            Run leak tests in container\n  \
+          cargo docs                  Build static HTML docs (mdBook)\n  \
           cargo lint                  Run formatting and clippy checks"
     );
 }
@@ -219,6 +223,40 @@ fn run_container_shell(root: &Path, args: &[String]) -> i32 {
     }
 
     run_in_container_interactive(root, &["/bin/bash".to_string()])
+}
+
+fn build_docs(root: &Path, args: &[String]) -> i32 {
+    let serve = args.iter().any(|a| a == "--serve");
+    let cmd = if serve { "serve" } else { "build" };
+
+    if Command::new("mdbook").arg("--version").output().is_ok() {
+        let status = Command::new("mdbook").arg(cmd).current_dir(root).status();
+        return run_status(status);
+    }
+
+    println!("'mdbook' is not installed locally on host. Running mdBook build via container...");
+    let tool = match detect_container_tool() {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("Error: {err}\nPlease install mdbook with: cargo install mdbook");
+            return 1;
+        }
+    };
+
+    let mount = format!("{}:/src:z", root.display());
+    let mut c = Command::new(tool);
+    c.args([
+        "run",
+        "--rm",
+        "-v",
+        &mount,
+        "-w",
+        "/src",
+        "ghcr.io/rust-lang/mdbook:latest",
+        "mdbook",
+        cmd,
+    ]);
+    run_status(c.status())
 }
 
 fn run_in_container(root: &Path, command_args: &[String]) -> i32 {
