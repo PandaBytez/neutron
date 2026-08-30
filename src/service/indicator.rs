@@ -228,26 +228,21 @@ where
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> MenuLayoutResult<'_> {
-        let (is_conn, prof, port_opt, rev) = if let Ok(st) = self.state.lock() {
+        let (prof, port_opt, rev) = if let Ok(st) = self.state.lock() {
             (
-                st.active_profile.is_some(),
                 st.active_profile.clone(),
                 st.forwarded_port,
                 st.menu_revision,
             )
         } else {
-            (false, None, None, 1)
+            (None, None, 1)
         };
 
         let mut children = Vec::new();
 
         // 1. Toggle Connect / Disconnect
-        let toggle_label = if is_conn {
-            if let Some(ref name) = prof {
-                format!("Disconnect ({name})")
-            } else {
-                "Disconnect".to_string()
-            }
+        let toggle_label = if let Some(ref name) = prof {
+            format!("Disconnect ({name})")
         } else {
             "Quick Connect (Random Eligible)".to_string()
         };
@@ -484,6 +479,54 @@ where
     })
 }
 
+/// Push a newly leased forwarded port to qBittorrent.
+///
+/// Gated behind the `qbittorrent` feature: the daemon calls this on every lease
+/// renewal, so a broken integration would reach a third-party Web API
+/// unattended. Compiled out unless the feature is enabled.
+#[cfg(feature = "qbittorrent")]
+fn sync_qbittorrent_port<C: NmClient>(client: &C, uuid: &str, port: u16) {
+    let Ok(config) =
+        crate::config::default_config_path().and_then(|path| crate::config::load(&path))
+    else {
+        return;
+    };
+    if !config.qbittorrent.enabled {
+        return;
+    }
+
+    let interface = client
+        .get_profile_diagnostics(uuid, true)
+        .ok()
+        .map(|diagnostics| diagnostics.interface_name);
+    let mut qclient = crate::portforward::qbittorrent::QBittorrentClient::new(&config.qbittorrent);
+    match qclient.sync_port(port, interface.as_deref()) {
+        Ok(report) => info!(
+            "qBittorrent port synced to {port} (interface: {:?})",
+            report.bound_interface
+        ),
+        Err(error) => warn!("qBittorrent auto-sync failed: {error}"),
+    }
+}
+
+/// No-op when the `qbittorrent` feature is disabled.
+#[cfg(not(feature = "qbittorrent"))]
+fn sync_qbittorrent_port<C: NmClient>(_: &C, _: &str, _: u16) {}
+
+/// The currently active WireGuard profile, if any.
+fn active_profile<C: NmClient>(client: &C) -> Option<crate::nm::WireguardProfile> {
+    client
+        .list_wireguard_profiles()
+        .ok()?
+        .into_iter()
+        .find(|profile| profile.is_active())
+}
+
+/// How often the tray re-reads NetworkManager. Each poll spawns `nmcli`, so this
+/// is deliberately slower than a UI refresh: the tray only has to notice a
+/// connection change within a second or two.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Run standalone persistent indicator daemon in the foreground.
 pub fn run_standalone_indicator<C>(client: C) -> AppResult<()>
 where
@@ -499,54 +542,157 @@ where
     info!("Starting Neutron persistent AppIndicator daemon...");
 
     let state = Arc::new(Mutex::new(IndicatorSharedState::default()));
-
-    // Seed initial active profile and port
-    if let Ok(profiles) = client.list_wireguard_profiles() {
-        let active = profiles.iter().find(|p| p.is_active());
-        let active_name = active.map(|p| p.name.clone());
-        let active_port = if let Some(p) = active
-            && let Some(addr) = client.tunnel_address(&p.uuid)
-            && let Some(gw) = crate::portforward::gateway_for_address(&addr)
-            && let Ok(port) = crate::portforward::request_mapping(gw)
-        {
-            Some(port)
-        } else {
-            None
-        };
-
-        if let Ok(mut st) = state.lock() {
-            st.active_profile = active_name;
-            st.forwarded_port = active_port;
-            st.menu_revision = 1;
-        }
-    }
-
     let _handle = spawn_indicator_service(client.clone(), state.clone());
 
-    // Monitor NetworkManager connection changes in loop
-    loop {
-        if let Ok(profiles) = client.list_wireguard_profiles() {
-            let active = profiles.iter().find(|p| p.is_active());
-            let active_name = active.map(|p| p.name.clone());
-            let active_port = if let Some(p) = active
-                && let Some(addr) = client.tunnel_address(&p.uuid)
-                && let Some(gw) = crate::portforward::gateway_for_address(&addr)
-                && let Ok(port) = crate::portforward::request_mapping(gw)
-            {
-                Some(port)
-            } else {
-                None
-            };
+    // The forwarded port is leased, not derived: it belongs to one tunnel and
+    // expires on its own. So it is tracked alongside the profile that owns it,
+    // and the lease clock advances only when a mapping actually succeeded --
+    // otherwise a transient failure would wait a further `RENEW_INTERVAL` and
+    // let the lease lapse, which is the very thing the interval exists to
+    // prevent.
+    let mut current: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut leased_at: Option<std::time::Instant> = None;
 
-            if let Ok(mut st) = state.lock()
-                && (st.active_profile != active_name || st.forwarded_port != active_port)
-            {
-                st.active_profile = active_name;
-                st.forwarded_port = active_port;
-                st.menu_revision += 1;
+    loop {
+        let active = active_profile(&client);
+        let active_name = active.as_ref().map(|profile| profile.name.clone());
+
+        if active_name != current {
+            // A different tunnel (or none): the old lease is not ours anymore.
+            current = active_name.clone();
+            port = None;
+            leased_at = None;
+        }
+
+        if let Some(profile) = active.as_ref()
+            && leased_at.is_none_or(|at| at.elapsed() >= crate::portforward::RENEW_INTERVAL)
+            && let Some(address) = client.tunnel_address(&profile.uuid)
+        {
+            leased_at = Some(std::time::Instant::now());
+            if let Some(mapped) = crate::portforward::port_for_tunnel_address(&address) {
+                let is_new_or_renewed_port = port != Some(mapped);
+                port = Some(mapped);
+
+                if is_new_or_renewed_port {
+                    sync_qbittorrent_port(&client, &profile.uuid, mapped);
+                }
+            } else {
+                port = None;
             }
         }
 
-        std::thread::sleep(Duration::from_secs(1));
+        if let Ok(mut st) = state.lock()
+            && (st.active_profile != active_name || st.forwarded_port != port)
+        {
+            st.active_profile = active_name;
+            st.forwarded_port = port;
+            st.menu_revision += 1;
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nm::{ProfileState, WireguardProfile};
+    use crate::testing::MockNmClient;
+
+    fn make_sni(active_profile: Option<String>, port: Option<u16>) -> StatusNotifierItem {
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile,
+            forwarded_port: port,
+            menu_revision: 1,
+        }));
+        StatusNotifierItem { state }
+    }
+
+    fn make_menu(active_profile: Option<String>, port: Option<u16>) -> DBusMenu<MockNmClient> {
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile,
+            forwarded_port: port,
+            menu_revision: 1,
+        }));
+        let client = MockNmClient::default();
+        DBusMenu { client, state }
+    }
+
+    #[test]
+    fn icon_pixmap_returns_expected_resolutions_and_differs_by_state() {
+        let sni_connected = make_sni(Some("wg-test".to_string()), None);
+        let pix_connected = sni_connected.icon_pixmap();
+        assert_eq!(pix_connected.len(), 2);
+        assert_eq!(pix_connected[0].0, 48);
+        assert_eq!(pix_connected[0].1, 48);
+        assert_eq!(pix_connected[1].0, 24);
+        assert_eq!(pix_connected[1].1, 24);
+
+        let sni_disconnected = make_sni(None, None);
+        let pix_disconnected = sni_disconnected.icon_pixmap();
+        assert_eq!(pix_disconnected.len(), 2);
+        assert_ne!(pix_connected[0].2, pix_disconnected[0].2);
+    }
+
+    #[test]
+    fn tool_tip_formats_active_profile_and_port() {
+        let sni = make_sni(Some("wg-fast".to_string()), Some(51820));
+        let (_, _, title, desc) = sni.tool_tip();
+        assert_eq!(title, "Neutron VPN");
+        assert!(desc.contains("Connected: wg-fast"));
+        assert!(desc.contains("Port: 51820"));
+
+        let sni_disconnected = make_sni(None, None);
+        let (_, _, title, desc) = sni_disconnected.tool_tip();
+        assert_eq!(title, "Neutron VPN");
+        assert_eq!(desc, "Disconnected");
+    }
+
+    #[test]
+    fn get_layout_connected_includes_disconnect_and_port() {
+        let menu = make_menu(Some("wg-fast".to_string()), Some(49152));
+        let (rev, (root_id, _, children)) = menu.get_layout(0, 1, Vec::new());
+        assert_eq!(rev, 1);
+        assert_eq!(root_id, 0);
+
+        // Children should contain: toggle (2), port (5), separator (3), quit (4)
+        assert_eq!(children.len(), 4);
+    }
+
+    #[test]
+    fn get_layout_disconnected_omits_port_and_shows_quick_connect() {
+        let menu = make_menu(None, None);
+        let (_, (_, _, children)) = menu.get_layout(0, 1, Vec::new());
+
+        // Children should contain: toggle (2), separator (3), quit (4) (no port item)
+        assert_eq!(children.len(), 3);
+    }
+
+    #[test]
+    fn active_profile_extracts_active_profile_from_client() {
+        let profiles = vec![
+            WireguardProfile {
+                name: "wg-1".to_string(),
+                uuid: "uuid-1".to_string(),
+                state: ProfileState::Inactive,
+            },
+            WireguardProfile {
+                name: "wg-2".to_string(),
+                uuid: "uuid-2".to_string(),
+                state: ProfileState::Active,
+            },
+        ];
+        let client = MockNmClient::new(profiles);
+        let active = active_profile(&client);
+        assert!(active.is_some());
+        assert_eq!(active.unwrap().name, "wg-2");
+
+        let client_none = MockNmClient::new(vec![WireguardProfile {
+            name: "wg-1".to_string(),
+            uuid: "uuid-1".to_string(),
+            state: ProfileState::Inactive,
+        }]);
+        assert!(active_profile(&client_none).is_none());
     }
 }

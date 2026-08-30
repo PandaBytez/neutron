@@ -188,43 +188,8 @@ fn set_autoconnect_at_login_in<C: NmClient>(
     // Persist last: the caller reverts its switch when this errors, so saving
     // before the work could leave the stored state disagreeing with the UI.
     let mut app_cfg = config::load(path)?;
-    app_cfg.autoconnect_at_boot = enable;
+    app_cfg.general.autoconnect_at_login = enable;
     config::save(path, &app_cfg)
-}
-
-/// Connect one random eligible profile, if the feature is enabled.
-///
-/// This is the whole auto-connect mechanism: the autostart entry relaunches the
-/// app at login and this runs immediately, issuing a direct `connection up`.
-/// NetworkManager is never asked to choose -- it only ever activates what it is
-/// explicitly told to, which is what keeps the app the single authority over
-/// which tunnel is up.
-///
-/// Does nothing but disable NetworkManager autoconnect when the feature is off,
-/// and leaves an already-connected profile alone.
-///
-/// Returns the name of the profile connected, or `None` when nothing was.
-pub fn startup_connect<C: NmClient>(client: &C, path: &Path) -> AppResult<Option<String>> {
-    let app_cfg = config::load(path)?;
-
-    if !app_cfg.autoconnect_at_boot {
-        normalize_autoconnect(client);
-        return Ok(None);
-    }
-
-    match run_startup_random_with_path(client, path)? {
-        StartupRandomResult::Connected(name) => Ok(Some(name)),
-        StartupRandomResult::SkippedAlreadyActive => Ok(None),
-    }
-}
-
-/// Keep NetworkManager passive without touching connections.
-///
-/// Used on ordinary app starts and after the profile set changes, so a profile
-/// that arrived carrying NetworkManager's `autoconnect=yes` default (a fresh
-/// import, or one added through GNOME Settings) cannot bring itself up.
-pub fn disable_nm_autoconnect<C: NmClient>(client: &C) {
-    normalize_autoconnect(client);
 }
 
 #[cfg(test)]
@@ -544,85 +509,31 @@ mod tests {
     }
 
     #[test]
-    fn connect_at_boot_defaults_to_on_for_a_fresh_install() {
+    fn connect_at_login_defaults_to_on_for_a_fresh_install() {
         // No config file at all: the app's headline feature must be active out
         // of the box rather than silently disabled by a derived `false`.
         let config_path = unique_test_config_path();
 
         let app_cfg = config::load(&config_path).expect("a missing config should load defaults");
 
-        assert!(app_cfg.autoconnect_at_boot);
+        assert!(app_cfg.general.autoconnect_at_login);
     }
 
     #[test]
-    fn startup_connect_connects_one_profile_when_enabled() {
-        // The whole auto-connect mechanism: a direct `connection up`, chosen by
-        // the app. NetworkManager is only told to stop activating things itself.
-        let client = MockNmClient::new(vec![
-            profile("wg-us", "uuid-1", ProfileState::Inactive),
-            profile("wg-eu", "uuid-2", ProfileState::Inactive),
-        ]);
+    fn connect_at_login_reads_the_legacy_autoconnect_at_boot_key() {
+        // Configs written before the two fields were merged stored the intent
+        // under the old top-level name; it must still be honored rather than
+        // silently reverting to the default.
         let config_path = unique_test_config_path();
-        write_config(&config_path, AppConfig::default());
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent).expect("parent dir should be created");
+        }
+        fs::write(&config_path, r#"{"general":{"autoconnect_at_boot":false}}"#)
+            .expect("legacy config should be written");
 
-        let connected = startup_connect(&client, &config_path).expect("startup connect should run");
+        let app_cfg = config::load(&config_path).expect("legacy config should load");
 
-        assert!(connected.is_some());
-        assert_eq!(
-            client.connected_profiles().len(),
-            1,
-            "exactly one profile may be brought up"
-        );
-        assert_eq!(
-            client.autoconnect_calls(),
-            vec!["autoconnect-all:off".to_string()],
-            "NetworkManager must never activate a profile by itself"
-        );
-        cleanup_test_artifacts(&config_path);
-    }
-
-    #[test]
-    fn startup_connect_does_nothing_but_disable_autoconnect_when_off() {
-        let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)]);
-        let config_path = unique_test_config_path();
-        write_config(
-            &config_path,
-            AppConfig {
-                autoconnect_at_boot: false,
-                ..AppConfig::default()
-            },
-        );
-
-        let connected = startup_connect(&client, &config_path).expect("startup connect should run");
-
-        assert!(connected.is_none());
-        assert!(
-            client.connected_profiles().is_empty(),
-            "nothing may be connected while the feature is off"
-        );
-        assert_eq!(
-            client.autoconnect_calls(),
-            vec!["autoconnect-all:off".to_string()]
-        );
-        cleanup_test_artifacts(&config_path);
-    }
-
-    #[test]
-    fn startup_connect_leaves_an_already_connected_profile_alone() {
-        // Relaunching must not drop a tunnel that is already up, and must not
-        // add a second one alongside it.
-        let client = MockNmClient::new(vec![
-            profile("wg-us", "uuid-1", ProfileState::Active),
-            profile("wg-eu", "uuid-2", ProfileState::Inactive),
-        ]);
-        let config_path = unique_test_config_path();
-        write_config(&config_path, AppConfig::default());
-
-        let connected = startup_connect(&client, &config_path).expect("startup connect should run");
-
-        assert!(connected.is_none());
-        assert!(client.connected_profiles().is_empty());
-        assert!(!client.calls().iter().any(|call| call == "disconnect"));
+        assert!(!app_cfg.general.autoconnect_at_login);
         cleanup_test_artifacts(&config_path);
     }
 
@@ -639,7 +550,8 @@ mod tests {
         assert!(
             config::load(&config_path)
                 .expect("config should load")
-                .autoconnect_at_boot
+                .general
+                .autoconnect_at_login
         );
         // Toggling a preference must not activate or drop a tunnel.
         assert!(client.connected_profiles().is_empty());
@@ -651,7 +563,8 @@ mod tests {
         assert!(
             !config::load(&config_path)
                 .expect("config should load")
-                .autoconnect_at_boot
+                .general
+                .autoconnect_at_login
         );
 
         let _ = std::fs::remove_dir_all(&autostart_dir);

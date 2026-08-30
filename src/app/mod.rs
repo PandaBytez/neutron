@@ -1,12 +1,14 @@
 pub(crate) mod eligibility;
 pub mod profile_list;
 pub mod refresh_sync;
-pub(crate) mod split_tunnel;
+pub mod split_tunnel;
 pub mod sync;
 
 use clap::{Parser, Subcommand};
 
 use crate::config;
+#[cfg(feature = "qbittorrent")]
+use crate::error::AppError;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
 use crate::nm::{self, NmClient, WireguardProfile};
@@ -56,10 +58,16 @@ enum Commands {
         #[command(subcommand)]
         command: SplitTunnelCommands,
     },
-    /// Run persistent system tray AppIndicator daemon in the background
+    /// Configure or synchronize dynamic port forwarding with qBittorrent WebUI
+    #[cfg(feature = "qbittorrent")]
+    #[command(alias = "qbittorrent")]
+    Qbit {
+        #[command(subcommand)]
+        command: QbitCommands,
+    },
+    /// Run the persistent system tray AppIndicator daemon in the background
+    #[command(alias = "daemon")]
     Indicator,
-    /// Run persistent system tray daemon (alias for indicator)
-    Daemon,
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,6 +102,32 @@ enum SplitTunnelCommands {
     Clear,
 }
 
+#[derive(Debug, Subcommand)]
+#[cfg(feature = "qbittorrent")]
+enum QbitCommands {
+    /// Show qBittorrent integration status, WebUI connectivity, and current ports
+    Status,
+    /// Test connection to the qBittorrent WebUI
+    Test,
+    /// Sync active VPN forwarded port to qBittorrent immediately
+    Sync,
+    /// Enable automatic port forwarding sync with qBittorrent
+    Enable,
+    /// Disable automatic port forwarding sync with qBittorrent
+    Disable,
+    /// Update qBittorrent WebUI connection settings
+    Config {
+        #[arg(long, help = "WebUI URL (e.g. http://127.0.0.1:8080)")]
+        url: Option<String>,
+        #[arg(long, help = "WebUI username")]
+        username: Option<String>,
+        #[arg(long, help = "WebUI password")]
+        password: Option<String>,
+        #[arg(long, help = "Bind qBittorrent to the active WireGuard interface")]
+        bind: Option<bool>,
+    },
+}
+
 pub fn run<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
 ) -> AppResult<()> {
@@ -107,13 +141,16 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
 ) -> AppResult<()> {
     match cli.command {
         None | Some(Commands::Tui) => crate::tui::run(client.clone()),
-        Some(Commands::Indicator) | Some(Commands::Daemon) => {
+        Some(Commands::Indicator) => {
             crate::service::indicator::run_standalone_indicator(client.clone())
         }
         Some(Commands::Sync) => {
             let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let report = sync::sync_profiles_dir(client, &app_cfg)?;
+            // Imported profiles have no lockdown allow-rule yet, so the ruleset
+            // has to be rebuilt before they can connect.
+            rebuild_lockdown_if_enabled(client, &path)?;
             if !report.imported.is_empty() {
                 println!(
                     "Imported {} new profiles: {}",
@@ -164,6 +201,8 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::KillSwitch { command }) => handle_kill_switch_command(client, command),
         Some(Commands::Lockdown { command }) => handle_lockdown_command(client, command),
         Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
+        #[cfg(feature = "qbittorrent")]
+        Some(Commands::Qbit { command }) => handle_qbit_command(client, command),
     }
 }
 
@@ -268,7 +307,7 @@ fn handle_kill_switch_command_with_path<C: NmClient>(
 /// untouched. This apply-then-persist ordering is a correctness invariant — see
 /// the `kill_switch_*_when_nm_fails` tests — and is shared by both the CLI
 /// handler and the GUI toggle so it lives in exactly one place.
-pub(crate) fn set_global_kill_switch<C: NmClient>(
+pub fn set_global_kill_switch<C: NmClient>(
     client: &C,
     path: &std::path::Path,
     enable: bool,
@@ -325,7 +364,7 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
 /// tunnels so their interfaces and endpoints are allowed through; disabling
 /// needs no tunnel data and always tears the ruleset down (the safeguard that
 /// the user can never be permanently locked out).
-pub(crate) fn set_global_lockdown<C: NmClient + FirewallClient>(
+pub fn set_global_lockdown<C: NmClient + FirewallClient>(
     client: &C,
     path: &std::path::Path,
     enable: bool,
@@ -366,30 +405,240 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
             println!("Global split-tunnel mode set to: {}", st_cfg.mode);
         }
         SplitTunnelCommands::AddCidr { cidr } => {
-            let st_cfg = split_tunnel::add_global_cidr(client, path, &cidr)?;
-            println!(
-                "Added CIDR '{}' to global split tunneling (mode: {}).",
-                cidr, st_cfg.mode
-            );
+            let (st_cfg, changed) = split_tunnel::add_global_cidr(client, path, &cidr)?;
+            if changed {
+                println!(
+                    "Added CIDR '{}' to global split tunneling (mode: {}).",
+                    cidr, st_cfg.mode
+                );
+            } else {
+                println!(
+                    "CIDR '{}' is already present in global split tunneling.",
+                    cidr
+                );
+            }
         }
         SplitTunnelCommands::RemoveCidr { cidr } => {
-            let _ = split_tunnel::remove_global_cidr(client, path, &cidr)?;
-            println!("Removed CIDR '{}' from global split tunneling.", cidr);
+            let (_, changed) = split_tunnel::remove_global_cidr(client, path, &cidr)?;
+            if changed {
+                println!("Removed CIDR '{}' from global split tunneling.", cidr);
+            } else {
+                println!("CIDR '{}' was not found in global split tunneling.", cidr);
+            }
         }
         SplitTunnelCommands::AddDomain { domain } => {
-            let st_cfg = split_tunnel::add_global_domain(client, path, &domain)?;
-            println!(
-                "Added domain '{}' to global split tunneling (mode: {}).",
-                domain, st_cfg.mode
-            );
+            let (st_cfg, changed) = split_tunnel::add_global_domain(client, path, &domain)?;
+            if changed {
+                println!(
+                    "Added domain '{}' to global split tunneling (mode: {}).",
+                    domain, st_cfg.mode
+                );
+            } else {
+                println!(
+                    "Domain '{}' is already present in global split tunneling.",
+                    domain
+                );
+            }
         }
         SplitTunnelCommands::RemoveDomain { domain } => {
-            let _ = split_tunnel::remove_global_domain(client, path, &domain)?;
-            println!("Removed domain '{}' from global split tunneling.", domain);
+            let (_, changed) = split_tunnel::remove_global_domain(client, path, &domain)?;
+            if changed {
+                println!("Removed domain '{}' from global split tunneling.", domain);
+            } else {
+                println!(
+                    "Domain '{}' was not found in global split tunneling.",
+                    domain
+                );
+            }
         }
         SplitTunnelCommands::Clear => {
             split_tunnel::clear_global(client, path)?;
             println!("Cleared global split-tunnel configuration.");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "qbittorrent")]
+fn handle_qbit_command<C: NmClient>(client: &C, command: QbitCommands) -> AppResult<()> {
+    let path = config::default_config_path()?;
+    handle_qbit_command_with_path(client, command, &path)
+}
+
+#[cfg(feature = "qbittorrent")]
+fn handle_qbit_command_with_path<C: NmClient>(
+    client: &C,
+    command: QbitCommands,
+    path: &std::path::Path,
+) -> AppResult<()> {
+    match command {
+        QbitCommands::Status => {
+            let app_cfg = config::load(path)?;
+            let qcfg = &app_cfg.qbittorrent;
+            println!("=== qBittorrent Port Forwarding Integration ===");
+            println!(
+                "Auto-Sync:         {}",
+                if qcfg.enabled { "Enabled" } else { "Disabled" }
+            );
+            println!("WebUI URL:         {}", qcfg.url);
+            println!(
+                "Authentication:    {}",
+                if qcfg.username.is_some() {
+                    "Configured"
+                } else {
+                    "None / Localhost bypass"
+                }
+            );
+            println!(
+                "Interface Binding: {}",
+                if qcfg.bind_interface {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            );
+            println!();
+
+            let profiles = client.list_wireguard_profiles()?;
+            let active = profiles.iter().find(|p| p.is_active());
+            if let Some(profile) = active {
+                println!("Active VPN Tunnel: {}", profile.name);
+                if let Some(addr) = client.tunnel_address(&profile.uuid) {
+                    if let Some(port) = crate::portforward::port_for_tunnel_address(&addr) {
+                        println!("Forwarded Port:    {port} (NAT-PMP Leased)");
+                    } else {
+                        println!(
+                            "Forwarded Port:    Unavailable (NAT-PMP mapping pending or unsupported)"
+                        );
+                    }
+                }
+            } else {
+                println!("Active VPN Tunnel: None (Disconnected)");
+            }
+
+            println!();
+            print!("Testing WebUI connection... ");
+            let mut qbit_client = crate::portforward::qbittorrent::QBittorrentClient::new(qcfg);
+            match qbit_client.app_version() {
+                Ok(ver) => {
+                    println!("Online (qBittorrent {ver})");
+                    if let Ok(prefs) = qbit_client.get_preferences() {
+                        println!("qBittorrent Listening Port:  {}", prefs.listen_port);
+                        if let Some(iface) = prefs.current_network_interface {
+                            println!("qBittorrent Bound Interface: {iface}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    println!("Offline / Error ({err})");
+                    println!(
+                        "Note: Ensure qBittorrent is running with Web UI enabled in Options -> Web UI."
+                    );
+                }
+            }
+        }
+        QbitCommands::Test => {
+            let app_cfg = config::load(path)?;
+            let mut qbit_client =
+                crate::portforward::qbittorrent::QBittorrentClient::new(&app_cfg.qbittorrent);
+            println!(
+                "Connecting to qBittorrent WebUI at {}...",
+                app_cfg.qbittorrent.url
+            );
+            let version = qbit_client.app_version()?;
+            let prefs = qbit_client.get_preferences()?;
+            println!("Success! Connected to qBittorrent {version}.");
+            println!("Current listening port: {}", prefs.listen_port);
+            if let Some(iface) = prefs.current_network_interface {
+                println!("Current network interface: {iface}");
+            }
+        }
+        QbitCommands::Sync => {
+            let app_cfg = config::load(path)?;
+            let profiles = client.list_wireguard_profiles()?;
+            let active = profiles
+                .iter()
+                .find(|p| p.is_active())
+                .ok_or(AppError::NoActiveProfile)?;
+
+            let addr = client.tunnel_address(&active.uuid).ok_or_else(|| {
+                AppError::PortForward("no IPv4 address found on active tunnel".to_string())
+            })?;
+
+            let port = crate::portforward::port_for_tunnel_address(&addr).ok_or_else(|| {
+                AppError::PortForward(
+                    "gateway did not return a forwarded port via NAT-PMP".to_string(),
+                )
+            })?;
+
+            let diag = client.get_profile_diagnostics(&active.uuid, true).ok();
+            let iface = diag.as_ref().map(|d| d.interface_name.as_str());
+
+            let mut qbit_client =
+                crate::portforward::qbittorrent::QBittorrentClient::new(&app_cfg.qbittorrent);
+            let report = qbit_client.sync_port(port, iface)?;
+
+            println!("qBittorrent port synchronized successfully!");
+            if let Some(prev) = report.previous_port {
+                println!("Port: {} -> {}", prev, report.new_port);
+            } else {
+                println!("Port: {}", report.new_port);
+            }
+            if let Some(bound) = report.bound_interface {
+                println!("Bound to interface: {}", bound);
+            }
+        }
+        QbitCommands::Enable => {
+            let mut app_cfg = config::load(path)?;
+            app_cfg.qbittorrent.enabled = true;
+            config::save(path, &app_cfg)?;
+            println!("qBittorrent automatic port forwarding sync enabled.");
+        }
+        QbitCommands::Disable => {
+            let mut app_cfg = config::load(path)?;
+            app_cfg.qbittorrent.enabled = false;
+            config::save(path, &app_cfg)?;
+            println!("qBittorrent automatic port forwarding sync disabled.");
+        }
+        QbitCommands::Config {
+            url,
+            username,
+            password,
+            bind,
+        } => {
+            let mut app_cfg = config::load(path)?;
+            if let Some(u) = url {
+                app_cfg.qbittorrent.url = u;
+            }
+            if let Some(user) = username {
+                app_cfg.qbittorrent.username = if user.trim().is_empty() {
+                    None
+                } else {
+                    Some(user)
+                };
+            }
+            if let Some(pass) = password {
+                app_cfg.qbittorrent.password = if pass.is_empty() { None } else { Some(pass) };
+            }
+            if let Some(b) = bind {
+                app_cfg.qbittorrent.bind_interface = b;
+            }
+            config::save(path, &app_cfg)?;
+            println!("qBittorrent configuration updated.");
+            println!("URL:            {}", app_cfg.qbittorrent.url);
+            println!(
+                "Username:       {}",
+                app_cfg.qbittorrent.username.as_deref().unwrap_or("<none>")
+            );
+            println!(
+                "Bind Interface: {}",
+                if app_cfg.qbittorrent.bind_interface {
+                    "true"
+                } else {
+                    "false"
+                }
+            );
         }
     }
 
@@ -407,8 +656,7 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
 ///
 /// Does nothing when lockdown is off, so callers can invoke it unconditionally
 /// after the profile set changes.
-#[cfg(test)]
-pub(crate) fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
+pub fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
     client: &C,
     path: &std::path::Path,
 ) -> AppResult<()> {
@@ -571,7 +819,7 @@ mod tests {
         let result =
             handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path);
 
-        assert!(matches!(result, Err(AppError::NmCommandFailed(_))));
+        assert!(matches!(result, Err(AppError::CommandFailed(_))));
         // The change was attempted, but because NetworkManager rejected it the
         // enabled intent must not be persisted.
         assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:on"]);
@@ -597,7 +845,7 @@ mod tests {
         let result =
             handle_kill_switch_command_with_path(&client, KillSwitchCommands::Disable, &path);
 
-        assert!(matches!(result, Err(AppError::NmCommandFailed(_))));
+        assert!(matches!(result, Err(AppError::CommandFailed(_))));
         // A failed disable must leave the previously-enabled state intact.
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.kill_switch_enabled);
@@ -859,6 +1107,52 @@ mod tests {
             persisted.global_split_tunnel.mode,
             config::SplitTunnelMode::Disabled
         );
+
+        cleanup_test_config(&path);
+    }
+
+    #[cfg(feature = "qbittorrent")]
+    #[test]
+    fn qbit_enable_and_disable_persists() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        handle_qbit_command_with_path(&client, QbitCommands::Enable, &path)
+            .expect("enable should succeed");
+        let loaded = config::load(&path).expect("config should load");
+        assert!(loaded.qbittorrent.enabled);
+
+        handle_qbit_command_with_path(&client, QbitCommands::Disable, &path)
+            .expect("disable should succeed");
+        let loaded = config::load(&path).expect("config should load");
+        assert!(!loaded.qbittorrent.enabled);
+
+        cleanup_test_config(&path);
+    }
+
+    #[cfg(feature = "qbittorrent")]
+    #[test]
+    fn qbit_config_updates_settings() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let path = unique_test_config_path();
+
+        handle_qbit_command_with_path(
+            &client,
+            QbitCommands::Config {
+                url: Some("http://192.168.1.100:8080".to_string()),
+                username: Some("myuser".to_string()),
+                password: Some("mypass".to_string()),
+                bind: Some(true),
+            },
+            &path,
+        )
+        .expect("config should succeed");
+
+        let loaded = config::load(&path).expect("config should load");
+        assert_eq!(loaded.qbittorrent.url, "http://192.168.1.100:8080");
+        assert_eq!(loaded.qbittorrent.username.as_deref(), Some("myuser"));
+        assert_eq!(loaded.qbittorrent.password.as_deref(), Some("mypass"));
+        assert!(loaded.qbittorrent.bind_interface);
 
         cleanup_test_config(&path);
     }

@@ -1,18 +1,24 @@
 //! Desktop autostart entry that relaunches the app at login.
 //!
-//! NetworkManager already brings the armed profile up at boot, so this is *not*
-//! what connects the VPN. Its job is to re-roll which profile is armed: the app
-//! has to run at some point between two boots for the selection to rotate, and
-//! a login autostart is the only place that happens without the user opening
-//! the window.
+//! This is what connects the VPN at login: the entry runs `neutron
+//! startup-random`, which picks one eligible profile and issues an explicit
+//! `connection up`. NetworkManager is never asked to choose -- `autoconnect` is
+//! held off on every profile (see [`crate::nm::autoconnect`]) precisely so the
+//! selector is the only thing that activates a tunnel.
 //!
-//! The entry is written by the app itself so the feature stays zero-config --
-//! the same approach the GUI already takes for its `.desktop` and icons.
+//! The entry is written by the app itself so the feature stays zero-config.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 use crate::{APP_ID, APP_NAME};
+
+/// The subcommand the autostart entry invokes at login.
+///
+/// Must name a real [`crate::app::Cli`] subcommand: a stale value here fails
+/// silently at login, since nothing is watching the exit status of an autostart
+/// entry. Asserted against the parser in the tests below.
+const AUTOSTART_ARGS: &str = "startup-random";
 
 /// Basename of the autostart entry. Derived from the application ID so desktop
 /// environments associate it with the installed launcher.
@@ -33,7 +39,7 @@ pub fn launch_command(args: &str) -> String {
     if let Ok(exe) = std::env::current_exe() {
         return format!("\"{}\" {args}", exe.display());
     }
-    format!("neutron-vpn {args}")
+    format!("neutron {args}")
 }
 
 /// The user's autostart directory, `~/.config/autostart`.
@@ -53,14 +59,11 @@ pub fn is_installed_in(dir: &Path) -> bool {
 }
 
 /// Write the autostart entry into `dir`, creating it if needed.
-///
-/// Starts hidden: an autostarted launch has no reason to steal focus at login,
-/// and the app already supports living in the tray.
 pub fn install_in(dir: &Path) -> AppResult<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(
         dir.join(entry_name()),
-        entry_contents(&launch_command("gui --hidden")),
+        entry_contents(&launch_command(AUTOSTART_ARGS)),
     )?;
     Ok(())
 }
@@ -101,7 +104,7 @@ mod tests {
 
     #[test]
     fn entry_is_a_hidden_autostart_application() {
-        let contents = entry_contents("\"/opt/neutron.AppImage\" gui --hidden");
+        let contents = entry_contents("\"/opt/neutron.AppImage\" startup-random");
 
         assert!(contents.starts_with("[Desktop Entry]\n"));
         assert!(contents.contains("Type=Application\n"));
@@ -110,21 +113,35 @@ mod tests {
         assert!(contents.contains("NoDisplay=true\n"));
         // GNOME treats a missing value here as disabled for some entries.
         assert!(contents.contains("X-GNOME-Autostart-enabled=true\n"));
-        assert!(contents.contains("Exec=\"/opt/neutron.AppImage\" gui --hidden\n"));
+        assert!(contents.contains("Exec=\"/opt/neutron.AppImage\" startup-random\n"));
+    }
+
+    #[test]
+    fn autostart_args_name_a_real_subcommand() {
+        // Regression: the entry invoked `gui --hidden` long after the `gui`
+        // subcommand was removed, so every login ran a command that clap
+        // rejected -- and nothing checks an autostart entry's exit status, so
+        // the feature failed silently.
+        use clap::Parser;
+
+        crate::app::Cli::try_parse_from(
+            std::iter::once("neutron").chain(AUTOSTART_ARGS.split_whitespace()),
+        )
+        .expect("the autostart entry must invoke a subcommand the CLI accepts");
     }
 
     #[test]
     fn launch_command_prefers_the_appimage_path() {
         // SAFETY: single-threaded test process; no other thread reads the env.
         unsafe { std::env::set_var("APPIMAGE", "/home/u/App Images/neutron.AppImage") };
-        let command = launch_command("gui --hidden");
+        let command = launch_command(AUTOSTART_ARGS);
         unsafe { std::env::remove_var("APPIMAGE") };
 
         // Quoted: `current_exe` inside an AppImage points at a temporary mount
         // that is gone by the next login, and the path may contain spaces.
         assert_eq!(
             command,
-            "\"/home/u/App Images/neutron.AppImage\" gui --hidden"
+            "\"/home/u/App Images/neutron.AppImage\" startup-random"
         );
     }
 
@@ -154,7 +171,7 @@ mod tests {
         install_in(&base).expect("install should create the entry");
         assert!(is_installed_in(&base));
         let written = std::fs::read_to_string(base.join(entry_name())).expect("entry should exist");
-        assert!(written.contains("gui --hidden"));
+        assert!(written.contains(AUTOSTART_ARGS));
 
         uninstall_in(&base).expect("uninstall should remove the entry");
         assert!(!is_installed_in(&base));

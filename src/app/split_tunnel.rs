@@ -20,11 +20,8 @@ pub fn apply_and_persist_global_split_tunnel<C: NmClient>(
     path: &Path,
     st_cfg: &SplitTunnelConfig,
 ) -> AppResult<()> {
-    let (v4_routes, v6_routes) = if st_cfg.mode.is_enabled() {
-        nm::split_tunnel::collect_all_routes(&st_cfg.cidrs, &st_cfg.domains)
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (v4_routes, v6_routes) =
+        nm::split_tunnel::routes_for(st_cfg.mode, &st_cfg.cidrs, &st_cfg.domains);
 
     client.apply_split_tunnel_all(st_cfg.mode, &v4_routes, &v6_routes)?;
 
@@ -35,17 +32,38 @@ pub fn apply_and_persist_global_split_tunnel<C: NmClient>(
     Ok(())
 }
 
+/// Load the global split-tunnel config, apply `edit` to it, and persist the
+/// result if `edit` reports a change.
+///
+/// The five mutators below all shared this load / edit / conditionally-apply
+/// shape; keeping it in one place is what guarantees they all honor the
+/// apply-before-persist ordering.
+fn mutate_global<C, F>(client: &C, path: &Path, edit: F) -> AppResult<(SplitTunnelConfig, bool)>
+where
+    C: NmClient,
+    F: FnOnce(&mut SplitTunnelConfig) -> AppResult<bool>,
+{
+    let mut st_cfg = config::load(path)?.global_split_tunnel;
+    let changed = edit(&mut st_cfg)?;
+    if changed {
+        apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+    }
+    Ok((st_cfg, changed))
+}
+
 /// Set global split tunnel mode.
 pub fn set_global_mode<C: NmClient>(
     client: &C,
     path: &Path,
     mode: SplitTunnelMode,
 ) -> AppResult<SplitTunnelConfig> {
-    let app_cfg = config::load(path)?;
-    let mut st_cfg = app_cfg.global_split_tunnel;
-    st_cfg.mode = mode;
-    apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
-    Ok(st_cfg)
+    let (cfg, _) = mutate_global(client, path, |st_cfg| {
+        st_cfg.mode = mode;
+        // Always reapplied: the mode decides how the existing routes are
+        // interpreted, so it must reach NetworkManager even when unchanged.
+        Ok(true)
+    })?;
+    Ok(cfg)
 }
 
 /// Add a CIDR or IP to the global split tunnel config.
@@ -53,19 +71,17 @@ pub fn add_global_cidr<C: NmClient>(
     client: &C,
     path: &Path,
     cidr: &str,
-) -> AppResult<SplitTunnelConfig> {
+) -> AppResult<(SplitTunnelConfig, bool)> {
     let (normalized, _) =
         nm::split_tunnel::parse_and_normalize_cidr(cidr).map_err(AppError::Config)?;
 
-    let app_cfg = config::load(path)?;
-    let mut st_cfg = app_cfg.global_split_tunnel;
-
-    if !st_cfg.cidrs.contains(&normalized) {
+    mutate_global(client, path, |st_cfg| {
+        if st_cfg.cidrs.contains(&normalized) {
+            return Ok(false);
+        }
         st_cfg.cidrs.push(normalized);
-        apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
-    }
-
-    Ok(st_cfg)
+        Ok(true)
+    })
 }
 
 /// Remove a CIDR or IP from the global split tunnel config.
@@ -73,20 +89,20 @@ pub fn remove_global_cidr<C: NmClient>(
     client: &C,
     path: &Path,
     cidr: &str,
-) -> AppResult<SplitTunnelConfig> {
-    let app_cfg = config::load(path)?;
-    let mut st_cfg = app_cfg.global_split_tunnel;
+) -> AppResult<(SplitTunnelConfig, bool)> {
+    // Matched both as given and as normalized, so `10.0.0.0/8` removes an entry
+    // stored from `10.1.2.3/8`, and a bare IP removes its `/32` form.
+    let normalized = nm::split_tunnel::parse_and_normalize_cidr(cidr)
+        .map(|(value, _)| value)
+        .unwrap_or_default();
 
-    let before_len = st_cfg.cidrs.len();
-    st_cfg
-        .cidrs
-        .retain(|c| c != cidr && c != &format!("{cidr}/32") && c != &format!("{cidr}/128"));
-
-    if st_cfg.cidrs.len() != before_len {
-        apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
-    }
-
-    Ok(st_cfg)
+    mutate_global(client, path, |st_cfg| {
+        let before = st_cfg.cidrs.len();
+        st_cfg
+            .cidrs
+            .retain(|entry| entry != cidr && *entry != normalized);
+        Ok(st_cfg.cidrs.len() != before)
+    })
 }
 
 /// Add a domain to the global split tunnel config.
@@ -94,19 +110,17 @@ pub fn add_global_domain<C: NmClient>(
     client: &C,
     path: &Path,
     domain: &str,
-) -> AppResult<SplitTunnelConfig> {
+) -> AppResult<(SplitTunnelConfig, bool)> {
     let normalized = nm::split_tunnel::normalize_domain(domain)
         .ok_or_else(|| AppError::Config("domain cannot be empty".to_string()))?;
 
-    let app_cfg = config::load(path)?;
-    let mut st_cfg = app_cfg.global_split_tunnel;
-
-    if !st_cfg.domains.contains(&normalized) {
+    mutate_global(client, path, |st_cfg| {
+        if st_cfg.domains.contains(&normalized) {
+            return Ok(false);
+        }
         st_cfg.domains.push(normalized);
-        apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
-    }
-
-    Ok(st_cfg)
+        Ok(true)
+    })
 }
 
 /// Remove a domain from the global split tunnel config.
@@ -114,27 +128,21 @@ pub fn remove_global_domain<C: NmClient>(
     client: &C,
     path: &Path,
     domain: &str,
-) -> AppResult<SplitTunnelConfig> {
+) -> AppResult<(SplitTunnelConfig, bool)> {
     // An empty domain can never match a stored entry, so normalizing it away to
     // an empty string is harmless: `retain` below simply removes nothing.
     let normalized = nm::split_tunnel::normalize_domain(domain).unwrap_or_default();
-    let app_cfg = config::load(path)?;
-    let mut st_cfg = app_cfg.global_split_tunnel;
 
-    let before_len = st_cfg.domains.len();
-    st_cfg.domains.retain(|d| d != &normalized);
-
-    if st_cfg.domains.len() != before_len {
-        apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
-    }
-
-    Ok(st_cfg)
+    mutate_global(client, path, |st_cfg| {
+        let before = st_cfg.domains.len();
+        st_cfg.domains.retain(|entry| entry != &normalized);
+        Ok(st_cfg.domains.len() != before)
+    })
 }
 
 /// Clear all global split tunneling rules and restore default full-tunneling.
 pub fn clear_global<C: NmClient>(client: &C, path: &Path) -> AppResult<()> {
-    let st_cfg = SplitTunnelConfig::default();
-    apply_and_persist_global_split_tunnel(client, path, &st_cfg)
+    apply_and_persist_global_split_tunnel(client, path, &SplitTunnelConfig::default())
 }
 
 /// Format the global split tunnel status for display in the CLI.
@@ -162,30 +170,6 @@ pub fn format_global_status(st_cfg: &SplitTunnelConfig) -> String {
     out
 }
 
-/// Format a concise summary subtitle for display in the TUI / status.
-#[allow(dead_code)]
-pub fn format_summary_subtitle(st_cfg: &SplitTunnelConfig) -> String {
-    match st_cfg.mode {
-        SplitTunnelMode::Disabled => "Disabled (Route all traffic through VPN)".to_string(),
-        SplitTunnelMode::Include => {
-            let num_routes = st_cfg.cidrs.len() + st_cfg.domains.len();
-            if num_routes == 0 {
-                "Include mode (no routes specified)".to_string()
-            } else {
-                format!("Include mode ({num_routes} destinations via VPN)")
-            }
-        }
-        SplitTunnelMode::Exclude => {
-            let num_routes = st_cfg.cidrs.len() + st_cfg.domains.len();
-            if num_routes == 0 {
-                "Exclude mode (no routes specified)".to_string()
-            } else {
-                format!("Exclude mode (bypass VPN for {num_routes} destinations)")
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,7 +190,7 @@ mod tests {
         let client = MockNmClient::new(vec![profile.clone()]);
         let path = testing::temp_config_path("st-global-1");
 
-        let mut st_cfg = SplitTunnelConfig {
+        let st_cfg = SplitTunnelConfig {
             mode: SplitTunnelMode::Include,
             cidrs: vec!["10.0.0.0/8".to_string()],
             domains: vec!["localhost".to_string()],
@@ -223,24 +207,43 @@ mod tests {
         assert_eq!(client.split_tunnel_calls().len(), 1);
 
         // Add CIDR
-        st_cfg = add_global_cidr(&client, &path, "192.168.1.0/24").unwrap();
+        let (st_cfg, changed) = add_global_cidr(&client, &path, "192.168.1.0/24").unwrap();
+        assert!(changed);
+        assert_eq!(st_cfg.cidrs.len(), 2);
+
+        // Add duplicate CIDR (no change)
+        let (st_cfg, changed) = add_global_cidr(&client, &path, "192.168.1.0/24").unwrap();
+        assert!(!changed);
         assert_eq!(st_cfg.cidrs.len(), 2);
 
         // Remove CIDR
-        st_cfg = remove_global_cidr(&client, &path, "10.0.0.0/8").unwrap();
+        let (st_cfg, changed) = remove_global_cidr(&client, &path, "10.0.0.0/8").unwrap();
+        assert!(changed);
+        assert_eq!(st_cfg.cidrs, vec!["192.168.1.0/24".to_string()]);
+
+        // Remove non-existent CIDR (no change)
+        let (st_cfg, changed) = remove_global_cidr(&client, &path, "10.0.0.0/8").unwrap();
+        assert!(!changed);
         assert_eq!(st_cfg.cidrs, vec!["192.168.1.0/24".to_string()]);
 
         // Add Domain
-        st_cfg = add_global_domain(&client, &path, "corp.internal").unwrap();
-        assert!(st_cfg.domains.contains(&"corp.internal".to_string()));
+        let (st_cfg, changed) = add_global_domain(&client, &path, "ip6-localhost").unwrap();
+        assert!(changed);
+        assert!(st_cfg.domains.contains(&"ip6-localhost".to_string()));
+
+        // Add duplicate Domain (no change)
+        let (_st_cfg, changed) = add_global_domain(&client, &path, "ip6-localhost").unwrap();
+        assert!(!changed);
 
         // Remove Domain
-        st_cfg = remove_global_domain(&client, &path, "localhost").unwrap();
-        assert_eq!(st_cfg.domains, vec!["corp.internal".to_string()]);
+        let (st_cfg, changed) = remove_global_domain(&client, &path, "localhost").unwrap();
+        assert!(changed);
+        assert_eq!(st_cfg.domains, vec!["ip6-localhost".to_string()]);
 
-        // Summary subtitle
-        let sub = format_summary_subtitle(&st_cfg);
-        assert!(sub.contains("Include mode"));
+        // Remove non-existent Domain (no change)
+        let (st_cfg, changed) = remove_global_domain(&client, &path, "localhost").unwrap();
+        assert!(!changed);
+        assert_eq!(st_cfg.domains, vec!["ip6-localhost".to_string()]);
 
         // Clear
         clear_global(&client, &path).unwrap();
