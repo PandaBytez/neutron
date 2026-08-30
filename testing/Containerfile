@@ -22,6 +22,10 @@ FROM registry.fedoraproject.org/fedora:latest
 # NetworkManager and firewalld with their shared D-Bus dependency, the WireGuard
 # userspace tools (key generation for fixtures, `wg show` diagnostics), and the
 # Rust toolchain.
+#
+# `rustfmt` and `clippy` are included so the sandbox can run the project's whole
+# Definition of Done -- fmt, clippy and every test tier -- without falling back
+# to the developer's own machine.
 RUN dnf install -y --setopt=install_weak_deps=False \
         NetworkManager \
         firewalld \
@@ -35,6 +39,8 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         iproute \
         cargo \
         rust \
+        rustfmt \
+        clippy \
         gcc \
     && dnf clean all
 
