@@ -116,6 +116,33 @@ pub fn read_interface_bytes(iface_name: Option<&str>) -> (u64, u64) {
     parse_interface_bytes(&content, iface_name)
 }
 
+/// The receive counter of `iface_name`, or `None` when no such interface exists.
+///
+/// Distinct from [`read_interface_bytes`], which cannot tell "the interface is
+/// absent" from "the interface has received nothing". Callers verifying a
+/// freshly created tunnel need that distinction: absent means the counter is
+/// about to start from zero, so any growth belongs to the new session.
+pub fn interface_receive_bytes(iface_name: &str) -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/net/dev").ok()?;
+    parse_interface_receive_bytes(&content, iface_name)
+}
+
+/// Pure parsing core of [`interface_receive_bytes`].
+fn parse_interface_receive_bytes(content: &str, iface_name: &str) -> Option<u64> {
+    for line in content.lines().skip(2) {
+        // A line without a colon is not an interface row; skip it rather than
+        // abandoning the search, or a malformed row would hide later ones.
+        let Some((iface, stats)) = line.split_once(':') else {
+            continue;
+        };
+        if iface.trim() != iface_name {
+            continue;
+        }
+        return stats.split_whitespace().next()?.parse::<u64>().ok();
+    }
+    None
+}
+
 /// Pure parsing core of [`read_interface_bytes`], taking `/proc/net/dev`-shaped
 /// content directly so it can be unit tested without a real `/proc` file.
 fn parse_interface_bytes(content: &str, iface_name: Option<&str>) -> (u64, u64) {
@@ -261,6 +288,22 @@ mod tests {
         assert_eq!(format_speed(500), "500 B/s");
         assert_eq!(format_speed(1500), "1.5 KB/s");
         assert_eq!(format_speed(2_500_000), "2.4 MB/s");
+    }
+
+    #[test]
+    fn interface_receive_bytes_distinguishes_absent_from_silent() {
+        // A tunnel that has received nothing and a tunnel that does not exist
+        // are different facts: the health check treats the first as a dead peer
+        // and the second as "not ours to verify", so they must not collapse
+        // into the same `0`.
+        let sample = "Inter-|   Receive                                                |  Transmit\n\
+                      face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+                      wg0: 0             0    0    0    0     0          0         0        0        0    0    0    0     0       0          0\n\
+                      wg1: 92            1    0    0    0     0          0         0      148        2    0    0    0     0       0          0\n";
+
+        assert_eq!(parse_interface_receive_bytes(sample, "wg0"), Some(0));
+        assert_eq!(parse_interface_receive_bytes(sample, "wg1"), Some(92));
+        assert_eq!(parse_interface_receive_bytes(sample, "wg_absent"), None);
     }
 
     #[test]

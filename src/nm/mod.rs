@@ -886,10 +886,10 @@ fn parse_nmcli_fields(line: &str) -> Vec<String> {
 /// with whatever routing NetworkManager chooses. The failure is logged so the
 /// cause is visible.
 ///
-/// Once up, the tunnel is verified (see [`health`]) and taken back down if it
-/// carries no traffic. Now that a full tunnel owns the default route, a peer
-/// that never answers would otherwise swallow every packet while the UI
-/// reported a working connection.
+/// Once up, the tunnel is verified (see [`health`]) and taken back down if the
+/// peer never completes a handshake. Now that a full tunnel owns the default
+/// route, a peer that never answers would otherwise swallow every packet while
+/// the UI reported a working connection.
 fn activate(uuid: &str) -> AppResult<()> {
     let has_ipv6 = profile_has_ipv6(uuid);
     if let Err(error) = run_nmcli_owned(&tunnel_routing::set_args(uuid, has_ipv6)) {
@@ -918,8 +918,30 @@ fn activate(uuid: &str) -> AppResult<()> {
             ));
         }
     }
+    // Whether the interface already exists is sampled *before* activation: a
+    // fresh one starts its receive counter at zero, which is what makes that
+    // counter a handshake signal. See `health`.
+    let interface = tunnel_interface_name(uuid);
+    let existed = interface
+        .as_deref()
+        .map(health::interface_exists)
+        .unwrap_or(false);
+
     run_nmcli(&["connection", "up", uuid])?;
-    verify_or_disconnect(uuid)
+    verify_or_disconnect(uuid, interface.as_deref(), existed)
+}
+
+/// The interface name configured on profile `uuid`, if it has a usable one.
+fn tunnel_interface_name(uuid: &str) -> Option<String> {
+    run_nmcli(&[
+        "-g",
+        "connection.interface-name",
+        "connection",
+        "show",
+        uuid,
+    ])
+    .ok()
+    .and_then(|value| parse_interface_name(&value))
 }
 
 /// Whether the health check is enabled. Defaults to on, including when the
@@ -932,28 +954,34 @@ fn health_check_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Confirm the tunnel behind `uuid` is passing traffic, deactivating it and
-/// reporting an error when it is not.
-fn verify_or_disconnect(uuid: &str) -> AppResult<()> {
+/// Confirm the peer behind `uuid` completed a handshake, deactivating the
+/// tunnel and reporting an error when it did not.
+///
+/// `interface` and `existed_before` must have been sampled *before* activation.
+fn verify_or_disconnect(
+    uuid: &str,
+    interface: Option<&str>,
+    existed_before: bool,
+) -> AppResult<()> {
     if !health_check_enabled() {
         return Ok(());
     }
 
     // Without an interface name there is nothing to sample; treat that as
     // healthy rather than tearing down a connection on a technicality.
-    let Some(interface) = run_nmcli(&[
-        "-g",
-        "connection.interface-name",
-        "connection",
-        "show",
-        uuid,
-    ])
-    .ok()
-    .and_then(|value| parse_interface_name(&value)) else {
+    let Some(interface) = interface else {
         return Ok(());
     };
 
-    if health::probe(&interface).is_healthy() {
+    // The interface was already up before this call, so its receive counter
+    // holds another activation's traffic and cannot be read as this one's
+    // handshake. Reconnecting a profile that is already connected is not a new
+    // tunnel to verify, and guessing here would disconnect a working one.
+    if existed_before {
+        return Ok(());
+    }
+
+    if health::probe(interface).is_healthy() {
         return Ok(());
     }
 
@@ -965,9 +993,9 @@ fn verify_or_disconnect(uuid: &str) -> AppResult<()> {
     }
 
     Err(AppError::TunnelUnhealthy(format!(
-        "{interface}: connected but no traffic is passing -- the peer is not \
-         responding (server down, or the profile's keys are no longer valid). \
-         Disconnected so it does not black-hole your traffic."
+        "{interface}: the peer never completed a handshake (server down, or the \
+         profile's keys are no longer valid). Disconnected so it does not \
+         black-hole your traffic."
     )))
 }
 
