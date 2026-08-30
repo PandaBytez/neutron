@@ -2,6 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
@@ -14,10 +15,6 @@ use crate::tui::state::{
 
 pub fn render(frame: &mut Frame, state: &TuiState) {
     let size = frame.area();
-    let theme = &state.theme;
-
-    // Render subtle themed textured backdrop
-    render_backdrop(frame, size, theme);
 
     let show_ascii = size.height >= 26;
     let banner_h = if show_ascii { 3 } else { 0 };
@@ -27,7 +24,7 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(banner_h), // Centered ASCII title logo
-            Constraint::Length(5),        // Header with Status, Bandwidth, Latency & Policies
+            Constraint::Length(5),        // Header with Status & Policies panels
             Constraint::Min(10),          // Main body: Left List, Right Full Detail
             Constraint::Length(4),        // Footer / Hotkeys + Status line
         ])
@@ -75,24 +72,20 @@ fn render_ascii_banner(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(banner, area);
 }
 
-fn render_backdrop(frame: &mut Frame, area: Rect, theme: &crate::tui::theme::Theme) {
-    let mut pattern_lines = Vec::with_capacity(area.height as usize);
-    for y in 0..area.height {
-        let mut row = String::with_capacity(area.width as usize);
-        for x in 0..area.width {
-            if (x + y * 2) % 6 == 0 {
-                row.push('·');
-            } else {
-                row.push(' ');
-            }
-        }
-        pattern_lines.push(Line::styled(row, theme.backdrop_grid));
-    }
-    let backdrop = Paragraph::new(pattern_lines);
-    frame.render_widget(backdrop, area);
+fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(52), // Left: Status & Telemetry
+            Constraint::Percentage(48), // Right: Policies
+        ])
+        .split(area);
+
+    render_status_panel(frame, header_chunks[0], state);
+    render_policies_panel(frame, header_chunks[1], state);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
+fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
     // Status pill (clean profile name)
@@ -114,11 +107,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
 
     // Dedicated Forwarded Port field (clean text, no background pill)
     let (port_label, port_val, port_val_style) = if let Some(port) = state.active_port {
-        ("Forwarded Port: ", format!("{port}"), theme.accent)
+        ("Port: ", format!("{port}"), theme.accent)
     } else if state.active_profile_name.is_some() {
-        ("Forwarded Port: ", "N/A".to_string(), theme.label_dim)
+        ("Port: ", "N/A".to_string(), theme.label_dim)
     } else {
-        ("Forwarded Port: ", "--".to_string(), theme.label_dim)
+        ("Port: ", "--".to_string(), theme.label_dim)
     };
 
     // Latency & Speed counters
@@ -132,20 +125,24 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
     let up_speed = format_speed(state.upload_rate);
     let speed_text = format!("↓ {down_speed:<9}  ↑ {up_speed}");
 
-    // Line 1: Status badge + Forwarded Port + Latency + Bandwidth rates
+    // Line 1: Status badge + Forwarded Port
     let line1 = Line::from(vec![
         Span::raw(" "),
         status_badge,
         Span::raw("   "),
         Span::styled(port_label, theme.label_dim),
         Span::styled(port_val, port_val_style),
-        Span::raw("   "),
+    ]);
+
+    // Line 2: Ping & D/U on the next line under connected
+    let line2 = Line::from(vec![
+        Span::raw(" "),
         Span::styled(latency_text, theme.keybinding),
         Span::raw("    "),
         Span::styled(speed_text, theme.accent),
     ]);
 
-    // Line 2: Public IP & DNS telemetry
+    // Line 3: Public IP & DNS telemetry
     let ip_text = if let Some(ref ip_info) = state.public_ip_info {
         ip_info.format_display()
     } else {
@@ -153,60 +150,21 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
     };
 
     let mut info_spans = vec![
-        Span::styled(" Public IP: ", theme.label_dim),
+        Span::styled(" IP: ", theme.label_dim),
         Span::styled(ip_text, theme.text_primary),
     ];
 
-    if let Some(ref dns) = state.selected_tunnel_dns {
+    if let Some(dns) = state
+        .selected_info
+        .as_ref()
+        .and_then(|i| i.tunnel_dns.as_ref())
+    {
         info_spans.push(Span::styled("  •  DNS: ", theme.label_dim));
         info_spans.push(Span::styled(dns, theme.accent));
     }
-    let line2 = Line::from(info_spans);
+    let line3 = Line::from(info_spans);
 
-    // Line 3: Merged Policies
-    let auto_mark = if state.config.general.autoconnect_at_login {
-        Span::styled("✔ ", theme.status_connected)
-    } else {
-        Span::styled("· ", theme.label_dim)
-    };
-
-    let kill_mark = if state.config.kill_switch_enabled {
-        Span::styled("✔ ", theme.status_connected)
-    } else {
-        Span::styled("· ", theme.label_dim)
-    };
-
-    let lock_mark = if state.config.lockdown_enabled {
-        Span::styled("✔ ", theme.status_connected)
-    } else {
-        Span::styled("· ", theme.label_dim)
-    };
-
-    let split_mode = state.config.global_split_tunnel.mode;
-    let split_count = state.config.global_split_tunnel.cidrs.len()
-        + state.config.global_split_tunnel.domains.len();
-
-    let split_desc = match split_mode {
-        SplitTunnelMode::Disabled => "Off".to_string(),
-        SplitTunnelMode::Include => format!("Include ({split_count})"),
-        SplitTunnelMode::Exclude => format!("Exclude ({split_count})"),
-    };
-
-    let line3 = Line::from(vec![
-        Span::styled(" Policies: ", theme.label_dim),
-        auto_mark,
-        Span::styled("[a] Auto-Connect", theme.text_primary),
-        Span::raw("   "),
-        kill_mark,
-        Span::styled("[k] Kill-Switch", theme.text_primary),
-        Span::raw("   "),
-        lock_mark,
-        Span::styled("[l] Lockdown", theme.text_primary),
-        Span::raw("   "),
-        Span::styled(format!("[t] Split Tunneling: {split_desc}"), theme.accent),
-    ]);
-
-    let header_widget = Paragraph::new(vec![line1, line2, line3]).block(
+    let status_widget = Paragraph::new(vec![line1, line2, line3]).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -214,7 +172,71 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
             .title(title),
     );
 
-    frame.render_widget(header_widget, area);
+    frame.render_widget(status_widget, area);
+}
+
+fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let theme = &state.theme;
+
+    let (auto_val, auto_val_style) = if state.config.general.autoconnect_at_login {
+        ("ON", theme.status_connected)
+    } else {
+        ("OFF", theme.label_dim)
+    };
+
+    let (kill_val, kill_val_style) = if state.config.kill_switch_enabled {
+        ("ON", theme.status_connected)
+    } else {
+        ("OFF", theme.label_dim)
+    };
+
+    let (lock_val, lock_val_style) = if state.config.lockdown_enabled {
+        ("ON", theme.status_connected)
+    } else {
+        ("OFF", theme.label_dim)
+    };
+
+    let split_count = state.config.global_split_tunnel.cidrs.len()
+        + state.config.global_split_tunnel.domains.len();
+
+    let (split_val, split_val_style) = match state.config.global_split_tunnel.mode {
+        SplitTunnelMode::Disabled => ("OFF".to_string(), theme.label_dim),
+        SplitTunnelMode::Include => (format!("Include ({split_count})"), theme.accent),
+        SplitTunnelMode::Exclude => (format!("Exclude ({split_count})"), theme.accent),
+    };
+
+    let line1 = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("[a] Auto-Connect: ", theme.text_primary),
+        Span::styled(auto_val, auto_val_style),
+        Span::raw("    "),
+        Span::styled("[k] Kill-Switch: ", theme.text_primary),
+        Span::styled(kill_val, kill_val_style),
+    ]);
+
+    let line2 = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("[l] Lockdown: ", theme.text_primary),
+        Span::styled(lock_val, lock_val_style),
+    ]);
+
+    let line3 = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("[t] Split Tunneling: ", theme.text_primary),
+        Span::styled(split_val, split_val_style),
+    ]);
+
+    let title = Line::from(vec![Span::styled(" 🛡  Policies ", theme.title)]);
+
+    let policies_widget = Paragraph::new(vec![line1, line2, line3]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme.border)
+            .title(title),
+    );
+
+    frame.render_widget(policies_widget, area);
 }
 
 fn render_body(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -233,6 +255,11 @@ fn render_body(frame: &mut Frame, area: Rect, state: &TuiState) {
 fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
+    // The selected row is padded out to here so its highlight is a solid bar.
+    // Without it the backdrop grid stays visible past the end of the text and
+    // the highlight looks like it has dots punched through it.
+    let inner_width = area.width.saturating_sub(2) as usize;
+
     let items: Vec<ListItem> = state
         .rows
         .iter()
@@ -240,13 +267,20 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
         .map(|(idx, row)| {
             let is_selected = idx == state.selected_index;
 
+            // Inactive rows get blank space rather than a marker, so only the
+            // connected profile carries a glyph. The width matches "✔ " to keep
+            // the name column aligned.
             let (icon, icon_style) = if row.is_active {
                 ("✔ ", theme.status_connected)
             } else {
-                ("· ", theme.inactive_profile)
+                ("  ", theme.inactive_profile)
             };
 
-            let prefix = if is_selected { "► " } else { "  " };
+            let prefix = if is_selected {
+                SELECTED_POINTER
+            } else {
+                UNSELECTED_POINTER
+            };
 
             let name_style = if row.is_active {
                 theme.active_profile
@@ -263,10 +297,19 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
             ];
 
             if !row.eligible {
-                spans.push(Span::styled(" [EXCLUDED]", theme.label_dim));
+                spans.push(Span::styled(" [EXCLUDED FROM POOL]", theme.label_dim));
             }
 
             let mut line = Line::from(spans);
+
+            // Every row is padded to the full inner width so the backdrop grid
+            // cannot show through past the end of the text. Without it the
+            // selected row's highlight has dots punched through it and inactive
+            // rows trail off into "wg-eu · · · ·".
+            let padding = inner_width.saturating_sub(line.width());
+            if padding > 0 {
+                line.push_span(Span::raw(" ".repeat(padding)));
+            }
             if is_selected {
                 line = line.style(theme.selected_item);
             }
@@ -276,9 +319,9 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
         .collect();
 
     let title = Line::from(vec![
-        Span::styled(format!(" Profiles ({}) ", state.rows.len()), theme.title),
+        Span::styled(format!(" 📋 Profiles ({}) ", state.rows.len()), theme.title),
         Span::styled(
-            " [↑/↓ Select, Space Connect, e Auto-pool] ",
+            " [↑/↓ Select, Space Connect, e Exclude from pool] ",
             theme.keybinding,
         ),
     ]);
@@ -297,6 +340,7 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
 fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
+    let info = state.selected_info.as_ref();
     let content = if let Some(row) = state.selected_row() {
         let mut lines = Vec::new();
 
@@ -310,7 +354,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         let (status_str, status_style) = if row.is_active {
             ("✔ Connected (Active Tunnel)", theme.status_connected)
         } else {
-            ("· Inactive", theme.status_disconnected)
+            ("Inactive", theme.status_disconnected)
         };
         lines.push(Line::from(vec![
             Span::styled("Status:        ", theme.label_dim),
@@ -318,12 +362,12 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         ]));
 
         let (elig_str, elig_style) = if row.eligible {
-            ("✔ Eligible for Random Startup", theme.status_connected)
+            ("✔ In pool (may be auto-connected)", theme.status_connected)
         } else {
-            ("✗ Excluded from Startup Pool", theme.label_dim)
+            ("✗ Excluded (never auto-connected)", theme.label_dim)
         };
         lines.push(Line::from(vec![
-            Span::styled("Startup Pool:  ", theme.label_dim),
+            Span::styled("Auto-Connect:  ", theme.label_dim),
             Span::styled(elig_str, elig_style),
         ]));
 
@@ -338,10 +382,9 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
                 ]));
             }
 
-            if let Some(ref addr) = state.selected_tunnel_address {
-                let gw_str = state
-                    .selected_gateway
-                    .as_deref()
+            if let Some(addr) = info.and_then(|i| i.tunnel_address.as_ref()) {
+                let gw_str = info
+                    .and_then(|i| i.gateway.as_deref())
                     .map(|gw| format!("  (Gateway: {gw})"))
                     .unwrap_or_default();
                 lines.push(Line::from(vec![
@@ -358,7 +401,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             }
         }
 
-        if let Some(ref dns) = state.selected_tunnel_dns {
+        if let Some(dns) = info.and_then(|i| i.tunnel_dns.as_ref()) {
             lines.push(Line::from(vec![
                 Span::styled("DNS Resolver:  ", theme.label_dim),
                 Span::styled(format!("{dns} (VPN Priority -1500)"), theme.text_secondary),
@@ -368,7 +411,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         lines.push(Line::raw(""));
 
         // Section: Diagnostics & Link Stats
-        if let Some(ref diag) = state.selected_diagnostics {
+        if let Some(diag) = info.map(|i| &i.diagnostics) {
             lines.push(Line::from(vec![
                 Span::styled("Remote Peer:   ", theme.label_dim),
                 Span::styled(&diag.endpoint, theme.text_primary),
@@ -418,61 +461,87 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme.border)
-            .title(Span::styled(" Details ", theme.title)),
+            .title(Span::styled(" 📊 Details ", theme.title)),
     );
 
     frame.render_widget(panel, area);
 }
 
+/// A `[key] label` badge pair for the footer and modal hint rows.
 fn key_item<'a>(
     theme: &'a crate::tui::theme::Theme,
+    badge: Style,
     key: &'a str,
     label: &'a str,
 ) -> Vec<Span<'a>> {
     vec![
-        Span::styled(format!(" {key} "), theme.key_badge),
+        Span::styled(format!(" {key} "), badge),
         Span::styled(format!(" {label}  "), theme.text_primary),
     ]
 }
 
-fn key_item_accent<'a>(
-    theme: &'a crate::tui::theme::Theme,
-    key: &'a str,
-    label: &'a str,
-) -> Vec<Span<'a>> {
-    vec![
-        Span::styled(format!(" {key} "), theme.key_badge_accent),
-        Span::styled(format!(" {label}  "), theme.text_primary),
-    ]
-}
+/// Marks the selected row in every list. Declared once so the profile list, the
+/// palette, the theme picker and the split-tunnel lists cannot drift apart.
+const SELECTED_POINTER: &str = "▶ ";
+
+/// Same width as [`SELECTED_POINTER`], for rows that are not selected.
+const UNSELECTED_POINTER: &str = "  ";
+
+/// Footer badges for keys that are not palette actions.
+const FOOTER_ACCENT_KEYS: [(&str, &str); 2] = [("Ctrl+P", "Menu"), ("Ctrl+T", "Theme")];
+
+/// Footer badges, with labels abbreviated to fit one row. Every key here must
+/// also be a palette shortcut -- asserted by the tests below, so the two views
+/// cannot drift.
+const FOOTER_KEYS: [(&str, &str); 10] = [
+    ("Space", "Connect/Down"),
+    ("s", "Switch"),
+    ("e", "Excl. from pool"),
+    ("t", "Split Tunneling"),
+    ("k", "KillSwitch"),
+    ("l", "Lockdown"),
+    ("a", "AutoLogin"),
+    ("r", "Sync"),
+    ("?", "Help"),
+    ("q", "Quit"),
+];
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
     let mut hotkeys = Vec::new();
-    hotkeys.extend(key_item_accent(theme, "Ctrl+P", "Menu"));
-    hotkeys.extend(key_item_accent(theme, "Ctrl+T", "Theme"));
-    hotkeys.extend(key_item(theme, "Space", "Connect/Down"));
-    hotkeys.extend(key_item(theme, "s", "Switch"));
-    hotkeys.extend(key_item(theme, "e", "Auto-pool"));
-    hotkeys.extend(key_item(theme, "t", "Split Tunneling"));
-    hotkeys.extend(key_item(theme, "k", "KillSwitch"));
-    hotkeys.extend(key_item(theme, "l", "Lockdown"));
-    hotkeys.extend(key_item(theme, "a", "AutoLogin"));
-    hotkeys.extend(key_item(theme, "r", "Sync"));
-    hotkeys.extend(key_item(theme, "?", "Help"));
-    hotkeys.extend(key_item(theme, "q", "Quit"));
+    for (key, label) in FOOTER_ACCENT_KEYS {
+        hotkeys.extend(key_item(theme, theme.key_badge_accent, key, label));
+    }
+    for (key, label) in FOOTER_KEYS {
+        hotkeys.extend(key_item(theme, theme.key_badge, key, label));
+    }
 
     let mut footer_lines = vec![Line::from(hotkeys)];
     if !state.status_message.is_empty() {
+        let (label, style) = if state.status_is_error {
+            (" ✖ ", theme.status_disconnected)
+        } else {
+            (" Status: ", theme.label_dim)
+        };
         footer_lines.push(Line::from(vec![
-            Span::styled(" Status: ", theme.label_dim),
-            Span::styled(&state.status_message, theme.title),
+            Span::styled(label, style),
+            Span::styled(
+                &state.status_message,
+                if state.status_is_error {
+                    theme.warning
+                } else {
+                    theme.title
+                },
+            ),
         ]));
     }
 
+    // Wrapped so a long diagnosis stays readable instead of being clipped at
+    // the panel edge -- the explanation is the useful part of a failure.
     let footer_widget = Paragraph::new(footer_lines)
         .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -546,7 +615,15 @@ fn render_command_palette_modal(
         .map(|(idx, item)| {
             let is_sel = idx == cp.selected_index;
             let mut spans = vec![
-                Span::styled(if is_sel { " ► " } else { "   " }, theme.accent),
+                Span::raw(" "),
+                Span::styled(
+                    if is_sel {
+                        SELECTED_POINTER
+                    } else {
+                        UNSELECTED_POINTER
+                    },
+                    theme.accent,
+                ),
                 Span::styled(
                     item.title,
                     if is_sel {
@@ -624,7 +701,15 @@ fn render_theme_picker_modal(
             let is_active = *id == state.theme.name;
 
             let mut spans = vec![
-                Span::styled(if is_sel { " ► " } else { "   " }, theme.accent),
+                Span::raw(" "),
+                Span::styled(
+                    if is_sel {
+                        SELECTED_POINTER
+                    } else {
+                        UNSELECTED_POINTER
+                    },
+                    theme.accent,
+                ),
                 Span::styled(
                     *label,
                     if is_sel {
@@ -674,72 +759,39 @@ fn render_theme_picker_modal(
     frame.render_widget(outer, popup_area);
 }
 
+/// List navigation, which moves the selection rather than running an action and
+/// so has no entry in the palette.
+const NAVIGATION_KEYS: [(&str, &str); 2] = [
+    ("↑ / ↓ (or p / n)", "Move through the profile list"),
+    ("Ctrl+P / :", "Open the command palette"),
+];
+
 fn render_help_modal(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
-    let popup_area = centered_rect(65, 75, area);
+    let popup_area = centered_rect(70, 80, area);
 
     frame.render_widget(Clear, popup_area);
 
-    let lines = vec![
-        Line::from(vec![Span::styled("General & Menu", theme.header)]),
-        Line::from(vec![
-            Span::styled("  Ctrl+P / :       ", theme.keybinding),
-            Span::raw("Open Menu"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Ctrl+T           ", theme.keybinding),
-            Span::raw("Open Theme Picker"),
-        ]),
-        Line::raw(""),
-        Line::from(vec![Span::styled("Navigation & Connections", theme.header)]),
-        Line::from(vec![
-            Span::styled("  ↑ / ↓ (or p / n) ", theme.keybinding),
-            Span::raw("Navigate profile list"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Space / Enter    ", theme.keybinding),
-            Span::raw("Connect or Disconnect selected profile"),
-        ]),
-        Line::from(vec![
-            Span::styled("  s                ", theme.keybinding),
-            Span::raw("Switch to selected profile"),
-        ]),
-        Line::from(vec![
-            Span::styled("  e                ", theme.keybinding),
-            Span::raw("Toggle startup-random eligibility"),
-        ]),
-        Line::from(vec![
-            Span::styled("  d / Delete       ", theme.keybinding),
-            Span::raw("Delete profile from NetworkManager"),
-        ]),
-        Line::raw(""),
-        Line::from(vec![Span::styled("Global Security Controls", theme.header)]),
-        Line::from(vec![
-            Span::styled("  t                ", theme.keybinding),
-            Span::raw("Open Split Tunneling manager modal"),
-        ]),
-        Line::from(vec![
-            Span::styled("  k                ", theme.keybinding),
-            Span::raw("Toggle Kill Switch (NM policy routing)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  l                ", theme.keybinding),
-            Span::raw("Toggle Lockdown mode (Always-on firewall)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  a                ", theme.keybinding),
-            Span::raw("Toggle Auto-Connect at Login"),
-        ]),
-        Line::from(vec![
-            Span::styled("  r                ", theme.keybinding),
-            Span::raw("Refresh & Auto-sync profiles drop folder"),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  Esc / q          ", theme.keybinding),
-            Span::raw("Close modal / Quit"),
-        ]),
-    ];
+    let mut lines = vec![Line::from(vec![Span::styled("Navigation", theme.header)])];
+    for (key, description) in NAVIGATION_KEYS {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<18}"), theme.keybinding),
+            Span::raw(description),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled("Actions", theme.header)]));
+
+    // Rendered from the palette's own list, so a new action documents itself
+    // and the help screen cannot drift out of step with what the keys do.
+    for item in CommandPaletteState::all_items() {
+        let key = item.shortcut.unwrap_or("—");
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<18}"), theme.keybinding),
+            Span::raw(item.description),
+        ]));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -831,7 +883,14 @@ fn render_split_tunnel_modal(
         .map(|(idx, c)| {
             let is_sel = st.focus == SplitTunnelFocus::CidrList && idx == st.selected_cidr;
             let line = Line::from(vec![
-                Span::styled(if is_sel { "► " } else { "  " }, theme.accent),
+                Span::styled(
+                    if is_sel {
+                        SELECTED_POINTER
+                    } else {
+                        UNSELECTED_POINTER
+                    },
+                    theme.accent,
+                ),
                 Span::styled(
                     c,
                     if is_sel {
@@ -865,7 +924,14 @@ fn render_split_tunnel_modal(
         .map(|(idx, d)| {
             let is_sel = st.focus == SplitTunnelFocus::DomainList && idx == st.selected_domain;
             let line = Line::from(vec![
-                Span::styled(if is_sel { "► " } else { "  " }, theme.accent),
+                Span::styled(
+                    if is_sel {
+                        SELECTED_POINTER
+                    } else {
+                        UNSELECTED_POINTER
+                    },
+                    theme.accent,
+                ),
                 Span::styled(
                     d,
                     if is_sel {
@@ -893,13 +959,17 @@ fn render_split_tunnel_modal(
 
     // Footer instructions
     let mut modal_keys = Vec::new();
-    modal_keys.extend(key_item(theme, "Tab", "Focus"));
-    modal_keys.extend(key_item(theme, "m", "Mode"));
-    modal_keys.extend(key_item(theme, "1", "Add CIDR"));
-    modal_keys.extend(key_item(theme, "2", "Add Domain"));
-    modal_keys.extend(key_item(theme, "x/Del", "Delete"));
-    modal_keys.extend(key_item(theme, "Ctrl+S", "Save & Apply"));
-    modal_keys.extend(key_item(theme, "Esc", "Cancel"));
+    for (key, label) in [
+        ("Tab", "Focus"),
+        ("m", "Mode"),
+        ("1", "Add CIDR"),
+        ("2", "Add Domain"),
+        ("x/Del", "Delete"),
+        ("Ctrl+S", "Save & Apply"),
+        ("Esc", "Cancel"),
+    ] {
+        modal_keys.extend(key_item(theme, theme.key_badge, key, label));
+    }
 
     let modal_footer = Paragraph::new(Line::from(modal_keys)).alignment(Alignment::Center);
     frame.render_widget(modal_footer, chunks[3]);
@@ -948,4 +1018,135 @@ fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state:
         .alignment(Alignment::Center);
 
     frame.render_widget(widget, popup_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_footer_key_is_a_real_palette_shortcut() {
+        // The footer abbreviates labels to fit one row, so it cannot render
+        // straight from the palette -- but its keys must still be actions that
+        // exist, or the row advertises a binding that does nothing.
+        let shortcuts: Vec<&str> = CommandPaletteState::all_items()
+            .into_iter()
+            .filter_map(|item| item.shortcut)
+            .collect();
+
+        for (key, label) in FOOTER_KEYS {
+            assert!(
+                shortcuts.contains(&key),
+                "footer offers '{key}' ({label}) but no palette action uses that key"
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_screen_documents_how_to_open_the_help_screen() {
+        // Regression: the hand-written help modal listed neither `?` nor `h`,
+        // so the only way to discover the Help key was to already know it.
+        let documented: Vec<&str> = CommandPaletteState::all_items()
+            .into_iter()
+            .filter_map(|item| item.shortcut)
+            .chain(NAVIGATION_KEYS.iter().map(|(key, _)| *key))
+            .collect();
+
+        assert!(documented.contains(&"?"));
+        assert!(documented.iter().any(|key| key.contains("Ctrl+P")));
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::app::profile_list::ProfileListRow;
+    use crate::config::AppConfig;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn row(name: &str, is_active: bool) -> ProfileListRow {
+        ProfileListRow {
+            name: name.to_string(),
+            uuid: format!("uuid-{name}"),
+            is_active,
+            state_label: if is_active { "active" } else { "inactive" },
+            eligible: true,
+            custom_info: None,
+        }
+    }
+
+    /// Render just the profile list and return its rows as plain strings.
+    fn rendered_list(rows: Vec<ProfileListRow>, selected: usize) -> Vec<String> {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.rows = rows;
+        state.selected_index = selected;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(40, 6)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_profile_list(frame, area, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_selected_row_highlight_is_solid_bar() {
+        let lines = rendered_list(vec![row("wg-eu", false), row("wg-us", false)], 0);
+        let selected = lines
+            .iter()
+            .find(|line| line.contains("wg-eu"))
+            .expect("the selected row should render");
+
+        assert!(
+            !selected.contains('·'),
+            "selected row must be padded cleanly: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn inactive_rows_carry_no_marker_and_the_active_row_keeps_its_tick() {
+        let lines = rendered_list(vec![row("wg-eu", false), row("wg-us", true)], 1);
+
+        let inactive = lines
+            .iter()
+            .find(|line| line.contains("wg-eu"))
+            .expect("inactive row should render");
+        assert!(
+            !inactive.contains('·'),
+            "inactive profiles must not be marked with a dot: {inactive:?}"
+        );
+
+        let active = lines
+            .iter()
+            .find(|line| line.contains("wg-us"))
+            .expect("active row should render");
+        assert!(active.contains('✔'), "{active:?}");
+    }
+
+    #[test]
+    fn the_selected_row_is_marked_with_a_triangle_pointer() {
+        let lines = rendered_list(vec![row("wg-eu", false), row("wg-us", false)], 1);
+
+        let selected = lines
+            .iter()
+            .find(|line| line.contains("wg-us"))
+            .expect("selected row should render");
+        assert!(
+            selected.contains('▶'),
+            "expected the triangle pointer: {selected:?}"
+        );
+        assert!(!selected.contains('►'), "the old arrow must be gone");
+    }
 }

@@ -7,7 +7,6 @@ use crate::config::ThemeConfig;
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub name: &'static str,
-    pub bg: Color,
     pub backdrop_grid: Style,
     pub border: Style,
     pub active_border: Style,
@@ -28,7 +27,6 @@ pub struct Theme {
     pub keybinding: Style,
     pub key_badge: Style,
     pub key_badge_accent: Style,
-    pub popup_bg: Style,
 }
 
 impl Theme {
@@ -63,7 +61,6 @@ impl Theme {
     pub fn osaka_jade() -> Self {
         Self {
             name: "osaka-jade",
-            bg: Color::Rgb(17, 28, 24),
             backdrop_grid: Style::default().fg(Color::Rgb(25, 42, 36)),
             border: Style::default().fg(Color::Rgb(83, 104, 91)),
             active_border: Style::default()
@@ -113,14 +110,12 @@ impl Theme {
                 .bg(Color::Rgb(45, 213, 183))
                 .fg(Color::Rgb(17, 28, 24))
                 .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Rgb(17, 28, 24)),
         }
     }
 
     pub fn catppuccin_mocha() -> Self {
         Self {
             name: "catppuccin-mocha",
-            bg: Color::Rgb(30, 30, 46),
             backdrop_grid: Style::default().fg(Color::Rgb(49, 50, 68)),
             border: Style::default().fg(Color::Rgb(88, 91, 112)),
             active_border: Style::default()
@@ -170,14 +165,12 @@ impl Theme {
                 .bg(Color::Rgb(203, 166, 247))
                 .fg(Color::Rgb(17, 17, 27))
                 .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Rgb(30, 30, 46)),
         }
     }
 
     pub fn nord() -> Self {
         Self {
             name: "nord",
-            bg: Color::Rgb(46, 52, 64),
             backdrop_grid: Style::default().fg(Color::Rgb(59, 66, 82)),
             border: Style::default().fg(Color::Rgb(76, 86, 106)),
             active_border: Style::default()
@@ -227,14 +220,12 @@ impl Theme {
                 .bg(Color::Rgb(136, 192, 208))
                 .fg(Color::Rgb(46, 52, 64))
                 .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Rgb(46, 52, 64)),
         }
     }
 
     pub fn gruvbox() -> Self {
         Self {
             name: "gruvbox",
-            bg: Color::Rgb(40, 40, 40),
             backdrop_grid: Style::default().fg(Color::Rgb(55, 52, 50)),
             border: Style::default().fg(Color::Rgb(124, 111, 100)),
             active_border: Style::default()
@@ -284,68 +275,62 @@ impl Theme {
                 .bg(Color::Rgb(254, 128, 25))
                 .fg(Color::Rgb(29, 32, 33))
                 .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Rgb(40, 40, 40)),
         }
     }
 
     pub fn monochrome() -> Self {
+        let soft_white = Color::Rgb(225, 225, 225);
+        let light_gray = Color::Rgb(190, 190, 190);
+        let mid_gray = Color::Rgb(150, 150, 150);
+        let dark_gray = Color::Rgb(100, 100, 100);
+        let surface_gray = Color::Rgb(50, 50, 50);
+
         Self {
             name: "monochrome",
-            bg: Color::Black,
-            backdrop_grid: Style::default().fg(Color::Rgb(40, 40, 40)),
-            border: Style::default().fg(Color::DarkGray),
-            active_border: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            title: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            header: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            backdrop_grid: Style::default().fg(Color::Rgb(35, 35, 35)),
+            border: Style::default().fg(dark_gray),
+            active_border: Style::default().fg(soft_white).add_modifier(Modifier::BOLD),
+            title: Style::default().fg(soft_white).add_modifier(Modifier::BOLD),
+            header: Style::default().fg(soft_white).add_modifier(Modifier::BOLD),
             selected_item: Style::default()
-                .bg(Color::White)
-                .fg(Color::Black)
+                .bg(surface_gray)
+                .fg(soft_white)
                 .add_modifier(Modifier::BOLD),
-            active_profile: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            inactive_profile: Style::default().fg(Color::Gray),
-            status_connected: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            status_disconnected: Style::default().fg(Color::DarkGray),
+            active_profile: Style::default().fg(soft_white).add_modifier(Modifier::BOLD),
+            inactive_profile: Style::default().fg(mid_gray),
+            status_connected: Style::default().fg(soft_white).add_modifier(Modifier::BOLD),
+            status_disconnected: Style::default().fg(dark_gray),
             status_pill_connected: Style::default()
-                .bg(Color::White)
-                .fg(Color::Black)
+                .bg(surface_gray)
+                .fg(soft_white)
                 .add_modifier(Modifier::BOLD),
-            status_pill_disconnected: Style::default().bg(Color::DarkGray).fg(Color::Black),
-            label_dim: Style::default().fg(Color::DarkGray),
-            text_primary: Style::default().fg(Color::White),
-            text_secondary: Style::default().fg(Color::Gray),
-            accent: Style::default().fg(Color::White),
+            status_pill_disconnected: Style::default()
+                .bg(Color::Rgb(35, 35, 35))
+                .fg(dark_gray)
+                .add_modifier(Modifier::BOLD),
+            label_dim: Style::default().fg(dark_gray),
+            text_primary: Style::default().fg(soft_white),
+            text_secondary: Style::default().fg(mid_gray),
+            accent: Style::default().fg(light_gray),
             warning: Style::default()
-                .fg(Color::White)
+                .fg(soft_white)
                 .add_modifier(Modifier::UNDERLINED),
-            keybinding: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            keybinding: Style::default().fg(soft_white).add_modifier(Modifier::BOLD),
             key_badge: Style::default()
-                .bg(Color::White)
-                .fg(Color::Black)
+                .bg(surface_gray)
+                .fg(soft_white)
                 .add_modifier(Modifier::BOLD),
             key_badge_accent: Style::default()
-                .bg(Color::White)
-                .fg(Color::Black)
+                .bg(light_gray)
+                .fg(Color::Rgb(20, 20, 20))
                 .add_modifier(Modifier::BOLD),
-            popup_bg: Style::default().bg(Color::Black),
         }
     }
 }
 
 fn parse_color(hex: &str) -> Option<Color> {
     let s = hex.trim().trim_start_matches('#');
-    if s.len() == 6 {
+    if s.len() == 6 && s.is_ascii() {
         let r = u8::from_str_radix(&s[0..2], 16).ok()?;
         let g = u8::from_str_radix(&s[2..4], 16).ok()?;
         let b = u8::from_str_radix(&s[4..6], 16).ok()?;
@@ -375,6 +360,8 @@ mod tests {
         assert_eq!(parse_color("00ff00"), Some(Color::Rgb(0, 255, 0)));
         assert_eq!(parse_color("blue"), Some(Color::Blue));
         assert_eq!(parse_color("invalid"), None);
+        assert_eq!(parse_color("日本"), None);
+        assert_eq!(parse_color("#日本"), None);
     }
 
     #[test]
@@ -383,6 +370,8 @@ mod tests {
         let _ = Theme::catppuccin_mocha();
         let _ = Theme::nord();
         let _ = Theme::gruvbox();
-        let _ = Theme::monochrome();
+        let mono = Theme::monochrome();
+        assert_ne!(mono.selected_item.bg, Some(Color::White));
+        assert_eq!(mono.title.fg, Some(Color::Rgb(225, 225, 225)));
     }
 }

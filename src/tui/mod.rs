@@ -89,24 +89,8 @@ where
         .collect();
     thread::spawn(move || {
         for (uuid, is_active) in rows_to_cache {
-            let tunnel_addr = client_for_cache.tunnel_address(&uuid);
-            let tunnel_dns = client_for_cache.tunnel_dns(&uuid);
-            let gateway = tunnel_addr
-                .as_deref()
-                .and_then(crate::portforward::gateway_for_address)
-                .map(|ip| ip.to_string());
-            let diag = client_for_cache
-                .get_profile_diagnostics(&uuid, is_active)
-                .unwrap_or_default();
-            let _ = cache_tx.send((
-                uuid,
-                crate::tui::state::CachedProfileInfo {
-                    diagnostics: diag,
-                    tunnel_address: tunnel_addr,
-                    tunnel_dns,
-                    gateway,
-                },
-            ));
+            let info = events::fetch_profile_info(&client_for_cache, &uuid, is_active);
+            let _ = cache_tx.send((uuid, info));
         }
     });
 
@@ -139,9 +123,52 @@ where
         start_nm_monitor_loop(monitor_events_clone);
     });
 
+    // The loop body is wrapped so the terminal is restored on *every* exit
+    // path. A `?` inside it (a failed draw or a lost stdin) previously skipped
+    // the restore below and left the shell in raw mode with no cursor -- the
+    // user's terminal was unusable until they blindly typed `reset`.
+    let outcome = run_event_loop(
+        &mut terminal,
+        &mut state,
+        &client,
+        &ip_tx,
+        &ip_rx,
+        &lat_rx,
+        &cache_rx,
+        &monitor_events,
+    );
+
+    restore_terminal(&mut terminal);
+    outcome
+}
+
+/// Restore the terminal to a usable state. Best-effort and infallible: this
+/// runs while unwinding from an error, and failing to undo one step must not
+/// prevent the others -- a half-restored terminal is what leaves a shell
+/// unusable.
+fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(terminal: &mut Terminal<B>) {
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+    let _ = terminal.show_cursor();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_event_loop<C, B>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    client: &C,
+    ip_tx: &std::sync::mpsc::Sender<crate::nm::network_info::PublicIpInfo>,
+    ip_rx: &std::sync::mpsc::Receiver<crate::nm::network_info::PublicIpInfo>,
+    lat_rx: &std::sync::mpsc::Receiver<u32>,
+    cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
+    monitor_events: &Arc<AtomicU64>,
+) -> AppResult<()>
+where
+    C: NmClient + FirewallClient + Clone + Send + Sync + 'static,
+    B: ratatui::backend::Backend,
+{
     let mut last_seen_event = 0_u64;
 
-    // Main TUI Event Loop
     while !state.should_quit {
         // Drain any incoming public IP updates from background worker
         while let Ok(info) = ip_rx.try_recv() {
@@ -163,14 +190,14 @@ where
 
         // Draw frame
         terminal.draw(|frame| {
-            ui::render(frame, &state);
+            ui::render(frame, state);
         })?;
 
         // Check if NetworkManager emitted connection change events
         let current_nm_event = monitor_events.load(Ordering::Relaxed);
         if current_nm_event != last_seen_event {
             last_seen_event = current_nm_event;
-            let _ = events::reload_profiles(&mut state, &client);
+            let _ = events::reload_profiles(state, client);
             spawn_public_ip_lookup(ip_tx.clone());
         }
 
@@ -178,14 +205,17 @@ where
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
-            events::handle_key_event(&mut state, &client, key)?;
+            // An action failing is an ordinary event -- an unreachable server,
+            // a profile NetworkManager rejects, a firewall prompt dismissed --
+            // so it is reported in the footer and the session continues.
+            // Propagating it here tore the whole interface down and dropped the
+            // user back to a bare shell, losing the very message that explained
+            // what went wrong.
+            if let Err(error) = events::handle_key_event(state, client, key) {
+                state.set_error(&error);
+            }
         }
     }
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
-    terminal.show_cursor()?;
 
     Ok(())
 }
