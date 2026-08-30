@@ -157,11 +157,11 @@ Quality checks & task runner:
 # Run formatting and strict clippy linting across all features
 cargo lint
 
-# Run all host unit and integration tests across all feature gates
-cargo test-all
-
-# Run standard test suite
+# Run standard host unit & integration test suite
 cargo test
+
+# Run ALL tests end-to-end (host tests + containerized system & leak tests)
+cargo test-all
 ```
 
 Containerized System & Leak Tests (requires `podman` or `docker`):

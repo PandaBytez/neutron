@@ -13,7 +13,8 @@ directory replaces it.
 
 | Tier | Where | Covers | Preferred Command | Low-Level Shell Script |
 | --- | --- | --- | --- | --- |
-| Unit + integration | host | logic, arg builders, TUI state | `cargo test` / `cargo test-all` | `cargo test` |
+| Full suite (All tiers) | host + container | all host tests + all container tests | `cargo test-all` | `cargo test && ./testing/run-container-tests.sh` |
+| Unit + integration | host | logic, arg builders, TUI state | `cargo test` / `cargo test-all -- --host-only` | `cargo test` |
 | System — NetworkManager | container | real profiles, routing, parsers | `cargo test-system -- --nm` | `./testing/run-container-tests.sh --nm` |
 | System — firewall | container | real firewalld rules, teardown | `cargo test-system -- --firewall` | `./testing/run-container-tests.sh --firewall` |
 | Leak demonstrations | container | regression guards | `cargo test-leaks` | `./testing/run-container-tests.sh --leaks` |
@@ -23,7 +24,10 @@ directory replaces it.
 Neutron supports standard Cargo tasks (`xtask`) configured in `.cargo/config.toml` so you do not need to invoke shell scripts directly:
 
 ```sh
-# Run all system tests in the container sandbox
+# Run ALL test tiers (host unit/integration tests + container sandbox tests)
+cargo test-all
+
+# Run only containerized system tests in sandbox
 cargo test-system
 
 # Run specific tiers
@@ -37,8 +41,7 @@ cargo test-leaks
 # Open an interactive shell inside the sandbox container
 cargo xtask container-shell
 
-# Run host tests across all feature gates & strict linter
-cargo test-all
+# Run strict linter across all feature gates
 cargo lint
 ```
 

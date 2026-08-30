@@ -11,11 +11,11 @@ fn main() {
     let workspace_root = project_root();
 
     let exit_code = match task {
+        "test-all" | "all" => run_all_tests(&workspace_root, &args[1..]),
         "test-system" | "system-tests" => run_system_tests(&workspace_root, &args[1..]),
         "test-leaks" | "leak-tests" => run_leak_tests(&workspace_root, &args[1..]),
         "container-shell" | "shell" => run_container_shell(&workspace_root, &args[1..]),
         "build-image" => build_container_image(&workspace_root, true),
-        "test-all" => run_host_tests(&workspace_root),
         "lint" => run_linter(&workspace_root),
         "help" | "--help" | "-h" => {
             print_help();
@@ -38,21 +38,22 @@ fn print_help() {
           cargo xtask <TASK> [OPTIONS]\n  \
           cargo <ALIAS> [OPTIONS]\n\n\
         TASKS:\n  \
+          test-all                    Run ALL tests: unit/integration + containerized system tests\n  \
           test-system, system-tests   Run destructive system tests inside a Podman container\n  \
           test-leaks, leak-tests      Run leak protection tests inside a Podman container\n  \
           container-shell, shell      Drop into an interactive shell inside the test container\n  \
           build-image                 Build/rebuild the neutron-sandbox container image\n  \
-          test-all                    Run all host unit and integration tests with all features\n  \
           lint                        Run cargo fmt and clippy with strict warnings\n\n\
-        CONTAINER TEST OPTIONS:\n  \
+        OPTIONS:\n  \
+          --host-only                 Run only host tests (skip container)\n  \
           --nm                        Run only NetworkManager system tests\n  \
           --firewall                  Run only Firewall lockdown system tests\n  \
           --rebuild                   Force rebuild the container image before running\n  \
           --filter <pattern>          Run specific tests matching pattern\n\n\
         CARGO SHORTCUT ALIASES:\n  \
+          cargo test-all              Execute entire test suite (host + container)\n  \
           cargo test-system           Run system tests in container\n  \
           cargo test-leaks            Run leak tests in container\n  \
-          cargo test-all              Run host tests with all features\n  \
           cargo lint                  Run formatting and clippy checks"
     );
 }
@@ -83,7 +84,6 @@ fn image_exists(tool: &str, image: &str) -> bool {
         }
     }
 
-    // Fallback inspect check
     let inspect = Command::new(tool)
         .args(["image", "inspect", image])
         .output();
@@ -127,6 +127,30 @@ fn build_container_image(root: &Path, force: bool) -> i32 {
             1
         }
     }
+}
+
+fn run_all_tests(root: &Path, args: &[String]) -> i32 {
+    println!("==> [1/2] Running host unit & integration tests (all feature gates)...");
+    let host_code = run_host_tests(root);
+    if host_code != 0 {
+        eprintln!("\n✖ Host tests failed with exit code {host_code}");
+        return host_code;
+    }
+
+    if args.iter().any(|a| a == "--host-only") {
+        println!("\n✔ Host tests passed (--host-only specified).");
+        return 0;
+    }
+
+    println!("\n==> [2/2] Running containerized system & leak tests in isolated sandbox...");
+    let system_code = run_system_tests(root, args);
+    if system_code != 0 {
+        eprintln!("\n✖ Container system tests failed with exit code {system_code}");
+        return system_code;
+    }
+
+    println!("\n✔ All test tiers passed successfully (Host + Container sandbox).");
+    0
 }
 
 fn run_system_tests(root: &Path, args: &[String]) -> i32 {
