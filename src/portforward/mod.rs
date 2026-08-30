@@ -49,26 +49,33 @@ pub const RENEW_INTERVAL: Duration = Duration::from_secs(45);
 /// responder rather than that it is busy.
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Parse the local IPv4 address from a tunnel address string (e.g. "10.2.0.2/32").
+pub fn parse_local_address(address: &str) -> Option<Ipv4Addr> {
+    let host = address.split('/').next()?.trim();
+    host.parse().ok()
+}
+
 /// The NAT-PMP gateway for a tunnel whose local address is `address`.
 ///
 /// WireGuard peers are configured with a host address such as `10.2.0.2/32`,
 /// which carries no gateway of its own. The responder sits at `.1` of that
 /// subnet, so the gateway is derived by replacing the final octet.
 pub fn gateway_for_address(address: &str) -> Option<Ipv4Addr> {
-    let host = address.split('/').next()?.trim();
-    let ip: Ipv4Addr = host.parse().ok()?;
+    let ip = parse_local_address(address)?;
     let [a, b, c, _] = ip.octets();
     Some(Ipv4Addr::new(a, b, c, 1))
 }
 
 /// Ask the gateway derived from a tunnel's local `address` to forward a port.
 ///
-/// Bundles [`gateway_for_address`] and [`request_mapping`], which every caller
+/// Bundles [`gateway_for_address`] and [`request_mapping_from`], which every caller
 /// needs together. Note this performs a blocking UDP round trip of up to
 /// [`READ_TIMEOUT`], so callers on a UI thread should only invoke it when the
 /// tunnel actually changed or the lease is due.
 pub fn port_for_tunnel_address(address: &str) -> Option<u16> {
-    request_mapping(gateway_for_address(address)?).ok()
+    let gateway = gateway_for_address(address)?;
+    let local_ip = parse_local_address(address);
+    request_mapping_from(local_ip, gateway).ok()
 }
 
 /// Encode a NAT-PMP mapping request.
@@ -147,15 +154,29 @@ fn describe_result_code(code: u16) -> String {
 /// pair, and a caller asking for "the forwarded port" expects both protocols to
 /// work. The UDP mapping decides the port; the TCP request reuses it.
 pub fn request_mapping(gateway: Ipv4Addr) -> AppResult<u16> {
-    let port = map_protocol(gateway, OP_MAP_UDP, 0)?;
+    request_mapping_from(None, gateway)
+}
+
+/// Ask `gateway` to forward a port using an optional `local_ip` source bind.
+pub fn request_mapping_from(local_ip: Option<Ipv4Addr>, gateway: Ipv4Addr) -> AppResult<u16> {
+    let port = map_protocol(local_ip, gateway, OP_MAP_UDP, 0)?;
     // Best effort: a provider that only forwards UDP still gives a usable port.
-    let _ = map_protocol(gateway, OP_MAP_TCP, port);
+    let _ = map_protocol(local_ip, gateway, OP_MAP_TCP, port);
     Ok(port)
 }
 
-fn map_protocol(gateway: Ipv4Addr, opcode: u8, requested_port: u16) -> AppResult<u16> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .map_err(|error| AppError::PortForward(format!("could not open a socket: {error}")))?;
+fn map_protocol(
+    local_ip: Option<Ipv4Addr>,
+    gateway: Ipv4Addr,
+    opcode: u8,
+    requested_port: u16,
+) -> AppResult<u16> {
+    let socket = if let Some(local) = local_ip {
+        UdpSocket::bind((local, 0)).or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))
+    } else {
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+    }
+    .map_err(|error| AppError::PortForward(format!("could not open a socket: {error}")))?;
     socket
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|error| AppError::PortForward(format!("could not set a timeout: {error}")))?;
@@ -278,10 +299,68 @@ mod tests {
     }
 
     #[test]
+    fn parses_local_address_from_tunnel_address() {
+        assert_eq!(
+            parse_local_address("10.2.0.2/32"),
+            Some(Ipv4Addr::new(10, 2, 0, 2))
+        );
+        assert_eq!(
+            parse_local_address("10.2.0.2"),
+            Some(Ipv4Addr::new(10, 2, 0, 2))
+        );
+        assert_eq!(parse_local_address(""), None);
+        assert_eq!(parse_local_address("not-an-address"), None);
+    }
+
+    #[test]
     fn returns_no_gateway_for_a_non_ipv4_address() {
         // IPv6-only tunnels and empty values have no derivable NAT-PMP gateway.
         assert_eq!(gateway_for_address("2a07:b944::2:2/128"), None);
         assert_eq!(gateway_for_address(""), None);
         assert_eq!(gateway_for_address("not-an-address"), None);
+    }
+
+    #[test]
+    fn mock_natpmp_responder_mapping_flow() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let responder = UdpSocket::bind(("127.0.0.1", 0)).expect("bind mock responder");
+        responder
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let port = responder.local_addr().unwrap().port();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            while !done_clone.load(Ordering::Relaxed) {
+                if let Ok((len, src)) = responder.recv_from(&mut buf) {
+                    if len >= 12 {
+                        let opcode = buf[1];
+                        let reply = response(opcode, 0, 48888);
+                        let _ = responder.send_to(&reply, src);
+                    }
+                }
+            }
+        });
+
+        let request = build_map_request(OP_MAP_UDP, 0, 0, LIFETIME);
+        let client_socket = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client_socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client_socket.send_to(&request, ("127.0.0.1", port)).unwrap();
+
+        let mut reply = [0u8; RESPONSE_LEN];
+        let (len, _) = client_socket.recv_from(&mut reply).unwrap();
+        let mapped = parse_map_response(&reply[..len], OP_MAP_UDP).unwrap();
+        assert_eq!(mapped, 48888);
+
+        done.store(true, Ordering::Relaxed);
+        let _ = handle.join();
     }
 }
