@@ -1,0 +1,66 @@
+# Disposable NetworkManager + firewalld sandbox for Neutron's system tests.
+#
+# Neutron drives `nmcli` and `firewall-cmd` against real system daemons, so the
+# only way to prove the real `CliNmClient` behaves correctly is to run it against
+# the real thing. Doing that on a developer's own machine is how several of the
+# leaks in BUGS.md came to be verified by hand: a bad route or ruleset takes the
+# host off the network, and the state left behind makes the next run
+# irreproducible.
+#
+# Isolation: netfilter tables and routing are per network namespace, so a
+# container with its own netns has its own firewall and routes. This was
+# verified before relying on it -- a uniquely marked `iptables` rule added
+# inside the container was confirmed absent from the host afterwards, with host
+# connectivity intact. That is what makes it safe to exercise lockdown's
+# REJECT-all ruleset here rather than in a VM.
+#
+# The one thing this tier cannot cover is persistence across a reboot, which
+# lockdown claims via `--permanent`. See `testing/vm/` for that.
+
+FROM registry.fedoraproject.org/fedora:41
+
+# NetworkManager and firewalld with their shared D-Bus dependency, the WireGuard
+# userspace tools (key generation for fixtures, `wg show` diagnostics), and the
+# Rust toolchain.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        NetworkManager \
+        firewalld \
+        iptables-nft \
+        dbus-daemon \
+        wireguard-tools \
+        iproute \
+        cargo \
+        rust \
+        gcc \
+    && dnf clean all
+
+# Neither daemon will manage anything without these, and a fresh container must
+# never inherit profiles or rules from a previous run.
+RUN mkdir -p /run/dbus /etc/NetworkManager/system-connections /var/lib/NetworkManager
+
+# Neutron escalates privilege for firewall changes by invoking `pkexec`. There is
+# no polkit authority or user session in a container, and the tests already run
+# as root, so this shim stands in for it.
+#
+# It is deliberately a plain `exec "$@"`: the point is to exercise the *real*
+# code path -- `build_firewall_script`'s `set -e` script and `shell_quote`'s
+# escaping still have to be correct, because the shim passes them through to a
+# real shell exactly as pkexec would.
+RUN printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/pkexec \
+    && chmod +x /usr/local/bin/pkexec
+
+# Keep cargo's output away from the mounted source tree so a container run can
+# never clobber the host's `target/` (different glibc, different flags).
+ENV CARGO_TARGET_DIR=/tmp/neutron-target
+
+# Consumed by `neutron::testing::require_sandbox`. The system tests refuse to
+# run unless this is set, so they cannot be executed against a real desktop by
+# accident -- see `testing/README.md`.
+ENV NEUTRON_TEST_SANDBOX=1
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+WORKDIR /src
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["cargo", "test", "--test", "system_nm", "--", "--ignored", "--test-threads=1"]

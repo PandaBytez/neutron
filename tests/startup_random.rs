@@ -88,7 +88,7 @@ fn integration_retries_all_eligible_profiles_when_connections_fail() {
 
     let result = service::run_startup_random_with_path(&client, &config_path);
 
-    assert!(matches!(result, Err(AppError::NmCommandFailed(_))));
+    assert!(matches!(result, Err(AppError::CommandFailed(_))));
     assert!(client.connected_profiles().is_empty());
     assert_eq!(client.attempted_profiles().len(), 2);
     testing::remove_temp_config(&config_path);
