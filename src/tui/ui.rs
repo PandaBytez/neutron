@@ -109,7 +109,11 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let (port_label, port_val, port_val_style) = if let Some(port) = state.active_port {
         ("Port: ", format!("{port}"), theme.accent)
     } else if state.active_profile_name.is_some() {
-        ("Port: ", "N/A".to_string(), theme.label_dim)
+        if !state.config.port_forwarding.enabled {
+            ("Port: ", "Disabled".to_string(), theme.label_dim)
+        } else {
+            ("Port: ", "N/A".to_string(), theme.label_dim)
+        }
     } else {
         ("Port: ", "--".to_string(), theme.label_dim)
     };
@@ -196,6 +200,14 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         ("OFF", theme.label_dim)
     };
 
+    // The leased port is the useful part, so it is shown in place of a bare
+    // "ON" once the gateway has granted one.
+    let (pf_val, pf_val_style) = match (state.config.port_forwarding.enabled, state.active_port) {
+        (false, _) => ("OFF".to_string(), theme.label_dim),
+        (true, Some(port)) => (format!("ON ({port})"), theme.status_connected),
+        (true, None) => ("ON".to_string(), theme.status_connected),
+    };
+
     let split_count = state.config.global_split_tunnel.cidrs.len()
         + state.config.global_split_tunnel.domains.len();
 
@@ -218,6 +230,9 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         Span::raw(" "),
         Span::styled("[l] Lockdown: ", theme.text_primary),
         Span::styled(lock_val, lock_val_style),
+        Span::raw("       "),
+        Span::styled("[f] Port Forward: ", theme.text_primary),
+        Span::styled(pf_val, pf_val_style),
     ]);
 
     let line3 = Line::from(vec![
@@ -493,13 +508,14 @@ const FOOTER_ACCENT_KEYS: [(&str, &str); 2] = [("Ctrl+P", "Menu"), ("Ctrl+T", "T
 /// Footer badges, with labels abbreviated to fit one row. Every key here must
 /// also be a palette shortcut -- asserted by the tests below, so the two views
 /// cannot drift.
-const FOOTER_KEYS: [(&str, &str); 10] = [
+const FOOTER_KEYS: [(&str, &str); 11] = [
     ("Space", "Connect/Down"),
     ("s", "Switch"),
     ("e", "Excl. from pool"),
     ("t", "Split Tunneling"),
     ("k", "KillSwitch"),
     ("l", "Lockdown"),
+    ("f", "PortFwd"),
     ("a", "AutoLogin"),
     ("r", "Sync"),
     ("?", "Help"),
@@ -1099,6 +1115,50 @@ mod render_tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Render just the policies panel and return its rows as plain strings.
+    fn rendered_policies(config: AppConfig, active_port: Option<u16>) -> Vec<String> {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
+        state.active_port = active_port;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(78, 5)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_policies_panel(frame, area, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_policies_panel_shows_port_forwarding_and_its_leased_port() {
+        // Port forwarding is a policy like the kill switch and lockdown, so it
+        // has to be visible and readable at a glance -- not buried in a config
+        // file. The leased port is the part the user actually needs.
+        let off = rendered_policies(AppConfig::default(), None).join("\n");
+        assert!(
+            off.contains("[f] Port Forward:") && off.contains("OFF"),
+            "the toggle and its key must render when off: {off}"
+        );
+
+        let mut on = AppConfig::default();
+        on.port_forwarding.enabled = true;
+        let leased = rendered_policies(on, Some(51820)).join("\n");
+        assert!(
+            leased.contains("51820"),
+            "a leased port must be shown next to the toggle: {leased}"
+        );
     }
 
     #[test]

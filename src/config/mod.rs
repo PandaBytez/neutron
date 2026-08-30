@@ -145,6 +145,12 @@ impl Default for ThemeConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PortForwardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QBittorrentConfig {
     #[serde(default)]
@@ -198,6 +204,9 @@ pub struct AppConfig {
     /// Theme and color customization
     #[serde(default)]
     pub theme: ThemeConfig,
+    /// NAT-PMP dynamic port forwarding
+    #[serde(default, alias = "port_forward", alias = "portforward")]
+    pub port_forwarding: PortForwardConfig,
     /// qBittorrent dynamic port forwarding synchronization
     #[serde(default)]
     pub qbittorrent: QBittorrentConfig,
@@ -495,6 +504,23 @@ mod tests {
         assert_eq!(loaded.qbittorrent.username.as_deref(), Some("admin"));
         assert_eq!(loaded.qbittorrent.password.as_deref(), Some("secret123"));
         assert!(loaded.qbittorrent.bind_interface);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn roundtrips_port_forwarding_config() {
+        let path = unique_path("port-forwarding-config");
+        let default_cfg = AppConfig::default();
+        assert!(!default_cfg.port_forwarding.enabled);
+
+        let config = AppConfig {
+            port_forwarding: PortForwardConfig { enabled: true },
+            ..AppConfig::default()
+        };
+
+        save(&path, &config).expect("config should save");
+        let loaded = load(&path).expect("config should load");
+        assert!(loaded.port_forwarding.enabled);
         cleanup(&path);
     }
 

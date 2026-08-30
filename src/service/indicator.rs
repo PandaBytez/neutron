@@ -565,7 +565,15 @@ where
             leased_at = None;
         }
 
-        if let Some(profile) = active.as_ref()
+        let port_forwarding_enabled = crate::config::default_config_path()
+            .and_then(|path| crate::config::load(&path))
+            .map(|cfg| cfg.port_forwarding.enabled)
+            .unwrap_or(false);
+
+        if !port_forwarding_enabled {
+            port = None;
+            leased_at = None;
+        } else if let Some(profile) = active.as_ref()
             && leased_at.is_none_or(|at| at.elapsed() >= crate::portforward::RENEW_INTERVAL)
             && let Some(address) = client.tunnel_address(&profile.uuid)
         {

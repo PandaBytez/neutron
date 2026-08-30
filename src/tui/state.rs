@@ -114,6 +114,12 @@ impl CommandPaletteState {
                 shortcut: Some("l"),
             },
             CommandPaletteItem {
+                id: "port_forwarding",
+                title: "Port Forwarding: Toggle NAT-PMP",
+                description: "Lease an incoming port from the VPN gateway and keep renewing it",
+                shortcut: Some("f"),
+            },
+            CommandPaletteItem {
                 id: "sync",
                 title: "Profiles: Sync Drop Directory",
                 description: "Import new .conf files from ~/.config/neutron/profiles",

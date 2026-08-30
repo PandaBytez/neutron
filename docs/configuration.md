@@ -84,6 +84,15 @@ transfer_rx = "#acd4cf"
 transfer_tx = "#e5c736"
 
 # ==============================================================================
+# Port Forwarding (NAT-PMP)
+# ==============================================================================
+[port_forwarding]
+# Lease an incoming port from the VPN gateway and keep renewing it.
+# Also togglable live from the TUI with `f`. Off by default: the lease is
+# renewed on a timer against the provider, so it is only requested on request.
+enabled = false
+
+# ==============================================================================
 # qBittorrent Dynamic Port Forwarding Sync
 # ==============================================================================
 [qbittorrent]

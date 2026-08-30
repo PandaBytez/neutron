@@ -67,6 +67,7 @@ fn action_for_key(key: KeyEvent) -> Option<&'static str> {
         KeyCode::Char('t') => Some("split_tunnel"),
         KeyCode::Char('k') => Some("kill_switch"),
         KeyCode::Char('l') => Some("lockdown"),
+        KeyCode::Char('f') => Some("port_forwarding"),
         KeyCode::Char('a') => Some("autoconnect"),
         KeyCode::Char('r') => Some("sync"),
         KeyCode::Char('d') | KeyCode::Delete => Some("delete"),
@@ -185,6 +186,24 @@ pub fn execute_action<C: ActionClient>(
             crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
             state.config.general.autoconnect_at_login = enable;
             state.set_status(format!("{} Auto-Connect at Login.", enabled_verb(enable)));
+        }
+        "port_forwarding" => {
+            let enable = !state.config.port_forwarding.enabled;
+            // Persisted before the reload below, which re-reads the config from
+            // disk into `state.config` and would otherwise revert the toggle.
+            let mut app_cfg = config::load(&state.config_path)?;
+            app_cfg.port_forwarding.enabled = enable;
+            config::save(&state.config_path, &app_cfg)?;
+            state.config.port_forwarding.enabled = enable;
+
+            // The lease belongs to a tunnel, not to the toggle. Forgetting which
+            // tunnel owns it makes the reload re-evaluate: it asks the gateway
+            // for a port when this turned forwarding on, and drops the port it
+            // is showing when this turned it off.
+            state.active_port_uuid = None;
+            reload_profiles(state, client)?;
+
+            state.set_status(format!("{} NAT-PMP Port Forwarding.", enabled_verb(enable)));
         }
         "sync" => {
             let report = sync::sync_profiles_dir(client, &state.config)?;
@@ -530,21 +549,26 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
     // and `reload_profiles` runs on every NetworkManager event -- which arrive
     // in bursts while a tunnel comes up. Only ask when the tunnel changed.
     let active_uuid = active.map(|row| row.uuid.clone());
-    if active_uuid != state.active_port_uuid {
-        let old_port = state.active_port;
-        state.active_port_uuid = active_uuid.clone();
-        state.active_port = active_uuid
-            .as_ref()
-            .and_then(|uuid| client.tunnel_address(uuid))
-            .as_deref()
-            .and_then(crate::portforward::port_for_tunnel_address);
+    if state.config.port_forwarding.enabled {
+        if active_uuid != state.active_port_uuid {
+            let old_port = state.active_port;
+            state.active_port_uuid = active_uuid.clone();
+            state.active_port = active_uuid
+                .as_ref()
+                .and_then(|uuid| client.tunnel_address(uuid))
+                .as_deref()
+                .and_then(crate::portforward::port_for_tunnel_address);
 
-        if state.active_port != old_port
-            && let Some(port) = state.active_port
-            && let Some(ref uuid) = active_uuid
-        {
-            sync_qbittorrent_port(state, client, uuid, port);
+            if state.active_port != old_port
+                && let Some(port) = state.active_port
+                && let Some(ref uuid) = active_uuid
+            {
+                sync_qbittorrent_port(state, client, uuid, port);
+            }
         }
+    } else {
+        state.active_port_uuid = None;
+        state.active_port = None;
     }
 
     if state.selected_index >= state.rows.len() {
@@ -601,6 +625,7 @@ mod tests {
             KeyCode::Char('t'),
             KeyCode::Char('k'),
             KeyCode::Char('l'),
+            KeyCode::Char('f'),
             KeyCode::Char('a'),
             KeyCode::Char('r'),
             KeyCode::Char('d'),
@@ -622,6 +647,56 @@ mod tests {
         for item in CommandPaletteState::all_items() {
             assert_ne!(item.id, "palette");
         }
+    }
+
+    #[test]
+    fn port_forwarding_is_off_until_the_policy_is_turned_on() {
+        // NAT-PMP leases are renewed on a timer against the provider's gateway,
+        // so they are opt-in: a user who never asked for a forwarded port must
+        // never have one requested on their behalf.
+        assert!(
+            !crate::config::AppConfig::default().port_forwarding.enabled,
+            "port forwarding must default to off"
+        );
+    }
+
+    #[test]
+    fn toggling_port_forwarding_persists_and_drops_a_stale_lease() {
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "wg-eu",
+            "uuid-eu",
+            crate::nm::ProfileState::Active,
+        )]);
+        let path = crate::testing::temp_config_path("tui-port-forwarding");
+        crate::config::save(&path, &crate::config::AppConfig::default())
+            .expect("config should save");
+        let mut state = TuiState::new(path.clone(), crate::config::AppConfig::default());
+
+        execute_action(&mut state, &client, "port_forwarding").expect("toggle should succeed");
+        assert!(state.config.port_forwarding.enabled);
+        assert!(
+            crate::config::load(&path)
+                .expect("config should load")
+                .port_forwarding
+                .enabled,
+            "the toggle must survive a restart, not just live in memory"
+        );
+
+        // A port shown while the policy was on must not linger once it is off:
+        // it would advertise a mapping nothing is renewing any more.
+        state.active_port = Some(51820);
+        execute_action(&mut state, &client, "port_forwarding").expect("toggle should succeed");
+
+        assert!(!state.config.port_forwarding.enabled);
+        assert_eq!(state.active_port, None, "a stale lease must be cleared");
+        assert!(
+            !crate::config::load(&path)
+                .expect("config should load")
+                .port_forwarding
+                .enabled
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
