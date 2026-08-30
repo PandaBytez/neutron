@@ -138,9 +138,9 @@ impl FirewallClient for crate::nm::CliNmClient {
 /// Querying the ruleset does not require root, so this deliberately does **not**
 /// go through `pkexec`: it never triggers a password prompt. That is what lets
 /// enable/disable read the current rules freely and confine privilege to the
-/// single batched write below (see [`crate::nm::host_command`]).
+/// single batched write below (see [`crate::process::host_command`]).
 fn read_marked_rules(family: &str) -> AppResult<String> {
-    let output = crate::nm::host_command(FIREWALL_CMD)
+    let output = crate::process::host_command(FIREWALL_CMD)
         .args(get_rules_batch(family))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -184,7 +184,7 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
     }
 
     let script = build_firewall_script(batches);
-    let output = crate::nm::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")])
+    let output = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")])
         .arg("sh")
         .arg("-c")
         .arg(&script)
@@ -200,7 +200,7 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let prefix = format!("pkexec {FIREWALL_CMD} batch failed");
-    Err(AppError::Firewall(crate::nm::format_command_error(
+    Err(AppError::Firewall(crate::process::format_command_error(
         &prefix,
         output.status,
         &stderr,
@@ -314,23 +314,23 @@ fn parse_marked_removals(family: &str, listing: &str) -> Vec<Vec<String>> {
 fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
     // Priorities order the rules within the chain: accepts (0/1) before the
     // catch-all reject (10).
-    let mut batches = vec![
-        add_rule(family, 0, &["-o", "lo", "-j", "ACCEPT"]),
-        add_rule(
+    let mut batches = vec![add_rule(family, 0, &["-o", "lo", "-j", "ACCEPT"])];
+
+    // When disconnected (no tunnels active), allow broad DNS so peer endpoints
+    // can resolve before connecting. When a tunnel is active, DNS travels through
+    // the tunnel interface (-o <iface> -j ACCEPT) without leaking outside.
+    if tunnels.is_empty() {
+        batches.push(add_rule(
             family,
-            0,
-            &[
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "ACCEPT",
-            ],
-        ),
-        add_rule(family, 1, &["-p", "udp", "--dport", "53", "-j", "ACCEPT"]),
-        add_rule(family, 1, &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"]),
-    ];
+            1,
+            &["-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+        ));
+        batches.push(add_rule(
+            family,
+            1,
+            &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
+        ));
+    }
 
     // Keep the local network reachable (LAN devices, DHCP, mDNS).
     batches.extend(local_network_batches(family));
@@ -340,9 +340,7 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
             batches.push(add_rule(family, 1, &["-o", interface, "-j", "ACCEPT"]));
         }
         for endpoint in &tunnel.endpoints {
-            if let Some(batch) = endpoint_rule(family, endpoint) {
-                batches.push(batch);
-            }
+            batches.extend(endpoint_rules(family, endpoint));
         }
     }
 
@@ -367,25 +365,82 @@ fn local_network_batches(family: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The handshake allow-rule for one peer endpoint, or `None` when the endpoint
-/// is an IP literal that belongs to the *other* address family.
+/// The handshake allow-rules for one peer endpoint.
 ///
 /// IP-literal endpoints are pinned to their exact address in the matching
-/// family. Hostname endpoints can resolve to either family, so they are allowed
-/// by destination port only (in both families); DNS is already allowed above so
-/// the name can resolve.
-fn endpoint_rule(family: &str, endpoint: &Endpoint) -> Option<Vec<String>> {
+/// family. Hostname endpoints are resolved to IP addresses and pinned to
+/// those addresses in the matching family so destination ports are not open
+/// broadly.
+fn endpoint_rules(family: &str, endpoint: &Endpoint) -> Vec<Vec<String>> {
     let port = endpoint.port.to_string();
-    let host_args = match endpoint.host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(_)) if family != "ipv4" => return None,
-        Ok(IpAddr::V6(_)) if family != "ipv6" => return None,
-        Ok(_) => vec!["-d", endpoint.host.as_str()],
-        Err(_) => Vec::new(),
-    };
-    let mut rule = vec!["-p", "udp"];
-    rule.extend(host_args);
-    rule.extend(["--dport", port.as_str(), "-j", "ACCEPT"]);
-    Some(add_rule(family, 1, &rule))
+    if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(_) if family == "ipv4" => {
+                let rule = [
+                    "-p",
+                    "udp",
+                    "-d",
+                    endpoint.host.as_str(),
+                    "--dport",
+                    port.as_str(),
+                    "-j",
+                    "ACCEPT",
+                ];
+                return vec![add_rule(family, 1, &rule)];
+            }
+            IpAddr::V6(_) if family == "ipv6" => {
+                let rule = [
+                    "-p",
+                    "udp",
+                    "-d",
+                    endpoint.host.as_str(),
+                    "--dport",
+                    port.as_str(),
+                    "-j",
+                    "ACCEPT",
+                ];
+                return vec![add_rule(family, 1, &rule)];
+            }
+            _ => return Vec::new(),
+        }
+    }
+
+    let ips = crate::nm::split_tunnel::resolve_domain_ips(&endpoint.host);
+    let mut rules = Vec::new();
+    for ip in ips {
+        match ip {
+            IpAddr::V4(v4) if family == "ipv4" => {
+                let v4_str = v4.to_string();
+                let rule = [
+                    "-p",
+                    "udp",
+                    "-d",
+                    v4_str.as_str(),
+                    "--dport",
+                    port.as_str(),
+                    "-j",
+                    "ACCEPT",
+                ];
+                rules.push(add_rule(family, 1, &rule));
+            }
+            IpAddr::V6(v6) if family == "ipv6" => {
+                let v6_str = v6.to_string();
+                let rule = [
+                    "-p",
+                    "udp",
+                    "-d",
+                    v6_str.as_str(),
+                    "--dport",
+                    port.as_str(),
+                    "-j",
+                    "ACCEPT",
+                ];
+                rules.push(add_rule(family, 1, &rule));
+            }
+            _ => {}
+        }
+    }
+    rules
 }
 
 /// Build a permanent `--direct --add-rule <family> filter OUTPUT <priority>
@@ -492,7 +547,6 @@ mod tests {
         let batches = lockdown_enable_batches(&[]);
 
         assert!(has_rule(&batches, &["-o", "lo", "-j", "ACCEPT"]));
-        assert!(has_rule(&batches, &["--ctstate", "ESTABLISHED,RELATED"]));
         assert!(has_rule(&batches, &["--dport", "53"]));
         // The catch-all reject carries the recognizable marker.
         assert!(has_rule(&batches, &["--comment", LOCKDOWN_MARKER]));
@@ -538,19 +592,12 @@ mod tests {
     }
 
     #[test]
-    fn hostname_endpoint_allows_port_in_both_families() {
-        let ipv4 = lockdown_family_batches("ipv4", &[tunnel("wg0", &[("vpn.example.com", 1194)])]);
-        let ipv6 = lockdown_family_batches("ipv6", &[tunnel("wg0", &[("vpn.example.com", 1194)])]);
+    fn hostname_endpoint_pins_resolved_addresses() {
+        let ipv4 = lockdown_family_batches("ipv4", &[tunnel("wg0", &[("localhost", 1194)])]);
+        let ipv6 = lockdown_family_batches("ipv6", &[tunnel("wg0", &[("localhost", 1194)])]);
 
-        // Port-only allow (no `-d`) so the resolved address can be either family.
-        for family in [&ipv4, &ipv6] {
-            assert!(has_rule(family, &["-p", "udp", "--dport", "1194"]));
-            assert!(
-                !family
-                    .iter()
-                    .any(|batch| batch.contains(&"vpn.example.com".to_string()))
-            );
-        }
+        assert!(has_rule(&ipv4, &["-d", "127.0.0.1", "--dport", "1194"]));
+        assert!(has_rule(&ipv6, &["-d", "::1", "--dport", "1194"]));
     }
 
     #[test]
