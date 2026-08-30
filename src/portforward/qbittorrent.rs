@@ -621,6 +621,17 @@ mod tests {
             bind_interface: true,
         };
 
+        if std::process::Command::new("curl")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("Skipping mock WebUI test: 'curl' is not installed in the environment.");
+            done.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+            return;
+        }
+
         let mut client = QBittorrentClient::new(&cfg);
         client.login().expect("login should succeed");
         assert_eq!(client.cookie.as_deref(), Some("mock_session_123"));
