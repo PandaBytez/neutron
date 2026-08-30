@@ -77,8 +77,24 @@ pub struct GeneralConfig {
     pub profiles_dir: String,
     #[serde(default = "default_true")]
     pub auto_sync_profiles: bool,
-    #[serde(default = "default_true")]
+    /// Whether a random eligible profile is connected at login.
+    ///
+    /// This is the *single* record of that intent: it mirrors whether the
+    /// autostart entry is installed (see [`crate::service::autostart`]), and is
+    /// what the UI renders. An earlier top-level `autoconnect_at_boot` field
+    /// duplicated it and drifted, so it is deliberately not reintroduced; the
+    /// alias keeps configs written by those versions loading correctly.
+    #[serde(default = "default_true", alias = "autoconnect_at_boot")]
     pub autoconnect_at_login: bool,
+    /// Whether a freshly activated tunnel is checked for actually carrying
+    /// traffic, and taken back down if it is not.
+    ///
+    /// On by default: `nmcli` reporting success only means the interface was
+    /// created, so without this a dead peer looks like a working connection
+    /// while swallowing every packet. Can be turned off for networks where the
+    /// probe is unreliable.
+    #[serde(default = "default_true")]
+    pub verify_tunnel_on_connect: bool,
 }
 
 fn default_profiles_dir() -> String {
@@ -91,6 +107,7 @@ impl Default for GeneralConfig {
             profiles_dir: default_profiles_dir(),
             auto_sync_profiles: default_true(),
             autoconnect_at_login: default_true(),
+            verify_tunnel_on_connect: default_true(),
         }
     }
 }
@@ -128,7 +145,37 @@ impl Default for ThemeConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QBittorrentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_qbittorrent_url")]
+    pub url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub bind_interface: bool,
+}
+
+fn default_qbittorrent_url() -> String {
+    "http://127.0.0.1:8080".to_string()
+}
+
+impl Default for QBittorrentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_qbittorrent_url(),
+            username: None,
+            password: None,
+            bind_interface: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -151,36 +198,16 @@ pub struct AppConfig {
     /// Theme and color customization
     #[serde(default)]
     pub theme: ThemeConfig,
+    /// qBittorrent dynamic port forwarding synchronization
+    #[serde(default)]
+    pub qbittorrent: QBittorrentConfig,
     /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
     #[serde(default)]
     pub profile_custom_info: BTreeMap<String, String>,
-    /// Split tunneling configuration indexed by profile UUID.
-    #[serde(default)]
-    pub split_tunnels: BTreeMap<String, SplitTunnelConfig>,
-    /// Compatibility alias for autoconnect_at_login
-    #[serde(default = "default_true")]
-    pub autoconnect_at_boot: bool,
 }
 
 fn default_true() -> bool {
     true
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            kill_switch_enabled: false,
-            lockdown_enabled: false,
-            excluded_profile_ids: BTreeSet::new(),
-            last_random_profile_id: None,
-            global_split_tunnel: SplitTunnelConfig::default(),
-            theme: ThemeConfig::default(),
-            profile_custom_info: BTreeMap::new(),
-            split_tunnels: BTreeMap::new(),
-            autoconnect_at_boot: default_true(),
-        }
-    }
 }
 
 pub fn load(path: &Path) -> AppResult<AppConfig> {
@@ -211,7 +238,6 @@ pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
 /// Drop every piece of Neutron-side metadata keyed by `uuid` from the in-memory config.
 pub fn forget_profile(config: &mut AppConfig, uuid: &str) -> bool {
     let mut changed = config.profile_custom_info.remove(uuid).is_some();
-    changed |= config.split_tunnels.remove(uuid).is_some();
     changed |= config.excluded_profile_ids.remove(uuid);
     if config.last_random_profile_id.as_deref() == Some(uuid) {
         config.last_random_profile_id = None;
@@ -224,9 +250,9 @@ fn write_atomically(path: &Path, body: &str) -> io::Result<()> {
     write_atomically_with(path, body, |src, dst| fs::rename(src, dst))
 }
 
-fn write_atomically_with<F>(path: &Path, body: &str, rename_fn: F) -> io::Result<()>
+fn write_atomically_with<F>(path: &Path, body: &str, mut rename_fn: F) -> io::Result<()>
 where
-    F: Fn(&Path, &Path) -> io::Result<()>,
+    F: FnMut(&Path, &Path) -> io::Result<()>,
 {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -297,10 +323,13 @@ pub fn default_config_path() -> AppResult<PathBuf> {
 /// Resolve the configured profiles drop directory, expanding any leading `~` to the home dir.
 pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
     let raw = &config.general.profiles_dir;
-    if let Some(stripped) = raw.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(stripped);
+    if let Some(home) = dirs::home_dir() {
+        if raw == "~" {
+            return home;
+        }
+        if let Some(stripped) = raw.strip_prefix("~/") {
+            return home.join(stripped);
+        }
     }
     PathBuf::from(raw)
 }
@@ -379,6 +408,19 @@ mod tests {
         let resolved = resolve_profiles_dir(&config);
         assert!(!resolved.to_string_lossy().starts_with('~'));
         assert!(resolved.to_string_lossy().ends_with("profiles"));
+
+        let bare_config = AppConfig {
+            general: GeneralConfig {
+                profiles_dir: "~".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bare_resolved = resolve_profiles_dir(&bare_config);
+        assert!(!bare_resolved.to_string_lossy().starts_with('~'));
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(bare_resolved, home);
+        }
     }
 
     #[test]
@@ -387,14 +429,6 @@ mod tests {
         config
             .profile_custom_info
             .insert("uuid-1".to_string(), "# notes".to_string());
-        config.split_tunnels.insert(
-            "uuid-1".to_string(),
-            SplitTunnelConfig {
-                mode: SplitTunnelMode::Include,
-                cidrs: vec!["10.0.0.0/8".to_string()],
-                domains: vec!["example.com".to_string()],
-            },
-        );
         config.excluded_profile_ids.insert("uuid-1".to_string());
         config.last_random_profile_id = Some("uuid-1".to_string());
 
@@ -402,7 +436,6 @@ mod tests {
 
         assert!(changed);
         assert!(config.profile_custom_info.is_empty());
-        assert!(config.split_tunnels.is_empty());
         assert!(config.excluded_profile_ids.is_empty());
         assert_eq!(config.last_random_profile_id, None);
     }
@@ -440,8 +473,78 @@ mod tests {
         assert_eq!(SplitTunnelMode::Disabled.to_string(), "disabled");
     }
 
+    #[test]
+    fn roundtrips_qbittorrent_config() {
+        let path = unique_path("qbittorrent-config");
+        let config = AppConfig {
+            qbittorrent: QBittorrentConfig {
+                enabled: true,
+                url: "http://192.168.1.50:8080".to_string(),
+                username: Some("admin".to_string()),
+                password: Some("secret123".to_string()),
+                bind_interface: true,
+            },
+            ..AppConfig::default()
+        };
+
+        save(&path, &config).expect("config should save");
+        let loaded = load(&path).expect("config should load");
+
+        assert!(loaded.qbittorrent.enabled);
+        assert_eq!(loaded.qbittorrent.url, "http://192.168.1.50:8080");
+        assert_eq!(loaded.qbittorrent.username.as_deref(), Some("admin"));
+        assert_eq!(loaded.qbittorrent.password.as_deref(), Some("secret123"));
+        assert!(loaded.qbittorrent.bind_interface);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn write_atomically_handles_cross_device_rename_fallback() {
+        let path = unique_path("atomic-cross-dev");
+        let body = "test content for cross-device fallback";
+
+        // Simulate CrossesDevices error on rename
+        let mut rename_called = false;
+        let res = write_atomically_with(&path, body, |src, _dst| {
+            rename_called = true;
+            assert!(src.exists());
+            Err(io::Error::from(io::ErrorKind::CrossesDevices))
+        });
+
+        assert!(
+            res.is_ok(),
+            "cross-device error should be handled by copy fallback"
+        );
+        assert!(rename_called);
+        assert!(path.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn write_atomically_cleans_up_tmp_on_rename_failure() {
+        let path = unique_path("atomic-fail-cleanup");
+        let body = "test content for failure cleanup";
+
+        let mut observed_tmp = None;
+        let res = write_atomically_with(&path, body, |src, _| {
+            observed_tmp = Some(src.to_path_buf());
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+
+        assert!(res.is_err());
+        let tmp = observed_tmp.expect("tmp path should have been passed to rename_fn");
+        assert!(!tmp.exists(), "temporary file must be removed on failure");
+        assert!(!path.exists());
+        cleanup(&path);
+    }
+
     fn unique_path(label: &str) -> PathBuf {
-        crate::testing::temp_config_path(label)
+        if label.ends_with(".json") {
+            crate::testing::temp_config_path(label)
+        } else {
+            crate::testing::temp_toml_config_path(label)
+        }
     }
 
     fn cleanup(path: &Path) {
