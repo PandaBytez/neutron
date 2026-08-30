@@ -41,10 +41,11 @@ wait_ready() {
     fail "$name did not become ready within ${READY_TIMEOUT}s"
 }
 
-# A stale socket from a previous run in the same container would make
-# dbus-daemon exit immediately.
-rm -f /run/dbus/system_bus_socket
-mkdir -p /run/dbus
+# A stale socket or PID from a previous run in the same container would make
+# daemons exit immediately.
+rm -f /run/dbus/system_bus_socket /run/dbus/pid /run/firewalld/firewalld.pid /run/NetworkManager/NetworkManager.pid
+mkdir -p /run/dbus /run/firewalld /var/log /etc/NetworkManager/system-connections
+
 dbus-daemon --system --fork
 
 # `--no-daemon`/`--nofork` keep both in the foreground so their lifetime is tied
@@ -52,7 +53,7 @@ dbus-daemon --system --fork
 NetworkManager --no-daemon >/var/log/neutron-nm.log 2>&1 &
 wait_ready NetworkManager $! /var/log/neutron-nm.log nmcli general status
 
-firewalld --nofork >/var/log/neutron-firewalld.log 2>&1 &
+firewalld --nofork --debug >/var/log/neutron-firewalld.log 2>&1 &
 wait_ready firewalld $! /var/log/neutron-firewalld.log firewall-cmd --state
 
 echo "sandbox: ready (NM $(nmcli -t -f STATE general status), firewalld $(firewall-cmd --state))" >&2

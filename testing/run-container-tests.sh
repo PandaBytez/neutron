@@ -40,7 +40,7 @@ command -v podman >/dev/null ||
 
 if [[ $rebuild -eq 1 ]] || ! podman image exists "$IMAGE"; then
     echo "==> building $IMAGE"
-    podman build -t "$IMAGE" -f "$REPO_ROOT/testing/Containerfile" "$REPO_ROOT/testing"
+    podman build -t "$IMAGE" -f "$REPO_ROOT/testing/Containerfile" "$REPO_ROOT"
 fi
 
 # --privileged: NetworkManager needs CAP_NET_ADMIN for WireGuard links and
@@ -51,11 +51,21 @@ fi
 # The source tree is mounted rather than copied so an edit-test cycle needs no
 # image rebuild. `:z` relabels for SELinux. CARGO_TARGET_DIR is set in the image
 # to keep build output off the mount.
-podman_args=(
-    run --rm -it
+podman_flags=(
+    run --rm
     --privileged
     -v "$REPO_ROOT:/src:z"
     -w /src
+)
+
+if [ -t 0 ]; then
+    podman_flags+=(-it)
+else
+    podman_flags+=(-i)
+fi
+
+podman_args=(
+    "${podman_flags[@]}"
     "$IMAGE"
 )
 

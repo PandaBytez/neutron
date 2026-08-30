@@ -25,7 +25,11 @@ FROM registry.fedoraproject.org/fedora:41
 RUN dnf install -y --setopt=install_weak_deps=False \
         NetworkManager \
         firewalld \
+        iptables \
         iptables-nft \
+        nftables \
+        procps-ng \
+        curl \
         dbus-daemon \
         wireguard-tools \
         iproute \
@@ -34,18 +38,17 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         gcc \
     && dnf clean all
 
-# Neither daemon will manage anything without these, and a fresh container must
-# never inherit profiles or rules from a previous run.
-RUN mkdir -p /run/dbus /etc/NetworkManager/system-connections /var/lib/NetworkManager
+# Configure firewalld for container environment: use iptables backend for direct rules
+# and disable table ownership checks.
+RUN mkdir -p /run/dbus /run/firewalld /etc/NetworkManager/system-connections /var/lib/NetworkManager /var/log \
+    && if [ -f /etc/firewalld/firewalld.conf ]; then \
+        sed -i 's/^FirewallBackend=.*/FirewallBackend=iptables/' /etc/firewalld/firewalld.conf; \
+        sed -i 's/^#*NftablesTableOwner=.*/NftablesTableOwner=false/' /etc/firewalld/firewalld.conf; \
+    fi
 
 # Neutron escalates privilege for firewall changes by invoking `pkexec`. There is
 # no polkit authority or user session in a container, and the tests already run
 # as root, so this shim stands in for it.
-#
-# It is deliberately a plain `exec "$@"`: the point is to exercise the *real*
-# code path -- `build_firewall_script`'s `set -e` script and `shell_quote`'s
-# escaping still have to be correct, because the shim passes them through to a
-# real shell exactly as pkexec would.
 RUN printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/pkexec \
     && chmod +x /usr/local/bin/pkexec
 
@@ -58,7 +61,7 @@ ENV CARGO_TARGET_DIR=/tmp/neutron-target
 # accident -- see `testing/README.md`.
 ENV NEUTRON_TEST_SANDBOX=1
 
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY testing/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /src
