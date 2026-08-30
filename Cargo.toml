@@ -5,6 +5,14 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Fast, lightweight WireGuard manager via NetworkManager"
 
+[features]
+# qBittorrent port-forward synchronisation. Off by default: the integration
+# drives a third-party Web API and has automatic paths that fire on every
+# reconnect, and it has not been validated against a real qBittorrent instance.
+# Build with `--features qbittorrent` to include it.
+default = []
+qbittorrent = []
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"

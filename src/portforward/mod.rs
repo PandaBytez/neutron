@@ -19,6 +19,9 @@
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
 
+#[cfg(feature = "qbittorrent")]
+pub mod qbittorrent;
+
 use crate::error::{AppError, AppResult};
 
 /// Well-known NAT-PMP port on the gateway (RFC 6886 §3).
@@ -56,6 +59,16 @@ pub fn gateway_for_address(address: &str) -> Option<Ipv4Addr> {
     let ip: Ipv4Addr = host.parse().ok()?;
     let [a, b, c, _] = ip.octets();
     Some(Ipv4Addr::new(a, b, c, 1))
+}
+
+/// Ask the gateway derived from a tunnel's local `address` to forward a port.
+///
+/// Bundles [`gateway_for_address`] and [`request_mapping`], which every caller
+/// needs together. Note this performs a blocking UDP round trip of up to
+/// [`READ_TIMEOUT`], so callers on a UI thread should only invoke it when the
+/// tunnel actually changed or the lease is due.
+pub fn port_for_tunnel_address(address: &str) -> Option<u16> {
+    request_mapping(gateway_for_address(address)?).ok()
 }
 
 /// Encode a NAT-PMP mapping request.
