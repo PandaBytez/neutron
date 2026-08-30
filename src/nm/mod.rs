@@ -1,16 +1,15 @@
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
-mod autoconnect;
-mod kill_switch;
+pub(crate) mod autoconnect;
+pub mod health;
+pub mod kill_switch;
 pub mod network_info;
 pub mod split_tunnel;
+pub mod tunnel_routing;
 
 /// Maximum time to wait for an `nmcli` invocation before giving up.
 ///
@@ -69,21 +68,6 @@ pub struct ProfileDiagnostics {
     pub keepalive: String,
 }
 
-impl ProfileDiagnostics {
-    pub fn unavailable(interface_name: String) -> Self {
-        Self {
-            interface_name,
-            public_key: "N/A".to_string(),
-            endpoint: "N/A".to_string(),
-            allowed_ips: "N/A".to_string(),
-            latest_handshake: "N/A".to_string(),
-            transfer_rx: "N/A".to_string(),
-            transfer_tx: "N/A".to_string(),
-            keepalive: "N/A".to_string(),
-        }
-    }
-}
-
 pub trait NmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>>;
     fn connect(&self, profile_identifier: &str) -> AppResult<()>;
@@ -116,21 +100,11 @@ pub trait NmClient {
     fn tunnel_address(&self, uuid: &str) -> Option<String>;
     /// The tunnel's configured DNS servers (e.g. `10.2.0.1`).
     fn tunnel_dns(&self, uuid: &str) -> Option<String>;
-    /// Open the native NetworkManager connection editor for the specified connection.
-    fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()>;
     /// Permanently delete a NetworkManager profile. NetworkManager deactivates
     /// the connection first if it is currently active. Any Neutron-side metadata
     /// that referenced the profile (provider comments, startup eligibility) is
     /// cleaned up too so stale entries don't accumulate.
     fn delete_profile(&self, uuid: &str) -> AppResult<()>;
-    /// Apply split-tunnel routing rules to a NetworkManager profile.
-    fn apply_split_tunnel(
-        &self,
-        uuid: &str,
-        mode: crate::config::SplitTunnelMode,
-        v4_routes: &[String],
-        v6_routes: &[String],
-    ) -> AppResult<()>;
     /// Apply split-tunnel routing rules to *every* WireGuard profile.
     fn apply_split_tunnel_all(
         &self,
@@ -215,8 +189,7 @@ impl NmClient for CliNmClient {
     fn connect(&self, profile_identifier: &str) -> AppResult<()> {
         let profiles = self.list_wireguard_profiles()?;
         let profile = find_unique_profile_by_identifier(&profiles, profile_identifier)?;
-        run_nmcli(&["connection", "up", &profile.uuid])?;
-        Ok(())
+        activate(&profile.uuid)
     }
 
     fn disconnect_active(&self) -> AppResult<()> {
@@ -242,8 +215,7 @@ impl NmClient for CliNmClient {
             run_nmcli(&["connection", "down", &active.uuid])?;
         }
 
-        run_nmcli(&["connection", "up", &target.uuid])?;
-        Ok(())
+        activate(&target.uuid)
     }
 
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
@@ -295,7 +267,13 @@ impl NmClient for CliNmClient {
             .to_str()
             .ok_or_else(|| AppError::Config("import path is not valid UTF-8".to_string()))?;
 
-        let before_profiles = self.list_wireguard_profiles().unwrap_or_default();
+        let before_profiles = match self.list_wireguard_profiles() {
+            Ok(profiles) => profiles,
+            Err(e) => {
+                tracing::warn!("failed to list profiles before import of {path_str}: {e}");
+                Vec::new()
+            }
+        };
         let before_uuids: std::collections::HashSet<String> =
             before_profiles.into_iter().map(|p| p.uuid).collect();
 
@@ -308,7 +286,13 @@ impl NmClient for CliNmClient {
             path_str,
         ])?;
 
-        let after_profiles = self.list_wireguard_profiles().unwrap_or_default();
+        let after_profiles = match self.list_wireguard_profiles() {
+            Ok(profiles) => profiles,
+            Err(e) => {
+                tracing::warn!("failed to list profiles after import of {path_str}: {e}");
+                Vec::new()
+            }
+        };
         let mut new_uuid = None;
         for p in after_profiles {
             if !before_uuids.contains(&p.uuid) {
@@ -340,7 +324,8 @@ impl NmClient for CliNmClient {
                     app_cfg.profile_custom_info.insert(uuid.clone(), comments);
                 }
                 if app_cfg.global_split_tunnel.mode.is_enabled() {
-                    let (v4, v6) = split_tunnel::collect_all_routes(
+                    let (v4, v6) = split_tunnel::routes_for(
+                        app_cfg.global_split_tunnel.mode,
                         &app_cfg.global_split_tunnel.cidrs,
                         &app_cfg.global_split_tunnel.domains,
                     );
@@ -350,6 +335,10 @@ impl NmClient for CliNmClient {
                         &v4,
                         &v6,
                     ));
+                }
+                if app_cfg.kill_switch_enabled {
+                    let has_ipv6 = profile_has_ipv6(&uuid);
+                    let _ = run_nmcli_owned(&kill_switch::set_args(uuid.as_str(), true, has_ipv6));
                 }
                 let _ = crate::config::save(&config_path, &app_cfg);
             }
@@ -363,122 +352,36 @@ impl NmClient for CliNmClient {
         uuid: &str,
         is_active: bool,
     ) -> AppResult<ProfileDiagnostics> {
-        let nm_output = run_nmcli(&["-s", "connection", "show", uuid])?;
-        let mut interface_name = String::new();
-        let mut endpoint = String::new();
-        let mut allowed_ips = String::new();
-        let mut keepalive = String::new();
-        let mut public_key = String::new();
+        let settings = parse_peer_settings(&run_nmcli(&["-s", "connection", "show", uuid])?);
+        let interface_name = settings
+            .interface_name
+            .clone()
+            .unwrap_or_else(|| uuid.to_string());
+        let mut diagnostics = settings_to_diagnostics(&settings, interface_name.clone(), is_active);
 
-        for line in nm_output.lines() {
-            if let Some((k, v)) = line.split_once(':') {
-                let key = k.trim();
-                let val = v.trim();
-                if key == "connection.interface-name" && val != "--" {
-                    interface_name = val.to_string();
-                } else if key == "wireguard.peers" && val != "--" {
-                    let tokens: Vec<&str> = val.split_whitespace().collect();
-                    if let Some(pk) = tokens.first()
-                        && !pk.contains('=')
-                    {
-                        public_key = pk.to_string();
-                    }
-                    for tok in &tokens {
-                        if let Some(ep) = tok.strip_prefix("endpoint=") {
-                            endpoint = ep.to_string();
-                        } else if let Some(ips) = tok.strip_prefix("allowed-ips=") {
-                            allowed_ips = ips.replace(';', ", ");
-                        } else if let Some(ka) = tok.strip_prefix("persistent-keepalive=") {
-                            keepalive = ka.to_string();
-                        }
-                    }
-                }
-            }
+        if !is_active {
+            return Ok(diagnostics);
         }
 
-        if interface_name.is_empty() {
-            interface_name = uuid.to_string();
-        }
-
-        let mut diag = ProfileDiagnostics {
-            interface_name: interface_name.clone(),
-            public_key: if public_key.is_empty() {
-                "N/A".to_string()
-            } else {
-                public_key
-            },
-            endpoint: if endpoint.is_empty() {
-                "N/A".to_string()
-            } else {
-                endpoint
-            },
-            allowed_ips: if allowed_ips.is_empty() {
-                "0.0.0.0/0, ::/0".to_string()
-            } else {
-                allowed_ips
-            },
-            latest_handshake: if is_active {
-                "Active".to_string()
-            } else {
-                "Inactive (Standby)".to_string()
-            },
-            transfer_rx: "0 B".to_string(),
-            transfer_tx: "0 B".to_string(),
-            keepalive: if keepalive.is_empty() {
-                "N/A".to_string()
-            } else {
-                keepalive
-            },
-        };
-
-        if is_active {
-            if let Ok(wg_stdout) = run_command_with_timeout(
-                "wg",
-                &["show", &interface_name, "dump"],
-                Duration::from_secs(2),
-            ) {
-                let mut lines = wg_stdout.lines();
-                if let Some(first_line) = lines.next() {
-                    let cols: Vec<&str> = first_line.split('\t').collect();
-                    if cols.len() >= 2 && !cols[1].is_empty() {
-                        diag.public_key = cols[1].to_string();
-                    }
-                }
-                if let Some(second_line) = lines.next() {
-                    let cols: Vec<&str> = second_line.split('\t').collect();
-                    if cols.len() >= 8 {
-                        if !cols[2].is_empty() && cols[2] != "(none)" {
-                            diag.endpoint = cols[2].to_string();
-                        }
-                        if !cols[3].is_empty() && cols[3] != "(none)" {
-                            diag.allowed_ips = cols[3].to_string();
-                        }
-                        if let Ok(ts) = cols[4].parse::<u64>()
-                            && ts > 0
-                        {
-                            diag.latest_handshake = format_handshake_time(ts);
-                        }
-                        if let Ok(rx) = cols[5].parse::<u64>() {
-                            diag.transfer_rx = format_bytes(rx);
-                        }
-                        if let Ok(tx) = cols[6].parse::<u64>() {
-                            diag.transfer_tx = format_bytes(tx);
-                        }
-                        if !cols[7].is_empty() && cols[7] != "off" {
-                            diag.keepalive = cols[7].to_string();
-                        }
-                    }
-                }
-            } else {
-                let (rx, tx) = crate::nm::network_info::read_interface_bytes(Some(&interface_name));
+        // `wg show` reports the live link, so it wins over the stored profile.
+        match crate::process::run_with_timeout(
+            "wg",
+            &["show", &interface_name, "dump"],
+            Duration::from_secs(2),
+        ) {
+            Ok(dump) => overlay_wg_dump(&mut diagnostics, &dump),
+            // `wg` is optional (read-only diagnostics), so fall back to the
+            // kernel's own byte counters for the interface.
+            Err(_) => {
+                let (rx, tx) = network_info::read_interface_bytes(Some(&interface_name));
                 if rx > 0 || tx > 0 {
-                    diag.transfer_rx = format_bytes(rx);
-                    diag.transfer_tx = format_bytes(tx);
+                    diagnostics.transfer_rx = format_bytes(rx);
+                    diagnostics.transfer_tx = format_bytes(tx);
                 }
             }
         }
 
-        Ok(diag)
+        Ok(diagnostics)
     }
 
     fn tunnel_address(&self, uuid: &str) -> Option<String> {
@@ -498,22 +401,6 @@ impl NmClient for CliNmClient {
             return None;
         }
         Some(trimmed.replace(',', ", "))
-    }
-
-    fn edit_connection(&self, uuid: &str, is_dark: bool) -> AppResult<()> {
-        let (theme, scheme) = if is_dark {
-            ("Adwaita:dark", "prefer-dark")
-        } else {
-            ("Adwaita:light", "prefer-light")
-        };
-        host_command_with_env(
-            "nm-connection-editor",
-            &[("GTK_THEME", theme), ("ADW_DEBUG_COLOR_SCHEME", scheme)],
-        )
-        .arg("-e")
-        .arg(uuid)
-        .spawn()?;
-        Ok(())
     }
 
     fn delete_profile(&self, uuid: &str) -> AppResult<()> {
@@ -536,18 +423,6 @@ impl NmClient for CliNmClient {
         Ok(())
     }
 
-    fn apply_split_tunnel(
-        &self,
-        uuid: &str,
-        mode: crate::config::SplitTunnelMode,
-        v4_routes: &[String],
-        v6_routes: &[String],
-    ) -> AppResult<()> {
-        let args = split_tunnel::set_args(uuid, mode, v4_routes, v6_routes);
-        run_nmcli_owned(&args)?;
-        Ok(())
-    }
-
     fn apply_split_tunnel_all(
         &self,
         mode: crate::config::SplitTunnelMode,
@@ -557,6 +432,147 @@ impl NmClient for CliNmClient {
         let profiles = self.list_wireguard_profiles()?;
         let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
         apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
+    }
+}
+
+/// The peer fields Neutron reads out of `nmcli -s connection show <uuid>`.
+///
+/// Every field is optional because a profile may legitimately omit it, and
+/// because NetworkManager prints `--` for unset values.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PeerSettings {
+    interface_name: Option<String>,
+    public_key: Option<String>,
+    endpoint: Option<String>,
+    allowed_ips: Option<String>,
+    keepalive: Option<String>,
+}
+
+/// Parse the `connection.interface-name` and `wireguard.peers` lines out of
+/// `nmcli -s connection show` output.
+///
+/// Split out of `get_profile_diagnostics` so the parsing can be tested without
+/// invoking `nmcli`.
+fn parse_peer_settings(output: &str) -> PeerSettings {
+    let mut settings = PeerSettings::default();
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if value == "--" || value.is_empty() {
+            continue;
+        }
+
+        match key {
+            "connection.interface-name" => settings.interface_name = Some(value.to_string()),
+            "wireguard.peers" => {
+                let mut tokens = value.split_whitespace().peekable();
+                // The peer's public key is printed bare, before the `k=v`
+                // pairs; a leading token containing `=` means it is absent.
+                if let Some(first) = tokens.peek()
+                    && !first.contains('=')
+                {
+                    settings.public_key = Some((*first).to_string());
+                }
+                for token in tokens {
+                    if let Some(endpoint) = token.strip_prefix("endpoint=") {
+                        settings.endpoint = Some(endpoint.to_string());
+                    } else if let Some(ips) = token.strip_prefix("allowed-ips=") {
+                        settings.allowed_ips = Some(ips.replace(';', ", "));
+                    } else if let Some(keepalive) = token.strip_prefix("persistent-keepalive=") {
+                        settings.keepalive = Some(keepalive.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    settings
+}
+
+/// Render parsed settings as diagnostics, filling unset fields with the
+/// placeholders the UI expects.
+fn settings_to_diagnostics(
+    settings: &PeerSettings,
+    interface_name: String,
+    is_active: bool,
+) -> ProfileDiagnostics {
+    fn or_na(value: &Option<String>) -> String {
+        value.clone().unwrap_or_else(|| "N/A".to_string())
+    }
+
+    ProfileDiagnostics {
+        interface_name,
+        public_key: or_na(&settings.public_key),
+        endpoint: or_na(&settings.endpoint),
+        allowed_ips: settings
+            .allowed_ips
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0/0, ::/0".to_string()),
+        latest_handshake: if is_active {
+            "Active"
+        } else {
+            "Inactive (Standby)"
+        }
+        .to_string(),
+        transfer_rx: "0 B".to_string(),
+        transfer_tx: "0 B".to_string(),
+        keepalive: or_na(&settings.keepalive),
+    }
+}
+
+/// Overlay live link statistics from `wg show <iface> dump` onto `diagnostics`.
+///
+/// The dump's first line describes the interface and the second the first peer,
+/// both tab separated. Fields that are absent, empty or `(none)` leave the
+/// profile-derived value in place.
+fn overlay_wg_dump(diagnostics: &mut ProfileDiagnostics, dump: &str) {
+    let mut lines = dump.lines();
+
+    if let Some(interface_line) = lines.next() {
+        let columns: Vec<&str> = interface_line.split('\t').collect();
+        if let Some(public_key) = columns.get(1).filter(|value| !value.is_empty()) {
+            diagnostics.public_key = (*public_key).to_string();
+        }
+    }
+
+    let Some(peer_line) = lines.next() else {
+        return;
+    };
+    let columns: Vec<&str> = peer_line.split('\t').collect();
+    if columns.len() < 8 {
+        return;
+    }
+
+    let present = |index: usize| -> Option<&str> {
+        columns
+            .get(index)
+            .copied()
+            .filter(|value| !value.is_empty() && *value != "(none)")
+    };
+
+    if let Some(endpoint) = present(2) {
+        diagnostics.endpoint = endpoint.to_string();
+    }
+    if let Some(allowed_ips) = present(3) {
+        diagnostics.allowed_ips = allowed_ips.to_string();
+    }
+    if let Some(timestamp) = present(4).and_then(|value| value.parse::<u64>().ok())
+        && timestamp > 0
+    {
+        diagnostics.latest_handshake = format_handshake_time(timestamp);
+    }
+    if let Some(rx) = present(5).and_then(|value| value.parse::<u64>().ok()) {
+        diagnostics.transfer_rx = format_bytes(rx);
+    }
+    if let Some(tx) = present(6).and_then(|value| value.parse::<u64>().ok()) {
+        diagnostics.transfer_tx = format_bytes(tx);
+    }
+    if let Some(keepalive) = present(7).filter(|value| *value != "off") {
+        diagnostics.keepalive = keepalive.to_string();
     }
 }
 
@@ -673,6 +689,13 @@ fn parse_endpoint(token: &str) -> Option<Endpoint> {
     })
 }
 
+/// Check whether a profile has IPv6 method enabled (not disabled/ignore/empty).
+fn profile_has_ipv6(uuid: &str) -> bool {
+    let method = run_nmcli(&["-g", "ipv6.method", "connection", "show", uuid]).unwrap_or_default();
+    let trimmed = method.trim();
+    !trimmed.is_empty() && trimmed != "disabled" && trimmed != "ignore" && trimmed != "--"
+}
+
 /// Build the per-profile `nmcli` argument batches that apply (`enable`) or
 /// remove the kill switch across *every* profile.
 ///
@@ -681,7 +704,10 @@ fn parse_endpoint(token: &str) -> Option<Endpoint> {
 fn kill_switch_arg_batches(profiles: &[WireguardProfile], enable: bool) -> Vec<Vec<String>> {
     profiles
         .iter()
-        .map(|profile| kill_switch::set_args(&profile.uuid, enable))
+        .map(|profile| {
+            let has_ipv6 = profile_has_ipv6(&profile.uuid);
+            kill_switch::set_args(&profile.uuid, enable, has_ipv6)
+        })
         .collect()
 }
 
@@ -758,10 +784,10 @@ where
         return Ok(());
     }
 
-    // No "failed" prefix here: `AppError::NmCommandFailed` already renders as
-    // "network manager command failed: ...", and each entry carries its own
+    // No "failed" prefix here: `AppError::CommandFailed` already renders as
+    // "command failed: ...", and each entry carries its own
     // cause.
-    Err(AppError::NmCommandFailed(format!(
+    Err(AppError::CommandFailed(format!(
         "{} of {} profiles rejected the change: {}",
         failures.len(),
         profiles.len(),
@@ -845,6 +871,106 @@ fn parse_nmcli_fields(line: &str) -> Vec<String> {
     fields
 }
 
+/// Bring connection `uuid` up, first making sure it will actually route
+/// traffic.
+///
+/// NetworkManager's `default` for automatic default-route handling was observed
+/// installing no routes at all, so a profile that has never been through a
+/// kill-switch sweep -- a fresh import, one added through GNOME Settings, or one
+/// left behind by an older version -- would activate and carry nothing while
+/// reporting success. Pinning it here means any profile repairs itself the first
+/// time it is used; see [`tunnel_routing`].
+///
+/// The pin is best-effort: if NetworkManager rejects the change the activation
+/// still proceeds, because refusing to connect at all is worse than connecting
+/// with whatever routing NetworkManager chooses. The failure is logged so the
+/// cause is visible.
+///
+/// Once up, the tunnel is verified (see [`health`]) and taken back down if it
+/// carries no traffic. Now that a full tunnel owns the default route, a peer
+/// that never answers would otherwise swallow every packet while the UI
+/// reported a working connection.
+fn activate(uuid: &str) -> AppResult<()> {
+    let has_ipv6 = profile_has_ipv6(uuid);
+    if let Err(error) = run_nmcli_owned(&tunnel_routing::set_args(uuid, has_ipv6)) {
+        tracing::warn!("could not pin automatic default-route handling on {uuid}: {error}");
+    }
+    // Also apply global kill switch setting and refresh split-tunnel routes (BUG-016, BUG-017)
+    if let Ok(config_path) = crate::config::default_config_path()
+        && let Ok(app_cfg) = crate::config::load(&config_path)
+    {
+        let _ = run_nmcli_owned(&kill_switch::set_args(
+            uuid,
+            app_cfg.kill_switch_enabled,
+            has_ipv6,
+        ));
+        if app_cfg.global_split_tunnel.mode.is_enabled() {
+            let (v4, v6) = split_tunnel::routes_for(
+                app_cfg.global_split_tunnel.mode,
+                &app_cfg.global_split_tunnel.cidrs,
+                &app_cfg.global_split_tunnel.domains,
+            );
+            let _ = run_nmcli_owned(&split_tunnel::set_args(
+                uuid,
+                app_cfg.global_split_tunnel.mode,
+                &v4,
+                &v6,
+            ));
+        }
+    }
+    run_nmcli(&["connection", "up", uuid])?;
+    verify_or_disconnect(uuid)
+}
+
+/// Whether the health check is enabled. Defaults to on, including when the
+/// config cannot be read -- a missing config must not silently disable a safety
+/// check.
+fn health_check_enabled() -> bool {
+    crate::config::default_config_path()
+        .and_then(|path| crate::config::load(&path))
+        .map(|config| config.general.verify_tunnel_on_connect)
+        .unwrap_or(true)
+}
+
+/// Confirm the tunnel behind `uuid` is passing traffic, deactivating it and
+/// reporting an error when it is not.
+fn verify_or_disconnect(uuid: &str) -> AppResult<()> {
+    if !health_check_enabled() {
+        return Ok(());
+    }
+
+    // Without an interface name there is nothing to sample; treat that as
+    // healthy rather than tearing down a connection on a technicality.
+    let Some(interface) = run_nmcli(&[
+        "-g",
+        "connection.interface-name",
+        "connection",
+        "show",
+        uuid,
+    ])
+    .ok()
+    .and_then(|value| parse_interface_name(&value)) else {
+        return Ok(());
+    };
+
+    if health::probe(&interface).is_healthy() {
+        return Ok(());
+    }
+
+    // Roll the activation back so the dead tunnel stops owning the default
+    // route. Best-effort: report the diagnosis even if the teardown fails,
+    // since that is the actionable part.
+    if let Err(error) = run_nmcli(&["connection", "down", uuid]) {
+        tracing::warn!("could not deactivate unhealthy tunnel {uuid}: {error}");
+    }
+
+    Err(AppError::TunnelUnhealthy(format!(
+        "{interface}: connected but no traffic is passing -- the peer is not \
+         responding (server down, or the profile's keys are no longer valid). \
+         Disconnected so it does not black-hole your traffic."
+    )))
+}
+
 fn run_nmcli(args: &[&str]) -> AppResult<String> {
     run_nmcli_with_timeout(args, NMCLI_TIMEOUT)
 }
@@ -857,99 +983,7 @@ fn run_nmcli_owned(args: &[String]) -> AppResult<String> {
 }
 
 fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String> {
-    run_command_with_timeout("nmcli", args, timeout)
-}
-
-/// Build a [`Command`] for `program` to execute on the system.
-pub(crate) fn host_command(program: &str) -> Command {
-    Command::new(program)
-}
-
-/// Like [`host_command`], but also sets environment variables on the process.
-pub(crate) fn host_command_with_env(program: &str, envs: &[(&str, &str)]) -> Command {
-    let mut command = Command::new(program);
-    command.envs(envs.iter().copied());
-    command
-}
-
-pub(crate) fn format_command_error(
-    prefix: &str,
-    status: std::process::ExitStatus,
-    stderr: &str,
-) -> String {
-    let stderr = stderr.trim();
-    let code = status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "terminated by signal".to_string());
-    if stderr.is_empty() {
-        format!("{prefix} (exit {code})")
-    } else {
-        format!("{stderr} (exit {code})")
-    }
-}
-
-fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> AppResult<String> {
-    let mut command = host_command(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-
-    // Drain stdout/stderr on separate threads so a large amount of output
-    // cannot fill the pipe buffers and deadlock the child while we wait.
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::NmCommandFailed(format!("{program} stdout unavailable")))?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::NmCommandFailed(format!("{program} stderr unavailable")))?;
-
-    let stdout_reader = thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buffer);
-        buffer
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buffer);
-        buffer
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::NmCommandFailed(format!(
-                "{program} {args:?} timed out after {}s",
-                timeout.as_secs()
-            )));
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-
-    if !status.success() {
-        let stderr_str = String::from_utf8_lossy(&stderr);
-        let prefix = format!("{program} {args:?} failed");
-        return Err(AppError::NmCommandFailed(format_command_error(
-            &prefix,
-            status,
-            &stderr_str,
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    crate::process::run_with_timeout("nmcli", args, timeout)
 }
 
 #[cfg(test)]
@@ -1150,7 +1184,7 @@ mod tests {
         // modified, each targeting its own UUID with the enable arguments.
         assert_eq!(batches.len(), 3);
         for (batch, uuid) in batches.iter().zip(["uuid-1", "uuid-2", "uuid-3"]) {
-            assert_eq!(batch, &kill_switch::set_args(uuid, true));
+            assert_eq!(batch, &kill_switch::set_args(uuid, true, false));
         }
     }
 
@@ -1161,8 +1195,8 @@ mod tests {
         let batches = kill_switch_arg_batches(&profiles, false);
 
         assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], kill_switch::set_args("uuid-1", false));
-        assert_eq!(batches[1], kill_switch::set_args("uuid-2", false));
+        assert_eq!(batches[0], kill_switch::set_args("uuid-1", false, false));
+        assert_eq!(batches[1], kill_switch::set_args("uuid-2", false, false));
     }
 
     #[test]
@@ -1225,14 +1259,14 @@ mod tests {
             let uuid = args[2].clone();
             attempted.push(uuid.clone());
             if uuid == "uuid-1" {
-                return Err(AppError::NmCommandFailed("simulated".to_string()));
+                return Err(AppError::CommandFailed("simulated".to_string()));
             }
             Ok(())
         });
 
         assert_eq!(attempted, vec!["uuid-1", "uuid-2", "uuid-3"]);
 
-        let Err(AppError::NmCommandFailed(message)) = result else {
+        let Err(AppError::CommandFailed(message)) = result else {
             panic!("the failure must still be reported");
         };
         // Numerator and denominator differ here, so a swapped or off-by-one
@@ -1251,11 +1285,11 @@ mod tests {
         let batches = autoconnect_arg_batches(&profiles, false);
 
         let result = apply_to_every_profile(&profiles, batches, |_| {
-            Err(AppError::NmCommandFailed("simulated".to_string()))
+            Err(AppError::CommandFailed("simulated".to_string()))
         });
 
-        let Err(AppError::NmCommandFailed(message)) = result else {
-            panic!("expected an aggregated NmCommandFailed error");
+        let Err(AppError::CommandFailed(message)) = result else {
+            panic!("expected an aggregated CommandFailed error");
         };
         assert!(message.contains("2 of 2 profiles"), "got: {message}");
         assert!(message.contains("wg-us (uuid-1)"), "got: {message}");
@@ -1277,65 +1311,101 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn command_timeout_kills_long_running_process() {
-        let start = Instant::now();
-        let result = run_command_with_timeout("sleep", &["10"], Duration::from_millis(150));
+    fn parses_peer_settings_from_nmcli_output() {
+        let output = "connection.interface-name:            wg0\n\
+                      wireguard.peers:                     PUBKEY= endpoint=1.2.3.4:51820 allowed-ips=0.0.0.0/0;::/0 persistent-keepalive=25\n\
+                      ipv4.method:                         manual\n";
 
-        assert!(
-            matches!(result, Err(AppError::NmCommandFailed(message)) if message.contains("timed out"))
+        let settings = parse_peer_settings(output);
+
+        assert_eq!(settings.interface_name.as_deref(), Some("wg0"));
+        assert_eq!(settings.endpoint.as_deref(), Some("1.2.3.4:51820"));
+        assert_eq!(settings.allowed_ips.as_deref(), Some("0.0.0.0/0, ::/0"));
+        assert_eq!(settings.keepalive.as_deref(), Some("25"));
+        // The bare leading token is the peer key; a `k=v` token is not.
+        assert_eq!(settings.public_key, None);
+    }
+
+    #[test]
+    fn parses_bare_public_key_and_treats_dashes_as_unset() {
+        let settings = parse_peer_settings(
+            "connection.interface-name:  --\nwireguard.peers:  abc123 endpoint=host:51820\n",
         );
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "timeout should return promptly instead of waiting for the process"
+
+        assert_eq!(settings.interface_name, None, "`--` means unset");
+        assert_eq!(settings.public_key.as_deref(), Some("abc123"));
+        assert_eq!(settings.endpoint.as_deref(), Some("host:51820"));
+    }
+
+    #[test]
+    fn diagnostics_fall_back_to_placeholders_for_unset_fields() {
+        let diagnostics =
+            settings_to_diagnostics(&PeerSettings::default(), "wg0".to_string(), false);
+
+        assert_eq!(diagnostics.public_key, "N/A");
+        assert_eq!(diagnostics.endpoint, "N/A");
+        assert_eq!(diagnostics.keepalive, "N/A");
+        // An unset allowed-ips means a full tunnel, not an unknown value.
+        assert_eq!(diagnostics.allowed_ips, "0.0.0.0/0, ::/0");
+        assert_eq!(diagnostics.latest_handshake, "Inactive (Standby)");
+    }
+
+    #[test]
+    fn wg_dump_overlays_live_link_statistics() {
+        let mut diagnostics =
+            settings_to_diagnostics(&PeerSettings::default(), "wg0".to_string(), true);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_secs();
+        let dump = format!(
+            "privkey\tifacekey\t51820\toff\n\
+             peerkey\tpsk\t9.9.9.9:51820\t10.0.0.0/8\t{now}\t2048\t1024\t25\n"
         );
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn command_success_returns_trimmed_stdout() {
-        let result = run_command_with_timeout("printf", &["hello"], Duration::from_secs(5))
-            .expect("printf should succeed");
+        overlay_wg_dump(&mut diagnostics, &dump);
 
-        assert_eq!(result, "hello");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_failure_includes_exit_code() {
-        let result = run_command_with_timeout("false", &[], Duration::from_secs(5));
-
-        assert!(matches!(
-            result,
-            Err(AppError::NmCommandFailed(message)) if message.contains("exit 1")
-        ));
+        assert_eq!(diagnostics.public_key, "ifacekey");
+        assert_eq!(diagnostics.endpoint, "9.9.9.9:51820");
+        assert_eq!(diagnostics.allowed_ips, "10.0.0.0/8");
+        assert_eq!(diagnostics.transfer_rx, "2.00 KiB");
+        assert_eq!(diagnostics.transfer_tx, "1.00 KiB");
+        assert_eq!(diagnostics.keepalive, "25");
+        assert!(diagnostics.latest_handshake.ends_with("ago"));
     }
 
     #[test]
-    fn host_command_creates_command_for_program() {
-        let command = host_command("nmcli");
+    fn wg_dump_placeholders_leave_profile_values_untouched() {
+        let settings = PeerSettings {
+            endpoint: Some("profile.example:51820".to_string()),
+            keepalive: Some("15".to_string()),
+            ..PeerSettings::default()
+        };
+        let mut diagnostics = settings_to_diagnostics(&settings, "wg0".to_string(), true);
 
-        assert_eq!(command.get_program(), "nmcli");
-        assert_eq!(command.get_args().count(), 0);
+        // `(none)`, empty columns, a zero handshake and `off` all mean "no live
+        // value", so the profile-derived ones must survive.
+        overlay_wg_dump(
+            &mut diagnostics,
+            "privkey\t\t51820\toff\npeerkey\t\t(none)\t\t0\t0\t0\toff\n",
+        );
+
+        assert_eq!(diagnostics.endpoint, "profile.example:51820");
+        assert_eq!(diagnostics.keepalive, "15");
+        assert_eq!(diagnostics.latest_handshake, "Active");
+        assert_eq!(diagnostics.transfer_rx, "0 B");
     }
 
     #[test]
-    fn host_command_with_env_sets_env_on_command() {
-        let command = host_command_with_env("pkexec", &[("SHELL", "/bin/sh")]);
+    fn wg_dump_ignores_truncated_output() {
+        let mut diagnostics =
+            settings_to_diagnostics(&PeerSettings::default(), "wg0".to_string(), true);
 
-        assert_eq!(command.get_program(), "pkexec");
-        assert_eq!(command.get_args().count(), 0);
-        let envs: Vec<_> = command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_str().expect("env key should be valid UTF-8"),
-                    value.map(|value| value.to_str().expect("env value should be valid UTF-8")),
-                )
-            })
-            .collect();
-        assert_eq!(envs, [("SHELL", Some("/bin/sh"))]);
+        overlay_wg_dump(&mut diagnostics, "privkey\tifacekey\t51820\toff\n");
+
+        assert_eq!(diagnostics.public_key, "ifacekey");
+        assert_eq!(diagnostics.transfer_rx, "0 B", "no peer line, no counters");
     }
 
     #[test]
