@@ -17,7 +17,7 @@
 # The one thing this tier cannot cover is persistence across a reboot, which
 # lockdown claims via `--permanent`. See `testing/vm/` for that.
 
-FROM registry.fedoraproject.org/fedora:41
+FROM registry.fedoraproject.org/fedora:latest
 
 # NetworkManager and firewalld with their shared D-Bus dependency, the WireGuard
 # userspace tools (key generation for fixtures, `wg show` diagnostics), and the
