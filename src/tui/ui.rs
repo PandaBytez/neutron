@@ -348,7 +348,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         lines.push(Line::from(vec![
             Span::styled("Profile:       ", theme.label_dim),
             Span::styled(&row.name, theme.title),
-            Span::styled(format!("  ({})", &row.uuid), theme.label_dim),
+            Span::styled(format!("  ({})", row.uuid), theme.label_dim),
         ]));
 
         let (status_str, status_style) = if row.is_active {

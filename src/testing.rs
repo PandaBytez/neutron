@@ -223,7 +223,7 @@ impl MockNmClient {
         }
         let mut settings = self.settings.lock().expect("mock mutex poisoned");
         let profile = settings.entry(uuid.clone()).or_default();
-        for pair in rest.chunks_exact(2) {
+        for pair in rest.as_chunks::<2>().0 {
             profile.insert(pair[0].clone(), pair[1].clone());
         }
     }
