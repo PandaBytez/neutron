@@ -5,6 +5,12 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Fast, lightweight WireGuard manager via NetworkManager"
 
+[workspace]
+members = [
+    ".",
+    "xtask",
+]
+
 [features]
 # qBittorrent port-forward synchronisation. Off by default: the integration
 # drives a third-party Web API and has automatic paths that fire on every

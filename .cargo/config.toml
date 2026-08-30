@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --package xtask --"
+test-system = "run --package xtask -- test-system"
+test-leaks = "run --package xtask -- test-leaks"
+test-all = "test --all-targets --features qbittorrent"
+lint = "run --package xtask -- lint"
