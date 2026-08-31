@@ -717,7 +717,7 @@ fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast,
     let toast_h = (lines_count + 2).min(area.height.saturating_sub(2));
 
     // Show toast notifications in the top-right corner
-    let toast_x = area.width.saturating_sub(toast_w + 2);
+    let toast_x = area.x + area.width.saturating_sub(toast_w + 2);
     let toast_y = area.y + 1;
     let toast_rect = Rect::new(toast_x, toast_y, toast_w, toast_h);
 
@@ -729,7 +729,13 @@ fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast,
         (theme.toast_bg, theme.active_border, theme.title)
     };
 
-    let p = Paragraph::new(Line::from(vec![Span::styled(&toast.message, text_style)]))
+    let msg_lines: Vec<Line> = toast
+        .message
+        .lines()
+        .map(|l| Line::from(Span::styled(l, text_style)))
+        .collect();
+
+    let p = Paragraph::new(msg_lines)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
         .block(

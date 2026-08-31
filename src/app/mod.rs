@@ -735,6 +735,8 @@ pub fn kill_other_neutron_processes() {
             fn kill(pid: i32, sig: i32) -> i32;
         }
 
+        let my_exe = std::env::current_exe().ok();
+
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -747,14 +749,22 @@ pub fn kill_other_neutron_processes() {
                 if pid == current_pid || pid <= 1 {
                     continue;
                 }
-                let cmdline_path = entry.path().join("cmdline");
-                if let Ok(cmdline) = std::fs::read_to_string(cmdline_path) {
-                    let is_neutron =
-                        cmdline.contains("neutron") || cmdline.contains("io.gitlab.neutron");
-                    if is_neutron {
-                        unsafe {
-                            let _ = kill(pid as i32, 15); // SIGTERM
-                        }
+
+                let exe_path = entry.path().join("exe");
+                let is_same_binary =
+                    if let (Some(my), Ok(target)) = (&my_exe, std::fs::read_link(&exe_path)) {
+                        target == *my
+                    } else {
+                        false
+                    };
+
+                let is_neutron_comm = std::fs::read_to_string(entry.path().join("comm"))
+                    .map(|comm| comm.trim() == "neutron")
+                    .unwrap_or(false);
+
+                if is_same_binary || is_neutron_comm {
+                    unsafe {
+                        let _ = kill(pid as i32, 15); // SIGTERM
                     }
                 }
             }
