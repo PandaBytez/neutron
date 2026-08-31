@@ -342,7 +342,11 @@ where
         (rev, (0, root_props, children))
     }
 
-    fn event(&self, id: i32, _event_id: &str, _data: Value<'_>, _timestamp: u32) {
+    fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: u32) {
+        if event_id != "clicked" {
+            return;
+        }
+
         match id {
             2 => {
                 let is_conn = self
@@ -480,76 +484,84 @@ where
                     .await;
             }
 
-            // Monitor state changes and emit D-Bus signals so tray hosts immediately re-render!
-            let mut last_profile: Option<String> = None;
-            let mut last_port: Option<u16> = None;
-            let mut last_favs: Vec<(String, String)> = Vec::new();
-            let mut last_rev: u32 = 0;
+            // Monitor state changes on a background thread and emit D-Bus signals so tray hosts immediately re-render
+            let conn_for_signals = conn.clone();
+            std::thread::spawn(move || {
+                let mut last_profile: Option<String> = None;
+                let mut last_port: Option<u16> = None;
+                let mut last_favs: Vec<(String, String)> = Vec::new();
+                let mut last_rev: u32 = 0;
 
-            loop {
-                let (cur_profile, cur_port, cur_favs, cur_rev) = if let Ok(st) = shared_state.lock()
-                {
-                    (
-                        st.active_profile.clone(),
-                        st.forwarded_port,
-                        st.favorite_profiles.clone(),
-                        st.menu_revision,
-                    )
-                } else {
-                    (None, None, Vec::new(), 0)
-                };
+                loop {
+                    let (cur_profile, cur_port, cur_favs, cur_rev) =
+                        if let Ok(st) = shared_state.lock() {
+                            (
+                                st.active_profile.clone(),
+                                st.forwarded_port,
+                                st.favorite_profiles.clone(),
+                                st.menu_revision,
+                            )
+                        } else {
+                            (None, None, Vec::new(), 0)
+                        };
 
-                if cur_profile != last_profile
-                    || cur_port != last_port
-                    || cur_favs != last_favs
-                    || cur_rev != last_rev
-                {
-                    last_profile = cur_profile;
-                    last_port = cur_port;
-                    last_favs = cur_favs;
-                    last_rev = cur_rev;
+                    if cur_profile != last_profile
+                        || cur_port != last_port
+                        || cur_favs != last_favs
+                        || cur_rev != last_rev
+                    {
+                        last_profile = cur_profile;
+                        last_port = cur_port;
+                        last_favs = cur_favs;
+                        last_rev = cur_rev;
 
-                    // Emit signals to tray host
-                    let _ = conn
-                        .emit_signal(
-                            Option::<&str>::None,
-                            "/StatusNotifierItem",
-                            "org.kde.StatusNotifierItem",
-                            "NewIcon",
-                            &(),
-                        )
-                        .await;
-                    let _ = conn
-                        .emit_signal(
-                            Option::<&str>::None,
-                            "/StatusNotifierItem",
-                            "org.kde.StatusNotifierItem",
-                            "NewToolTip",
-                            &(),
-                        )
-                        .await;
-                    let _ = conn
-                        .emit_signal(
-                            Option::<&str>::None,
-                            "/StatusNotifierItem",
-                            "org.kde.StatusNotifierItem",
-                            "NewStatus",
-                            &("Active"),
-                        )
-                        .await;
-                    let _ = conn
-                        .emit_signal(
-                            Option::<&str>::None,
-                            "/MenuBar",
-                            "com.canonical.dbusmenu",
-                            "LayoutUpdated",
-                            &(cur_rev, 0i32),
-                        )
-                        .await;
+                        // Emit signals to tray host
+                        zbus::block_on(async {
+                            let _ = conn_for_signals
+                                .emit_signal(
+                                    Option::<&str>::None,
+                                    "/StatusNotifierItem",
+                                    "org.kde.StatusNotifierItem",
+                                    "NewIcon",
+                                    &(),
+                                )
+                                .await;
+                            let _ = conn_for_signals
+                                .emit_signal(
+                                    Option::<&str>::None,
+                                    "/StatusNotifierItem",
+                                    "org.kde.StatusNotifierItem",
+                                    "NewToolTip",
+                                    &(),
+                                )
+                                .await;
+                            let _ = conn_for_signals
+                                .emit_signal(
+                                    Option::<&str>::None,
+                                    "/StatusNotifierItem",
+                                    "org.kde.StatusNotifierItem",
+                                    "NewStatus",
+                                    &("Active"),
+                                )
+                                .await;
+                            let _ = conn_for_signals
+                                .emit_signal(
+                                    Option::<&str>::None,
+                                    "/MenuBar",
+                                    "com.canonical.dbusmenu",
+                                    "LayoutUpdated",
+                                    &(cur_rev, 0i32),
+                                )
+                                .await;
+                        });
+                    }
+
+                    std::thread::sleep(Duration::from_millis(200));
                 }
+            });
 
-                std::thread::sleep(Duration::from_millis(200));
-            }
+            // Keep D-Bus connection processing all incoming requests with 0ms latency
+            std::future::pending::<()>().await
         });
     })
 }

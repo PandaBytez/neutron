@@ -243,10 +243,14 @@ where
         // Update real-time bandwidth throughput rates (1.5s sampling)
         state.update_throughput();
 
-        // Draw frame
-        terminal.draw(|frame| {
+        // Draw frame (ignore transient interrupted errors)
+        if let Err(err) = terminal.draw(|frame| {
             ui::render(frame, state);
-        })?;
+        }) {
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                tracing::warn!("terminal draw error: {err}");
+            }
+        }
 
         // Check if NetworkManager emitted connection change events
         let current_nm_event = monitor_events.load(Ordering::Relaxed);
@@ -257,17 +261,23 @@ where
         }
 
         // Poll for user keyboard input with 50ms timeout (smooth 20 FPS refresh)
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            // An action failing is an ordinary event -- an unreachable server,
-            // a profile NetworkManager rejects, a firewall prompt dismissed --
-            // so it is reported in the footer and the session continues.
-            // Propagating it here tore the whole interface down and dropped the
-            // user back to a bare shell, losing the very message that explained
-            // what went wrong.
-            if let Err(error) = events::handle_key_event(state, client, key) {
-                state.set_error(&error);
+        match event::poll(Duration::from_millis(50)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => {
+                    if let Err(error) = events::handle_key_event(state, client, key) {
+                        state.set_error(&error);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    tracing::warn!("crossterm event read error: {e}");
+                }
+            },
+            Ok(false) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                tracing::warn!("crossterm event poll error: {e}");
             }
         }
     }
