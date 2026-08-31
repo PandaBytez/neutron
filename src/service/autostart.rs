@@ -33,13 +33,8 @@ fn entry_name() -> String {
 /// app exits -- an autostart entry pointing there would silently fail at the
 /// next login.
 pub fn launch_command(args: &str) -> String {
-    if let Ok(appimage) = std::env::var("APPIMAGE") {
-        return format!("\"{appimage}\" {args}");
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        return format!("\"{}\" {args}", exe.display());
-    }
-    format!("neutron {args}")
+    let app = crate::process::current_app_path();
+    format!("\"{}\" {args}", app.to_string_lossy())
 }
 
 /// The user's autostart directory, `~/.config/autostart`.

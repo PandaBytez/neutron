@@ -751,12 +751,10 @@ pub fn kill_other_neutron_processes() {
                 }
 
                 let exe_path = entry.path().join("exe");
-                let is_same_binary =
-                    if let (Some(my), Ok(target)) = (&my_exe, std::fs::read_link(&exe_path)) {
-                        target == *my
-                    } else {
-                        false
-                    };
+                let is_same_binary = match (&my_exe, std::fs::read_link(&exe_path)) {
+                    (Some(my), Ok(target)) => target == *my,
+                    _ => false,
+                };
 
                 let is_neutron_comm = std::fs::read_to_string(entry.path().join("comm"))
                     .map(|comm| comm.trim() == "neutron")

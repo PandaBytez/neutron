@@ -224,29 +224,18 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
 fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
-    let (auto_val, auto_val_style) = if state.config.general.autoconnect_at_login {
-        ("ON", theme.status_connected)
-    } else {
-        ("OFF", theme.label_dim)
+    let toggle_status = |enabled: bool| {
+        if enabled {
+            ("ON", theme.status_connected)
+        } else {
+            ("OFF", theme.label_dim)
+        }
     };
 
-    let (kill_val, kill_val_style) = if state.config.kill_switch_enabled {
-        ("ON", theme.status_connected)
-    } else {
-        ("OFF", theme.label_dim)
-    };
-
-    let (lock_val, lock_val_style) = if state.config.lockdown_enabled {
-        ("ON", theme.status_connected)
-    } else {
-        ("OFF", theme.label_dim)
-    };
-
-    let (pf_val, pf_val_style) = if state.config.port_forwarding.enabled {
-        ("ON", theme.status_connected)
-    } else {
-        ("OFF", theme.label_dim)
-    };
+    let (auto_val, auto_val_style) = toggle_status(state.config.general.autoconnect_at_login);
+    let (kill_val, kill_val_style) = toggle_status(state.config.kill_switch_enabled);
+    let (lock_val, lock_val_style) = toggle_status(state.config.lockdown_enabled);
+    let (pf_val, pf_val_style) = toggle_status(state.config.port_forwarding.enabled);
 
     let split_count = state.config.global_split_tunnel.cidrs.len()
         + state.config.global_split_tunnel.domains.len();

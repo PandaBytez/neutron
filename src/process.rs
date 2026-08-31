@@ -17,6 +17,18 @@ pub fn host_command(program: &str) -> Command {
     Command::new(program)
 }
 
+/// Resolve the path or name of the currently running application binary,
+/// accounting for `$APPIMAGE`, `current_exe()`, and fallback.
+pub fn current_app_path() -> std::ffi::OsString {
+    if let Ok(appimage) = std::env::var("APPIMAGE") {
+        std::ffi::OsString::from(appimage)
+    } else if let Ok(exe) = std::env::current_exe() {
+        exe.into_os_string()
+    } else {
+        std::ffi::OsString::from("neutron")
+    }
+}
+
 /// Like [`host_command`], but also sets environment variables on the process.
 pub fn host_command_with_env(program: &str, envs: &[(&str, &str)]) -> Command {
     let mut command = Command::new(program);
@@ -153,6 +165,12 @@ mod tests {
 
         assert_eq!(command.get_program(), "nmcli");
         assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[test]
+    fn current_app_path_resolves_non_empty() {
+        let path = current_app_path();
+        assert!(!path.is_empty());
     }
 
     #[test]

@@ -86,34 +86,8 @@ impl QBittorrentClient {
         };
 
         let url = self.endpoint_url("api/v2/auth/login");
-        let timeout_str = format_curl_timeout(self.timeout);
-        let output = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-i",
-                "--max-time",
-                &timeout_str,
-                "-X",
-                "POST",
-                &url,
-                "--data-urlencode",
-                &format!("username={username}"),
-                "--data-urlencode",
-                &format!("password={password}"),
-            ])
-            .output()
-            .map_err(|err| {
-                AppError::QBittorrent(format!("failed to invoke curl for login: {err}"))
-            })?;
-
-        if !output.status.success() {
-            return Err(AppError::QBittorrent(
-                "qBittorrent WebUI is unreachable (curl connection failed)".to_string(),
-            ));
-        }
-
-        let raw = String::from_utf8_lossy(&output.stdout);
-        let resp = parse_http_response(&raw)?;
+        let resp =
+            self.http_post_urlencoded(&url, &[("username", username), ("password", password)])?;
 
         if resp.status == 403 || resp.body.trim() == "Fails." {
             return Err(AppError::QBittorrent(

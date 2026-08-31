@@ -90,13 +90,7 @@ pub fn ensure_indicator_daemon_running() {
         return;
     }
 
-    let program = if let Ok(appimage) = std::env::var("APPIMAGE") {
-        std::ffi::OsString::from(appimage)
-    } else if let Ok(exe) = std::env::current_exe() {
-        exe.into_os_string()
-    } else {
-        std::ffi::OsString::from("neutron")
-    };
+    let program = crate::process::current_app_path();
 
     #[cfg(unix)]
     {

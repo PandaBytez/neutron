@@ -225,7 +225,7 @@ impl NmClient for CliNmClient {
         // value while the caller sees a single error. Converting it to
         // `apply_to_every_profile` is a behavior change to a security-relevant
         // setting and is deliberately left out of the autoconnect fix.
-        for args in kill_switch_arg_batches(&profiles, enable) {
+        for args in kill_switch_arg_batches(&profiles, enable, profile_has_ipv6) {
             run_nmcli_owned(&args)?;
         }
         Ok(())
@@ -701,13 +701,17 @@ fn profile_has_ipv6(uuid: &str) -> bool {
 ///
 /// Extracted from [`CliNmClient::set_kill_switch_all`] so the "global = every
 /// profile" behavior is unit-testable without invoking `nmcli`.
-fn kill_switch_arg_batches(profiles: &[WireguardProfile], enable: bool) -> Vec<Vec<String>> {
+fn kill_switch_arg_batches<F>(
+    profiles: &[WireguardProfile],
+    enable: bool,
+    mut has_ipv6: F,
+) -> Vec<Vec<String>>
+where
+    F: FnMut(&str) -> bool,
+{
     profiles
         .iter()
-        .map(|profile| {
-            let has_ipv6 = profile_has_ipv6(&profile.uuid);
-            kill_switch::set_args(&profile.uuid, enable, has_ipv6)
-        })
+        .map(|profile| kill_switch::set_args(&profile.uuid, enable, has_ipv6(&profile.uuid)))
         .collect()
 }
 
@@ -1206,7 +1210,7 @@ mod tests {
             profile("wg-as", "uuid-3"),
         ];
 
-        let batches = kill_switch_arg_batches(&profiles, true);
+        let batches = kill_switch_arg_batches(&profiles, true, |_| false);
 
         // One batch per profile: the kill switch is global, so every profile is
         // modified, each targeting its own UUID with the enable arguments.
@@ -1220,7 +1224,7 @@ mod tests {
     fn kill_switch_arg_batches_target_every_profile_to_disable() {
         let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-eu", "uuid-2")];
 
-        let batches = kill_switch_arg_batches(&profiles, false);
+        let batches = kill_switch_arg_batches(&profiles, false, |_| false);
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0], kill_switch::set_args("uuid-1", false, false));
@@ -1230,8 +1234,8 @@ mod tests {
     #[test]
     fn kill_switch_arg_batches_is_empty_without_profiles() {
         // No profiles means no `nmcli` calls at all (rather than an error).
-        assert!(kill_switch_arg_batches(&[], true).is_empty());
-        assert!(kill_switch_arg_batches(&[], false).is_empty());
+        assert!(kill_switch_arg_batches(&[], true, |_| false).is_empty());
+        assert!(kill_switch_arg_batches(&[], false, |_| false).is_empty());
     }
 
     #[test]
