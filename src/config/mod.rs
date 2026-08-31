@@ -196,6 +196,9 @@ pub struct AppConfig {
     /// Profiles explicitly excluded from startup-random selection.
     #[serde(default)]
     pub excluded_profile_ids: BTreeSet<String>,
+    /// Profiles marked as favorites (pinned to tray quick actions).
+    #[serde(default, alias = "favorites", alias = "favorite_profiles")]
+    pub favorite_profile_ids: BTreeSet<String>,
     #[serde(default, alias = "last_random_profile")]
     pub last_random_profile_id: Option<String>,
     /// Global split tunneling configuration applied across all WireGuard profiles.
@@ -248,6 +251,7 @@ pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
 pub fn forget_profile(config: &mut AppConfig, uuid: &str) -> bool {
     let mut changed = config.profile_custom_info.remove(uuid).is_some();
     changed |= config.excluded_profile_ids.remove(uuid);
+    changed |= config.favorite_profile_ids.remove(uuid);
     if config.last_random_profile_id.as_deref() == Some(uuid) {
         config.last_random_profile_id = None;
         changed = true;

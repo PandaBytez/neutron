@@ -46,7 +46,7 @@ Neutron VPN derives the default NAT-PMP gateway IP automatically:
 
 ## Auto-Renewal Lifecycle
 
-Port forwarding is a policy toggle and is **off by default** — a lease is renewed on a timer against the provider's gateway, so it is never requested unless asked for. Turn it on with **`f`** in the TUI (shown in the Policies panel alongside Kill-Switch and Lockdown), or set it in `~/.config/neutron/config.toml`:
+Port forwarding is **off by default** — a lease is renewed on a timer against the provider's gateway, so it is never requested unless asked for. Turn it on with **`f`** in the TUI (or via the Command Palette), or set it in `~/.config/neutron/config.toml`:
 
 ```toml
 [port_forwarding]

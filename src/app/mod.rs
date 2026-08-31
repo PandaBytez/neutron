@@ -41,6 +41,11 @@ enum Commands {
         #[command(subcommand)]
         command: EligibleCommands,
     },
+    /// Manage favorite profiles pinned to tray quick actions
+    Favorite {
+        #[command(subcommand)]
+        command: FavoriteCommands,
+    },
     /// Run one-shot random startup profile connection
     StartupRandom,
     /// Inspect or toggle global kill switch (NetworkManager policy routing)
@@ -68,10 +73,19 @@ enum Commands {
     /// Run the persistent system tray AppIndicator daemon in the background
     #[command(alias = "daemon")]
     Indicator,
+    /// Terminate any running background daemon/processes and launch fresh instance
+    Restart,
 }
 
 #[derive(Debug, Subcommand)]
 enum EligibleCommands {
+    List,
+    Add { profile: String },
+    Remove { profile: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum FavoriteCommands {
     List,
     Add { profile: String },
     Remove { profile: String },
@@ -176,6 +190,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             let rows = profile_list::build_rows(
                 &profiles,
                 &app_cfg.excluded_profile_ids,
+                &app_cfg.favorite_profile_ids,
                 &app_cfg.profile_custom_info,
             );
             for row in rows {
@@ -187,7 +202,9 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::Disconnect) => client.disconnect_active(),
         Some(Commands::Switch { profile }) => client.switch_to(&profile),
         Some(Commands::StartupRandom) => {
-            match service::run_startup_random(client)? {
+            let res = service::run_startup_random(client);
+            service::indicator::ensure_indicator_daemon_running();
+            match res? {
                 service::StartupRandomResult::Connected(selected) => {
                     println!("Startup random connected: {selected}");
                 }
@@ -197,7 +214,13 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             }
             Ok(())
         }
+        Some(Commands::Restart) => {
+            kill_other_neutron_processes();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::tui::run(client.clone())
+        }
         Some(Commands::Eligible { command }) => handle_eligible_command(client, command),
+        Some(Commands::Favorite { command }) => handle_favorite_command(client, command),
         Some(Commands::KillSwitch { command }) => handle_kill_switch_command(client, command),
         Some(Commands::Lockdown { command }) => handle_lockdown_command(client, command),
         Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
@@ -254,6 +277,42 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
                 println!("Profile excluded from startup-random: {profile} ({profile_id})");
             } else {
                 println!("Profile already excluded: {profile} ({profile_id})");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -> AppResult<()> {
+    let path = config::default_config_path()?;
+    let mut app_cfg = config::load(&path)?;
+    let profiles = client.list_wireguard_profiles()?;
+
+    match command {
+        FavoriteCommands::List => {
+            for profile in &profiles {
+                let is_fav = app_cfg.favorite_profile_ids.contains(&profile.uuid);
+                let mark = if is_fav { "★" } else { " " };
+                println!("{mark} {} ({})", profile.name, profile.uuid);
+            }
+        }
+        FavoriteCommands::Add { profile } => {
+            let profile_id = resolve_profile_id(&profiles, &profile)?;
+            if app_cfg.favorite_profile_ids.insert(profile_id.clone()) {
+                config::save(&path, &app_cfg)?;
+                println!("Starred profile as favorite: {profile} ({profile_id})");
+            } else {
+                println!("Profile already in favorites: {profile} ({profile_id})");
+            }
+        }
+        FavoriteCommands::Remove { profile } => {
+            let profile_id = resolve_profile_id(&profiles, &profile)?;
+            if app_cfg.favorite_profile_ids.remove(&profile_id) {
+                config::save(&path, &app_cfg)?;
+                println!("Removed profile from favorites: {profile} ({profile_id})");
+            } else {
+                println!("Profile not in favorites: {profile} ({profile_id})");
             }
         }
     }
@@ -667,6 +726,42 @@ pub fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
     client.enable_lockdown(&tunnels)
 }
 
+/// Terminate all running neutron processes on the system except the current process.
+pub fn kill_other_neutron_processes() {
+    let current_pid = std::process::id();
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(pid_str) = name.to_str() else {
+                    continue;
+                };
+                let Ok(pid) = pid_str.parse::<u32>() else {
+                    continue;
+                };
+                if pid == current_pid || pid <= 1 {
+                    continue;
+                }
+                let cmdline_path = entry.path().join("cmdline");
+                if let Ok(cmdline) = std::fs::read_to_string(cmdline_path) {
+                    let is_neutron =
+                        cmdline.contains("neutron") || cmdline.contains("io.gitlab.neutron");
+                    if is_neutron {
+                        unsafe {
+                            let _ = kill(pid as i32, 15); // SIGTERM
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn resolve_profile_id(
     profiles: &[WireguardProfile],
     profile_identifier: &str,
@@ -735,6 +830,12 @@ mod tests {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
         let result = execute(&client, cli);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn kill_other_neutron_processes_does_not_panic() {
+        // Safe to call when no other processes exist or in test environments
+        kill_other_neutron_processes();
     }
 
     #[test]

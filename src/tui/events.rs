@@ -64,10 +64,11 @@ fn action_for_key(key: KeyEvent) -> Option<&'static str> {
         KeyCode::Char(' ') | KeyCode::Enter => Some("toggle"),
         KeyCode::Char('s') => Some("switch"),
         KeyCode::Char('e') => Some("eligible"),
+        KeyCode::Char('f') | KeyCode::Char('*') | KeyCode::Char('v') => Some("favorite"),
         KeyCode::Char('t') => Some("split_tunnel"),
         KeyCode::Char('k') => Some("kill_switch"),
         KeyCode::Char('l') => Some("lockdown"),
-        KeyCode::Char('f') => Some("port_forwarding"),
+        KeyCode::Char('o') => Some("port_forwarding"),
         KeyCode::Char('a') => Some("autoconnect"),
         KeyCode::Char('r') => Some("sync"),
         KeyCode::Char('d') | KeyCode::Delete => Some("delete"),
@@ -166,6 +167,27 @@ pub fn execute_action<C: ActionClient>(
                 reload_profiles(state, client)?;
             }
         }
+        "favorite" => {
+            let Some(row) = state.selected_row() else {
+                return Ok(());
+            };
+            let (uuid, name, was_fav) = (row.uuid.clone(), row.name.clone(), row.is_favorite);
+            let mut app_cfg = config::load(&state.config_path)?;
+            if was_fav {
+                app_cfg.favorite_profile_ids.remove(&uuid);
+            } else {
+                app_cfg.favorite_profile_ids.insert(uuid.clone());
+            }
+            config::save(&state.config_path, &app_cfg)?;
+            state.config = app_cfg;
+            reload_profiles(state, client)?;
+            let msg = if was_fav {
+                format!("Removed '{name}' from favorites.")
+            } else {
+                format!("Starred '{name}' as favorite.")
+            };
+            state.set_status(msg);
+        }
         "kill_switch" => {
             let enable = !state.config.kill_switch_enabled;
             crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
@@ -185,7 +207,7 @@ pub fn execute_action<C: ActionClient>(
             let enable = !state.config.general.autoconnect_at_login;
             crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
             state.config.general.autoconnect_at_login = enable;
-            state.set_status(format!("{} Auto-Connect at Login.", enabled_verb(enable)));
+            state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
         }
         "port_forwarding" => {
             let enable = !state.config.port_forwarding.enabled;
@@ -212,14 +234,14 @@ pub fn execute_action<C: ActionClient>(
             // blocked by the terminal REJECT.
             crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
             reload_profiles(state, client)?;
-            state.status_message = if report.imported.is_empty() {
-                "Refreshed profiles.".to_string()
+            if report.imported.is_empty() {
+                state.set_status("Refreshed profiles.");
             } else {
-                format!(
+                state.set_status(format!(
                     "Synced drop directory: imported {} profiles.",
                     report.imported.len()
-                )
-            };
+                ));
+            }
         }
         #[cfg(feature = "qbittorrent")]
         "qbit_sync" => {
@@ -233,17 +255,19 @@ pub fn execute_action<C: ActionClient>(
                 );
                 match qclient.sync_port(port, iface) {
                     Ok(rep) => {
-                        state.status_message =
-                            format!("qBittorrent synced: port {} applied.", rep.new_port);
+                        state.set_status(format!(
+                            "qBittorrent synced: port {} applied.",
+                            rep.new_port
+                        ));
                     }
                     Err(err) => {
                         state.set_status(format!("qBittorrent sync failed: {err}"));
                     }
                 }
             } else {
-                state.status_message =
-                    "No forwarded port available (connect to a VPN with NAT-PMP first)."
-                        .to_string();
+                state.set_status(
+                    "No forwarded port available (connect to a VPN with NAT-PMP first).",
+                );
             }
         }
         #[cfg(feature = "qbittorrent")]
@@ -253,10 +277,10 @@ pub fn execute_action<C: ActionClient>(
             app_cfg.qbittorrent.enabled = enable;
             config::save(&state.config_path, &app_cfg)?;
             state.config.qbittorrent.enabled = enable;
-            state.status_message = format!(
+            state.set_status(format!(
                 "{} qBittorrent Port Forward Auto-Sync.",
                 enabled_verb(enable)
-            );
+            ));
         }
         "delete" => {
             if let Some(row) = state.selected_row() {
@@ -538,6 +562,7 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
     state.rows = crate::app::profile_list::build_rows(
         &profiles,
         &app_cfg.excluded_profile_ids,
+        &app_cfg.favorite_profile_ids,
         &app_cfg.profile_custom_info,
     );
     state.config = app_cfg;
@@ -622,10 +647,13 @@ mod tests {
             KeyCode::Char(' '),
             KeyCode::Char('s'),
             KeyCode::Char('e'),
+            KeyCode::Char('f'),
+            KeyCode::Char('*'),
+            KeyCode::Char('v'),
             KeyCode::Char('t'),
             KeyCode::Char('k'),
             KeyCode::Char('l'),
-            KeyCode::Char('f'),
+            KeyCode::Char('o'),
             KeyCode::Char('a'),
             KeyCode::Char('r'),
             KeyCode::Char('d'),
@@ -694,6 +722,42 @@ mod tests {
                 .expect("config should load")
                 .port_forwarding
                 .enabled
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn toggling_favorite_persists_and_updates_row() {
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "wg-star",
+            "uuid-star",
+            crate::nm::ProfileState::Inactive,
+        )]);
+        let path = crate::testing::temp_config_path("tui-favorite");
+        crate::config::save(&path, &crate::config::AppConfig::default())
+            .expect("config should save");
+        let mut state = TuiState::new(path.clone(), crate::config::AppConfig::default());
+        reload_profiles(&mut state, &client).unwrap();
+
+        assert!(!state.rows[0].is_favorite);
+
+        execute_action(&mut state, &client, "favorite").expect("favorite toggle should succeed");
+        assert!(state.rows[0].is_favorite);
+        assert!(
+            crate::config::load(&path)
+                .unwrap()
+                .favorite_profile_ids
+                .contains("uuid-star")
+        );
+
+        execute_action(&mut state, &client, "favorite").expect("favorite untoggle should succeed");
+        assert!(!state.rows[0].is_favorite);
+        assert!(
+            !crate::config::load(&path)
+                .unwrap()
+                .favorite_profile_ids
+                .contains("uuid-star")
         );
 
         let _ = std::fs::remove_file(&path);

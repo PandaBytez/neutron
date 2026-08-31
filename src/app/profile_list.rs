@@ -7,6 +7,7 @@ pub struct ProfileListRow {
     pub is_active: bool,
     pub state_label: &'static str,
     pub eligible: bool,
+    pub is_favorite: bool,
     pub custom_info: Option<String>,
 }
 
@@ -16,12 +17,18 @@ pub fn format_cli_row(row: &ProfileListRow) -> String {
     } else {
         "not-eligible"
     };
-    format!("{} [{}] {}", row.name, row.state_label, eligible)
+    let fav = if row.is_favorite {
+        " [★ favorite]"
+    } else {
+        ""
+    };
+    format!("{} [{}] {}{}", row.name, row.state_label, eligible, fav)
 }
 
 pub fn build_rows(
     profiles: &[WireguardProfile],
     excluded_profile_ids: &std::collections::BTreeSet<String>,
+    favorite_profile_ids: &std::collections::BTreeSet<String>,
     profile_custom_info: &std::collections::BTreeMap<String, String>,
 ) -> Vec<ProfileListRow> {
     let mut rows: Vec<_> = profiles
@@ -36,6 +43,7 @@ pub fn build_rows(
                 "inactive"
             },
             eligible: !excluded_profile_ids.contains(&profile.uuid),
+            is_favorite: favorite_profile_ids.contains(&profile.uuid),
             custom_info: profile_custom_info.get(&profile.uuid).cloned(),
         })
         .collect();
@@ -64,12 +72,16 @@ mod tests {
         let mut excluded = std::collections::BTreeSet::new();
         excluded.insert("uuid-us".to_string());
 
+        let mut favorites = std::collections::BTreeSet::new();
+        favorites.insert("uuid-eu".to_string());
+
         let rows = build_rows(
             &[
                 profile("wg-eu", "uuid-eu", ProfileState::Inactive),
                 profile("wg-us", "uuid-us", ProfileState::Active),
             ],
             &excluded,
+            &favorites,
             &std::collections::BTreeMap::new(),
         );
 
@@ -77,9 +89,11 @@ mod tests {
         assert_eq!(rows[0].name, "wg-eu");
         assert_eq!(rows[0].state_label, "inactive");
         assert!(rows[0].eligible);
+        assert!(rows[0].is_favorite);
         assert_eq!(rows[1].name, "wg-us");
         assert_eq!(rows[1].state_label, "active");
         assert!(!rows[1].eligible);
+        assert!(!rows[1].is_favorite);
     }
 
     #[test]
@@ -89,6 +103,7 @@ mod tests {
                 profile("wg-eu", "uuid-eu", ProfileState::Inactive),
                 profile("wg-us", "uuid-us", ProfileState::Active),
             ],
+            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             &std::collections::BTreeMap::new(),
         );
@@ -103,6 +118,7 @@ mod tests {
                 profile("wg-z", "uuid-z", ProfileState::Inactive),
                 profile("wg-a", "uuid-a", ProfileState::Inactive),
             ],
+            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             &std::collections::BTreeMap::new(),
         );
@@ -119,11 +135,12 @@ mod tests {
             is_active: true,
             state_label: "active",
             eligible: true,
+            is_favorite: true,
             custom_info: None,
         };
 
         let line = format_cli_row(&row);
 
-        assert_eq!(line, "wg-us [active] eligible");
+        assert_eq!(line, "wg-us [active] eligible [★ favorite]");
     }
 }

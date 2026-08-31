@@ -29,6 +29,7 @@ const DISCONNECTED_24_ARGB32: &[u8] =
 pub struct IndicatorSharedState {
     pub active_profile: Option<String>,
     pub forwarded_port: Option<u16>,
+    pub favorite_profiles: Vec<(String, String)>,
     pub menu_revision: u32,
 }
 
@@ -81,6 +82,41 @@ pub fn is_indicator_running() -> bool {
             false
         }
     })
+}
+
+/// Ensure background indicator daemon is running (spawn once if not already active).
+pub fn ensure_indicator_daemon_running() {
+    if is_indicator_running() {
+        return;
+    }
+
+    let program = if let Ok(appimage) = std::env::var("APPIMAGE") {
+        std::ffi::OsString::from(appimage)
+    } else if let Ok(exe) = std::env::current_exe() {
+        exe.into_os_string()
+    } else {
+        std::ffi::OsString::from("neutron")
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(program);
+        cmd.arg("indicator")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                setsid();
+                Ok(())
+            });
+        }
+        let _ = cmd.spawn();
+    }
 }
 
 pub struct StatusNotifierItem {
@@ -228,14 +264,15 @@ where
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> MenuLayoutResult<'_> {
-        let (prof, port_opt, rev) = if let Ok(st) = self.state.lock() {
+        let (prof, port_opt, favorites, rev) = if let Ok(st) = self.state.lock() {
             (
                 st.active_profile.clone(),
                 st.forwarded_port,
+                st.favorite_profiles.clone(),
                 st.menu_revision,
             )
         } else {
-            (None, None, 1)
+            (None, None, Vec::new(), 1)
         };
 
         let mut children = Vec::new();
@@ -252,8 +289,36 @@ where
         toggle_props.insert("visible".to_string(), Value::from(true));
         children.push(Value::from((2i32, toggle_props, Vec::<Value<'_>>::new())));
 
-        // 2. Port Forwarding (Copy)
+        // 2. Favorite Profiles Quick Actions
+        if !favorites.is_empty() {
+            let mut fav_sep = HashMap::new();
+            fav_sep.insert("type".to_string(), Value::from("separator"));
+            fav_sep.insert("visible".to_string(), Value::from(true));
+            children.push(Value::from((10i32, fav_sep, Vec::<Value<'_>>::new())));
+
+            for (idx, (_uuid, name)) in favorites.iter().enumerate() {
+                let is_active = prof.as_deref() == Some(name.as_str());
+                let label = if is_active {
+                    format!("● {name} (Active)")
+                } else {
+                    name.clone()
+                };
+                let mut fav_props = HashMap::new();
+                fav_props.insert("label".to_string(), Value::from(label));
+                fav_props.insert("enabled".to_string(), Value::from(true));
+                fav_props.insert("visible".to_string(), Value::from(true));
+                let item_id = 100 + idx as i32;
+                children.push(Value::from((item_id, fav_props, Vec::<Value<'_>>::new())));
+            }
+        }
+
+        // 3. Port Forwarding (Copy)
         if let Some(port) = port_opt {
+            let mut port_sep = HashMap::new();
+            port_sep.insert("type".to_string(), Value::from("separator"));
+            port_sep.insert("visible".to_string(), Value::from(true));
+            children.push(Value::from((11i32, port_sep, Vec::<Value<'_>>::new())));
+
             let mut port_props = HashMap::new();
             port_props.insert(
                 "label".to_string(),
@@ -264,13 +329,13 @@ where
             children.push(Value::from((5i32, port_props, Vec::<Value<'_>>::new())));
         }
 
-        // 3. Separator
+        // 4. Separator
         let mut sep_props = HashMap::new();
         sep_props.insert("type".to_string(), Value::from("separator"));
         sep_props.insert("visible".to_string(), Value::from(true));
         children.push(Value::from((3i32, sep_props, Vec::<Value<'_>>::new())));
 
-        // 4. Quit
+        // 5. Quit
         let mut quit_props = HashMap::new();
         quit_props.insert("label".to_string(), Value::from("Quit Neutron"));
         quit_props.insert("enabled".to_string(), Value::from(true));
@@ -307,6 +372,14 @@ where
             }
             4 => {
                 std::process::exit(0);
+            }
+            item_id if item_id >= 100 => {
+                let idx = (item_id - 100) as usize;
+                if let Ok(st) = self.state.lock()
+                    && let Some((uuid, _)) = st.favorite_profiles.get(idx)
+                {
+                    let _ = self.client.switch_to(uuid);
+                }
             }
             _ => {}
         }
@@ -416,22 +489,30 @@ where
             // Monitor state changes and emit D-Bus signals so tray hosts immediately re-render!
             let mut last_profile: Option<String> = None;
             let mut last_port: Option<u16> = None;
+            let mut last_favs: Vec<(String, String)> = Vec::new();
             let mut last_rev: u32 = 0;
 
             loop {
-                let (cur_profile, cur_port, cur_rev) = if let Ok(st) = shared_state.lock() {
+                let (cur_profile, cur_port, cur_favs, cur_rev) = if let Ok(st) = shared_state.lock()
+                {
                     (
                         st.active_profile.clone(),
                         st.forwarded_port,
+                        st.favorite_profiles.clone(),
                         st.menu_revision,
                     )
                 } else {
-                    (None, None, 0)
+                    (None, None, Vec::new(), 0)
                 };
 
-                if cur_profile != last_profile || cur_port != last_port || cur_rev != last_rev {
+                if cur_profile != last_profile
+                    || cur_port != last_port
+                    || cur_favs != last_favs
+                    || cur_rev != last_rev
+                {
                     last_profile = cur_profile;
                     last_port = cur_port;
+                    last_favs = cur_favs;
                     last_rev = cur_rev;
 
                     // Emit signals to tray host
@@ -514,6 +595,7 @@ fn sync_qbittorrent_port<C: NmClient>(client: &C, uuid: &str, port: u16) {
 fn sync_qbittorrent_port<C: NmClient>(_: &C, _: &str, _: u16) {}
 
 /// The currently active WireGuard profile, if any.
+#[cfg(test)]
 fn active_profile<C: NmClient>(client: &C) -> Option<crate::nm::WireguardProfile> {
     client
         .list_wireguard_profiles()
@@ -555,8 +637,20 @@ where
     let mut leased_at: Option<std::time::Instant> = None;
 
     loop {
-        let active = active_profile(&client);
-        let active_name = active.as_ref().map(|profile| profile.name.clone());
+        let profiles = client.list_wireguard_profiles().unwrap_or_default();
+        let active = profiles.iter().find(|p| p.is_active());
+        let active_name = active.map(|profile| profile.name.clone());
+
+        let app_cfg = crate::config::default_config_path()
+            .ok()
+            .and_then(|path| crate::config::load(&path).ok())
+            .unwrap_or_default();
+
+        let favorites: Vec<(String, String)> = profiles
+            .iter()
+            .filter(|p| app_cfg.favorite_profile_ids.contains(&p.uuid))
+            .map(|p| (p.uuid.clone(), p.name.clone()))
+            .collect();
 
         if active_name != current {
             // A different tunnel (or none): the old lease is not ours anymore.
@@ -565,15 +659,12 @@ where
             leased_at = None;
         }
 
-        let port_forwarding_enabled = crate::config::default_config_path()
-            .and_then(|path| crate::config::load(&path))
-            .map(|cfg| cfg.port_forwarding.enabled)
-            .unwrap_or(false);
+        let port_forwarding_enabled = app_cfg.port_forwarding.enabled;
 
         if !port_forwarding_enabled {
             port = None;
             leased_at = None;
-        } else if let Some(profile) = active.as_ref()
+        } else if let Some(profile) = active
             && leased_at.is_none_or(|at| at.elapsed() >= crate::portforward::RENEW_INTERVAL)
             && let Some(address) = client.tunnel_address(&profile.uuid)
         {
@@ -591,10 +682,13 @@ where
         }
 
         if let Ok(mut st) = state.lock()
-            && (st.active_profile != active_name || st.forwarded_port != port)
+            && (st.active_profile != active_name
+                || st.forwarded_port != port
+                || st.favorite_profiles != favorites)
         {
             st.active_profile = active_name;
             st.forwarded_port = port;
+            st.favorite_profiles = favorites;
             st.menu_revision += 1;
         }
 
@@ -612,6 +706,7 @@ mod tests {
         let state = Arc::new(Mutex::new(IndicatorSharedState {
             active_profile,
             forwarded_port: port,
+            favorite_profiles: Vec::new(),
             menu_revision: 1,
         }));
         StatusNotifierItem { state }
@@ -621,10 +716,30 @@ mod tests {
         let state = Arc::new(Mutex::new(IndicatorSharedState {
             active_profile,
             forwarded_port: port,
+            favorite_profiles: Vec::new(),
             menu_revision: 1,
         }));
         let client = MockNmClient::default();
         DBusMenu { client, state }
+    }
+
+    #[test]
+    fn get_layout_with_favorites_includes_quick_actions() {
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: Some("wg-fast".to_string()),
+            forwarded_port: None,
+            favorite_profiles: vec![
+                ("uuid-fast".to_string(), "wg-fast".to_string()),
+                ("uuid-backup".to_string(), "wg-backup".to_string()),
+            ],
+            menu_revision: 1,
+        }));
+        let client = MockNmClient::default();
+        let menu = DBusMenu { client, state };
+
+        let (_, (_, _, children)) = menu.get_layout(0, 1, Vec::new());
+        // Children should contain: toggle (2), separator (10), fav 1 (100), fav 2 (101), separator (3), quit (4)
+        assert_eq!(children.len(), 6);
     }
 
     #[test]
@@ -664,8 +779,8 @@ mod tests {
         assert_eq!(rev, 1);
         assert_eq!(root_id, 0);
 
-        // Children should contain: toggle (2), port (5), separator (3), quit (4)
-        assert_eq!(children.len(), 4);
+        // Children should contain: toggle (2), port separator (11), port (5), separator (3), quit (4)
+        assert_eq!(children.len(), 5);
     }
 
     #[test]

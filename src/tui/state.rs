@@ -19,6 +19,13 @@ pub fn wrap_prev(index: usize, len: usize) -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub message: String,
+    pub is_error: bool,
+    pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveModal {
     None,
     Help,
@@ -85,13 +92,19 @@ impl CommandPaletteState {
             },
             CommandPaletteItem {
                 id: "eligible",
-                title: "Auto-Connect Pool: Exclude or Include Selected Profile",
+                title: "Auto Connect Pool: Exclude or Include Selected Profile",
                 description: "Excluded profiles are never picked by the random login selector",
                 shortcut: Some("e"),
             },
             CommandPaletteItem {
+                id: "favorite",
+                title: "Favorite: Star or Unstar Selected Profile",
+                description: "Starred favorite profiles appear in the tray indicator quick actions",
+                shortcut: Some("f"),
+            },
+            CommandPaletteItem {
                 id: "autoconnect",
-                title: "Auto-Connect at Login: Toggle",
+                title: "Auto Connect at Login: Toggle",
                 description: "Connect a random profile from the pool when you log in",
                 shortcut: Some("a"),
             },
@@ -109,15 +122,15 @@ impl CommandPaletteState {
             },
             CommandPaletteItem {
                 id: "lockdown",
-                title: "Lockdown: Toggle Always-On Firewall",
-                description: "Block all traffic except the tunnel, its handshake, DNS and the LAN",
+                title: "Lockdown Mode: Toggle Always-On Firewall",
+                description: "Block all traffic except the tunnel, its handshake, DNS and the LAN (requires root)",
                 shortcut: Some("l"),
             },
             CommandPaletteItem {
                 id: "port_forwarding",
-                title: "Port Forwarding: Toggle NAT-PMP",
+                title: "Port Forward: Toggle NAT-PMP",
                 description: "Lease an incoming port from the VPN gateway and keep renewing it",
-                shortcut: Some("f"),
+                shortcut: Some("o"),
             },
             CommandPaletteItem {
                 id: "sync",
@@ -309,6 +322,7 @@ pub struct TuiState {
     /// Whether [`Self::status_message`] reports a failure, so the footer can
     /// style it as one instead of burying it among routine confirmations.
     pub status_is_error: bool,
+    pub toast: Option<Toast>,
     pub modal: ActiveModal,
     pub should_quit: bool,
 }
@@ -334,6 +348,7 @@ impl TuiState {
             last_net_sample: None,
             status_message: String::new(),
             status_is_error: false,
+            toast: None,
             modal: ActiveModal::None,
             should_quit: false,
         }
@@ -348,24 +363,44 @@ impl TuiState {
         };
 
         let elapsed = now.duration_since(prev_time).as_secs_f64();
-        if elapsed >= 0.2 {
+        if elapsed >= 1.5 {
             self.download_rate = (rx.saturating_sub(prev_rx) as f64 / elapsed).round() as u64;
             self.upload_rate = (tx.saturating_sub(prev_tx) as f64 / elapsed).round() as u64;
             self.last_net_sample = Some((now, rx, tx));
         }
     }
 
-    /// Report a completed action in the footer.
+    /// Report a completed action in a toast notification.
     pub fn set_status(&mut self, message: impl Into<String>) {
-        self.status_message = message.into();
+        let msg = message.into();
+        self.status_message = msg.clone();
         self.status_is_error = false;
+        self.toast = Some(Toast {
+            message: msg,
+            is_error: false,
+            created_at: std::time::Instant::now(),
+        });
     }
 
-    /// Report a failed action in the footer. Kept distinct from
+    /// Report a failed action in a toast notification. Kept distinct from
     /// [`Self::set_status`] so an error cannot be mistaken for a success.
     pub fn set_error(&mut self, error: &crate::error::AppError) {
-        self.status_message = error.to_string();
+        let msg = error.to_string();
+        self.status_message = msg.clone();
         self.status_is_error = true;
+        self.toast = Some(Toast {
+            message: msg,
+            is_error: true,
+            created_at: std::time::Instant::now(),
+        });
+    }
+
+    /// Return the currently active toast if it has not expired (visible for 3s).
+    pub fn active_toast(&self) -> Option<&Toast> {
+        match self.toast.as_ref() {
+            Some(t) if t.created_at.elapsed() < std::time::Duration::from_secs(3) => Some(t),
+            _ => None,
+        }
     }
 
     pub fn selected_row(&self) -> Option<&ProfileListRow> {
@@ -433,5 +468,22 @@ mod tests {
 
         cp.filter = "no-such-action".to_string();
         assert!(cp.filtered_items().is_empty());
+    }
+
+    #[test]
+    fn toast_expires_after_3_seconds() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/cfg"), AppConfig::default());
+        state.set_status("Hello toast");
+        assert!(state.active_toast().is_some());
+        assert_eq!(state.active_toast().unwrap().message, "Hello toast");
+        assert!(!state.active_toast().unwrap().is_error);
+
+        // Manually simulate 4 seconds passing
+        if let Some(ref mut toast) = state.toast {
+            toast.created_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(4))
+                .unwrap();
+        }
+        assert!(state.active_toast().is_none());
     }
 }

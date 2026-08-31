@@ -27,6 +27,8 @@ pub struct Theme {
     pub keybinding: Style,
     pub key_badge: Style,
     pub key_badge_accent: Style,
+    pub toast_bg: Color,
+    pub toast_error_bg: Color,
 }
 
 impl Theme {
@@ -110,6 +112,8 @@ impl Theme {
                 .bg(Color::Rgb(45, 213, 183))
                 .fg(Color::Rgb(17, 28, 24))
                 .add_modifier(Modifier::BOLD),
+            toast_bg: Color::Rgb(28, 48, 38),
+            toast_error_bg: Color::Rgb(58, 32, 30),
         }
     }
 
@@ -165,6 +169,8 @@ impl Theme {
                 .bg(Color::Rgb(203, 166, 247))
                 .fg(Color::Rgb(17, 17, 27))
                 .add_modifier(Modifier::BOLD),
+            toast_bg: Color::Rgb(49, 50, 68),
+            toast_error_bg: Color::Rgb(69, 40, 50),
         }
     }
 
@@ -220,6 +226,8 @@ impl Theme {
                 .bg(Color::Rgb(136, 192, 208))
                 .fg(Color::Rgb(46, 52, 64))
                 .add_modifier(Modifier::BOLD),
+            toast_bg: Color::Rgb(59, 66, 82),
+            toast_error_bg: Color::Rgb(76, 48, 56),
         }
     }
 
@@ -275,6 +283,8 @@ impl Theme {
                 .bg(Color::Rgb(254, 128, 25))
                 .fg(Color::Rgb(29, 32, 33))
                 .add_modifier(Modifier::BOLD),
+            toast_bg: Color::Rgb(60, 56, 54),
+            toast_error_bg: Color::Rgb(76, 42, 40),
         }
     }
 
@@ -322,8 +332,10 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             key_badge_accent: Style::default()
                 .bg(light_gray)
-                .fg(Color::Rgb(20, 20, 20))
+                .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
+            toast_bg: Color::Rgb(38, 38, 38),
+            toast_error_bg: Color::Rgb(50, 30, 30),
         }
     }
 }

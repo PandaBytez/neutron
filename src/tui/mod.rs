@@ -96,26 +96,7 @@ where
     });
 
     // Ensure background indicator daemon is running (spawn once if not already active)
-    if !crate::service::indicator::is_indicator_running()
-        && let Ok(exe) = std::env::current_exe()
-    {
-        use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("indicator")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        unsafe {
-            cmd.pre_exec(|| {
-                unsafe extern "C" {
-                    fn setsid() -> i32;
-                }
-                setsid();
-                Ok(())
-            });
-        }
-        let _ = cmd.spawn();
-    }
+    crate::service::indicator::ensure_indicator_daemon_running();
 
     // NetworkManager monitor event counter
     let monitor_events = Arc::new(AtomicU64::new(0));
@@ -192,6 +173,7 @@ where
     B: ratatui::backend::Backend,
 {
     let mut last_seen_event = 0_u64;
+    let mut last_diag_sample = std::time::Instant::now();
 
     while !state.should_quit {
         // Drain any incoming public IP updates from background worker
@@ -209,7 +191,16 @@ where
             state.profile_cache.entry(uuid).or_insert(info);
         }
 
-        // Update real-time bandwidth throughput rates
+        // Periodically refresh active profile diagnostics / total data every 1.5s in sync with throughput rates
+        if last_diag_sample.elapsed() >= Duration::from_millis(1500) {
+            last_diag_sample = std::time::Instant::now();
+            if let Some((uuid, _, true)) = state.selected_identity() {
+                state.profile_cache.remove(&uuid);
+                events::update_diagnostics(state, client);
+            }
+        }
+
+        // Update real-time bandwidth throughput rates (1.5s sampling)
         state.update_throughput();
 
         // Draw frame

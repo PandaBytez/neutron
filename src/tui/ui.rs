@@ -13,29 +13,30 @@ use crate::tui::state::{
     TuiState,
 };
 
+pub const MIN_WIDTH: u16 = 120;
+pub const MIN_HEIGHT: u16 = 30;
+
 pub fn render(frame: &mut Frame, state: &TuiState) {
     let size = frame.area();
 
-    let show_ascii = size.height >= 26;
-    let banner_h = if show_ascii { 3 } else { 0 };
+    if size.width < MIN_WIDTH || size.height < MIN_HEIGHT {
+        render_size_warning(frame, size, state);
+        return;
+    }
 
-    // Overall vertical layout: ASCII Banner (if height permits), Header, Body, Footer
+    // Overall vertical layout: Header, Body, Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(banner_h), // Centered ASCII title logo
-            Constraint::Length(5),        // Header with Status & Policies panels
-            Constraint::Min(10),          // Main body: Left List, Right Full Detail
-            Constraint::Length(4),        // Footer / Hotkeys + Status line
+            Constraint::Length(5), // Header with Status & Policies panels
+            Constraint::Min(10),   // Main body: Left List, Right Full Detail
+            Constraint::Length(4), // Footer with Hotkeys and Legend
         ])
         .split(size);
 
-    if show_ascii {
-        render_ascii_banner(frame, chunks[0], state);
-    }
-    render_header(frame, chunks[1], state);
-    render_body(frame, chunks[2], state);
-    render_footer(frame, chunks[3], state);
+    render_header(frame, chunks[0], state);
+    render_body(frame, chunks[1], state);
+    render_footer(frame, chunks[2], state);
 
     // Overlay Modals
     match &state.modal {
@@ -48,28 +49,48 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
         }
         ActiveModal::None => {}
     }
+
+    // Floating Toast Notification (stays visible for 3s)
+    if let Some(toast) = state.active_toast() {
+        render_toast(frame, size, toast, state);
+    }
 }
 
-fn render_ascii_banner(frame: &mut Frame, area: Rect, state: &TuiState) {
+fn render_size_warning(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
-
-    let ascii_lines = vec![
-        Line::from(vec![
-            Span::styled(" █\\  █ █▀▀█ █  █ ▀█▀ █▀▀█ █▀▀█ █\\  █", theme.header),
-            Span::styled("░", theme.label_dim),
-        ]),
-        Line::from(vec![
-            Span::styled(" █ \\ █ █▀▀  █  █  █  █▄▄▀ █  █ █ \\ █", theme.accent),
-            Span::styled("░", theme.label_dim),
-        ]),
-        Line::from(vec![
-            Span::styled(" █  \\█ ▀▀▀▀  ▀▀   ▀  ▀  ▀ ▀▀▀▀ █  \\█", theme.header),
-            Span::styled("░", theme.label_dim),
-        ]),
+    let msg = vec![
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            " ⚠ Terminal window too small! ",
+            theme.warning,
+        )]),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            format!(
+                "Current size: {}x{}  |  Minimum required: {}x{}",
+                area.width, area.height, MIN_WIDTH, MIN_HEIGHT
+            ),
+            theme.text_secondary,
+        )]),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            "Please resize or zoom out your terminal window.",
+            theme.label_dim,
+        )]),
     ];
 
-    let banner = Paragraph::new(ascii_lines).alignment(Alignment::Center);
-    frame.render_widget(banner, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.warning)
+        .title(Span::styled(" Window Size Warning ", theme.warning));
+
+    let paragraph = Paragraph::new(msg)
+        .block(block)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(paragraph, area);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -90,32 +111,34 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
 
     // Status pill (clean profile name)
     let (status_text, status_style) = if let Some(ref name) = state.active_profile_name {
-        (
-            format!(" ✔ Connected: {name} "),
-            theme.status_pill_connected,
-        )
+        (format!(" Connected: {name} "), theme.status_pill_connected)
     } else {
-        (
-            " ○ Disconnected ".to_string(),
-            theme.status_pill_disconnected,
-        )
+        (" Disconnected ".to_string(), theme.status_pill_disconnected)
     };
 
-    let title = Line::from(vec![Span::styled(" ⚡ Status ", theme.title)]);
+    let status_icon_style = if state.active_profile_name.is_some() {
+        theme.status_connected
+    } else {
+        theme.label_dim
+    };
+    let title = Line::from(vec![
+        Span::styled(" 🌐 ", status_icon_style),
+        Span::styled("Status ", theme.title),
+    ]);
 
     let status_badge = Span::styled(status_text, status_style);
 
-    // Dedicated Forwarded Port field (clean text, no background pill)
+    // Dedicated Forwarded Port field (clean text, with icon)
     let (port_label, port_val, port_val_style) = if let Some(port) = state.active_port {
-        ("Port: ", format!("{port}"), theme.accent)
+        ("🔌 Port: ", format!("{port}"), theme.accent)
     } else if state.active_profile_name.is_some() {
         if !state.config.port_forwarding.enabled {
-            ("Port: ", "Disabled".to_string(), theme.label_dim)
+            ("🔌 Port: ", "Disabled".to_string(), theme.label_dim)
         } else {
-            ("Port: ", "N/A".to_string(), theme.label_dim)
+            ("🔌 Port: ", "N/A".to_string(), theme.label_dim)
         }
     } else {
-        ("Port: ", "--".to_string(), theme.label_dim)
+        ("🔌 Port: ", "--".to_string(), theme.label_dim)
     };
 
     // Latency & Speed counters
@@ -129,52 +152,50 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let up_speed = format_speed(state.upload_rate);
     let speed_text = format!("↓ {down_speed:<9}  ↑ {up_speed}");
 
-    // Line 1: Status badge + Forwarded Port
+    // Line 1: Status badge + Ping + Up/Down live speeds
     let line1 = Line::from(vec![
         Span::raw(" "),
         status_badge,
-        Span::raw("   "),
-        Span::styled(port_label, theme.label_dim),
-        Span::styled(port_val, port_val_style),
-    ]);
-
-    // Line 2: Ping & D/U on the next line under connected
-    let line2 = Line::from(vec![
-        Span::raw(" "),
+        Span::raw("  "),
         Span::styled(latency_text, theme.keybinding),
         Span::raw("    "),
         Span::styled(speed_text, theme.accent),
     ]);
 
-    // Line 3: Public IP & DNS telemetry
-    let ip_text = if let Some(ref ip_info) = state.public_ip_info {
+    // Line 2: Public IP
+    let pub_ip_text = if let Some(ref ip_info) = state.public_ip_info {
         ip_info.format_display()
     } else {
-        "Detecting public IP...".to_string()
+        "Detecting...".to_string()
     };
+    let line2 = Line::from(vec![
+        Span::styled(" Public IP: ", theme.label_dim),
+        Span::styled(pub_ip_text, theme.text_primary),
+    ]);
 
-    let mut info_spans = vec![
-        Span::styled(" IP: ", theme.label_dim),
-        Span::styled(ip_text, theme.text_primary),
-    ];
-
-    if let Some(dns) = state
+    // Line 3: DNS Resolver under Public IP + Port under/alongside DNS
+    let dns_text = state
         .selected_info
         .as_ref()
-        .and_then(|i| i.tunnel_dns.as_ref())
-    {
-        info_spans.push(Span::styled("  •  DNS: ", theme.label_dim));
-        info_spans.push(Span::styled(dns, theme.accent));
-    }
-    let line3 = Line::from(info_spans);
+        .and_then(|i| i.tunnel_dns.as_deref())
+        .unwrap_or("N/A");
+    let line3 = Line::from(vec![
+        Span::styled(" DNS:       ", theme.label_dim),
+        Span::styled(dns_text, theme.accent),
+        Span::raw("    "),
+        Span::styled(port_label, theme.label_dim),
+        Span::styled(port_val, port_val_style),
+    ]);
 
-    let status_widget = Paragraph::new(vec![line1, line2, line3]).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(theme.border)
-            .title(title),
-    );
+    let status_widget = Paragraph::new(vec![line1, line2, line3])
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(theme.border)
+                .title(title),
+        );
 
     frame.render_widget(status_widget, area);
 }
@@ -200,12 +221,10 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         ("OFF", theme.label_dim)
     };
 
-    // The leased port is the useful part, so it is shown in place of a bare
-    // "ON" once the gateway has granted one.
-    let (pf_val, pf_val_style) = match (state.config.port_forwarding.enabled, state.active_port) {
-        (false, _) => ("OFF".to_string(), theme.label_dim),
-        (true, Some(port)) => (format!("ON ({port})"), theme.status_connected),
-        (true, None) => ("ON".to_string(), theme.status_connected),
+    let (pf_val, pf_val_style) = if state.config.port_forwarding.enabled {
+        ("ON", theme.status_connected)
+    } else {
+        ("OFF", theme.label_dim)
     };
 
     let split_count = state.config.global_split_tunnel.cidrs.len()
@@ -217,21 +236,28 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         SplitTunnelMode::Exclude => (format!("Exclude ({split_count})"), theme.accent),
     };
 
+    let col1_w = 34_usize;
+    let auto_lead = "[a] Auto Connect: ";
+    let auto_pad = col1_w.saturating_sub(auto_lead.len() + auto_val.len());
+
+    let lock_lead = "[l] Lockdown Mode (root): ";
+    let lock_pad = col1_w.saturating_sub(lock_lead.len() + lock_val.len());
+
     let line1 = Line::from(vec![
         Span::raw(" "),
-        Span::styled("[a] Auto-Connect: ", theme.text_primary),
+        Span::styled(auto_lead, theme.text_primary),
         Span::styled(auto_val, auto_val_style),
-        Span::raw("    "),
-        Span::styled("[k] Kill-Switch: ", theme.text_primary),
+        Span::raw(" ".repeat(auto_pad)),
+        Span::styled("[k] Kill Switch: ", theme.text_primary),
         Span::styled(kill_val, kill_val_style),
     ]);
 
     let line2 = Line::from(vec![
         Span::raw(" "),
-        Span::styled("[l] Lockdown: ", theme.text_primary),
+        Span::styled(lock_lead, theme.text_primary),
         Span::styled(lock_val, lock_val_style),
-        Span::raw("       "),
-        Span::styled("[f] Port Forward: ", theme.text_primary),
+        Span::raw(" ".repeat(lock_pad)),
+        Span::styled("[o] Port Forward: ", theme.text_primary),
         Span::styled(pf_val, pf_val_style),
     ]);
 
@@ -243,13 +269,15 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
 
     let title = Line::from(vec![Span::styled(" 🛡  Policies ", theme.title)]);
 
-    let policies_widget = Paragraph::new(vec![line1, line2, line3]).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(theme.border)
-            .title(title),
-    );
+    let policies_widget = Paragraph::new(vec![line1, line2, line3])
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(theme.border)
+                .title(title),
+        );
 
     frame.render_widget(policies_widget, area);
 }
@@ -274,6 +302,15 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
     // Without it the backdrop grid stays visible past the end of the text and
     // the highlight looks like it has dots punched through it.
     let inner_width = area.width.saturating_sub(2) as usize;
+
+    // Fixed column width for profile names so all markers align in their own columns
+    let name_col_w = state
+        .rows
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(16)
+        .max(18);
 
     let items: Vec<ListItem> = state
         .rows
@@ -305,15 +342,31 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
                 theme.text_secondary
             };
 
-            let mut spans = vec![
+            let (fav_icon, fav_style) = if row.is_favorite {
+                ("★", theme.keybinding)
+            } else {
+                (" ", theme.label_dim)
+            };
+
+            let (excl_icon, excl_style) = if !row.eligible {
+                ("⊘", theme.warning)
+            } else {
+                (" ", theme.label_dim)
+            };
+
+            let name_len = row.name.chars().count();
+            let name_pad = name_col_w.saturating_sub(name_len);
+
+            let spans = vec![
                 Span::styled(prefix, theme.accent),
                 Span::styled(icon, icon_style),
                 Span::styled(&row.name, name_style),
+                Span::raw(" ".repeat(name_pad)),
+                Span::raw("   "),
+                Span::styled(fav_icon, fav_style),
+                Span::raw("   "),
+                Span::styled(excl_icon, excl_style),
             ];
-
-            if !row.eligible {
-                spans.push(Span::styled(" [EXCLUDED FROM POOL]", theme.label_dim));
-            }
 
             let mut line = Line::from(spans);
 
@@ -335,10 +388,7 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
 
     let title = Line::from(vec![
         Span::styled(format!(" 📋 Profiles ({}) ", state.rows.len()), theme.title),
-        Span::styled(
-            " [↑/↓ Select, Space Connect, e Exclude from pool] ",
-            theme.keybinding,
-        ),
+        Span::styled(" [↑/↓] ", theme.keybinding),
     ]);
 
     let list_widget = List::new(items).block(
@@ -355,8 +405,17 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
 fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border)
+        .title(Span::styled(" 📋 Details ", theme.title));
+
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
     let info = state.selected_info.as_ref();
-    let content = if let Some(row) = state.selected_row() {
+    if let Some(row) = state.selected_row() {
         let mut lines = Vec::new();
 
         // Section: Overview
@@ -367,7 +426,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         ]));
 
         let (status_str, status_style) = if row.is_active {
-            ("✔ Connected (Active Tunnel)", theme.status_connected)
+            ("Connected (Active Tunnel)", theme.status_connected)
         } else {
             ("Inactive", theme.status_disconnected)
         };
@@ -382,21 +441,27 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             ("✗ Excluded (never auto-connected)", theme.label_dim)
         };
         lines.push(Line::from(vec![
-            Span::styled("Auto-Connect:  ", theme.label_dim),
+            Span::styled("Auto Connect:   ", theme.label_dim),
             Span::styled(elig_str, elig_style),
+        ]));
+
+        let (fav_str, fav_style) = if row.is_favorite {
+            (
+                "★ Favorite (pinned to tray quick actions)",
+                theme.keybinding,
+            )
+        } else {
+            ("No", theme.label_dim)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Favorite:       ", theme.label_dim),
+            Span::styled(fav_str, fav_style),
         ]));
 
         lines.push(Line::raw(""));
 
         // Section: Network & Routing
         if row.is_active {
-            if let Some(ref ip_info) = state.public_ip_info {
-                lines.push(Line::from(vec![
-                    Span::styled("Public IP:     ", theme.label_dim),
-                    Span::styled(ip_info.format_display(), theme.text_primary),
-                ]));
-            }
-
             if let Some(addr) = info.and_then(|i| i.tunnel_address.as_ref()) {
                 let gw_str = info
                     .and_then(|i| i.gateway.as_deref())
@@ -466,20 +531,111 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             ]));
         }
 
-        lines
+        let content_len = lines.len() as u16;
+        let panel = Paragraph::new(lines).wrap(Wrap { trim: true });
+        frame.render_widget(panel, inner_area);
+
+        let is_connected = row.is_active || state.active_profile_name.is_some();
+        render_telemetry_watermark(frame, inner_area, content_len, is_connected, theme);
     } else {
-        vec![Line::styled("No profile selected.", theme.label_dim)]
+        let is_connected = state.active_profile_name.is_some();
+        render_empty_telemetry(frame, inner_area, is_connected, theme);
+    }
+}
+
+fn watermark_static_spans<'a>(
+    is_connected: bool,
+    theme: &'a crate::tui::theme::Theme,
+) -> (Vec<Span<'a>>, Vec<Span<'a>>, Vec<Span<'a>>) {
+    let core_style = if is_connected {
+        theme.accent
+    } else {
+        theme.label_dim
     };
+    let grid_style = theme.backdrop_grid;
 
-    let panel = Paragraph::new(content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(theme.border)
-            .title(Span::styled(" 📊 Details ", theme.title)),
-    );
+    // Line 1: NEUTRON (15 chars)
+    let name_line = vec![Span::styled(" N E U T R O N ", theme.label_dim)];
 
-    frame.render_widget(panel, area);
+    // Line 2: Particle Accelerator Logo (15 chars)
+    let logo_line = vec![
+        Span::styled("---==[ ", grid_style),
+        Span::styled("⚛", core_style),
+        Span::styled(" ]==---", grid_style),
+    ];
+
+    // Line 3: Network Manager in small caps (15 chars)
+    let subtitle_line = vec![Span::styled("ɴᴇᴛᴡᴏʀᴋ ᴍᴀɴᴀɢᴇʀ", theme.backdrop_grid)];
+
+    (name_line, logo_line, subtitle_line)
+}
+
+fn render_telemetry_watermark(
+    frame: &mut Frame,
+    inner_area: Rect,
+    content_lines: u16,
+    is_connected: bool,
+    theme: &crate::tui::theme::Theme,
+) {
+    let watermark_height = 3;
+    if inner_area.height > content_lines + watermark_height {
+        let watermark_area = Rect {
+            x: inner_area.x,
+            y: inner_area.y + inner_area.height.saturating_sub(watermark_height),
+            width: inner_area.width,
+            height: watermark_height,
+        };
+        let (mut line1, mut line2, mut line3) = watermark_static_spans(is_connected, theme);
+
+        // Pad each line with 3 spaces so right alignment keeps a clean right margin
+        line1.push(Span::raw("   "));
+        line2.push(Span::raw("   "));
+        line3.push(Span::raw("   "));
+
+        let watermark_lines = vec![Line::from(line1), Line::from(line2), Line::from(line3)];
+        let watermark_widget = Paragraph::new(watermark_lines).alignment(Alignment::Right);
+        frame.render_widget(watermark_widget, watermark_area);
+    } else if inner_area.height >= content_lines + 2 {
+        let watermark_area = Rect {
+            x: inner_area.x,
+            y: inner_area.y + inner_area.height.saturating_sub(1),
+            width: inner_area.width,
+            height: 1,
+        };
+        let icon_style = if is_connected {
+            theme.accent
+        } else {
+            theme.label_dim
+        };
+        let watermark_line = Line::from(vec![
+            Span::styled("⚛ ", icon_style),
+            Span::styled("NEUTRON ", theme.label_dim),
+            Span::styled("• ɴᴇᴛᴡᴏʀᴋ ᴍᴀɴᴀɢᴇʀ", theme.backdrop_grid),
+            Span::raw("   "),
+        ]);
+        let watermark_widget = Paragraph::new(watermark_line).alignment(Alignment::Right);
+        frame.render_widget(watermark_widget, watermark_area);
+    }
+}
+
+fn render_empty_telemetry(
+    frame: &mut Frame,
+    area: Rect,
+    is_connected: bool,
+    theme: &crate::tui::theme::Theme,
+) {
+    let (line1, line2, line3) = watermark_static_spans(is_connected, theme);
+
+    let empty_lines = vec![
+        Line::raw(""),
+        Line::from(line1),
+        Line::from(line2),
+        Line::from(line3),
+        Line::raw(""),
+        Line::styled("No profile selected.", theme.label_dim),
+    ];
+    let p = Paragraph::new(empty_lines).alignment(Alignment::Center);
+    frame.render_widget(p, area);
 }
 
 /// A `[key] label` badge pair for the footer and modal hint rows.
@@ -491,7 +647,7 @@ fn key_item<'a>(
 ) -> Vec<Span<'a>> {
     vec![
         Span::styled(format!(" {key} "), badge),
-        Span::styled(format!(" {label}  "), theme.text_primary),
+        Span::styled(format!(" {label} "), theme.text_primary),
     ]
 }
 
@@ -508,15 +664,11 @@ const FOOTER_ACCENT_KEYS: [(&str, &str); 2] = [("Ctrl+P", "Menu"), ("Ctrl+T", "T
 /// Footer badges, with labels abbreviated to fit one row. Every key here must
 /// also be a palette shortcut -- asserted by the tests below, so the two views
 /// cannot drift.
-const FOOTER_KEYS: [(&str, &str); 11] = [
-    ("Space", "Connect/Down"),
+const FOOTER_KEYS: [(&str, &str); 7] = [
+    ("Space", "Connect"),
     ("s", "Switch"),
-    ("e", "Excl. from pool"),
-    ("t", "Split Tunneling"),
-    ("k", "KillSwitch"),
-    ("l", "Lockdown"),
-    ("f", "PortFwd"),
-    ("a", "AutoLogin"),
+    ("f", "Favorite"),
+    ("e", "Excl. Pool"),
     ("r", "Sync"),
     ("?", "Help"),
     ("q", "Quit"),
@@ -533,29 +685,15 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
         hotkeys.extend(key_item(theme, theme.key_badge, key, label));
     }
 
-    let mut footer_lines = vec![Line::from(hotkeys)];
-    if !state.status_message.is_empty() {
-        let (label, style) = if state.status_is_error {
-            (" ✖ ", theme.status_disconnected)
-        } else {
-            (" Status: ", theme.label_dim)
-        };
-        footer_lines.push(Line::from(vec![
-            Span::styled(label, style),
-            Span::styled(
-                &state.status_message,
-                if state.status_is_error {
-                    theme.warning
-                } else {
-                    theme.title
-                },
-            ),
-        ]));
-    }
+    let legend_spans = vec![
+        Span::styled("Legend:  ", theme.label_dim),
+        Span::styled("★ ", theme.keybinding),
+        Span::styled("Favorite    ", theme.text_secondary),
+        Span::styled("⊘ ", theme.warning),
+        Span::styled("Excluded from pool", theme.text_secondary),
+    ];
 
-    // Wrapped so a long diagnosis stays readable instead of being clipped at
-    // the panel edge -- the explanation is the useful part of a failure.
-    let footer_widget = Paragraph::new(footer_lines)
+    let footer_widget = Paragraph::new(vec![Line::from(hotkeys), Line::from(legend_spans)])
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
         .block(
@@ -566,6 +704,43 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
         );
 
     frame.render_widget(footer_widget, area);
+}
+
+fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast, state: &TuiState) {
+    let theme = &state.theme;
+    let max_w = (area.width.saturating_sub(4)).clamp(25, 60);
+    let msg_len = toast.message.chars().count() as u16;
+    let toast_w = (msg_len + 6).clamp(25, max_w);
+
+    let content_w = toast_w.saturating_sub(4).max(1);
+    let lines_count = msg_len.div_ceil(content_w).max(1);
+    let toast_h = (lines_count + 2).min(area.height.saturating_sub(2));
+
+    // Show toast notifications in the top-right corner
+    let toast_x = area.width.saturating_sub(toast_w + 2);
+    let toast_y = area.y + 1;
+    let toast_rect = Rect::new(toast_x, toast_y, toast_w, toast_h);
+
+    frame.render_widget(Clear, toast_rect);
+
+    let (bg_color, border_style, text_style) = if toast.is_error {
+        (theme.toast_error_bg, theme.warning, theme.warning)
+    } else {
+        (theme.toast_bg, theme.active_border, theme.title)
+    };
+
+    let p = Paragraph::new(Line::from(vec![Span::styled(&toast.message, text_style)]))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_type(BorderType::Thick)
+                .border_style(border_style)
+                .style(Style::default().bg(bg_color)),
+        );
+
+    frame.render_widget(p, toast_rect);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1088,6 +1263,7 @@ mod render_tests {
             is_active,
             state_label: if is_active { "active" } else { "inactive" },
             eligible: true,
+            is_favorite: false,
             custom_info: None,
         }
     }
@@ -1118,9 +1294,8 @@ mod render_tests {
     }
 
     /// Render just the policies panel and return its rows as plain strings.
-    fn rendered_policies(config: AppConfig, active_port: Option<u16>) -> Vec<String> {
-        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
-        state.active_port = active_port;
+    fn rendered_policies(config: AppConfig) -> Vec<String> {
+        let state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
 
         let mut terminal =
             Terminal::new(TestBackend::new(78, 5)).expect("test terminal should build");
@@ -1142,22 +1317,170 @@ mod render_tests {
     }
 
     #[test]
-    fn the_policies_panel_shows_port_forwarding_and_its_leased_port() {
-        // Port forwarding is a policy like the kill switch and lockdown, so it
-        // has to be visible and readable at a glance -- not buried in a config
-        // file. The leased port is the part the user actually needs.
-        let off = rendered_policies(AppConfig::default(), None).join("\n");
+    fn the_policies_panel_shows_consistent_spaced_policy_names() {
+        let off = rendered_policies(AppConfig::default()).join("\n");
         assert!(
-            off.contains("[f] Port Forward:") && off.contains("OFF"),
-            "the toggle and its key must render when off: {off}"
+            off.contains("[a] Auto Connect:") && off.contains("OFF"),
+            "Auto Connect must use space and render: {off}"
         );
-
-        let mut on = AppConfig::default();
-        on.port_forwarding.enabled = true;
-        let leased = rendered_policies(on, Some(51820)).join("\n");
         assert!(
-            leased.contains("51820"),
-            "a leased port must be shown next to the toggle: {leased}"
+            off.contains("[k] Kill Switch:") && off.contains("OFF"),
+            "Kill Switch must use space and render: {off}"
+        );
+        assert!(
+            off.contains("[l] Lockdown Mode (root):") && off.contains("OFF"),
+            "Lockdown Mode (root) must render: {off}"
+        );
+        assert!(
+            off.contains("[o] Port Forward:") && off.contains("OFF"),
+            "Port Forward must render: {off}"
+        );
+        assert!(
+            !off.contains("(51820)") && !off.contains("ON ("),
+            "Port Forward toggle must not have port numbers in brackets: {off}"
+        );
+        assert!(
+            off.contains("[t] Split Tunneling:") && off.contains("OFF"),
+            "Split Tunneling must render: {off}"
+        );
+    }
+
+    #[test]
+    fn the_status_panel_shows_forwarded_port_with_icon() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.active_profile_name = Some("wg-us".to_string());
+        state.active_port = Some(51820);
+        state.latency_ms = Some(42);
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(78, 5)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_status_panel(frame, area, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains('🔌') && rendered.contains("Port:") && rendered.contains("51820"),
+            "status panel must render the port with icon: {rendered}"
+        );
+        assert!(
+            rendered.contains("⏱ 42ms"),
+            "status panel must render ping next to connected: {rendered}"
+        );
+        assert!(
+            rendered.contains("Public IP:") && rendered.contains("DNS:"),
+            "status panel must render public IP and DNS labels: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_toast_notification_renders_when_active() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.set_status("VPN connected successfully");
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                render(frame, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let toast_line = rendered
+            .lines()
+            .find(|l| l.contains("VPN connected successfully"))
+            .expect("toast must render");
+        assert!(
+            !toast_line.contains("Notification"),
+            "toast notification must not contain 'Notification' title: {toast_line}"
+        );
+        assert!(
+            !toast_line.contains('✔'),
+            "toast notification must not contain checkmarks: {toast_line}"
+        );
+    }
+
+    #[test]
+    fn terminal_window_size_warning_on_small_dimensions() {
+        let state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                render(frame, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Terminal window too small") && rendered.contains("120x30"),
+            "size warning must render when below minimal size: {rendered}"
+        );
+    }
+
+    #[test]
+    fn favorite_profile_shows_star_indicator() {
+        let mut fav_row = row("wg-fav", false);
+        fav_row.is_favorite = true;
+        let lines = rendered_list(vec![fav_row, row("wg-other", false)], 0);
+
+        let fav_line = lines
+            .iter()
+            .find(|line| line.contains("wg-fav"))
+            .expect("favorite row should render");
+
+        assert!(
+            fav_line.contains('★'),
+            "favorite row must contain ★ marker: {fav_line}"
+        );
+    }
+
+    #[test]
+    fn excluded_profile_shows_excluded_indicator() {
+        let mut excl_row = row("wg-excl", false);
+        excl_row.eligible = false;
+        let lines = rendered_list(vec![excl_row, row("wg-other", false)], 0);
+
+        let excl_line = lines
+            .iter()
+            .find(|line| line.contains("wg-excl"))
+            .expect("excluded row should render");
+
+        assert!(
+            excl_line.contains('⊘'),
+            "excluded row must contain ⊘ marker: {excl_line}"
         );
     }
 
@@ -1208,5 +1531,103 @@ mod render_tests {
             "expected the triangle pointer: {selected:?}"
         );
         assert!(!selected.contains('►'), "the old arrow must be gone");
+    }
+
+    #[test]
+    fn details_panel_renders_watermark_when_empty() {
+        let state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        let mut terminal =
+            Terminal::new(TestBackend::new(60, 20)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_telemetry_panel(frame, area, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains('⚛') && rendered.contains("N E U T R O N"),
+            "empty details panel must render watermark emblem: {rendered}"
+        );
+        assert!(
+            rendered.contains("No profile selected"),
+            "empty details panel must state no profile selected: {rendered}"
+        );
+    }
+
+    #[test]
+    fn details_panel_renders_watermark_when_profile_selected() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.rows = vec![row("wg-eu", false)];
+        state.selected_index = 0;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(70, 25)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_telemetry_panel(frame, area, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Profile:") && rendered.contains("wg-eu"),
+            "details panel must render profile info: {rendered}"
+        );
+        assert!(
+            rendered.contains('⚛') && rendered.contains("N E U T R O N"),
+            "details panel must render watermark in empty bottom space: {rendered}"
+        );
+    }
+
+    #[test]
+    fn footer_renders_legend() {
+        let state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 4)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, area, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Legend:")
+                && rendered.contains('★')
+                && rendered.contains('⊘')
+                && !rendered.contains('✔'),
+            "footer must render legend with favorite and exclusion icons: {rendered}"
+        );
     }
 }
