@@ -95,6 +95,23 @@ where
         }
     });
 
+    // Channel for non-blocking asynchronous connection requests & worker replies
+    let (connect_tx, connect_rx) = std::sync::mpsc::channel::<(String, String, bool)>();
+    let (conn_res_tx, conn_res_rx) = std::sync::mpsc::channel::<(String, AppResult<()>, bool)>();
+    state.connect_tx = Some(connect_tx);
+
+    let client_for_conn = client.clone();
+    thread::spawn(move || {
+        while let Ok((uuid, name, is_connect)) = connect_rx.recv() {
+            let res = if is_connect {
+                client_for_conn.switch_to(&uuid)
+            } else {
+                client_for_conn.disconnect_active()
+            };
+            let _ = conn_res_tx.send((name, res, is_connect));
+        }
+    });
+
     // Ensure background indicator daemon is running (spawn once if not already active)
     crate::service::indicator::ensure_indicator_daemon_running();
 
@@ -119,6 +136,7 @@ where
         &ip_rx,
         &lat_rx,
         &cache_rx,
+        &conn_res_rx,
         &monitor_events,
     );
 
@@ -166,6 +184,7 @@ fn run_event_loop<C, B>(
     ip_rx: &std::sync::mpsc::Receiver<crate::nm::network_info::PublicIpInfo>,
     lat_rx: &std::sync::mpsc::Receiver<u32>,
     cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
+    conn_res_rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
     monitor_events: &Arc<AtomicU64>,
 ) -> AppResult<()>
 where
@@ -189,6 +208,27 @@ where
         // Drain any background profile cache updates
         while let Ok((uuid, info)) = cache_rx.try_recv() {
             state.profile_cache.entry(uuid).or_insert(info);
+        }
+
+        // Drain any incoming background connection/disconnection results
+        while let Ok((name, res, is_connect)) = conn_res_rx.try_recv() {
+            state.connecting = None;
+            match res {
+                Ok(()) => {
+                    if is_connect {
+                        state.set_status(format!("Connected '{name}'."));
+                        spawn_public_ip_lookup(ip_tx.clone());
+                    } else {
+                        state.set_status(format!("Disconnected '{name}'."));
+                    }
+                    let _ = events::reload_profiles(state, client);
+                    events::update_diagnostics(state, client);
+                }
+                Err(err) => {
+                    state.set_error(&err);
+                    let _ = events::reload_profiles(state, client);
+                }
+            }
         }
 
         // Periodically refresh active profile diagnostics / total data every 1.5s in sync with throughput rates

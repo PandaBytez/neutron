@@ -26,6 +26,14 @@ pub struct Toast {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectingState {
+    pub uuid: String,
+    pub name: String,
+    pub is_disconnect: bool,
+    pub started_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveModal {
     None,
     Help,
@@ -323,6 +331,8 @@ pub struct TuiState {
     /// style it as one instead of burying it among routine confirmations.
     pub status_is_error: bool,
     pub toast: Option<Toast>,
+    pub connecting: Option<ConnectingState>,
+    pub connect_tx: Option<std::sync::mpsc::Sender<(String, String, bool)>>,
     pub modal: ActiveModal,
     pub should_quit: bool,
 }
@@ -349,6 +359,8 @@ impl TuiState {
             status_message: String::new(),
             status_is_error: false,
             toast: None,
+            connecting: None,
+            connect_tx: None,
             modal: ActiveModal::None,
             should_quit: false,
         }

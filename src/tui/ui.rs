@@ -50,8 +50,10 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
         ActiveModal::None => {}
     }
 
-    // Floating Toast Notification (stays visible for 3s)
-    if let Some(toast) = state.active_toast() {
+    // Floating Toast Notification or Connecting Progress
+    if let Some(ref conn) = state.connecting {
+        render_connecting_toast(frame, size, conn, state);
+    } else if let Some(toast) = state.active_toast() {
         render_toast(frame, size, toast, state);
     }
 }
@@ -110,13 +112,30 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let theme = &state.theme;
 
     // Status pill (clean profile name)
-    let (status_text, status_style) = if let Some(ref name) = state.active_profile_name {
+    let (status_text, status_style) = if let Some(ref conn) = state.connecting {
+        let elapsed = conn.started_at.elapsed();
+        const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = SPINNER_FRAMES[(elapsed.as_millis() / 80) as usize % SPINNER_FRAMES.len()];
+        if conn.is_disconnect {
+            (
+                format!(" Disconnecting: {} {spinner} ", conn.name),
+                theme.status_pill_disconnected,
+            )
+        } else {
+            (
+                format!(" Connecting: {} {spinner} ", conn.name),
+                theme.status_pill_connected,
+            )
+        }
+    } else if let Some(ref name) = state.active_profile_name {
         (format!(" Connected: {name} "), theme.status_pill_connected)
     } else {
         (" Disconnected ".to_string(), theme.status_pill_disconnected)
     };
 
-    let status_icon_style = if state.active_profile_name.is_some() {
+    let status_icon_style = if state.connecting.is_some() {
+        theme.accent
+    } else if state.active_profile_name.is_some() {
         theme.status_connected
     } else {
         theme.label_dim
@@ -142,7 +161,9 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     };
 
     // Latency & Speed counters
-    let latency_text = if let Some(ms) = state.latency_ms {
+    let latency_text = if state.connecting.is_some() {
+        "⏱ handshake...".to_string()
+    } else if let Some(ms) = state.latency_ms {
         format!("⏱ {ms}ms")
     } else {
         "⏱ --ms".to_string()
@@ -321,11 +342,24 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
 
             // Inactive rows get blank space rather than a marker, so only the
             // connected profile carries a glyph. The width matches "✔ " to keep
-            // the name column aligned.
-            let (icon, icon_style) = if row.is_active {
-                ("✔ ", theme.status_connected)
+            // the name column aligned. While connecting, a live spinner cycles here.
+            let is_connecting_row = state
+                .connecting
+                .as_ref()
+                .map(|c| c.uuid == row.uuid)
+                .unwrap_or(false);
+
+            let (icon, icon_style) = if is_connecting_row {
+                let elapsed = state.connecting.as_ref().unwrap().started_at.elapsed();
+                const SPINNER_FRAMES: [&str; 10] =
+                    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let spinner =
+                    SPINNER_FRAMES[(elapsed.as_millis() / 80) as usize % SPINNER_FRAMES.len()];
+                (format!("{spinner} "), theme.accent)
+            } else if row.is_active {
+                ("✔ ".to_string(), theme.status_connected)
             } else {
-                ("  ", theme.inactive_profile)
+                ("  ".to_string(), theme.inactive_profile)
             };
 
             let prefix = if is_selected {
@@ -704,6 +738,63 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
         );
 
     frame.render_widget(footer_widget, area);
+}
+
+fn render_connecting_toast(
+    frame: &mut Frame,
+    area: Rect,
+    conn: &crate::tui::state::ConnectingState,
+    state: &TuiState,
+) {
+    let theme = &state.theme;
+    let elapsed = conn.started_at.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+
+    const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner = SPINNER_FRAMES[(elapsed.as_millis() / 80) as usize % SPINNER_FRAMES.len()];
+
+    let action_str = if conn.is_disconnect {
+        format!("Disconnecting from {}... ({elapsed_secs:.1}s)", conn.name)
+    } else {
+        format!("Connecting to {}... ({elapsed_secs:.1}s)", conn.name)
+    };
+
+    let sub_str = if conn.is_disconnect {
+        "Tearing down WireGuard interface..."
+    } else {
+        "Waiting for WireGuard handshake..."
+    };
+
+    let max_len = (action_str.chars().count() + 2).max(sub_str.chars().count()) as u16;
+    let toast_w = (max_len + 6).clamp(38, area.width.saturating_sub(4).max(38));
+    let toast_h = 4_u16;
+
+    let toast_x = area.x + area.width.saturating_sub(toast_w + 2);
+    let toast_y = area.y + 1;
+    let toast_rect = Rect::new(toast_x, toast_y, toast_w, toast_h);
+
+    frame.render_widget(Clear, toast_rect);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{spinner} "), theme.accent),
+            Span::styled(action_str, theme.title),
+        ]),
+        Line::from(Span::styled(sub_str, theme.text_secondary)),
+    ];
+
+    let p = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_type(BorderType::Thick)
+                .border_style(theme.active_border)
+                .style(Style::default().bg(theme.toast_bg)),
+        );
+
+    frame.render_widget(p, toast_rect);
 }
 
 fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast, state: &TuiState) {
@@ -1634,6 +1725,49 @@ mod render_tests {
                 && rendered.contains('⊘')
                 && !rendered.contains('✔'),
             "footer must render legend with favorite and exclusion icons: {rendered}"
+        );
+    }
+
+    #[test]
+    fn connecting_state_animates_status_pill_and_profile_row() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.rows = vec![row("wg-cz", false), row("wg-us", false)];
+        state.connecting = Some(crate::tui::state::ConnectingState {
+            uuid: "uuid-wg-cz".to_string(),
+            name: "wg-cz".to_string(),
+            is_disconnect: false,
+            started_at: std::time::Instant::now(),
+        });
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                render(frame, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Connecting: wg-cz"),
+            "status pill must show connecting state: {rendered}"
+        );
+        assert!(
+            rendered.contains("Waiting for WireGuard handshake"),
+            "connecting toast must render handshake wait notice: {rendered}"
+        );
+        assert!(
+            rendered.contains("⏱ handshake..."),
+            "latency counter should show handshake probing: {rendered}"
         );
     }
 }

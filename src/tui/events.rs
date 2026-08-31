@@ -127,28 +127,74 @@ pub fn execute_action<C: ActionClient>(
                 ));
         }
         "toggle" => {
+            if state.connecting.is_some() {
+                return Ok(());
+            }
             if let Some((uuid, name, is_active)) = state.selected_identity() {
-                if is_active {
-                    client.disconnect_active()?;
-                    state.set_status(format!("Disconnected '{name}'."));
+                if let Some(ref tx) = state.connect_tx {
+                    state.connecting = Some(crate::tui::state::ConnectingState {
+                        uuid: uuid.clone(),
+                        name: name.clone(),
+                        is_disconnect: is_active,
+                        started_at: std::time::Instant::now(),
+                    });
+                    let _ = tx.send((uuid, name, !is_active));
                 } else {
-                    client.switch_to(&uuid)?;
-                    state.set_status(format!("Connected '{name}'."));
+                    if is_active {
+                        client.disconnect_active()?;
+                        state.set_status(format!("Disconnected '{name}'."));
+                    } else {
+                        client.switch_to(&uuid)?;
+                        state.set_status(format!("Connected '{name}'."));
+                    }
+                    reload_profiles(state, client)?;
                 }
-                reload_profiles(state, client)?;
             }
         }
         "switch" => {
-            if let Some((uuid, name, _)) = state.selected_identity() {
-                client.switch_to(&uuid)?;
-                state.set_status(format!("Switched to '{name}'."));
-                reload_profiles(state, client)?;
+            if state.connecting.is_some() {
+                return Ok(());
+            }
+            if let Some((uuid, name, is_active)) = state.selected_identity() {
+                if is_active {
+                    return Ok(());
+                }
+                if let Some(ref tx) = state.connect_tx {
+                    state.connecting = Some(crate::tui::state::ConnectingState {
+                        uuid: uuid.clone(),
+                        name: name.clone(),
+                        is_disconnect: false,
+                        started_at: std::time::Instant::now(),
+                    });
+                    let _ = tx.send((uuid, name, true));
+                } else {
+                    client.switch_to(&uuid)?;
+                    state.set_status(format!("Switched to '{name}'."));
+                    reload_profiles(state, client)?;
+                }
             }
         }
         "disconnect" => {
-            client.disconnect_active()?;
-            state.set_status("Disconnected active VPN.");
-            reload_profiles(state, client)?;
+            if state.connecting.is_some() {
+                return Ok(());
+            }
+            let name = state
+                .active_profile_name
+                .clone()
+                .unwrap_or_else(|| "VPN".to_string());
+            if let Some(ref tx) = state.connect_tx {
+                state.connecting = Some(crate::tui::state::ConnectingState {
+                    uuid: String::new(),
+                    name: name.clone(),
+                    is_disconnect: true,
+                    started_at: std::time::Instant::now(),
+                });
+                let _ = tx.send((String::new(), name, false));
+            } else {
+                client.disconnect_active()?;
+                state.set_status("Disconnected active VPN.");
+                reload_profiles(state, client)?;
+            }
         }
         "eligible" => {
             let Some(row) = state.selected_row() else {
