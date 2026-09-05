@@ -288,12 +288,14 @@ fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.toml");
 
-    let mut config = AppConfig::default();
-    config.kill_switch_enabled = true;
-    config.global_split_tunnel = SplitTunnelConfig {
-        mode: SplitTunnelMode::Include,
-        cidrs: vec!["10.0.0.0/8".to_string()],
-        domains: Vec::new(),
+    let config = AppConfig {
+        kill_switch_enabled: true,
+        global_split_tunnel: SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            cidrs: vec!["10.0.0.0/8".to_string()],
+            domains: Vec::new(),
+        },
+        ..Default::default()
     };
     config::save(&config_path, &config).expect("config should save");
 
@@ -343,12 +345,14 @@ fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel(
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.toml");
 
-    let mut config = AppConfig::default();
-    config.kill_switch_enabled = true;
-    config.global_split_tunnel = SplitTunnelConfig {
-        mode: SplitTunnelMode::Exclude,
-        cidrs: vec!["192.168.1.0/24".to_string()],
-        domains: Vec::new(),
+    let config = AppConfig {
+        kill_switch_enabled: true,
+        global_split_tunnel: SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            cidrs: vec!["192.168.1.0/24".to_string()],
+            domains: Vec::new(),
+        },
+        ..Default::default()
     };
     config::save(&config_path, &config).expect("config should save");
 

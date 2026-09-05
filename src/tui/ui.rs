@@ -1129,28 +1129,59 @@ fn render_split_tunnel_modal(
     state: &TuiState,
 ) {
     let theme = &state.theme;
-    let popup_area = centered_rect(70, 75, area);
+    let popup_area = centered_rect(75, 80, area);
 
     frame.render_widget(Clear, popup_area);
 
-    let mode_str = match st.mode {
-        SplitTunnelMode::Disabled => "[ Disabled ]  Include   Exclude  ",
-        SplitTunnelMode::Include => "  Disabled  [ Include ]  Exclude  ",
-        SplitTunnelMode::Exclude => "  Disabled   Include  [ Exclude ]",
+    let has_lockdown_warning = state.config.lockdown_enabled;
+
+    let constraints = if has_lockdown_warning {
+        vec![
+            Constraint::Length(3), // Mode Selector
+            Constraint::Length(2), // Lockdown warning banner
+            Constraint::Min(6),    // Domains & CIDRs Columns
+            Constraint::Length(2), // Controls footer
+        ]
+    } else {
+        vec![
+            Constraint::Length(3), // Mode Selector
+            Constraint::Min(6),    // Domains & CIDRs Columns
+            Constraint::Length(2), // Controls footer
+        ]
     };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Mode Selector
-            Constraint::Length(3), // Input Row
-            Constraint::Min(5),    // CIDRs & Domains Lists
-            Constraint::Length(2), // Controls footer
-        ])
+        .constraints(constraints)
         .margin(1)
         .split(popup_area);
 
-    // Mode Selector
+    // 1. Mode Selector
+    let mut mode_spans = vec![Span::styled(" Mode:  ", theme.text_secondary)];
+    for (idx, (label, mode)) in [
+        ("Disabled", SplitTunnelMode::Disabled),
+        ("Include", SplitTunnelMode::Include),
+        ("Exclude", SplitTunnelMode::Exclude),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let is_current = st.mode == *mode;
+        let is_cursor = st.focus == SplitTunnelFocus::Mode && st.highlighted_mode == idx;
+        let text = format!(" [ {label} ] ");
+        let style = if is_cursor && is_current {
+            theme.selected_item
+        } else if is_cursor {
+            theme.key_badge_accent
+        } else if is_current {
+            theme.status_pill_connected
+        } else {
+            theme.key_badge
+        };
+        mode_spans.push(Span::styled(text, style));
+        mode_spans.push(Span::raw("  "));
+    }
+
     let mode_style = if st.focus == SplitTunnelFocus::Mode {
         theme.active_border
     } else {
@@ -1161,146 +1192,212 @@ fn render_split_tunnel_modal(
         .borders(Borders::ALL)
         .border_style(mode_style)
         .title(Span::styled(
-            " [m] Routing Mode (Tab to switch) ",
+            " Routing Mode (←/→ Navigate, Space/Enter Select) ",
             theme.title,
         ));
 
-    let mode_widget =
-        Paragraph::new(Line::from(vec![Span::styled(mode_str, theme.accent)])).block(mode_block);
+    let mode_widget = Paragraph::new(Line::from(mode_spans)).block(mode_block);
     frame.render_widget(mode_widget, chunks[0]);
 
-    // Input Bar
-    let input_title = match st.focus {
-        SplitTunnelFocus::CidrInput => " Add Subnet / CIDR (Enter to add): ",
-        SplitTunnelFocus::DomainInput => " Add Domain Name (Enter to add): ",
-        _ => " Input (Select input tab below): ",
+    let (columns_chunk, footer_chunk) = if has_lockdown_warning {
+        // Lockdown Warning
+        let warn_line = Line::from(vec![
+            Span::styled(" ⚠ Lockdown Active: ", theme.warning),
+            Span::styled(
+                "All non-VPN traffic is blocked while disconnected. Excluded traffic will not route without an active tunnel.",
+                theme.text_secondary,
+            ),
+        ]);
+        let warn_widget = Paragraph::new(warn_line);
+        frame.render_widget(warn_widget, chunks[1]);
+        (chunks[2], chunks[3])
+    } else {
+        (chunks[1], chunks[2])
     };
 
-    let input_widget = Paragraph::new(Line::from(vec![
-        Span::styled(&st.input_buffer, theme.title),
-        Span::styled("█", theme.accent),
+    // 2. Side-by-Side Columns: Left = Domains, Right = Subnets / CIDRs
+    let col_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(columns_chunk);
+
+    // Left Column: Domains
+    let domain_box_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(col_chunks[0]);
+
+    // Domain Input Box
+    let domain_input_style = if st.focus == SplitTunnelFocus::DomainInput {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let domain_input_widget = Paragraph::new(Line::from(vec![
+        Span::styled(&st.domain_input, theme.title),
+        Span::styled(
+            if st.focus == SplitTunnelFocus::DomainInput {
+                "█"
+            } else {
+                ""
+            },
+            theme.accent,
+        ),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(theme.border)
-            .title(input_title),
+            .border_style(domain_input_style)
+            .title(" + Add Domain (Enter to add) "),
     );
-    frame.render_widget(input_widget, chunks[1]);
-
-    // Lists
-    let list_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[2]);
-
-    // CIDR List
-    let cidr_items: Vec<ListItem> = st
-        .cidrs
-        .iter()
-        .enumerate()
-        .map(|(idx, c)| {
-            let is_sel = st.focus == SplitTunnelFocus::CidrList && idx == st.selected_cidr;
-            let line = Line::from(vec![
-                Span::styled(
-                    if is_sel {
-                        SELECTED_POINTER
-                    } else {
-                        UNSELECTED_POINTER
-                    },
-                    theme.accent,
-                ),
-                Span::styled(
-                    c,
-                    if is_sel {
-                        theme.title
-                    } else {
-                        theme.text_secondary
-                    },
-                ),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
-
-    let cidr_list_widget = List::new(cidr_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(if st.focus == SplitTunnelFocus::CidrList {
-                theme.active_border
-            } else {
-                theme.border
-            })
-            .title(format!(" CIDRs ({}) ", st.cidrs.len())),
-    );
-    frame.render_widget(cidr_list_widget, list_chunks[0]);
+    frame.render_widget(domain_input_widget, domain_box_chunks[0]);
 
     // Domain List
-    let domain_items: Vec<ListItem> = st
-        .domains
-        .iter()
-        .enumerate()
-        .map(|(idx, d)| {
-            let is_sel = st.focus == SplitTunnelFocus::DomainList && idx == st.selected_domain;
-            let line = Line::from(vec![
-                Span::styled(
-                    if is_sel {
-                        SELECTED_POINTER
-                    } else {
-                        UNSELECTED_POINTER
-                    },
-                    theme.accent,
-                ),
-                Span::styled(
-                    d,
-                    if is_sel {
-                        theme.title
-                    } else {
-                        theme.text_secondary
-                    },
-                ),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
-
+    let domain_list_style = if st.focus == SplitTunnelFocus::DomainList {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let domain_items: Vec<ListItem> = if st.domains.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "   (No domains added)",
+            theme.label_dim,
+        )]))]
+    } else {
+        st.domains
+            .iter()
+            .enumerate()
+            .map(|(idx, d)| {
+                let is_sel = st.focus == SplitTunnelFocus::DomainList && idx == st.selected_domain;
+                let line = Line::from(vec![
+                    Span::styled(
+                        if is_sel {
+                            SELECTED_POINTER
+                        } else {
+                            UNSELECTED_POINTER
+                        },
+                        theme.accent,
+                    ),
+                    Span::styled(
+                        d,
+                        if is_sel {
+                            theme.title
+                        } else {
+                            theme.text_secondary
+                        },
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect()
+    };
     let domain_list_widget = List::new(domain_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(if st.focus == SplitTunnelFocus::DomainList {
-                theme.active_border
-            } else {
-                theme.border
-            })
-            .title(format!(" Domains ({}) ", st.domains.len())),
+            .border_style(domain_list_style)
+            .title(format!(" 🏷️  Domains ({}) ", st.domains.len())),
     );
-    frame.render_widget(domain_list_widget, list_chunks[1]);
+    frame.render_widget(domain_list_widget, domain_box_chunks[1]);
 
-    // Footer instructions
+    // Right Column: Subnets / CIDRs
+    let cidr_box_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(col_chunks[1]);
+
+    // CIDR Input Box
+    let cidr_input_style = if st.focus == SplitTunnelFocus::CidrInput {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let cidr_input_widget = Paragraph::new(Line::from(vec![
+        Span::styled(&st.cidr_input, theme.title),
+        Span::styled(
+            if st.focus == SplitTunnelFocus::CidrInput {
+                "█"
+            } else {
+                ""
+            },
+            theme.accent,
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(cidr_input_style)
+            .title(" + Add CIDR / Subnet (Enter to add) "),
+    );
+    frame.render_widget(cidr_input_widget, cidr_box_chunks[0]);
+
+    // CIDR List
+    let cidr_list_style = if st.focus == SplitTunnelFocus::CidrList {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let cidr_items: Vec<ListItem> = if st.cidrs.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "   (No subnets added)",
+            theme.label_dim,
+        )]))]
+    } else {
+        st.cidrs
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                let is_sel = st.focus == SplitTunnelFocus::CidrList && idx == st.selected_cidr;
+                let line = Line::from(vec![
+                    Span::styled(
+                        if is_sel {
+                            SELECTED_POINTER
+                        } else {
+                            UNSELECTED_POINTER
+                        },
+                        theme.accent,
+                    ),
+                    Span::styled(
+                        c,
+                        if is_sel {
+                            theme.title
+                        } else {
+                            theme.text_secondary
+                        },
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect()
+    };
+    let cidr_list_widget = List::new(cidr_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(cidr_list_style)
+            .title(format!(" 🌐 Subnets / CIDRs ({}) ", st.cidrs.len())),
+    );
+    frame.render_widget(cidr_list_widget, cidr_box_chunks[1]);
+
+    // 3. Footer instructions
     let mut modal_keys = Vec::new();
     for (key, label) in [
-        ("Tab", "Focus"),
-        ("m", "Mode"),
-        ("1", "Add CIDR"),
-        ("2", "Add Domain"),
-        ("x/Del", "Delete"),
-        ("Ctrl+S", "Save & Apply"),
-        ("Esc", "Cancel"),
+        ("Tab", "Panel"),
+        ("←/→", "Switch"),
+        ("↑/↓", "Select"),
+        ("Space/Enter", "Select/Add"),
+        ("Del/x", "Delete"),
+        ("Esc", "Close"),
     ] {
         modal_keys.extend(key_item(theme, theme.key_badge, key, label));
     }
 
     let modal_footer = Paragraph::new(Line::from(modal_keys)).alignment(Alignment::Center);
-    frame.render_widget(modal_footer, chunks[3]);
+    frame.render_widget(modal_footer, footer_chunk);
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme.active_border)
-        .title(Span::styled(
-            " Global Split Tunneling Manager ",
-            theme.title,
-        ));
+        .title(Span::styled(" Global Split Tunneling ", theme.title));
     frame.render_widget(outer_block, popup_area);
 }
 

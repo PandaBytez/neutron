@@ -10,7 +10,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::eligibility;
-use crate::app::split_tunnel;
 use crate::app::sync;
 use crate::config::{self, SplitTunnelMode};
 use crate::error::AppResult;
@@ -468,93 +467,110 @@ fn handle_split_tunnel_key<C: NmClient>(
     client: &C,
     key: KeyEvent,
 ) -> AppResult<()> {
-    let ActiveModal::SplitTunnel(ref mut st) = state.modal else {
-        return Ok(());
-    };
+    let mut should_apply_cfg = None;
+    let mut close_modal = false;
 
-    // Global save & apply.
-    if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s'))
-        || key.code == KeyCode::F(2)
-    {
-        let new_cfg = st.to_config();
-        split_tunnel::apply_and_persist_global_split_tunnel(client, &state.config_path, &new_cfg)?;
-        state.config.global_split_tunnel = new_cfg;
-        state.modal = ActiveModal::None;
-        state.set_status("Saved & applied global split tunneling.");
-        return Ok(());
-    }
+    if let ActiveModal::SplitTunnel(ref mut st) = state.modal {
+        let typing = st.focus.is_text_input();
 
-    if key.code == KeyCode::Esc {
-        state.modal = ActiveModal::None;
-        state.set_status("Split tunneling changes discarded.");
-        return Ok(());
-    }
-
-    let typing = st.focus.is_text_input();
-
-    match key.code {
-        KeyCode::Tab => st.focus = st.focus.next(),
-        KeyCode::BackTab => st.focus = st.focus.prev(),
-        KeyCode::Char('1') if !typing => st.focus = SplitTunnelFocus::CidrInput,
-        KeyCode::Char('2') if !typing => st.focus = SplitTunnelFocus::DomainInput,
-        KeyCode::Char('m') if !typing => {
-            st.mode = match st.mode {
-                SplitTunnelMode::Disabled => SplitTunnelMode::Include,
-                SplitTunnelMode::Include => SplitTunnelMode::Exclude,
-                SplitTunnelMode::Exclude => SplitTunnelMode::Disabled,
-            };
-        }
-        KeyCode::Enter => match st.focus {
-            SplitTunnelFocus::CidrInput => {
-                if let Ok((normalized, _)) =
-                    nm::split_tunnel::parse_and_normalize_cidr(&st.input_buffer)
-                {
-                    if !st.cidrs.contains(&normalized) {
-                        st.cidrs.push(normalized);
-                    }
-                    st.input_buffer.clear();
+        match key.code {
+            KeyCode::Esc => {
+                if st.focus == SplitTunnelFocus::DomainInput && !st.domain_input.is_empty() {
+                    st.domain_input.clear();
+                } else if st.focus == SplitTunnelFocus::CidrInput && !st.cidr_input.is_empty() {
+                    st.cidr_input.clear();
+                } else {
+                    close_modal = true;
                 }
             }
-            SplitTunnelFocus::DomainInput => {
-                if let Some(domain) = nm::split_tunnel::normalize_domain(&st.input_buffer) {
-                    if !st.domains.contains(&domain) {
-                        st.domains.push(domain);
-                    }
-                    st.input_buffer.clear();
+            KeyCode::Tab => st.next_panel(),
+            KeyCode::BackTab => st.prev_panel(),
+            KeyCode::Left => st.move_left(),
+            KeyCode::Right => st.move_right(),
+            KeyCode::Up => st.move_up(),
+            KeyCode::Down => st.move_down(),
+            KeyCode::Char(' ') if st.focus == SplitTunnelFocus::Mode => {
+                st.mode = match st.highlighted_mode {
+                    0 => SplitTunnelMode::Disabled,
+                    1 => SplitTunnelMode::Include,
+                    _ => SplitTunnelMode::Exclude,
+                };
+                should_apply_cfg = Some(st.to_config());
+            }
+            KeyCode::Enter => match st.focus {
+                SplitTunnelFocus::Mode => {
+                    st.mode = match st.highlighted_mode {
+                        0 => SplitTunnelMode::Disabled,
+                        1 => SplitTunnelMode::Include,
+                        _ => SplitTunnelMode::Exclude,
+                    };
+                    should_apply_cfg = Some(st.to_config());
                 }
-            }
+                SplitTunnelFocus::DomainInput => {
+                    if let Some(domain) = nm::split_tunnel::normalize_domain(&st.domain_input) {
+                        if !st.domains.contains(&domain) {
+                            st.domains.push(domain);
+                            st.selected_domain = st.domains.len().saturating_sub(1);
+                            should_apply_cfg = Some(st.to_config());
+                        }
+                        st.domain_input.clear();
+                    }
+                }
+                SplitTunnelFocus::CidrInput => {
+                    if let Ok((normalized, _)) =
+                        nm::split_tunnel::parse_and_normalize_cidr(&st.cidr_input)
+                    {
+                        if !st.cidrs.contains(&normalized) {
+                            st.cidrs.push(normalized);
+                            st.selected_cidr = st.cidrs.len().saturating_sub(1);
+                            should_apply_cfg = Some(st.to_config());
+                        }
+                        st.cidr_input.clear();
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Backspace if typing => match st.focus {
+                SplitTunnelFocus::DomainInput => {
+                    st.domain_input.pop();
+                }
+                SplitTunnelFocus::CidrInput => {
+                    st.cidr_input.pop();
+                }
+                _ => {}
+            },
+            KeyCode::Delete | KeyCode::Char('x') if !typing => match st.focus {
+                SplitTunnelFocus::DomainList => {
+                    remove_selected(&mut st.domains, &mut st.selected_domain);
+                    if st.domains.is_empty() {
+                        st.focus = SplitTunnelFocus::DomainInput;
+                    }
+                    should_apply_cfg = Some(st.to_config());
+                }
+                SplitTunnelFocus::CidrList => {
+                    remove_selected(&mut st.cidrs, &mut st.selected_cidr);
+                    if st.cidrs.is_empty() {
+                        st.focus = SplitTunnelFocus::CidrInput;
+                    }
+                    should_apply_cfg = Some(st.to_config());
+                }
+                _ => {}
+            },
+            KeyCode::Char(c) if typing => match st.focus {
+                SplitTunnelFocus::DomainInput => st.domain_input.push(c),
+                SplitTunnelFocus::CidrInput => st.cidr_input.push(c),
+                _ => {}
+            },
             _ => {}
-        },
-        KeyCode::Backspace if typing => {
-            st.input_buffer.pop();
         }
-        KeyCode::Up => match st.focus {
-            SplitTunnelFocus::CidrList => {
-                st.selected_cidr = wrap_prev(st.selected_cidr, st.cidrs.len())
-            }
-            SplitTunnelFocus::DomainList => {
-                st.selected_domain = wrap_prev(st.selected_domain, st.domains.len())
-            }
-            _ => {}
-        },
-        KeyCode::Down => match st.focus {
-            SplitTunnelFocus::CidrList => {
-                st.selected_cidr = wrap_next(st.selected_cidr, st.cidrs.len())
-            }
-            SplitTunnelFocus::DomainList => {
-                st.selected_domain = wrap_next(st.selected_domain, st.domains.len())
-            }
-            _ => {}
-        },
-        KeyCode::Delete | KeyCode::Char('x') if !typing => match st.focus {
-            SplitTunnelFocus::CidrList => remove_selected(&mut st.cidrs, &mut st.selected_cidr),
-            SplitTunnelFocus::DomainList => {
-                remove_selected(&mut st.domains, &mut st.selected_domain)
-            }
-            _ => {}
-        },
-        KeyCode::Char(c) if typing => st.input_buffer.push(c),
-        _ => {}
+    }
+
+    if close_modal {
+        state.modal = ActiveModal::None;
+    }
+
+    if let Some(cfg) = should_apply_cfg {
+        state.apply_split_tunnel(client, cfg)?;
     }
 
     Ok(())
@@ -1014,55 +1030,28 @@ mod tests {
                 &crate::config::SplitTunnelConfig::default(),
             ));
 
-        // 'm' toggles mode: Disabled -> Include -> Exclude -> Disabled
+        // Right arrow moves to Include mode, Space selects & auto-applies
         handle_key_event(
             &mut state,
             &client,
-            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
         )
         .unwrap();
         if let ActiveModal::SplitTunnel(ref st) = state.modal {
             assert_eq!(st.mode, SplitTunnelMode::Include);
         }
+        assert_eq!(
+            state.config.global_split_tunnel.mode,
+            SplitTunnelMode::Include
+        );
 
-        // '1' focuses CidrInput
-        handle_key_event(
-            &mut state,
-            &client,
-            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
-        )
-        .unwrap();
-        if let ActiveModal::SplitTunnel(ref st) = state.modal {
-            assert_eq!(st.focus, SplitTunnelFocus::CidrInput);
-        }
-
-        // Type CIDR "10.0.0.0/8" and press Enter
-        for c in "10.0.0.0/8".chars() {
-            handle_key_event(
-                &mut state,
-                &client,
-                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-            )
-            .unwrap();
-        }
-        handle_key_event(
-            &mut state,
-            &client,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )
-        .unwrap();
-        if let ActiveModal::SplitTunnel(ref st) = state.modal {
-            assert_eq!(st.cidrs, vec!["10.0.0.0/8".to_string()]);
-            assert_eq!(st.input_buffer, "");
-        }
-
-        // '2' focuses DomainInput
-        handle_key_event(
-            &mut state,
-            &client,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-        )
-        .unwrap();
+        // Tab switches panel to DomainInput
         handle_key_event(
             &mut state,
             &client,
@@ -1073,7 +1062,7 @@ mod tests {
             assert_eq!(st.focus, SplitTunnelFocus::DomainInput);
         }
 
-        // Type domain "example.com" and press Enter
+        // Type domain "example.com" and press Enter to auto-apply
         for c in "example.com".chars() {
             handle_key_event(
                 &mut state,
@@ -1090,20 +1079,56 @@ mod tests {
         .unwrap();
         if let ActiveModal::SplitTunnel(ref st) = state.modal {
             assert_eq!(st.domains, vec!["example.com".to_string()]);
+            assert_eq!(st.domain_input, "");
         }
+        assert_eq!(
+            state.config.global_split_tunnel.domains,
+            vec!["example.com".to_string()]
+        );
 
-        // Ctrl+S saves and applies
+        // Tab switches panel to CidrInput
         handle_key_event(
             &mut state,
             &client,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        )
+        .unwrap();
+        if let ActiveModal::SplitTunnel(ref st) = state.modal {
+            assert_eq!(st.focus, SplitTunnelFocus::CidrInput);
+        }
+
+        // Type CIDR "10.0.0.0/8" and press Enter to auto-apply
+        for c in "10.0.0.0/8".chars() {
+            handle_key_event(
+                &mut state,
+                &client,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        if let ActiveModal::SplitTunnel(ref st) = state.modal {
+            assert_eq!(st.cidrs, vec!["10.0.0.0/8".to_string()]);
+            assert_eq!(st.cidr_input, "");
+        }
+        assert_eq!(
+            state.config.global_split_tunnel.cidrs,
+            vec!["10.0.0.0/8".to_string()]
+        );
+
+        // Esc closes modal
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         )
         .unwrap();
         assert_eq!(state.modal, ActiveModal::None);
-        assert_eq!(
-            state.config.global_split_tunnel.mode,
-            SplitTunnelMode::Include
-        );
 
         crate::testing::remove_temp_config(&path);
     }

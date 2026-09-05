@@ -115,6 +115,30 @@ where
         }
     });
 
+    // Channel for non-blocking asynchronous split tunneling application
+    let (split_tunnel_tx, split_tunnel_rx) =
+        std::sync::mpsc::channel::<crate::config::SplitTunnelConfig>();
+    let (st_res_tx, st_res_rx) =
+        std::sync::mpsc::channel::<(crate::config::SplitTunnelConfig, AppResult<()>)>();
+    state.split_tunnel_tx = Some(split_tunnel_tx);
+
+    let client_for_st = client.clone();
+    let config_path_for_st = state.config_path.clone();
+    thread::spawn(move || {
+        while let Ok(mut cfg) = split_tunnel_rx.recv() {
+            // Coalesce rapid updates: drain to the latest config
+            while let Ok(newer_cfg) = split_tunnel_rx.try_recv() {
+                cfg = newer_cfg;
+            }
+            let res = crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
+                &client_for_st,
+                &config_path_for_st,
+                &cfg,
+            );
+            let _ = st_res_tx.send((cfg, res));
+        }
+    });
+
     // Ensure background indicator daemon is running (spawn once if not already active)
     crate::service::indicator::ensure_indicator_daemon_running();
 
@@ -140,6 +164,7 @@ where
         &lat_rx,
         &cache_rx,
         &conn_res_rx,
+        &st_res_rx,
         &monitor_events,
     );
 
@@ -188,6 +213,7 @@ fn run_event_loop<C, B>(
     lat_rx: &std::sync::mpsc::Receiver<u32>,
     cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
     conn_res_rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
+    st_res_rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
     monitor_events: &Arc<AtomicU64>,
 ) -> AppResult<()>
 where
@@ -230,6 +256,18 @@ where
                 Err(err) => {
                     state.set_error(&err);
                     let _ = events::reload_profiles(state, client);
+                }
+            }
+        }
+
+        // Drain any incoming background split tunneling application results
+        while let Ok((_cfg, res)) = st_res_rx.try_recv() {
+            match res {
+                Ok(()) => {
+                    state.set_status("Split tunneling applied & saved.");
+                }
+                Err(err) => {
+                    state.set_error(&err);
                 }
             }
         }
