@@ -9,6 +9,7 @@ use crate::nm::{NmClient, WireguardProfile};
 
 pub mod autostart;
 pub mod indicator;
+pub mod lease;
 
 pub enum StartupRandomResult {
     Connected(String),

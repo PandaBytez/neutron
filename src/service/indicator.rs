@@ -11,6 +11,7 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::error::AppResult;
 use crate::nm::NmClient;
+use crate::service::lease::QbitSyncStatus;
 
 pub const INDICATOR_BUS_NAME: &str = "io.gitlab.neutron_vpn.indicator";
 
@@ -566,39 +567,124 @@ where
     })
 }
 
-/// Push a newly leased forwarded port to qBittorrent.
+/// Push a newly leased forwarded port to qBittorrent, reporting what came of it
+/// so the daemon can publish the verdict for the TUI to render.
 ///
 /// Gated behind the `qbittorrent` feature: the daemon calls this on every lease
 /// renewal, so a broken integration would reach a third-party Web API
 /// unattended. Compiled out unless the feature is enabled.
 #[cfg(feature = "qbittorrent")]
-fn sync_qbittorrent_port<C: NmClient>(client: &C, uuid: &str, port: u16) {
+fn sync_qbittorrent_port<C: NmClient>(client: &C, uuid: &str, port: u16) -> QbitSyncStatus {
     let Ok(config) =
         crate::config::default_config_path().and_then(|path| crate::config::load(&path))
     else {
-        return;
+        return QbitSyncStatus::Pending;
     };
     if !config.qbittorrent.enabled {
-        return;
+        return QbitSyncStatus::Pending;
     }
 
-    let interface = client
-        .get_profile_diagnostics(uuid, true)
-        .ok()
-        .map(|diagnostics| diagnostics.interface_name);
-    let mut qclient = crate::portforward::qbittorrent::QBittorrentClient::new(&config.qbittorrent);
-    match qclient.sync_port(port, interface.as_deref()) {
-        Ok(report) => info!(
-            "qBittorrent port synced to {port} (interface: {:?})",
-            report.bound_interface
-        ),
-        Err(error) => warn!("qBittorrent auto-sync failed: {error}"),
+    match crate::app::qbittorrent::sync_port(client, &config.qbittorrent, uuid, port) {
+        Ok(report) => {
+            info!(
+                "qBittorrent port synced to {port} (interface: {:?})",
+                report.bound_interface
+            );
+            QbitSyncStatus::Synchronized
+        }
+        Err(error) => {
+            warn!("qBittorrent auto-sync failed: {error}");
+            QbitSyncStatus::Failed
+        }
     }
 }
 
 /// No-op when the `qbittorrent` feature is disabled.
 #[cfg(not(feature = "qbittorrent"))]
-fn sync_qbittorrent_port<C: NmClient>(_: &C, _: &str, _: u16) {}
+fn sync_qbittorrent_port<C: NmClient>(_: &C, _: &str, _: u16) -> QbitSyncStatus {
+    QbitSyncStatus::Pending
+}
+
+/// The daemon's running record of the forwarded-port lease.
+///
+/// The port is leased, not derived: it belongs to one tunnel, expires on its
+/// own, and has to be renewed before it lapses. Those rules were previously
+/// inlined in the poll loop, where two of them were wrong and neither could be
+/// tested; they live here so each one can be stated and checked on its own.
+#[derive(Debug, Default)]
+struct LeaseTracker {
+    /// The tunnel the lease belongs to, by uuid.
+    tunnel_uuid: Option<String>,
+    /// The port the gateway mapped.
+    port: Option<u16>,
+    /// When the mapping last succeeded. Advanced only on success, so a transient
+    /// failure retries on the next poll rather than waiting out another
+    /// [`crate::portforward::RENEW_INTERVAL`] and letting the lease lapse.
+    leased_at: Option<std::time::Instant>,
+    /// What became of the last push to qBittorrent.
+    qbit_sync: QbitSyncStatus,
+}
+
+impl LeaseTracker {
+    /// Drop the lease unless it still belongs to `active_uuid`.
+    ///
+    /// Compared by uuid rather than by name because NetworkManager allows two
+    /// profiles to share a name. Keyed by name, a switch between two such
+    /// profiles reads as no change at all, and the lease obtained for one goes on
+    /// being published against the other -- which is how a port ends up bound to
+    /// the wrong interface.
+    fn follow_tunnel(&mut self, active_uuid: &Option<String>) {
+        if self.tunnel_uuid != *active_uuid {
+            self.tunnel_uuid = active_uuid.clone();
+            self.release();
+        }
+    }
+
+    /// Give up the lease and everything said about it.
+    fn release(&mut self) {
+        self.port = None;
+        self.leased_at = None;
+        self.qbit_sync = QbitSyncStatus::Pending;
+    }
+
+    /// Whether the mapping should be renewed on this poll.
+    fn is_due(&self) -> bool {
+        self.leased_at
+            .is_none_or(|at| at.elapsed() >= crate::portforward::RENEW_INTERVAL)
+    }
+
+    /// Record the outcome of a renewal, reporting whether qBittorrent should now
+    /// be told about the port.
+    ///
+    /// A renewal normally returns the same port, so a push gated only on the port
+    /// *changing* would never retry: qBittorrent started after a failed first
+    /// attempt would stay unsynced for the life of the tunnel, showing a failure
+    /// the user has no way to clear. A previous failure is therefore retried on
+    /// every renewal.
+    fn record(&mut self, mapped: Option<u16>) -> bool {
+        self.leased_at = Some(std::time::Instant::now());
+
+        let Some(mapped) = mapped else {
+            self.release();
+            return false;
+        };
+
+        let changed = self.port != Some(mapped);
+        self.port = Some(mapped);
+        changed || self.qbit_sync == QbitSyncStatus::Failed
+    }
+
+    /// The lease as published for the TUI.
+    fn publication(&self, profile_uuid: Option<String>) -> crate::service::lease::LeaseState {
+        crate::service::lease::LeaseState {
+            port: self.port,
+            profile_uuid,
+            qbit_sync: self.qbit_sync,
+            // Stamped on publication; the caller has no business inventing a time.
+            ..Default::default()
+        }
+    }
+}
 
 /// The currently active WireGuard profile, if any.
 #[cfg(test)]
@@ -613,7 +699,7 @@ fn active_profile<C: NmClient>(client: &C) -> Option<crate::nm::WireguardProfile
 /// How often the tray re-reads NetworkManager. Each poll spawns `nmcli`, so this
 /// is deliberately slower than a UI refresh: the tray only has to notice a
 /// connection change within a second or two.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run standalone persistent indicator daemon in the foreground.
 pub fn run_standalone_indicator<C>(client: C) -> AppResult<()>
@@ -627,25 +713,30 @@ where
         return Ok(());
     }
 
+    // The check above asks the session bus, so it cannot answer when there is no
+    // session bus -- and that is exactly when a second daemon gets spawned. The
+    // published lease carries its author's pid, which settles ownership without
+    // needing a bus at all. Without this, every launch would add another NAT-PMP
+    // renewer on one lease and another writer against one qBittorrent.
+    if let Some(owner) = crate::service::lease::live_owner()
+        && owner != std::process::id()
+    {
+        debug!("Neutron daemon {owner} already holds the port lease, exiting.");
+        return Ok(());
+    }
+
     info!("Starting Neutron persistent AppIndicator daemon...");
 
     let state = Arc::new(Mutex::new(IndicatorSharedState::default()));
     let _handle = spawn_indicator_service(client.clone(), state.clone());
 
-    // The forwarded port is leased, not derived: it belongs to one tunnel and
-    // expires on its own. So it is tracked alongside the profile that owns it,
-    // and the lease clock advances only when a mapping actually succeeded --
-    // otherwise a transient failure would wait a further `RENEW_INTERVAL` and
-    // let the lease lapse, which is the very thing the interval exists to
-    // prevent.
-    let mut current: Option<String> = None;
-    let mut port: Option<u16> = None;
-    let mut leased_at: Option<std::time::Instant> = None;
+    let mut lease = LeaseTracker::default();
 
     loop {
         let profiles = client.list_wireguard_profiles().unwrap_or_default();
         let active = profiles.iter().find(|p| p.is_active());
         let active_name = active.map(|profile| profile.name.clone());
+        let active_uuid = active.map(|profile| profile.uuid.clone());
 
         let app_cfg = crate::config::default_config_path()
             .ok()
@@ -658,42 +749,32 @@ where
             .map(|p| (p.uuid.clone(), p.name.clone()))
             .collect();
 
-        if active_name != current {
-            // A different tunnel (or none): the old lease is not ours anymore.
-            current = active_name.clone();
-            port = None;
-            leased_at = None;
-        }
+        lease.follow_tunnel(&active_uuid);
 
-        let port_forwarding_enabled = app_cfg.port_forwarding.enabled;
-
-        if !port_forwarding_enabled {
-            port = None;
-            leased_at = None;
+        if !app_cfg.port_forwarding.enabled {
+            lease.release();
         } else if let Some(profile) = active
-            && leased_at.is_none_or(|at| at.elapsed() >= crate::portforward::RENEW_INTERVAL)
+            && lease.is_due()
             && let Some(address) = client.tunnel_address(&profile.uuid)
         {
-            leased_at = Some(std::time::Instant::now());
-            if let Some(mapped) = crate::portforward::port_for_tunnel_address(&address) {
-                let is_new_or_renewed_port = port != Some(mapped);
-                port = Some(mapped);
-
-                if is_new_or_renewed_port {
-                    sync_qbittorrent_port(&client, &profile.uuid, mapped);
-                }
-            } else {
-                port = None;
+            let mapped = crate::portforward::port_for_tunnel_address(&address);
+            if lease.record(mapped) {
+                lease.qbit_sync =
+                    sync_qbittorrent_port(&client, &profile.uuid, lease.port.unwrap_or_default());
             }
         }
 
+        // Republished every poll even when nothing changed: the timestamp is how
+        // a reader tells a held lease from one left behind by a dead daemon.
+        crate::service::lease::publish(&lease.publication(active_uuid.clone()));
+
         if let Ok(mut st) = state.lock()
             && (st.active_profile != active_name
-                || st.forwarded_port != port
+                || st.forwarded_port != lease.port
                 || st.favorite_profiles != favorites)
         {
             st.active_profile = active_name;
-            st.forwarded_port = port;
+            st.forwarded_port = lease.port;
             st.favorite_profiles = favorites;
             st.menu_revision += 1;
         }
@@ -727,6 +808,118 @@ mod tests {
         }));
         let client = MockNmClient::default();
         DBusMenu { client, state }
+    }
+
+    #[test]
+    fn a_lease_survives_a_poll_that_finds_the_same_tunnel() {
+        let mut lease = LeaseTracker::default();
+        let eu = Some("uuid-eu".to_string());
+
+        lease.follow_tunnel(&eu);
+        lease.record(Some(51820));
+        lease.follow_tunnel(&eu);
+
+        assert_eq!(lease.port, Some(51820));
+    }
+
+    #[test]
+    fn a_lease_is_dropped_when_the_tunnel_changes() {
+        let mut lease = LeaseTracker::default();
+
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(51820));
+        lease.follow_tunnel(&Some("uuid-us".to_string()));
+
+        assert_eq!(lease.port, None, "the new tunnel has no lease yet");
+        assert_eq!(lease.qbit_sync, QbitSyncStatus::Pending);
+    }
+
+    #[test]
+    fn two_profiles_sharing_a_name_are_still_different_tunnels() {
+        // NetworkManager allows duplicate connection names. Keyed by name, this
+        // switch reads as no change, and the lease obtained for the first
+        // profile goes on being published against the second -- handing
+        // qBittorrent one profile's port bound to the other's interface.
+        let mut lease = LeaseTracker::default();
+
+        lease.follow_tunnel(&Some("uuid-first".to_string()));
+        lease.record(Some(51820));
+        lease.follow_tunnel(&Some("uuid-second".to_string()));
+
+        assert_eq!(lease.port, None);
+    }
+
+    #[test]
+    fn a_renewal_returning_the_same_port_does_not_re_push() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+
+        assert!(
+            lease.record(Some(51820)),
+            "the first mapping must be pushed"
+        );
+        assert!(
+            !lease.record(Some(51820)),
+            "an unchanged port needs no second push"
+        );
+    }
+
+    #[test]
+    fn a_renewal_returning_a_different_port_is_pushed() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(51820));
+
+        assert!(lease.record(Some(40000)));
+    }
+
+    #[test]
+    fn a_failed_push_is_retried_on_the_next_renewal() {
+        // Otherwise qBittorrent started after the first attempt stays unsynced
+        // for the life of the tunnel, showing a failure the user cannot clear:
+        // the port is stable, so "push only when it changes" means never again.
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(51820));
+        lease.qbit_sync = QbitSyncStatus::Failed;
+
+        assert!(
+            lease.record(Some(51820)),
+            "a failure must be retried even though the port is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_successful_push_is_not_retried_forever() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(51820));
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+
+        assert!(!lease.record(Some(51820)));
+    }
+
+    #[test]
+    fn a_renewal_that_maps_nothing_gives_up_the_lease() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(51820));
+
+        assert!(!lease.record(None), "there is no port to push");
+        assert_eq!(lease.port, None);
+        assert_eq!(lease.qbit_sync, QbitSyncStatus::Pending);
+    }
+
+    #[test]
+    fn a_fresh_lease_is_not_due_for_renewal_but_an_unheld_one_is() {
+        let mut lease = LeaseTracker::default();
+        assert!(lease.is_due(), "with no lease there is nothing to wait for");
+
+        lease.record(Some(51820));
+        assert!(
+            !lease.is_due(),
+            "a just-renewed lease must not be re-requested"
+        );
     }
 
     #[test]
