@@ -620,6 +620,34 @@ mod tests {
         assert_eq!(sync_res.new_port, 55432);
         assert_eq!(sync_res.bound_interface.as_deref(), Some("wg0"));
 
+        // Combination 2: bind_interface = false
+        let mut client_nobind = QBittorrentClient::new(&QBittorrentConfig {
+            enabled: true,
+            url: format!("http://127.0.0.1:{port}"),
+            username: None,
+            password: None,
+            bind_interface: false,
+        });
+        let sync_nobind = client_nobind
+            .sync_port(55433, Some("wg0"))
+            .expect("sync should succeed without bind");
+        assert_eq!(sync_nobind.new_port, 55433);
+        assert_eq!(sync_nobind.bound_interface, None);
+
+        // Combination 3: bind_interface = true but interface_name = None
+        let mut client_noiface = QBittorrentClient::new(&QBittorrentConfig {
+            enabled: true,
+            url: format!("http://127.0.0.1:{port}"),
+            username: None,
+            password: None,
+            bind_interface: true,
+        });
+        let sync_noiface = client_noiface
+            .sync_port(55434, None)
+            .expect("sync should succeed when interface is None");
+        assert_eq!(sync_noiface.new_port, 55434);
+        assert_eq!(sync_noiface.bound_interface, None);
+
         done.store(true, Ordering::Relaxed);
         let _ = handle.join();
     }

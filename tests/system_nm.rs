@@ -264,6 +264,24 @@ fn tunnel_address_and_dns_are_read_from_a_real_profile() {
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
+fn tunnel_address_derives_natpmp_gateway_and_bind_address() {
+    require_sandbox();
+    let fixture = Fixture::import("natpmp-gw", "10.2.0.2/32", "10.2.0.1");
+
+    let addr = CliNmClient
+        .tunnel_address(&fixture.uuid)
+        .expect("tunnel address should exist");
+    assert_eq!(addr, "10.2.0.2/32");
+
+    let local_ip = neutron::portforward::parse_local_address(&addr);
+    assert_eq!(local_ip, Some(std::net::Ipv4Addr::new(10, 2, 0, 2)));
+
+    let gw = neutron::portforward::gateway_for_address(&addr);
+    assert_eq!(gw, Some(std::net::Ipv4Addr::new(10, 2, 0, 1)));
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
 fn importing_disables_autoconnect_so_nothing_activates_itself() {
     // NetworkManager defaults `autoconnect` to yes and each WireGuard profile is
     // its own interface, so without this every profile activates at boot and the
