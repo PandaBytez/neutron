@@ -1158,14 +1158,12 @@ fn render_split_tunnel_modal(
 
     // 1. Mode Selector
     let mut mode_spans = vec![Span::styled(" Mode:  ", theme.text_secondary)];
-    for (idx, (label, mode)) in [
-        ("Disabled", SplitTunnelMode::Disabled),
-        ("Include", SplitTunnelMode::Include),
-        ("Exclude", SplitTunnelMode::Exclude),
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (idx, mode) in SplitTunnelModalState::MODES.iter().enumerate() {
+        let label = match mode {
+            SplitTunnelMode::Disabled => "Disabled",
+            SplitTunnelMode::Include => "Include",
+            SplitTunnelMode::Exclude => "Exclude",
+        };
         let is_current = st.mode == *mode;
         let is_cursor = st.focus == SplitTunnelFocus::Mode && st.highlighted_mode == idx;
         let text = format!(" [ {label} ] ");
@@ -1222,160 +1220,38 @@ fn render_split_tunnel_modal(
         .split(columns_chunk);
 
     // Left Column: Domains
-    let domain_box_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(4)])
-        .split(col_chunks[0]);
-
-    // Domain Input Box
-    let domain_input_style = if st.focus == SplitTunnelFocus::DomainInput {
-        theme.active_border
-    } else {
-        theme.border
-    };
-    let domain_input_widget = Paragraph::new(Line::from(vec![
-        Span::styled(&st.domain_input, theme.title),
-        Span::styled(
-            if st.focus == SplitTunnelFocus::DomainInput {
-                "█"
-            } else {
-                ""
-            },
-            theme.accent,
-        ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(domain_input_style)
-            .title(" + Add Domain (Enter to add) "),
+    render_entry_column(
+        frame,
+        col_chunks[0],
+        EntryColumnParams {
+            title: format!(" 🏷️  Domains ({}) ", st.domains.len()),
+            input_title: " + Add Domain (Enter to add) ",
+            input_value: &st.domain_input,
+            is_input_focused: st.focus == SplitTunnelFocus::DomainInput,
+            items: &st.domains,
+            selected_idx: st.selected_domain,
+            is_list_focused: st.focus == SplitTunnelFocus::DomainList,
+            empty_label: "   (No domains added)",
+        },
+        theme,
     );
-    frame.render_widget(domain_input_widget, domain_box_chunks[0]);
-
-    // Domain List
-    let domain_list_style = if st.focus == SplitTunnelFocus::DomainList {
-        theme.active_border
-    } else {
-        theme.border
-    };
-    let domain_items: Vec<ListItem> = if st.domains.is_empty() {
-        vec![ListItem::new(Line::from(vec![Span::styled(
-            "   (No domains added)",
-            theme.label_dim,
-        )]))]
-    } else {
-        st.domains
-            .iter()
-            .enumerate()
-            .map(|(idx, d)| {
-                let is_sel = st.focus == SplitTunnelFocus::DomainList && idx == st.selected_domain;
-                let line = Line::from(vec![
-                    Span::styled(
-                        if is_sel {
-                            SELECTED_POINTER
-                        } else {
-                            UNSELECTED_POINTER
-                        },
-                        theme.accent,
-                    ),
-                    Span::styled(
-                        d,
-                        if is_sel {
-                            theme.title
-                        } else {
-                            theme.text_secondary
-                        },
-                    ),
-                ]);
-                ListItem::new(line)
-            })
-            .collect()
-    };
-    let domain_list_widget = List::new(domain_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(domain_list_style)
-            .title(format!(" 🏷️  Domains ({}) ", st.domains.len())),
-    );
-    frame.render_widget(domain_list_widget, domain_box_chunks[1]);
 
     // Right Column: Subnets / CIDRs
-    let cidr_box_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(4)])
-        .split(col_chunks[1]);
-
-    // CIDR Input Box
-    let cidr_input_style = if st.focus == SplitTunnelFocus::CidrInput {
-        theme.active_border
-    } else {
-        theme.border
-    };
-    let cidr_input_widget = Paragraph::new(Line::from(vec![
-        Span::styled(&st.cidr_input, theme.title),
-        Span::styled(
-            if st.focus == SplitTunnelFocus::CidrInput {
-                "█"
-            } else {
-                ""
-            },
-            theme.accent,
-        ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(cidr_input_style)
-            .title(" + Add CIDR / Subnet (Enter to add) "),
+    render_entry_column(
+        frame,
+        col_chunks[1],
+        EntryColumnParams {
+            title: format!(" 🌐 Subnets / CIDRs ({}) ", st.cidrs.len()),
+            input_title: " + Add CIDR / Subnet (Enter to add) ",
+            input_value: &st.cidr_input,
+            is_input_focused: st.focus == SplitTunnelFocus::CidrInput,
+            items: &st.cidrs,
+            selected_idx: st.selected_cidr,
+            is_list_focused: st.focus == SplitTunnelFocus::CidrList,
+            empty_label: "   (No subnets added)",
+        },
+        theme,
     );
-    frame.render_widget(cidr_input_widget, cidr_box_chunks[0]);
-
-    // CIDR List
-    let cidr_list_style = if st.focus == SplitTunnelFocus::CidrList {
-        theme.active_border
-    } else {
-        theme.border
-    };
-    let cidr_items: Vec<ListItem> = if st.cidrs.is_empty() {
-        vec![ListItem::new(Line::from(vec![Span::styled(
-            "   (No subnets added)",
-            theme.label_dim,
-        )]))]
-    } else {
-        st.cidrs
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                let is_sel = st.focus == SplitTunnelFocus::CidrList && idx == st.selected_cidr;
-                let line = Line::from(vec![
-                    Span::styled(
-                        if is_sel {
-                            SELECTED_POINTER
-                        } else {
-                            UNSELECTED_POINTER
-                        },
-                        theme.accent,
-                    ),
-                    Span::styled(
-                        c,
-                        if is_sel {
-                            theme.title
-                        } else {
-                            theme.text_secondary
-                        },
-                    ),
-                ]);
-                ListItem::new(line)
-            })
-            .collect()
-    };
-    let cidr_list_widget = List::new(cidr_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(cidr_list_style)
-            .title(format!(" 🌐 Subnets / CIDRs ({}) ", st.cidrs.len())),
-    );
-    frame.render_widget(cidr_list_widget, cidr_box_chunks[1]);
 
     // 3. Footer instructions
     let mut modal_keys = Vec::new();
@@ -1399,6 +1275,93 @@ fn render_split_tunnel_modal(
         .border_style(theme.active_border)
         .title(Span::styled(" Global Split Tunneling ", theme.title));
     frame.render_widget(outer_block, popup_area);
+}
+
+struct EntryColumnParams<'a> {
+    title: String,
+    input_title: &'static str,
+    input_value: &'a str,
+    is_input_focused: bool,
+    items: &'a [String],
+    selected_idx: usize,
+    is_list_focused: bool,
+    empty_label: &'static str,
+}
+
+fn render_entry_column(
+    frame: &mut Frame,
+    area: Rect,
+    params: EntryColumnParams<'_>,
+    theme: &crate::tui::theme::Theme,
+) {
+    let box_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(area);
+
+    let input_style = if params.is_input_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let input_widget = Paragraph::new(Line::from(vec![
+        Span::styled(params.input_value, theme.title),
+        Span::styled(if params.is_input_focused { "█" } else { "" }, theme.accent),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(input_style)
+            .title(params.input_title),
+    );
+    frame.render_widget(input_widget, box_chunks[0]);
+
+    let list_style = if params.is_list_focused {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let list_items: Vec<ListItem> = if params.items.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            params.empty_label,
+            theme.label_dim,
+        )]))]
+    } else {
+        params
+            .items
+            .iter()
+            .enumerate()
+            .map(|(idx, val)| {
+                let is_sel = params.is_list_focused && idx == params.selected_idx;
+                let line = Line::from(vec![
+                    Span::styled(
+                        if is_sel {
+                            SELECTED_POINTER
+                        } else {
+                            UNSELECTED_POINTER
+                        },
+                        theme.accent,
+                    ),
+                    Span::styled(
+                        val,
+                        if is_sel {
+                            theme.title
+                        } else {
+                            theme.text_secondary
+                        },
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect()
+    };
+    let list_widget = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(list_style)
+            .title(params.title),
+    );
+    frame.render_widget(list_widget, box_chunks[1]);
 }
 
 fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state: &TuiState) {

@@ -255,12 +255,14 @@ pub struct SplitTunnelModalState {
 }
 
 impl SplitTunnelModalState {
+    pub const MODES: [SplitTunnelMode; 3] = [
+        SplitTunnelMode::Disabled,
+        SplitTunnelMode::Include,
+        SplitTunnelMode::Exclude,
+    ];
+
     pub fn from_config(st: &SplitTunnelConfig) -> Self {
-        let highlighted_mode = match st.mode {
-            SplitTunnelMode::Disabled => 0,
-            SplitTunnelMode::Include => 1,
-            SplitTunnelMode::Exclude => 2,
-        };
+        let highlighted_mode = Self::MODES.iter().position(|&m| m == st.mode).unwrap_or(0);
         Self {
             mode: st.mode,
             highlighted_mode,
@@ -272,6 +274,10 @@ impl SplitTunnelModalState {
             selected_cidr: 0,
             selected_domain: 0,
         }
+    }
+
+    pub fn selected_highlighted_mode(&self) -> SplitTunnelMode {
+        Self::MODES[self.highlighted_mode.min(Self::MODES.len() - 1)]
     }
 
     pub fn to_config(&self) -> SplitTunnelConfig {

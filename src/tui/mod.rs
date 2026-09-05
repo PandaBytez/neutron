@@ -268,6 +268,9 @@ where
                 }
                 Err(err) => {
                     state.set_error(&err);
+                    if let Ok(persisted) = crate::config::load(&state.config_path) {
+                        state.config.global_split_tunnel = persisted.global_split_tunnel;
+                    }
                 }
             }
         }

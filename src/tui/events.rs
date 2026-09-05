@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::eligibility;
 use crate::app::sync;
-use crate::config::{self, SplitTunnelMode};
+use crate::config;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
 use crate::nm::{self, NmClient};
@@ -489,23 +489,11 @@ fn handle_split_tunnel_key<C: NmClient>(
             KeyCode::Right => st.move_right(),
             KeyCode::Up => st.move_up(),
             KeyCode::Down => st.move_down(),
-            KeyCode::Char(' ') if st.focus == SplitTunnelFocus::Mode => {
-                st.mode = match st.highlighted_mode {
-                    0 => SplitTunnelMode::Disabled,
-                    1 => SplitTunnelMode::Include,
-                    _ => SplitTunnelMode::Exclude,
-                };
+            KeyCode::Char(' ') | KeyCode::Enter if st.focus == SplitTunnelFocus::Mode => {
+                st.mode = st.selected_highlighted_mode();
                 should_apply_cfg = Some(st.to_config());
             }
             KeyCode::Enter => match st.focus {
-                SplitTunnelFocus::Mode => {
-                    st.mode = match st.highlighted_mode {
-                        0 => SplitTunnelMode::Disabled,
-                        1 => SplitTunnelMode::Include,
-                        _ => SplitTunnelMode::Exclude,
-                    };
-                    should_apply_cfg = Some(st.to_config());
-                }
                 SplitTunnelFocus::DomainInput => {
                     if let Some(domain) = nm::split_tunnel::normalize_domain(&st.domain_input) {
                         if !st.domains.contains(&domain) {
@@ -679,6 +667,7 @@ pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SplitTunnelMode;
     use crate::tui::state::CommandPaletteState;
 
     #[test]
