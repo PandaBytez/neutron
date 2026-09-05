@@ -3,3 +3,7 @@
 /build-dir
 /build-dir-appimage
 *.AppImage
+
+# Local tracking documents
+TODO.md
+BUGS.md
