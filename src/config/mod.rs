@@ -129,7 +129,7 @@ pub struct ThemeConfig {
 }
 
 fn default_theme_preset() -> String {
-    "osaka-jade".to_string()
+    "nord".to_string()
 }
 
 impl Default for ThemeConfig {
@@ -404,7 +404,7 @@ mod tests {
         assert!(loaded.excluded_profile_ids.is_empty());
         assert!(!loaded.kill_switch_enabled);
         assert!(!loaded.lockdown_enabled);
-        assert_eq!(loaded.theme.preset, "osaka-jade");
+        assert_eq!(loaded.theme.preset, "nord");
         cleanup(&path);
     }
 

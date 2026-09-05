@@ -956,7 +956,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.modal, ActiveModal::None);
-        assert_eq!(state.config.theme.preset, "catppuccin-mocha");
+        assert_eq!(state.config.theme.preset, "osaka-jade");
 
         crate::testing::remove_temp_config(&path);
     }

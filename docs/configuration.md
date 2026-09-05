@@ -72,16 +72,16 @@ excluded_profiles = [
 # Telemetry polling rate in milliseconds (handshake, transfer counters)
 refresh_interval_ms = 1000
 
-# Built-in theme preset: "osaka-jade" (default), "catppuccin", "nord", "gruvbox", "monochrome"
-theme = "osaka-jade"
+# Built-in theme preset: "nord" (default), "osaka-jade", "catppuccin", "gruvbox", "monochrome"
+theme = "nord"
 
 # Optional custom color overrides (accepts hex #rrggbb or standard color names)
 [tui.colors]
-active_border = "#2dd5b7"
-status_connected = "#63b07a"
-status_disconnected = "#ff5345"
-transfer_rx = "#acd4cf"
-transfer_tx = "#e5c736"
+active_border = "#88c0d0"
+status_connected = "#a3be8c"
+status_disconnected = "#bf616a"
+transfer_rx = "#81a1c1"
+transfer_tx = "#ebcb8b"
 
 # ==============================================================================
 # Port Forwarding (NAT-PMP)
@@ -118,9 +118,9 @@ Neutron features a built-in terminal theme engine with 5 carefully calibrated co
 
 | Theme | Description | Accent Colors | Best For |
 | :--- | :--- | :--- | :--- |
-| **`osaka-jade` (Default)** | Osaka Jade / Bamboo palette | Jade Cyan, Bamboo Green, Gold | Dark forest green aesthetic |
+| **`nord` (Default)** | Arctic, north-bluish clean palette | Frost Cyan, Polar Night Gray | Minimalist dark setups |
+| **`osaka-jade`** | Osaka Jade / Bamboo palette | Jade Cyan, Bamboo Green, Gold | Dark forest green aesthetic |
 | **`catppuccin`** | Soothing pastel palette (Mocha) | Mauve, Sapphire, Peach | Modern terminal setups |
-| **`nord`** | Arctic, north-bluish clean palette | Frost Cyan, Polar Night Gray | Minimalist dark setups |
 | **`gruvbox`** | Retro groove warm earthy palette | Warm Amber, Forest Green | Tiling window managers & vim users |
 | **`monochrome`** | High-compatibility black & white | High-contrast ASCII/ANSI | Minimal TTYs, serial consoles, 16-color terms |
 

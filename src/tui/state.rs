@@ -213,9 +213,9 @@ impl Default for ThemePickerState {
         Self {
             selected_index: 0,
             themes: vec![
+                ("nord", "Nord (Arctic Frost)"),
                 ("osaka-jade", "Osaka Jade"),
                 ("catppuccin-mocha", "Catppuccin Mocha"),
-                ("nord", "Nord (Arctic Frost)"),
                 ("gruvbox", "Gruvbox Dark"),
                 ("monochrome", "Monochrome (High-Contrast)"),
             ],
