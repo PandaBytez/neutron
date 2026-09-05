@@ -2,7 +2,7 @@
 
 A high-performance WireGuard manager for Linux built in Rust, utilizing NetworkManager as the underlying networking control plane.
 
-Branded as **Neutron VPN** (`io.gitlab.neutron_vpn.neutron`), distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
+Branded as **Neutron VPN** (`io.github.pandabytez.neutron`), distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
 
 ---
 
@@ -226,7 +226,7 @@ cargo test --test active_connection_policies
 - Profile import (GUI only) runs `nmcli connection import type wireguard file
   <path>`, so NetworkManager stays the single source of truth — no local copy of
   the `.conf` is kept.
-- The application binary is named **Neutron VPN** (`neutron-vpn`) with zero runtime shared library dependencies when compiled for the musl target.
+- The application binary is named **Neutron** (`neutron`) with zero runtime shared library dependencies when compiled for the musl target.
 
 ## Roadmap summary
 

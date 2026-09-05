@@ -13,7 +13,7 @@ use crate::error::AppResult;
 use crate::nm::NmClient;
 use crate::service::lease::QbitSyncStatus;
 
-pub const INDICATOR_BUS_NAME: &str = "io.gitlab.neutron_vpn.indicator";
+pub const INDICATOR_BUS_NAME: &str = "io.github.pandabytez.neutron.indicator";
 
 pub type ToolTipTuple = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
 pub type MenuLayoutResult<'a> = (u32, (i32, HashMap<String, Value<'a>>, Vec<Value<'a>>));

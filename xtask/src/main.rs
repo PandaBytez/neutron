@@ -44,7 +44,7 @@ fn print_help() {
           test-leaks, leak-tests      Run leak protection tests inside a Podman container\n  \
           container-shell, shell      Drop into an interactive shell inside the test container\n  \
           build-image                 Build/rebuild the neutron-sandbox container image\n  \
-          docs, build-docs            Build mdBook documentation for GitLab Pages\n  \
+          docs, build-docs            Build mdBook documentation for GitHub Pages\n  \
           lint                        Run cargo fmt and clippy with strict warnings\n\n\
         OPTIONS:\n  \
           --host-only                 Run only host tests (skip container)\n  \

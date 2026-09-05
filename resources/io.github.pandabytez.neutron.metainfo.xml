@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.gitlab.neutron_vpn.neutron</id>
+  <id>io.github.pandabytez.neutron</id>
   <name>Neutron VPN</name>
   <summary>Manage VPN connections with NetworkManager</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
-  <developer id="io.gitlab.neutron_vpn">
+  <developer id="io.github.pandabytez">
     <name>Neutron VPN</name>
   </developer>
   <description>
@@ -23,7 +23,7 @@
       <li>Enable an always-on lockdown firewall that blocks all non-VPN traffic, even while disconnected</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.gitlab.neutron_vpn.neutron.desktop</launchable>
+  <launchable type="desktop-id">io.github.pandabytez.neutron.desktop</launchable>
   <url type="homepage">https://github.com/PandaBytez/neutron</url>
   <url type="bugtracker">https://github.com/PandaBytez/neutron/issues</url>
   <url type="vcs-browser">https://github.com/PandaBytez/neutron</url>

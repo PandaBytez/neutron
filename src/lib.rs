@@ -1,4 +1,4 @@
-pub const APP_ID: &str = "io.gitlab.neutron_vpn.neutron";
+pub const APP_ID: &str = "io.github.pandabytez.neutron";
 pub const APP_NAME: &str = "Neutron";
 
 pub mod app;

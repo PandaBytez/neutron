@@ -61,7 +61,7 @@ Neutron VPN is designed with a strictly decoupled architecture where all network
 
 ### 5. `service/` — Boot-Time Automation
 - Implements the one-shot random profile selector for login / boot.
-- Manages XDG desktop autostart entries (`~/.config/autostart/io.gitlab.neutron_vpn.neutron.desktop`).
+- Manages XDG desktop autostart entries (`~/.config/autostart/io.github.pandabytez.neutron.desktop`).
 - Prevents immediate profile repeats and respects user-defined eligibility exclusion sets.
 
 ---
