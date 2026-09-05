@@ -1,6 +1,6 @@
 [Unit]
 Description=Neutron VPN startup random profile selector
-Documentation=https://gitlab.com/neutron-vpn/neutron
+Documentation=https://github.com/PandaBytez/neutron
 
 # OPTIONAL. Boot-time connection does not need this unit: the app arms exactly
 # one profile with `connection.autoconnect`, and NetworkManager brings it up at

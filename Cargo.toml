@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Fast, lightweight WireGuard manager via NetworkManager"
+repository = "https://github.com/PandaBytez/neutron"
+homepage = "https://github.com/PandaBytez/neutron"
 
 [workspace]
 members = [

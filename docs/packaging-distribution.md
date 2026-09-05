@@ -21,8 +21,8 @@ Sample formula for custom tap (`brew tap pandabytez/neutron-vpn`):
 ```ruby
 class NeutronVpn < Formula
   desc "WireGuard profile manager via NetworkManager"
-  homepage "https://gitlab.com/neutron-vpn/neutron"
-  url "https://gitlab.com/neutron-vpn/neutron/-/archive/v0.1.0/neutron-0.1.0.tar.gz"
+  homepage "https://github.com/PandaBytez/neutron"
+  url "https://github.com/PandaBytez/neutron/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "<checksum>"
   license "GPL-3.0-or-later"
 
@@ -65,10 +65,10 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="High-performance WireGuard manager via NetworkManager"
 arch=('x86_64' 'aarch64')
-url="https://gitlab.com/neutron-vpn/neutron"
+url="https://github.com/PandaBytez/neutron"
 license=('GPL-3.0-or-later')
 depends=('networkmanager')
-source_x86_64=("https://gitlab.com/neutron-vpn/neutron/releases/download/v${pkgver}/neutron-vpn-linux-amd64.tar.gz")
+source_x86_64=("https://github.com/PandaBytez/neutron/releases/download/v${pkgver}/neutron-vpn-linux-amd64.tar.gz")
 sha256sums_x86_64=('SKIP')
 
 package() {

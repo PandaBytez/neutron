@@ -24,9 +24,9 @@
     </ul>
   </description>
   <launchable type="desktop-id">io.gitlab.neutron_vpn.neutron.desktop</launchable>
-  <url type="homepage">https://gitlab.com/neutron-vpn/neutron</url>
-  <url type="bugtracker">https://gitlab.com/neutron-vpn/neutron/-/issues</url>
-  <url type="vcs-browser">https://gitlab.com/neutron-vpn/neutron</url>
+  <url type="homepage">https://github.com/PandaBytez/neutron</url>
+  <url type="bugtracker">https://github.com/PandaBytez/neutron/issues</url>
+  <url type="vcs-browser">https://github.com/PandaBytez/neutron</url>
   <screenshots>
     <screenshot type="default">
       <image>https://gitlab.com/neutron-vpn/neutron/-/raw/v0.1.0/screenshots/Main-page.png</image>

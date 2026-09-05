@@ -10,8 +10,8 @@ src = "docs"
 build-dir = "public"
 
 [output.html]
-git-repository-url = "https://gitlab.com/neutron0/neutron"
-edit-url-template = "https://gitlab.com/neutron0/neutron/-/edit/main/docs/{path}"
+git-repository-url = "https://github.com/PandaBytez/neutron"
+edit-url-template = "https://github.com/PandaBytez/neutron/edit/main/docs/{path}"
 default-theme = "rust"
 preferred-dark-theme = "navy"
 site-url = "/neutron/"
