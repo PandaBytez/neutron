@@ -274,3 +274,100 @@ fn switching_profiles_pins_routing_on_the_new_target() {
 
     testing::remove_temp_config(&path);
 }
+
+#[test]
+fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "neutron-import-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = sandbox.join("neutron");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+
+    let mut config = AppConfig::default();
+    config.kill_switch_enabled = true;
+    config.global_split_tunnel = SplitTunnelConfig {
+        mode: SplitTunnelMode::Include,
+        cidrs: vec!["10.0.0.0/8".to_string()],
+        domains: Vec::new(),
+    };
+    config::save(&config_path, &config).expect("config should save");
+
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
+
+    let client = MockNmClient::new(vec![]);
+    client
+        .import_wireguard_profile(std::path::Path::new("/tmp/wg-imported.conf"))
+        .expect("import should succeed");
+
+    assert_eq!(
+        client
+            .setting("uuid-wg-imported", "connection.autoconnect")
+            .as_deref(),
+        Some("no"),
+        "importing must disable autoconnect so selector manages startup"
+    );
+    assert_eq!(
+        client
+            .setting("uuid-wg-imported", "ipv4.dns-priority")
+            .as_deref(),
+        Some("-1500"),
+        "importing must inherit active global kill switch setting"
+    );
+    assert_eq!(
+        client
+            .setting("uuid-wg-imported", "ipv4.never-default")
+            .as_deref(),
+        Some("yes"),
+        "importing must inherit active global split tunnel configuration"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "neutron-activate-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = sandbox.join("neutron");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+
+    let mut config = AppConfig::default();
+    config.kill_switch_enabled = true;
+    config.global_split_tunnel = SplitTunnelConfig {
+        mode: SplitTunnelMode::Exclude,
+        cidrs: vec!["192.168.1.0/24".to_string()],
+        domains: Vec::new(),
+    };
+    config::save(&config_path, &config).expect("config should save");
+
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
+
+    let client = MockNmClient::new(vec![profile("wg-raw", "uuid-raw", ProfileState::Inactive)]);
+    client.connect("uuid-raw").expect("connect should succeed");
+
+    assert_eq!(
+        client.setting("uuid-raw", "ipv4.dns-priority").as_deref(),
+        Some("-1500"),
+        "connecting must apply global kill switch to previously unconfigured profile"
+    );
+    assert_eq!(
+        client.setting("uuid-raw", "ipv4.never-default").as_deref(),
+        Some("yes"),
+        "connecting must apply global split tunnel routing to profile"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

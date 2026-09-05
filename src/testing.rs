@@ -184,6 +184,8 @@ pub struct MockNmClient {
     lockdown_calls: Arc<Mutex<Vec<String>>>,
     split_tunnel_calls: Arc<Mutex<Vec<String>>>,
     imported: Arc<Mutex<Vec<String>>>,
+    extra_profiles: Arc<Mutex<Vec<WireguardProfile>>>,
+    deleted: Arc<Mutex<HashSet<String>>>,
     /// Simulated NetworkManager profile settings, keyed by UUID then property.
     ///
     /// Populated by replaying the *real* `nmcli` argument builders, so a test
@@ -233,12 +235,7 @@ impl MockNmClient {
     where
         F: Fn(&str) -> Vec<String>,
     {
-        for uuid in self
-            .profiles
-            .iter()
-            .map(|profile| profile.uuid.clone())
-            .collect::<Vec<_>>()
-        {
+        for uuid in self.uuids() {
             self.apply_args(&build(&uuid));
         }
     }
@@ -269,8 +266,12 @@ impl MockNmClient {
 
     /// Every profile UUID the mock knows about.
     pub fn uuids(&self) -> Vec<String> {
+        let deleted = self.deleted.lock().expect("mock mutex poisoned");
+        let extra = self.extra_profiles.lock().expect("mock mutex poisoned");
         self.profiles
             .iter()
+            .chain(extra.iter())
+            .filter(|profile| !deleted.contains(&profile.uuid))
             .map(|profile| profile.uuid.clone())
             .collect()
     }
@@ -448,9 +449,13 @@ impl NmClient for MockNmClient {
             return Err(AppError::CommandFailed("simulated".to_string()));
         }
         let active = self.active_uuids();
+        let deleted = self.deleted.lock().expect("mock mutex poisoned");
+        let extra = self.extra_profiles.lock().expect("mock mutex poisoned");
         Ok(self
             .profiles
             .iter()
+            .chain(extra.iter())
+            .filter(|profile| !deleted.contains(&profile.uuid))
             .map(|profile| WireguardProfile {
                 state: if active.contains(&profile.uuid) {
                     ProfileState::Active
@@ -473,11 +478,35 @@ impl NmClient for MockNmClient {
         }
 
         // Mirrors the real client: routing is pinned immediately before the
-        // profile is brought up.
+        // profile is brought up, along with active kill switch and split tunnel policies.
         self.apply_args(&crate::nm::tunnel_routing::set_args(
             profile_identifier,
             true,
         ));
+        if let Ok(config_path) = crate::config::default_config_path()
+            && let Ok(app_cfg) = crate::config::load(&config_path)
+        {
+            if app_cfg.kill_switch_enabled {
+                self.apply_args(&crate::nm::kill_switch::set_args(
+                    profile_identifier,
+                    true,
+                    true,
+                ));
+            }
+            if app_cfg.global_split_tunnel.mode.is_enabled() {
+                let (v4, v6) = crate::nm::split_tunnel::routes_for(
+                    app_cfg.global_split_tunnel.mode,
+                    &app_cfg.global_split_tunnel.cidrs,
+                    &app_cfg.global_split_tunnel.domains,
+                );
+                self.apply_args(&crate::nm::split_tunnel::set_args(
+                    profile_identifier,
+                    app_cfg.global_split_tunnel.mode,
+                    &v4,
+                    &v6,
+                ));
+            }
+        }
         if self.unhealthy {
             // As the real client does: the tunnel came up but carries no
             // traffic, so it is rolled back rather than left black-holing.
@@ -517,6 +546,30 @@ impl NmClient for MockNmClient {
             profile_identifier,
             true,
         ));
+        if let Ok(config_path) = crate::config::default_config_path()
+            && let Ok(app_cfg) = crate::config::load(&config_path)
+        {
+            if app_cfg.kill_switch_enabled {
+                self.apply_args(&crate::nm::kill_switch::set_args(
+                    profile_identifier,
+                    true,
+                    true,
+                ));
+            }
+            if app_cfg.global_split_tunnel.mode.is_enabled() {
+                let (v4, v6) = crate::nm::split_tunnel::routes_for(
+                    app_cfg.global_split_tunnel.mode,
+                    &app_cfg.global_split_tunnel.cidrs,
+                    &app_cfg.global_split_tunnel.domains,
+                );
+                self.apply_args(&crate::nm::split_tunnel::set_args(
+                    profile_identifier,
+                    app_cfg.global_split_tunnel.mode,
+                    &v4,
+                    &v6,
+                ));
+            }
+        }
         if self.unhealthy {
             return Err(AppError::TunnelUnhealthy(format!(
                 "{profile_identifier}: connected but no traffic is passing"
@@ -573,6 +626,50 @@ impl NmClient for MockNmClient {
                 path.display()
             )));
         }
+
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported");
+        let uuid = format!("uuid-{stem}");
+
+        let profile = WireguardProfile {
+            name: stem.to_string(),
+            uuid: uuid.clone(),
+            state: ProfileState::Inactive,
+        };
+        self.extra_profiles
+            .lock()
+            .expect("mock mutex poisoned")
+            .push(profile);
+
+        // NetworkManager imports enable autoconnect by default, so Neutron
+        // disables it immediately so startup-random works.
+        self.apply_args(&crate::nm::autoconnect::set_args(&uuid, false));
+
+        // When imported while global security settings are active, the new profile
+        // immediately inherits kill switch and split-tunnel settings.
+        if let Ok(config_path) = crate::config::default_config_path()
+            && let Ok(app_cfg) = crate::config::load(&config_path)
+        {
+            if app_cfg.kill_switch_enabled {
+                self.apply_args(&crate::nm::kill_switch::set_args(&uuid, true, true));
+            }
+            if app_cfg.global_split_tunnel.mode.is_enabled() {
+                let (v4, v6) = crate::nm::split_tunnel::routes_for(
+                    app_cfg.global_split_tunnel.mode,
+                    &app_cfg.global_split_tunnel.cidrs,
+                    &app_cfg.global_split_tunnel.domains,
+                );
+                self.apply_args(&crate::nm::split_tunnel::set_args(
+                    &uuid,
+                    app_cfg.global_split_tunnel.mode,
+                    &v4,
+                    &v6,
+                ));
+            }
+        }
+
         Ok(format!("Imported {}", path.display()))
     }
 
@@ -615,6 +712,22 @@ impl NmClient for MockNmClient {
 
     fn delete_profile(&self, uuid: &str) -> AppResult<()> {
         record(&self.calls, format!("delete:{}", uuid));
+        self.deleted
+            .lock()
+            .expect("mock mutex poisoned")
+            .insert(uuid.to_string());
+        self.active
+            .lock()
+            .expect("mock mutex poisoned")
+            .retain(|u| u != uuid);
+        self.settings
+            .lock()
+            .expect("mock mutex poisoned")
+            .remove(uuid);
+        self.extra_profiles
+            .lock()
+            .expect("mock mutex poisoned")
+            .retain(|p| p.uuid != uuid);
         Ok(())
     }
 
