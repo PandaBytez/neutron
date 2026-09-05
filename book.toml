@@ -12,6 +12,6 @@ build-dir = "public"
 [output.html]
 git-repository-url = "https://github.com/PandaBytez/neutron"
 edit-url-template = "https://github.com/PandaBytez/neutron/edit/main/docs/{path}"
-default-theme = "rust"
-preferred-dark-theme = "navy"
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
 site-url = "/neutron/"

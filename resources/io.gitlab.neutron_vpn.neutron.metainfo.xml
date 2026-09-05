@@ -29,15 +29,15 @@
   <url type="vcs-browser">https://github.com/PandaBytez/neutron</url>
   <screenshots>
     <screenshot type="default">
-      <image>https://gitlab.com/neutron-vpn/neutron/-/raw/v0.1.0/screenshots/Main-page.png</image>
+      <image>https://raw.githubusercontent.com/PandaBytez/neutron/v0.1.0/screenshots/Main-page.png</image>
       <caption>Manage and switch between WireGuard profiles</caption>
     </screenshot>
     <screenshot>
-      <image>https://gitlab.com/neutron-vpn/neutron/-/raw/v0.1.0/screenshots/Import-page.png</image>
+      <image>https://raw.githubusercontent.com/PandaBytez/neutron/v0.1.0/screenshots/Import-page.png</image>
       <caption>Import a profile from a provider or a file</caption>
     </screenshot>
     <screenshot>
-      <image>https://gitlab.com/neutron-vpn/neutron/-/raw/v0.1.0/screenshots/Startup-dropdown.png</image>
+      <image>https://raw.githubusercontent.com/PandaBytez/neutron/v0.1.0/screenshots/Startup-dropdown.png</image>
       <caption>Choose what connects at startup</caption>
     </screenshot>
   </screenshots>
