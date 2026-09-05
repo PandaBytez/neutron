@@ -14,26 +14,28 @@ Neutron VPN is designed for easy distribution across all major Linux packaging e
 
 ---
 
-## 1. Homebrew Tap Formula (`Formula/neutron-vpn.rb`)
+## 1. Homebrew Tap Formula (`Formula/neutron.rb`)
 
-Sample formula for custom tap (`brew tap pandabytez/neutron-vpn`):
+Sample formula for custom tap (`brew tap pandabytez/tap`):
 
 ```ruby
-class NeutronVpn < Formula
-  desc "WireGuard profile manager via NetworkManager"
+class Neutron < Formula
+  desc "Fast WireGuard profile manager via NetworkManager"
   homepage "https://github.com/PandaBytez/neutron"
   url "https://github.com/PandaBytez/neutron/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "<checksum>"
   license "GPL-3.0-or-later"
 
   depends_on "rust" => :build
+  depends_on :linux
 
   def install
-    system "cargo", "install", *std_cargo_args(path: ".")
+    system "cargo", "install", *std_cargo_args
+    bin.install_symlink "neutron" => "neutron-vpn"
   end
 
   test do
-    assert_match "Neutron VPN", shell_output("#{bin}/neutron-vpn --help")
+    assert_match "Neutron", shell_output("#{bin}/neutron --help")
   end
 end
 ```
