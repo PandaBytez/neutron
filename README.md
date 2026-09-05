@@ -93,13 +93,11 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-### Boot Automation (Systemd User Service)
+### Auto-Connect at Login
 
-Install the optional user service to re-randomize candidate profiles at every desktop login:
+Auto-connect is built directly into Neutron: press **`a`** in the TUI (or set `autoconnect_at_login = true` in `config.toml`) to automatically connect an eligible WireGuard profile at desktop login.
 
-```bash
-cat systemd/README.md
-```
+For headless servers without an XDG desktop environment, an optional user service is provided in [`systemd/`](systemd/).
 
 ---
 
