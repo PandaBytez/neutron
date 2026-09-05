@@ -8,11 +8,12 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragr
 
 use crate::config::SplitTunnelMode;
 use crate::nm::network_info::format_speed;
+#[cfg(feature = "qbittorrent")]
+use crate::service::lease::QbitSyncStatus;
 use crate::tui::state::{
     ActiveModal, CommandPaletteState, SplitTunnelFocus, SplitTunnelModalState, ThemePickerState,
     TuiState,
 };
-
 pub const MIN_WIDTH: u16 = 120;
 pub const MIN_HEIGHT: u16 = 30;
 
@@ -147,18 +148,24 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
 
     let status_badge = Span::styled(status_text, status_style);
 
-    // Dedicated Forwarded Port field (clean text, with icon)
-    let (port_label, port_val, port_val_style) = if let Some(port) = state.active_port {
-        ("🔌 Port: ", format!("{port}"), theme.accent)
+    // Dedicated Forwarded Port field (clean text, with icon).
+    //
+    // The port comes from the tray daemon, which owns the lease. When it is not
+    // publishing one there is nothing renewing a port, so that is reported as
+    // its own state rather than as a bare "N/A" -- otherwise a stopped daemon
+    // looks like a provider that does not offer port forwarding.
+    let (port_val, port_val_style) = if let Some(port) = state.forwarded_port() {
+        (format!("{port}"), theme.accent)
+    } else if !state.config.port_forwarding.enabled {
+        ("Disabled".to_string(), theme.label_dim)
+    } else if state.lease.is_none() {
+        ("No daemon".to_string(), theme.warning)
     } else if state.active_profile_name.is_some() {
-        if !state.config.port_forwarding.enabled {
-            ("🔌 Port: ", "Disabled".to_string(), theme.label_dim)
-        } else {
-            ("🔌 Port: ", "N/A".to_string(), theme.label_dim)
-        }
+        ("N/A".to_string(), theme.label_dim)
     } else {
-        ("🔌 Port: ", "--".to_string(), theme.label_dim)
+        ("--".to_string(), theme.label_dim)
     };
+    let port_label = "🔌 Port: ";
 
     // Latency & Speed counters
     let latency_text = if state.connecting.is_some() {
@@ -200,13 +207,15 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         .as_ref()
         .and_then(|i| i.tunnel_dns.as_deref())
         .unwrap_or("N/A");
-    let line3 = Line::from(vec![
+    let mut line3 = vec![
         Span::styled(" DNS:       ", theme.label_dim),
         Span::styled(dns_text, theme.accent),
-        Span::raw("    "),
+        Span::raw("  "),
         Span::styled(port_label, theme.label_dim),
         Span::styled(port_val, port_val_style),
-    ]);
+    ];
+    line3.extend(qbit_sync_badge(state));
+    let line3 = Line::from(line3);
 
     let status_widget = Paragraph::new(vec![line1, line2, line3])
         .wrap(Wrap { trim: true })
@@ -219,6 +228,39 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         );
 
     frame.render_widget(status_widget, area);
+}
+
+/// The qBittorrent port-sync badge for the status line, or nothing at all when
+/// the integration is switched off -- it only describes that one feature, so it
+/// would be noise for everyone who does not use it.
+///
+/// Styled with the same pills as the connection badge so it reads as live state
+/// rather than as another static label.
+#[cfg(feature = "qbittorrent")]
+fn qbit_sync_badge(state: &TuiState) -> Vec<Span<'static>> {
+    if !state.config.qbittorrent.enabled {
+        return Vec::new();
+    }
+
+    let theme = &state.theme;
+    let (label, style) = match state.qbit_sync() {
+        Some(QbitSyncStatus::Synchronized) => {
+            (" qBittorrent: Synced ", theme.status_pill_connected)
+        }
+        Some(QbitSyncStatus::Failed) => (" qBittorrent: Failed ", theme.status_pill_disconnected),
+        Some(QbitSyncStatus::Pending) => (" qBittorrent: Pending ", theme.status_pill_disconnected),
+        // The daemon performs the push, so without it there is no verdict to
+        // report -- distinct from having pushed and failed.
+        None => (" qBittorrent: No daemon ", theme.status_pill_disconnected),
+    };
+
+    vec![Span::raw("  "), Span::styled(label, style)]
+}
+
+/// No badge when the `qbittorrent` feature is compiled out.
+#[cfg(not(feature = "qbittorrent"))]
+fn qbit_sync_badge(_: &TuiState) -> Vec<Span<'static>> {
+    Vec::new()
 }
 
 fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -496,7 +538,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
                 ]));
             }
 
-            if let Some(port) = state.active_port {
+            if let Some(port) = state.forwarded_port() {
                 lines.push(Line::from(vec![
                     Span::styled("NAT-PMP Port:  ", theme.label_dim),
                     Span::styled(format!("{port} (Leased & Auto-Renewing)"), theme.keybinding),
@@ -1431,31 +1473,45 @@ mod render_tests {
         );
     }
 
-    #[test]
-    fn the_status_panel_shows_forwarded_port_with_icon() {
-        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
-        state.active_profile_name = Some("wg-us".to_string());
-        state.active_port = Some(51820);
-        state.latency_ms = Some(42);
+    /// Render just the status panel and return it as one plain string.
+    fn rendered_status(state: &TuiState) -> String {
+        rendered_status_at(state, 78)
+    }
 
+    /// [`rendered_status`] at an explicit panel width, for the cases where the
+    /// width is the thing under test.
+    fn rendered_status_at(state: &TuiState, width: u16) -> String {
         let mut terminal =
-            Terminal::new(TestBackend::new(78, 5)).expect("test terminal should build");
+            Terminal::new(TestBackend::new(width, 5)).expect("test terminal should build");
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_status_panel(frame, area, &state);
+                render_status_panel(frame, area, state);
             })
             .expect("draw should succeed");
 
         let buffer = terminal.backend().buffer().clone();
-        let rendered = (0..buffer.area.height)
+        (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<String>>()
-            .join("\n");
+            .join("\n")
+    }
+
+    #[test]
+    fn the_status_panel_shows_forwarded_port_with_icon() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.active_profile_name = Some("wg-us".to_string());
+        state.lease = Some(crate::service::lease::LeaseState {
+            port: Some(51820),
+            ..Default::default()
+        });
+        state.latency_ms = Some(42);
+
+        let rendered = rendered_status(&state);
 
         assert!(
             rendered.contains('🔌') && rendered.contains("Port:") && rendered.contains("51820"),
@@ -1469,6 +1525,146 @@ mod render_tests {
             rendered.contains("Public IP:") && rendered.contains("DNS:"),
             "status panel must render public IP and DNS labels: {rendered}"
         );
+    }
+
+    #[cfg(feature = "qbittorrent")]
+    mod qbittorrent_badge {
+        use super::*;
+        use crate::service::lease::{LeaseState, QbitSyncStatus};
+
+        /// A connected tunnel whose lease the daemon is publishing, with
+        /// qBittorrent sync switched on.
+        fn synced_state(status: QbitSyncStatus) -> TuiState {
+            let mut state = state_without_daemon();
+            state.lease = Some(LeaseState {
+                port: Some(51820),
+                profile_uuid: Some("uuid-us".to_string()),
+                qbit_sync: status,
+                ..Default::default()
+            });
+            state
+        }
+
+        /// The same tunnel, but with no daemon publishing a lease.
+        fn state_without_daemon() -> TuiState {
+            let mut config = AppConfig::default();
+            config.qbittorrent.enabled = true;
+            config.port_forwarding.enabled = true;
+
+            let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
+            state.active_profile_name = Some("wg-us".to_string());
+            state
+        }
+
+        #[test]
+        fn the_badge_is_hidden_while_the_integration_is_switched_off() {
+            // It describes one optional integration, so leaving it on screen for
+            // everyone who does not use it would be noise -- and would read as a
+            // failure, since nothing is ever synced.
+            let mut state = synced_state(QbitSyncStatus::Synchronized);
+            state.config.qbittorrent.enabled = false;
+
+            let rendered = rendered_status(&state);
+
+            assert!(
+                !rendered.contains("qBittorrent"),
+                "badge must stay hidden when auto-sync is off: {rendered}"
+            );
+        }
+
+        #[test]
+        fn the_badge_reports_a_lease_that_reached_qbittorrent() {
+            let rendered = rendered_status(&synced_state(QbitSyncStatus::Synchronized));
+
+            assert!(
+                rendered.contains("qBittorrent: Synced"),
+                "badge must report the synchronized lease: {rendered}"
+            );
+        }
+
+        #[test]
+        fn the_badge_reports_a_rejected_push() {
+            let rendered = rendered_status(&synced_state(QbitSyncStatus::Failed));
+
+            assert!(
+                rendered.contains("qBittorrent: Failed"),
+                "badge must report the failure: {rendered}"
+            );
+        }
+
+        #[test]
+        fn the_badge_shares_the_connection_status_highlight() {
+            // The badge is meant to read as live state, like the Connected pill,
+            // rather than as another static label sitting next to it.
+            let theme = &synced_state(QbitSyncStatus::Pending).theme;
+            let connected = theme.status_pill_connected;
+            let disconnected = theme.status_pill_disconnected;
+
+            let styled = |status| {
+                qbit_sync_badge(&synced_state(status))
+                    .into_iter()
+                    .map(|span| span.style)
+                    .collect::<Vec<_>>()
+            };
+
+            assert!(styled(QbitSyncStatus::Synchronized).contains(&connected));
+            assert!(styled(QbitSyncStatus::Failed).contains(&disconnected));
+            assert!(styled(QbitSyncStatus::Pending).contains(&disconnected));
+        }
+
+        #[test]
+        fn without_a_daemon_the_badge_says_so_rather_than_reporting_a_failure() {
+            // The daemon performs the push, so with no daemon there is no
+            // verdict. Showing "Failed" would blame qBittorrent for a service
+            // that was never asked, and "Synced" would be a plain lie.
+            let rendered = rendered_status(&state_without_daemon());
+
+            assert!(
+                rendered.contains("qBittorrent: No daemon"),
+                "an absent daemon must be named as such: {rendered}"
+            );
+        }
+
+        #[test]
+        fn without_a_daemon_the_port_is_not_shown_as_unsupported() {
+            // A stopped daemon and a provider that offers no port forwarding are
+            // different problems with different fixes, so they must not both
+            // render as "N/A".
+            let rendered = rendered_status(&state_without_daemon());
+
+            assert!(
+                rendered.contains("No daemon"),
+                "the port field must distinguish a stopped daemon: {rendered}"
+            );
+        }
+
+        #[test]
+        fn the_status_line_still_fits_the_minimum_terminal_width() {
+            // The badge shares a line with DNS and the forwarded port. The status
+            // panel gets 52% of the window, so at MIN_WIDTH the three together
+            // have ~60 columns; overflowing wraps onto a fourth line that the
+            // 5-row header clips, which would silently drop the badge entirely.
+            let mut state = synced_state(QbitSyncStatus::Failed);
+            state.selected_info = Some(crate::tui::state::CachedProfileInfo {
+                tunnel_dns: Some("10.2.0.1".to_string()),
+                ..Default::default()
+            });
+
+            let rendered = rendered_status_at(&state, MIN_WIDTH * 52 / 100);
+
+            assert!(
+                rendered.contains("DNS:") && rendered.contains("10.2.0.1"),
+                "DNS must survive at the minimum width: {rendered}"
+            );
+            assert!(
+                rendered.contains("51820"),
+                "the forwarded port must survive at the minimum width: {rendered}"
+            );
+            assert!(
+                rendered.contains("qBittorrent: Failed"),
+                "the badge must survive at the minimum width: {rendered}"
+            );
+        }
     }
 
     #[test]

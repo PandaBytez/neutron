@@ -71,6 +71,9 @@ where
         let _ = crate::app::sync::sync_profiles_dir(&client, &state.config);
     }
     let _ = events::reload_profiles(&mut state, &client);
+    // Read once up front so the first frame shows the daemon's lease rather than
+    // reporting it missing until the first periodic tick.
+    events::refresh_lease(&mut state);
 
     // Initial focus on active profile (or index 0) once at TUI startup
     if let Some(active_idx) = state.rows.iter().position(|r| r.is_active) {
@@ -234,6 +237,12 @@ where
         // Periodically refresh active profile diagnostics / total data every 1.5s in sync with throughput rates
         if last_diag_sample.elapsed() >= Duration::from_millis(1500) {
             last_diag_sample = std::time::Instant::now();
+
+            // The lease is renewed on the daemon's own clock, not in response to
+            // anything NetworkManager reports, so it has to be re-read on a tick
+            // rather than only when the profile list changes.
+            events::refresh_lease(state);
+
             if let Some((uuid, _, true)) = state.selected_identity() {
                 state.profile_cache.remove(&uuid);
                 events::update_diagnostics(state, client);

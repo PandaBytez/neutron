@@ -264,11 +264,9 @@ pub fn execute_action<C: ActionClient>(
             config::save(&state.config_path, &app_cfg)?;
             state.config.port_forwarding.enabled = enable;
 
-            // The lease belongs to a tunnel, not to the toggle. Forgetting which
-            // tunnel owns it makes the reload re-evaluate: it asks the gateway
-            // for a port when this turned forwarding on, and drops the port it
-            // is showing when this turned it off.
-            state.active_port_uuid = None;
+            // Nothing local to drop: the daemon owns the lease and picks the
+            // new setting up on its next poll, which the periodic lease refresh
+            // then shows. Reloaded anyway so the rest of the view stays current.
             reload_profiles(state, client)?;
 
             state.set_status(format!("{} NAT-PMP Port Forwarding.", enabled_verb(enable)));
@@ -291,29 +289,45 @@ pub fn execute_action<C: ActionClient>(
         }
         #[cfg(feature = "qbittorrent")]
         "qbit_sync" => {
-            if let Some(port) = state.active_port {
-                let iface = state
-                    .selected_info
-                    .as_ref()
-                    .and_then(|info| info.diagnostics.interface_name.as_str().into());
-                let mut qclient = crate::portforward::qbittorrent::QBittorrentClient::new(
-                    &state.config.qbittorrent,
-                );
-                match qclient.sync_port(port, iface) {
-                    Ok(rep) => {
-                        state.set_status(format!(
-                            "qBittorrent synced: port {} applied.",
-                            rep.new_port
-                        ));
-                    }
-                    Err(err) => {
-                        state.set_status(format!("qBittorrent sync failed: {err}"));
+            // Both halves come from the daemon's lease: the port is only
+            // meaningful together with the tunnel it was obtained for, which is
+            // also what decides the interface qBittorrent binds to.
+            //
+            // Pushed straight away rather than by asking the daemon to do it,
+            // because the point of the action is an answer now. The badge keeps
+            // reporting the daemon's own verdict and converges on the next poll;
+            // the toast is what reports this push.
+            let lease = state
+                .lease
+                .as_ref()
+                .and_then(|lease| Some((lease.profile_uuid.clone()?, lease.port?)));
+
+            match lease {
+                Some((uuid, port)) => {
+                    match crate::app::qbittorrent::sync_port(
+                        client,
+                        &state.config.qbittorrent,
+                        &uuid,
+                        port,
+                    ) {
+                        Ok(report) => state.set_status(format!(
+                            "qBittorrent: synchronized port {}.",
+                            report.new_port
+                        )),
+                        Err(error) => state.set_error(&error),
                     }
                 }
-            } else {
-                state.set_status(
-                    "No forwarded port available (connect to a VPN with NAT-PMP first).",
-                );
+                // Distinguished, because the three causes have three different
+                // fixes and one message for all of them sends the user looking
+                // in the wrong place.
+                None if !state.config.port_forwarding.enabled => {
+                    state.set_status("No forwarded port: NAT-PMP port forwarding is off.")
+                }
+                None if state.lease.is_none() => {
+                    state.set_status("No forwarded port: the background daemon is not running.")
+                }
+                None => state
+                    .set_status("No forwarded port yet (connect to a VPN that offers NAT-PMP)."),
             }
         }
         #[cfg(feature = "qbittorrent")]
@@ -327,6 +341,8 @@ pub fn execute_action<C: ActionClient>(
                 "{} qBittorrent Port Forward Auto-Sync.",
                 enabled_verb(enable)
             ));
+            // No local verdict to reset: the daemon reads this setting on its
+            // next poll and republishes what it decides.
         }
         "delete" => {
             if let Some(row) = state.selected_row() {
@@ -553,28 +569,17 @@ fn remove_selected(list: &mut Vec<String>, selected: &mut usize) {
     *selected = (*selected).min(list.len().saturating_sub(1));
 }
 
-/// Push a newly leased forwarded port to qBittorrent.
+/// Re-read the forwarded-port lease the daemon publishes.
 ///
-/// Gated behind the `qbittorrent` feature: this fires automatically whenever the
-/// port changes, so a broken integration would reach out to a third-party Web
-/// API on every reconnect. Compiled out unless the feature is enabled.
-#[cfg(feature = "qbittorrent")]
-fn sync_qbittorrent_port<C: NmClient>(state: &TuiState, client: &C, uuid: &str, port: u16) {
-    if !state.config.qbittorrent.enabled {
-        return;
-    }
-    let interface = client
-        .get_profile_diagnostics(uuid, true)
-        .ok()
-        .map(|diagnostics| diagnostics.interface_name);
-    let mut qclient =
-        crate::portforward::qbittorrent::QBittorrentClient::new(&state.config.qbittorrent);
-    let _ = qclient.sync_port(port, interface.as_deref());
+/// The whole of the TUI's knowledge of the lease. Cheap enough to call on every
+/// tick: a small read from `$XDG_RUNTIME_DIR`, which is tmpfs.
+///
+/// A lease the daemon has stopped republishing reads as absent rather than as
+/// its last contents, so a daemon that died cannot leave the port on screen
+/// while nothing is renewing it.
+pub fn refresh_lease(state: &mut TuiState) {
+    state.lease = crate::service::lease::read();
 }
-
-/// No-op when the `qbittorrent` feature is disabled.
-#[cfg(not(feature = "qbittorrent"))]
-fn sync_qbittorrent_port<C: NmClient>(_: &TuiState, _: &C, _: &str, _: u16) {}
 
 /// Read everything the details pane shows for one profile.
 ///
@@ -613,34 +618,15 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
     );
     state.config = app_cfg;
 
-    let active = state.rows.iter().find(|row| row.is_active);
-    state.active_profile_name = active.map(|row| row.name.clone());
-
-    // Requesting a mapping is a blocking UDP round trip on the render thread,
-    // and `reload_profiles` runs on every NetworkManager event -- which arrive
-    // in bursts while a tunnel comes up. Only ask when the tunnel changed.
-    let active_uuid = active.map(|row| row.uuid.clone());
-    if state.config.port_forwarding.enabled {
-        if active_uuid != state.active_port_uuid {
-            let old_port = state.active_port;
-            state.active_port_uuid = active_uuid.clone();
-            state.active_port = active_uuid
-                .as_ref()
-                .and_then(|uuid| client.tunnel_address(uuid))
-                .as_deref()
-                .and_then(crate::portforward::port_for_tunnel_address);
-
-            if state.active_port != old_port
-                && let Some(port) = state.active_port
-                && let Some(ref uuid) = active_uuid
-            {
-                sync_qbittorrent_port(state, client, uuid, port);
-            }
-        }
-    } else {
-        state.active_port_uuid = None;
-        state.active_port = None;
-    }
+    // Both facts about the active row are taken in one pass so the borrow of
+    // `state.rows` ends here: everything below mutates `state` as a whole.
+    let (active_uuid, active_name) = state
+        .rows
+        .iter()
+        .find(|row| row.is_active)
+        .map(|row| (row.uuid.clone(), row.name.clone()))
+        .unzip();
+    state.active_profile_name = active_name;
 
     if state.selected_index >= state.rows.len() {
         state.selected_index = state.rows.len().saturating_sub(1);
@@ -648,7 +634,7 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
 
     // Drop the active profile's cache entry so its live transfer counters and
     // handshake time are re-read rather than served stale.
-    if let Some(uuid) = active.map(|row| row.uuid.clone()) {
+    if let Some(uuid) = active_uuid {
         state.profile_cache.remove(&uuid);
     }
 
@@ -735,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn toggling_port_forwarding_persists_and_drops_a_stale_lease() {
+    fn toggling_port_forwarding_persists() {
         let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
             "wg-eu",
             "uuid-eu",
@@ -756,13 +742,9 @@ mod tests {
             "the toggle must survive a restart, not just live in memory"
         );
 
-        // A port shown while the policy was on must not linger once it is off:
-        // it would advertise a mapping nothing is renewing any more.
-        state.active_port = Some(51820);
         execute_action(&mut state, &client, "port_forwarding").expect("toggle should succeed");
 
         assert!(!state.config.port_forwarding.enabled);
-        assert_eq!(state.active_port, None, "a stale lease must be cleared");
         assert!(
             !crate::config::load(&path)
                 .expect("config should load")
@@ -1124,5 +1106,103 @@ mod tests {
         );
 
         crate::testing::remove_temp_config(&path);
+    }
+}
+
+#[cfg(all(test, feature = "qbittorrent"))]
+mod qbittorrent_tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::service::lease::LeaseState;
+    use crate::testing::{
+        MockNmClient, MockQBittorrentWebUi, curl_available, temp_config_path,
+        unreachable_qbittorrent_url,
+    };
+
+    /// A TUI holding the daemon's lease, with qBittorrent pointed at `url`.
+    fn state_holding_lease(url: String) -> (TuiState, MockNmClient) {
+        let mut config = AppConfig::default();
+        config.qbittorrent.enabled = true;
+        config.qbittorrent.url = url;
+
+        let path = temp_config_path("tui-qbit");
+        crate::config::save(&path, &config).expect("config should save");
+
+        let mut state = TuiState::new(path, config);
+        state.lease = Some(LeaseState {
+            port: Some(51820),
+            profile_uuid: Some("uuid-eu".to_string()),
+            ..Default::default()
+        });
+
+        (state, MockNmClient::default())
+    }
+
+    #[test]
+    fn a_failed_manual_push_is_reported_as_an_error() {
+        let (mut state, client) = state_holding_lease(unreachable_qbittorrent_url());
+
+        execute_action(&mut state, &client, "qbit_sync").expect("action should not abort");
+
+        let toast = state.active_toast().expect("a failure must raise a toast");
+        assert!(
+            toast.is_error,
+            "a failed push must be styled as an error, not as a routine confirmation"
+        );
+    }
+
+    #[test]
+    fn an_accepted_manual_push_names_the_port_it_applied() {
+        if !curl_available() {
+            return;
+        }
+        let server = MockQBittorrentWebUi::start();
+        let (mut state, client) = state_holding_lease(server.url());
+
+        execute_action(&mut state, &client, "qbit_sync").expect("action should not abort");
+
+        let toast = state.active_toast().expect("a sync must raise a toast");
+        assert!(!toast.is_error);
+        assert!(
+            toast.message.contains("51820"),
+            "the toast must name the port that was applied: {}",
+            toast.message
+        );
+        assert!(
+            server.last_set_preferences().contains("51820"),
+            "the lease's port must be the one pushed"
+        );
+    }
+
+    #[test]
+    fn without_a_published_lease_nothing_is_pushed() {
+        // No daemon means no lease, and a port the TUI does not have is not one
+        // it can offer. It must say so rather than push something invented.
+        let (mut state, client) = state_holding_lease(unreachable_qbittorrent_url());
+        state.lease = None;
+
+        execute_action(&mut state, &client, "qbit_sync").expect("action should not abort");
+
+        assert!(state.status_message.contains("No forwarded port"));
+        assert!(
+            !state.status_is_error,
+            "having no lease is a normal state, not a failure"
+        );
+    }
+
+    #[test]
+    fn a_lease_without_a_port_is_not_pushed_either() {
+        // Port forwarding switched off: the daemon publishes a lease with no
+        // port rather than none at all.
+        let (mut state, client) = state_holding_lease(unreachable_qbittorrent_url());
+        state.lease = Some(LeaseState {
+            port: None,
+            profile_uuid: Some("uuid-eu".to_string()),
+            ..Default::default()
+        });
+
+        execute_action(&mut state, &client, "qbit_sync").expect("action should not abort");
+
+        assert!(state.status_message.contains("No forwarded port"));
     }
 }

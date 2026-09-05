@@ -6,6 +6,7 @@ use crate::app::profile_list::ProfileListRow;
 use crate::config::{AppConfig, SplitTunnelConfig, SplitTunnelMode};
 use crate::nm::ProfileDiagnostics;
 use crate::nm::network_info::PublicIpInfo;
+use crate::service::lease::{LeaseState, QbitSyncStatus};
 use crate::tui::theme::Theme;
 
 /// The index after `index`, wrapping to the start. Yields 0 for an empty list.
@@ -317,10 +318,15 @@ pub struct TuiState {
     pub selected_index: usize,
     pub selected_info: Option<CachedProfileInfo>,
     pub active_profile_name: Option<String>,
-    pub active_port: Option<u16>,
-    /// The profile [`Self::active_port`] was leased for, so the blocking NAT-PMP
-    /// round trip is only repeated when the tunnel actually changes.
-    pub active_port_uuid: Option<String>,
+    /// The forwarded-port lease as last published by the tray daemon, or `None`
+    /// when it is not publishing one.
+    ///
+    /// Read rather than obtained: the lease has a renewal timer, and the daemon
+    /// owns it because it outlives any TUI session. Asking the gateway here too
+    /// would race that timer, push a second copy at qBittorrent, and block the
+    /// render thread on a UDP round trip -- and still go stale, since the TUI
+    /// only learns of a tunnel change while it happens to be open.
+    pub lease: Option<LeaseState>,
     pub public_ip_info: Option<PublicIpInfo>,
     pub download_rate: u64,
     pub upload_rate: u64,
@@ -349,8 +355,7 @@ impl TuiState {
             selected_index: 0,
             selected_info: None,
             active_profile_name: None,
-            active_port: None,
-            active_port_uuid: None,
+            lease: None,
             public_ip_info: None,
             download_rate: 0,
             upload_rate: 0,
@@ -413,6 +418,21 @@ impl TuiState {
             Some(t) if t.created_at.elapsed() < std::time::Duration::from_secs(3) => Some(t),
             _ => None,
         }
+    }
+
+    /// The forwarded port the daemon currently holds, if any.
+    ///
+    /// `None` covers both "no lease" and "no daemon publishing one"; the two are
+    /// the same thing to a reader, since an unpublished lease is not being
+    /// renewed and so is not a port anyone can rely on.
+    pub fn forwarded_port(&self) -> Option<u16> {
+        self.lease.as_ref()?.port
+    }
+
+    /// What the daemon's last push to qBittorrent came to, or `None` when it is
+    /// not publishing a lease to have pushed.
+    pub fn qbit_sync(&self) -> Option<QbitSyncStatus> {
+        Some(self.lease.as_ref()?.qbit_sync)
     }
 
     pub fn selected_row(&self) -> Option<&ProfileListRow> {
