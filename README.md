@@ -2,7 +2,7 @@
 
 A high-performance WireGuard manager for Linux built in Rust, utilizing NetworkManager as the underlying networking control plane.
 
-Branded as **Neutron VPN** (`io.gitlab.neutron_vpn.neutron`), distributed as an **AppImage**, **Homebrew Formula**, and standalone static binaries.
+Branded as **Neutron VPN** (`io.gitlab.neutron_vpn.neutron`), distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
 
 ---
 
@@ -137,18 +137,15 @@ Install the optional user service for startup-random automation:
 cat systemd/README.md
 ```
 
-AppImage packaging:
-
-To build the standalone AppImage:
+Building & standalone installation:
 
 ```bash
-./appimage/build-appimage.sh
-```
+# Build release binary
+cargo build --release
 
-This compiles the release binary and packages it into `Neutron-VPN-<arch>.AppImage`. You can then run it directly:
-
-```bash
-./Neutron-VPN-x86_64.AppImage
+# Statically linked musl binary (zero dynamic dependencies)
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 Quality checks & task runner:
@@ -229,14 +226,12 @@ cargo test --test active_connection_policies
 - Profile import (GUI only) runs `nmcli connection import type wireguard file
   <path>`, so NetworkManager stays the single source of truth — no local copy of
   the `.conf` is kept.
-- Packaging is AppImage ready, and the desktop entry and AppStream
-  metainfo validate cleanly (`desktop-file-validate`, `appstreamcli validate`).
-  The application is named **Neutron VPN** (`neutron-vpn`).
+- The application binary is named **Neutron VPN** (`neutron-vpn`) with zero runtime shared library dependencies when compiled for the musl target.
 
 ## Roadmap summary
 
 1. MVP core: profile list + manual connect/switch
 2. Random-on-boot selector service (once per boot)
 3. UX hardening and failure recovery
-4. AppImage packaging
+4. Universal packaging & distribution (Homebrew, AUR, Static Musl)
 5. Advanced features (provider ingestion, kill-switch helper)

@@ -16,7 +16,7 @@ Neutron VPN is designed for easy distribution across all major Linux packaging e
 
 ## 1. Homebrew Tap Formula (`Formula/neutron-vpn.rb`)
 
-Sample formula for custom tap (`brew tap deffi/neutron-vpn`):
+Sample formula for custom tap (`brew tap pandabytez/neutron-vpn`):
 
 ```ruby
 class NeutronVpn < Formula
