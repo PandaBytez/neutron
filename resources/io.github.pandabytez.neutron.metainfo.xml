@@ -28,16 +28,16 @@
   <url type="vcs-browser">https://github.com/PandaBytez/neutron</url>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/PandaBytez/neutron/v0.1.0/screenshots/Main-page.png</image>
-      <caption>Manage and switch between WireGuard profiles</caption>
+      <image>https://raw.githubusercontent.com/PandaBytez/neutron/main/docs/screenshots/Neutron-Connected.png</image>
+      <caption>Manage and switch between WireGuard profiles with real-time telemetry</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/PandaBytez/neutron/v0.1.0/screenshots/Import-page.png</image>
-      <caption>Import a profile from a provider or a file</caption>
+      <image>https://raw.githubusercontent.com/PandaBytez/neutron/main/docs/screenshots/Neutron-Themes.png</image>
+      <caption>Interactive theme picker and calibrated color palettes</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/PandaBytez/neutron/v0.1.0/screenshots/Startup-dropdown.png</image>
-      <caption>Choose what connects at startup</caption>
+      <image>https://raw.githubusercontent.com/PandaBytez/neutron/main/docs/screenshots/Neutron-Tray.png</image>
+      <caption>Persistent system tray indicator with quick desktop actions</caption>
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1" />

@@ -5,6 +5,11 @@
   <small>ɴ ᴇ ᴛ ᴡ ᴏ ʀ ᴋ &nbsp; ᴍ ᴀ ɴ ᴀ ɢ ᴇ ʀ</small>
 </h1>
 
+<!--suppress HtmlDeprecatedAttribute -->
+<p align="center">
+  <img src="docs/screenshots/Neutron-Connected.png" alt="Neutron TUI - Active WireGuard Connection" width="850">
+</p>
+
 A lightweight, high-performance WireGuard manager for Linux built in Rust, utilizing NetworkManager as the underlying
 networking control plane. Designed to be minimal and resource-efficient, Neutron runs as a standalone ~3–5 MB binary
 with zero dynamic dependencies, uses only ~10–15 MB of RAM, idles at 0% CPU, and launches in under 10 ms.

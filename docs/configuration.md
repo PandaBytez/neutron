@@ -114,7 +114,9 @@ bind_interface = false
 
 ## Theming Engine
 
-Neutron features a built-in terminal theme engine with 5 carefully calibrated color palettes:
+Neutron features a built-in terminal theme engine with 5 carefully calibrated color palettes that can be toggled live via `Ctrl+T`:
+
+![Neutron Interactive Theme Picker](screenshots/Neutron-Themes.png)
 
 | Theme | Description | Accent Colors | Best For |
 | :--- | :--- | :--- | :--- |

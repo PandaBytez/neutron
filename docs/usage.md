@@ -18,6 +18,8 @@ neutron
 neutron tui
 ```
 
+![Neutron TUI - Active WireGuard Connection](screenshots/Neutron-Connected.png)
+
 ### TUI Screen Layout
 
 * **Header (Top):**
@@ -72,6 +74,14 @@ Pressing **`t`** opens the side-by-side Split Tunneling manager:
 ### Command Palette (`Ctrl+P` or `:`)
 
 Press **`Ctrl+P`** or **`:`** to open the Command Palette. Type any keyword (e.g. "kill", "split", "theme", "sync") to filter actions, then press `Enter` to execute.
+
+---
+
+### Theme Picker (`Ctrl+T`)
+
+Press **`Ctrl+T`** to switch between calibrated color palettes live without restarting the app:
+
+![Neutron Interactive Theme Picker](screenshots/Neutron-Themes.png)
 
 ---
 
@@ -166,7 +176,11 @@ neutron qbit disable
 neutron qbit config --url http://127.0.0.1:8080 --bind true
 ```
 
-### Background Daemon & Automation
+### System Tray AppIndicator & Background Daemon
+
+Neutron includes a pure-Rust D-Bus `StatusNotifierItem` and `DBusMenu` system tray indicator (`src/service/indicator.rs` via `zbus`) that monitors link health and provides quick desktop controls:
+
+![Neutron System Tray AppIndicator](screenshots/Neutron-Tray.png)
 
 ```bash
 # Run persistent D-Bus system tray AppIndicator daemon
