@@ -1,5 +1,7 @@
 pub(crate) mod eligibility;
 pub mod profile_list;
+#[cfg(feature = "qbittorrent")]
+pub mod qbittorrent;
 pub mod refresh_sync;
 pub mod split_tunnel;
 pub mod sync;
@@ -564,6 +566,14 @@ fn handle_qbit_command_with_path<C: NmClient>(
             if let Some(profile) = active {
                 println!("Active VPN Tunnel: {}", profile.name);
                 if let Some(addr) = client.tunnel_address(&profile.uuid) {
+                    // Asked of the gateway rather than read from
+                    // `service::lease`, unlike the TUI. A one-shot command owns
+                    // no lease and cannot renew one, so there is no timer here
+                    // to race; asking directly keeps `qbit status` working as a
+                    // diagnostic on a machine where the daemon is not running,
+                    // which is exactly when it gets reached for. NAT-PMP returns
+                    // the mapping already in place, so this reports the daemon's
+                    // port rather than displacing it.
                     if let Some(port) = crate::portforward::port_for_tunnel_address(&addr) {
                         println!("Forwarded Port:    {port} (NAT-PMP Leased)");
                     } else {
@@ -625,18 +635,18 @@ fn handle_qbit_command_with_path<C: NmClient>(
                 AppError::PortForward("no IPv4 address found on active tunnel".to_string())
             })?;
 
+            // As in `qbit status`: a one-shot command holds no lease, so it asks
+            // the gateway instead of reading the daemon's publication and keeps
+            // working with no daemon running. The request renews the existing
+            // mapping rather than replacing it, so the port pushed here is the
+            // one the daemon is already holding.
             let port = crate::portforward::port_for_tunnel_address(&addr).ok_or_else(|| {
                 AppError::PortForward(
                     "gateway did not return a forwarded port via NAT-PMP".to_string(),
                 )
             })?;
 
-            let diag = client.get_profile_diagnostics(&active.uuid, true).ok();
-            let iface = diag.as_ref().map(|d| d.interface_name.as_str());
-
-            let mut qbit_client =
-                crate::portforward::qbittorrent::QBittorrentClient::new(&app_cfg.qbittorrent);
-            let report = qbit_client.sync_port(port, iface)?;
+            let report = qbittorrent::sync_port(client, &app_cfg.qbittorrent, &active.uuid, port)?;
 
             println!("qBittorrent port synchronized successfully!");
             if let Some(prev) = report.previous_port {
