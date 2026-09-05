@@ -1,10 +1,12 @@
-# Neutron
+<div align="center">
+  <h1>N E U T R O N</h1>
+  <h3>---==[ ⚛ ]==---</h3>
+  <h4>ɴᴇᴛᴡᴏʀᴋ ᴍᴀɴᴀɢᴇʀ</h4>
+</div>
 
-N E U T R O N<br>
----==[ ⚛ ]==---<br>
-ɴᴇᴛᴡᴏʀᴋ ᴍᴀɴᴀɢᴇʀ
-
-A lightweight, high-performance WireGuard manager for Linux built in Rust, utilizing NetworkManager as the underlying networking control plane. Designed to be minimal and resource-efficient, Neutron runs as a standalone ~3–5 MB binary with zero dynamic dependencies, uses only ~10–15 MB of RAM, idles at 0% CPU, and launches in under 10 ms.
+A lightweight, high-performance WireGuard manager for Linux built in Rust, utilizing NetworkManager as the underlying
+networking control plane. Designed to be minimal and resource-efficient, Neutron runs as a standalone ~3–5 MB binary
+with zero dynamic dependencies, uses only ~10–15 MB of RAM, idles at 0% CPU, and launches in under 10 ms.
 
 Distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
 
@@ -12,15 +14,24 @@ Distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
 
 ## Key Features
 
-- **NetworkManager Source-of-Truth**: Native integration with NetworkManager WireGuard connections without managing raw `wg-quick` scripts.
+- **NetworkManager Source-of-Truth**: Native integration with NetworkManager WireGuard connections without managing raw
+  `wg-quick` scripts.
 - **Connection Management**: Instant manual connect, disconnect, and switch between WireGuard profiles.
-- **Random Profile on Boot**: Automatically picks and connects a random eligible profile at login/boot, avoiding immediate repeats.
-- **Global Split Tunneling**: Route only specific subnets/domains through the WireGuard tunnel (*Include mode*) or bypass the tunnel for selected traffic (*Exclude mode*) using NetworkManager policy routing.
-- **Dynamic NAT-PMP Port Forwarding & qBittorrent Sync**: Automatic gateway discovery, port lease requests, periodic background renewals, and seamless automatic port synchronization with **qBittorrent** (native, Flatpak, and containers) via its local Web API.
-- **NetworkManager-Native Kill Switch**: Strict routing table isolation (`fwmark` + `suppress_prefixlength 0`) with negative DNS priorities to eliminate DNS and routing leaks.
-- **Always-On Lockdown Firewall**: Permanent `firewalld` Netfilter rules via `pkexec` blocking all physical traffic while disconnected, leaving only encrypted handshakes and local LAN traffic reachable.
-- **Multi-File Profile Import**: Import `.conf` files in batches directly into NetworkManager with automated validation and error aggregation.
-- **Multiple Interfaces**: Lightweight zero-dependency TUI (Terminal UI), comprehensive scriptable CLI, and a modern desktop GUI.
+- **Random Profile on Boot**: Automatically picks and connects a random eligible profile at login/boot, avoiding
+  immediate repeats.
+- **Global Split Tunneling**: Route only specific subnets/domains through the WireGuard tunnel (*Include mode*) or
+  bypass the tunnel for selected traffic (*Exclude mode*) using NetworkManager policy routing.
+- **Dynamic NAT-PMP Port Forwarding & qBittorrent Sync**: Automatic gateway discovery, port lease requests, periodic
+  background renewals, and seamless automatic port synchronization with **qBittorrent** (native, Flatpak, and
+  containers) via its local Web API.
+- **NetworkManager-Native Kill Switch**: Strict routing table isolation (`fwmark` + `suppress_prefixlength 0`) with
+  negative DNS priorities to eliminate DNS and routing leaks.
+- **Always-On Lockdown Firewall**: Permanent `firewalld` Netfilter rules via `pkexec` blocking all physical traffic
+  while disconnected, leaving only encrypted handshakes and local LAN traffic reachable.
+- **Multi-File Profile Import**: Import `.conf` files in batches directly into NetworkManager with automated validation
+  and error aggregation.
+- **Multiple Interfaces**: Lightweight zero-dependency TUI (Terminal UI), comprehensive scriptable CLI, and a modern
+  desktop GUI.
 
 ---
 
@@ -38,13 +49,15 @@ brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron
 
 ### 2. Import Profiles
 
-Neutron automatically pre-creates `~/.config/neutron/profiles/` with secure user-only permissions (`0700`). Simply copy your WireGuard configuration files (`*.conf`) into the drop directory:
+Neutron automatically pre-creates `~/.config/neutron/profiles/` with secure user-only permissions (`0700`). Simply place
+your WireGuard configuration files (`*.conf`) into the drop directory in your file manager app or use command:
 
 ```bash
-cp *.conf ~/.config/neutron/profiles/
+mv *.conf ~/.config/neutron/profiles/
 ```
 
-> **Note:** If you already have WireGuard profiles loaded in NetworkManager, you can skip this step — Neutron detects and manages all existing NetworkManager profiles automatically.
+> **Note:** If you already have WireGuard profiles loaded in NetworkManager, you can skip this step — Neutron detects
+> and manages all existing NetworkManager profiles automatically.
 
 ### 3. Launch TUI & Useful Commands
 
@@ -56,24 +69,14 @@ Launch the full interactive TUI:
 neutron
 ```
 
-Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles with `s`, configure split tunneling with `t`, toggle the kill switch with `k`, or press `Ctrl+P` for the command palette.
+Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles with `s`, configure split tunneling with
+`t`, toggle the kill switch with `k`, or press `Ctrl+P` for the command palette.
 
-#### Useful CLI Commands
+#### Complete restart command
 
 ```bash
-# Sync and batch-import new/updated profiles from the drop directory
-neutron sync
-
 # Restart background daemon and refresh system tray state
 neutron restart
-
-# List all WireGuard profiles with active status and pool eligibility
-neutron list
-
-# Connect, switch, or disconnect profiles
-neutron connect "Profile-Name"
-neutron switch "Other-Profile"
-neutron disconnect
 ```
 
 📖 **Complete documentation & keybindings:** See the full [**Usage Guide (TUI & CLI)**](docs/usage.md).
@@ -109,7 +112,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ### Auto-Connect at Login
 
-Auto-connect is built directly into Neutron: press **`a`** in the TUI (or set `autoconnect_at_login = true` in `config.toml`) to automatically connect an eligible WireGuard profile at desktop login.
+Auto-connect is built directly into Neutron: press **`a`** in the TUI (or set `autoconnect_at_login = true` in
+`config.toml`) to automatically connect an eligible WireGuard profile at desktop login.
 
 For headless servers without an XDG desktop environment, an optional user service is provided in [`systemd/`](systemd/).
 
@@ -150,10 +154,31 @@ cargo xtask container-shell
 
 ## Implementation Notes
 
-- **Auto-connect compatibility**: NetworkManager's native connection properties, such as automatic connection (`connection.autoconnect` and `connection.autoconnect-priority`), are fully supported. Neutron's boot-time random selector service first checks if any WireGuard profile is already active. If NetworkManager has already auto-connected a preferred profile, the randomizer cleanly skips selection, ensuring they complement each other perfectly.
-- Application config (excluded-profile set and last random selection) is written atomically and, on Unix, restricted to owner-only access (`0o600`). No private keys or secrets are ever stored here; those remain in NetworkManager.
-- All `nmcli` invocations run with a 30-second timeout and surface the command exit code on failure, so a stuck NetworkManager call cannot hang the CLI or GUI indefinitely.
-- The kill switch is global and NetworkManager-native: it is a single on/off policy, remembered in app config, that is applied to every WireGuard profile. Enabling it forces each WireGuard connection's automatic default-route policy routing on (`wireguard.ip4/ip6-auto-default-route`) and gives the tunnel exclusive DNS priority. NetworkManager then installs the same `fwmark` + `suppress_prefixlength 0` policy rules as `wg-quick`, so while a tunnel is active all non-tunnel traffic is dropped instead of leaking to the physical default route. It applies the next time a profile is activated and is effective for full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0` allowed IPs). No firewall rules or privileged helper are involved.
-- Lockdown is an optional always-on firewall that closes the kill switch's one gap: the kill switch only protects traffic *while a tunnel is active*, whereas lockdown blocks all non-tunnel traffic even while disconnected and across reboots. It installs permanent `firewalld` direct rules on the OUTPUT chain (both IPv4 and IPv6) that allow only loopback, established connections, DNS, the WireGuard tunnel interfaces, and the peer endpoints (so the *encrypted* handshake can still leave); everything else is rejected by a `neutron-lockdown`-tagged rule. Because it touches the system firewall, `firewall-cmd` runs through `pkexec` (polkit caches the prompt, so enabling/disabling asks for a password at most once), and the disable path always tears the ruleset down so the user can never be permanently locked out. The pure rule-builders are unit-tested; the privileged `firewall-cmd`/`pkexec` calls need a real firewalld and root, so they are verified by running the binary, not in `cargo test`.
-- Profile import runs `nmcli connection import type wireguard file <path>`, so NetworkManager stays the single source of truth — no local copy of the `.conf` is kept.
-- The application binary is named **Neutron** (`neutron`) with zero runtime shared library dependencies when compiled for the musl target.
+- **Auto-connect compatibility**: NetworkManager's native connection properties, such as automatic connection
+  (`connection.autoconnect` and `connection.autoconnect-priority`), are fully supported. Neutron's boot-time random
+  selector service first checks if any WireGuard profile is already active. If NetworkManager has already auto-connected
+  a preferred profile, the randomizer cleanly skips selection, ensuring they complement each other perfectly.
+- Application config (excluded-profile set and last random selection) is written atomically and, on Unix, restricted to
+  owner-only access (`0o600`). No private keys or secrets are ever stored here; those remain in NetworkManager.
+- All `nmcli` invocations run with a 30-second timeout and surface the command exit code on failure, so a stuck
+  NetworkManager call cannot hang the CLI or GUI indefinitely.
+- The kill switch is global and NetworkManager-native: it is a single on/off policy, remembered in app config, that is
+  applied to every WireGuard profile. Enabling it forces each WireGuard connection's automatic default-route policy
+  routing on (`wireguard.ip4/ip6-auto-default-route`) and gives the tunnel exclusive DNS priority. NetworkManager then
+  installs the same `fwmark` + `suppress_prefixlength 0` policy rules as `wg-quick`, so while a tunnel is active all
+  non-tunnel traffic is dropped instead of leaking to the physical default route. It applies the next time a profile is
+  activated and is effective for full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0` allowed IPs). No firewall rules
+  or privileged helper are involved.
+- Lockdown is an optional always-on firewall that closes the kill switch's one gap: the kill switch only protects
+  traffic *while a tunnel is active*, whereas lockdown blocks all non-tunnel traffic even while disconnected and across
+  reboots. It installs permanent `firewalld` direct rules on the OUTPUT chain (both IPv4 and IPv6) that allow only
+  loopback, established connections, DNS, the WireGuard tunnel interfaces, and the peer endpoints (so the *encrypted*
+  handshake can still leave); everything else is rejected by a `neutron-lockdown`-tagged rule. Because it touches the
+  system firewall, `firewall-cmd` runs through `pkexec` (polkit caches the prompt, so enabling/disabling asks for a
+  password at most once), and the disable path always tears the ruleset down so the user can never be permanently locked
+  out. The pure rule-builders are unit-tested; the privileged `firewall-cmd`/`pkexec` calls need a real firewalld and
+  root, so they are verified by running the binary, not in `cargo test`.
+- Profile import runs `nmcli connection import type wireguard file <path>`, so NetworkManager stays the single source of
+  truth — no local copy of the `.conf` is kept.
+- The application binary is named **Neutron** (`neutron`) with zero runtime shared library dependencies when compiled
+  for the musl target.
