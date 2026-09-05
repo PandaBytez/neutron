@@ -28,20 +28,19 @@ Distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
 
 ### 1. One-Line Install
 
-Install via Homebrew:
+Install via Homebrew (including tap trust so background auto-updates work seamlessly):
 
 ```bash
-brew install pandabytez/tap/neutron
+brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron
 ```
 
 *(Or via Cargo: `cargo install --git https://github.com/PandaBytez/neutron.git`)*
 
 ### 2. Import Profiles
 
-Copy your WireGuard configuration files (`*.conf`) into the profile drop directory:
+Neutron automatically pre-creates `~/.config/neutron/profiles/` with secure user-only permissions (`0700`). Simply copy your WireGuard configuration files (`*.conf`) into the drop directory:
 
 ```bash
-mkdir -p ~/.config/neutron/profiles
 cp *.conf ~/.config/neutron/profiles/
 ```
 

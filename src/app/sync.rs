@@ -34,6 +34,19 @@ pub fn ensure_profiles_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Ensure the application directories (~/.config/neutron and profiles inbox) exist
+/// with secure user-only permissions (0700 on Unix).
+pub fn ensure_app_dirs(config: &AppConfig) -> std::io::Result<()> {
+    if let Ok(config_path) = config::default_config_path()
+        && let Some(parent) = config_path.parent()
+    {
+        ensure_profiles_dir(parent)?;
+    }
+    let dir = config::resolve_profiles_dir(config);
+    ensure_profiles_dir(&dir)?;
+    Ok(())
+}
+
 /// Scan the configured `profiles_dir` inbox and import any new `.conf` files into NetworkManager.
 ///
 /// Successfully imported or already-existing profiles are removed from the inbox directory so that
@@ -187,6 +200,31 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         // Failed import keeps the file so user doesn't lose it
         assert!(conf.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn ensure_app_dirs_creates_profiles_directory() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "neutron-ensure-dirs-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profiles = temp_dir.join("profiles");
+        let config = AppConfig {
+            general: config::GeneralConfig {
+                profiles_dir: profiles.to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(!profiles.exists());
+        ensure_app_dirs(&config).unwrap();
+        assert!(profiles.is_dir());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

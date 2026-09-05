@@ -147,6 +147,12 @@ enum QbitCommands {
 pub fn run<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
 ) -> AppResult<()> {
+    if let Ok(config_path) = config::default_config_path()
+        && let Ok(app_cfg) = config::load(&config_path)
+    {
+        let _ = sync::ensure_app_dirs(&app_cfg);
+    }
+
     let cli = Cli::parse();
     execute(client, cli)
 }

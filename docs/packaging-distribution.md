@@ -8,7 +8,7 @@ Neutron is designed for easy distribution across all major Linux packaging ecosy
 
 | Format | Target Platform | Dependencies | Standalone? | Build Command |
 | :--- | :--- | :--- | :---: | :--- |
-| **Homebrew** | Linux / Linuxbrew | Zero (Pure Rust TUI/CLI) | Yes | `brew install neutron` |
+| **Homebrew** | Linux / Linuxbrew | Zero (Pure Rust TUI/CLI) | Yes | `brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron` |
 | **Static Musl** | Headless Servers, SSH | Zero (Static musl binary) | Yes | `cargo build --target x86_64-unknown-linux-musl` |
 | **Arch AUR** | Arch Linux, Manjaro | System dependencies | Native | `makepkg -si` |
 
