@@ -397,16 +397,28 @@ where
 }
 
 fn copy_to_clipboard(text: &str) {
-    if std::process::Command::new("wl-copy")
-        .arg(text)
-        .status()
-        .is_ok()
+    if let Ok(status) = std::process::Command::new("wl-copy").arg(text).status()
+        && status.success()
     {
         return;
     }
     use std::io::Write;
     if let Ok(mut child) = std::process::Command::new("xclip")
         .args(["-selection", "clipboard"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if let Ok(status) = child.wait()
+            && status.success()
+        {
+            return;
+        }
+    }
+    if let Ok(mut child) = std::process::Command::new("xsel")
+        .args(["--clipboard", "--input"])
         .stdin(std::process::Stdio::piped())
         .spawn()
     {

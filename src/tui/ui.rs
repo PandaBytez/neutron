@@ -374,14 +374,10 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
             // Inactive rows get blank space rather than a marker, so only the
             // connected profile carries a glyph. The width matches "✔ " to keep
             // the name column aligned. While connecting, a live spinner cycles here.
-            let is_connecting_row = state
-                .connecting
-                .as_ref()
-                .map(|c| c.uuid == row.uuid)
-                .unwrap_or(false);
+            let is_connecting = state.connecting.as_ref().filter(|c| c.uuid == row.uuid);
 
-            let (icon, icon_style) = if is_connecting_row {
-                let elapsed = state.connecting.as_ref().unwrap().started_at.elapsed();
+            let (icon, icon_style) = if let Some(conn) = is_connecting {
+                let elapsed = conn.started_at.elapsed();
                 const SPINNER_FRAMES: [&str; 10] =
                     ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
                 let spinner =

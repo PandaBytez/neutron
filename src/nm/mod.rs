@@ -169,15 +169,27 @@ impl NmClient for CliNmClient {
 
         let mut active_uuids = std::collections::HashSet::new();
         for line in active.lines() {
-            let (_name, uuid, typ) = parse_nmcli_triplet(line)?;
-            if typ == "wireguard" {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok((_name, uuid, typ)) = parse_nmcli_triplet(trimmed)
+                && typ == "wireguard"
+            {
                 active_uuids.insert(uuid);
             }
         }
 
         let mut profiles = Vec::new();
         for line in connections.lines() {
-            let (name, uuid, typ) = parse_nmcli_triplet(line)?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (name, uuid, typ) = match parse_nmcli_triplet(trimmed) {
+                Ok(triplet) => triplet,
+                Err(_) => continue,
+            };
 
             if typ != "wireguard" {
                 continue;
@@ -221,8 +233,8 @@ impl NmClient for CliNmClient {
             return Ok(());
         }
 
-        if let Some(active) = profiles.iter().find(|profile| profile.is_active()) {
-            run_nmcli(&["connection", "down", &active.uuid])?;
+        for profile in profiles.iter().filter(|p| p.is_active()) {
+            let _ = run_nmcli(&["connection", "down", &profile.uuid]);
         }
 
         activate(&target.uuid)
@@ -1104,6 +1116,26 @@ mod tests {
         let result = parse_nmcli_triplet("only-two:fields");
 
         assert!(matches!(result, Err(AppError::NmParseFailed(_))));
+    }
+
+    #[test]
+    fn parses_nmcli_triplets_ignoring_blank_or_malformed_lines() {
+        let input = "wg-us:uuid-1:wireguard\n\nwarning: something\nwg-eu:uuid-2:wireguard\n";
+        let mut profiles = Vec::new();
+        for line in input.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok((name, uuid, typ)) = parse_nmcli_triplet(trimmed)
+                && typ == "wireguard"
+            {
+                profiles.push((name, uuid));
+            }
+        }
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].0, "wg-us");
+        assert_eq!(profiles[1].0, "wg-eu");
     }
 
     #[test]
