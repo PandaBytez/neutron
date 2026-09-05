@@ -40,6 +40,18 @@ class Neutron < Formula
 end
 ```
 
+### Tap Trust Verification (Modern Homebrew)
+
+Under Homebrew's tap trust model, non-official taps can be explicitly marked as trusted:
+
+```bash
+# Trust the tap
+brew trust pandabytez/tap
+
+# Or trust specifically the neutron formula
+brew trust --formula pandabytez/tap/neutron
+```
+
 ---
 
 ## 2. Static Musl Target (Headless Servers / Homelabs)
