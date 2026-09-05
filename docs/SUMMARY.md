@@ -1,6 +1,7 @@
 # Summary
 
 - [Overview](README.md)
+- [Usage Guide (TUI & CLI)](usage.md)
 - [System Architecture](architecture.md)
 - [NetworkManager Integration](networkmanager.md)
 - [Security & Kill Switch](security.md)
