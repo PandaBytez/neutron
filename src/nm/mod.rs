@@ -98,6 +98,16 @@ pub trait NmClient {
     /// The tunnel's local IPv4 address (e.g. `10.2.0.2/32`), used to derive the
     /// NAT-PMP gateway that hands out a forwarded port.
     fn tunnel_address(&self, uuid: &str) -> Option<String>;
+    /// The tunnel's network interface, or `None` when NetworkManager has no name
+    /// configured for it.
+    ///
+    /// Deliberately distinct from [`ProfileDiagnostics::interface_name`], which
+    /// substitutes the profile uuid when no name is set so the details pane
+    /// always has something to print. That substitute is a label, not a device:
+    /// anything that goes on to *use* the interface -- binding a socket to it,
+    /// bringing it up -- must ask here, or it ends up pointed at a device that
+    /// does not exist.
+    fn tunnel_interface(&self, uuid: &str) -> Option<String>;
     /// The tunnel's configured DNS servers (e.g. `10.2.0.1`).
     fn tunnel_dns(&self, uuid: &str) -> Option<String>;
     /// Permanently delete a NetworkManager profile. NetworkManager deactivates
@@ -392,6 +402,10 @@ impl NmClient for CliNmClient {
             return None;
         }
         Some(first.to_string())
+    }
+
+    fn tunnel_interface(&self, uuid: &str) -> Option<String> {
+        tunnel_interface_name(uuid)
     }
 
     fn tunnel_dns(&self, uuid: &str) -> Option<String> {

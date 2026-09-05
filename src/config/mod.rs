@@ -259,7 +259,10 @@ pub fn forget_profile(config: &mut AppConfig, uuid: &str) -> bool {
     changed
 }
 
-fn write_atomically(path: &Path, body: &str) -> io::Result<()> {
+/// Write `body` to `path` so a concurrent reader sees either the old contents or
+/// the new ones, never a partial write. Shared with
+/// [`crate::service::lease`], which republishes a file a running TUI is reading.
+pub(crate) fn write_atomically(path: &Path, body: &str) -> io::Result<()> {
     write_atomically_with(path, body, |src, dst| fs::rename(src, dst))
 }
 

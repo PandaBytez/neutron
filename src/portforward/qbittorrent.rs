@@ -546,109 +546,57 @@ mod tests {
 
     #[test]
     fn mock_webui_server_login_and_sync_port() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::thread;
+        use crate::testing::{MockQBittorrentWebUi, curl_available};
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let done = Arc::new(AtomicBool::new(false));
-        let done_clone = done.clone();
-
-        let handle = thread::spawn(move || {
-            while !done_clone.load(Ordering::Relaxed) {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buffer = [0u8; 1024];
-                    let n = stream.read(&mut buffer).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buffer[..n]);
-
-                    if req.contains("/api/v2/auth/login") {
-                        let resp = "HTTP/1.1 200 OK\r\nSet-Cookie: SID=mock_session_123; Path=/\r\nContent-Length: 3\r\n\r\nOk.";
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("/api/v2/app/version") {
-                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nv4.6.3";
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("/api/v2/app/preferences") {
-                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"listen_port\": 40000, \"current_network_interface\": \"\"}";
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if req.contains("/api/v2/app/setPreferences") {
-                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else {
-                        let resp = "HTTP/1.1 404 Not Found\r\n\r\n";
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
-
-        let cfg = QBittorrentConfig {
-            enabled: true,
-            url: format!("http://127.0.0.1:{port}"),
-            username: Some("admin".to_string()),
-            password: Some("adminadmin".to_string()),
-            bind_interface: true,
-        };
-
-        if std::process::Command::new("curl")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if !curl_available() {
             eprintln!("Skipping mock WebUI test: 'curl' is not installed in the environment.");
-            done.store(true, Ordering::Relaxed);
-            let _ = handle.join();
             return;
         }
 
-        let mut client = QBittorrentClient::new(&cfg);
+        let server = MockQBittorrentWebUi::start();
+        let base = |bind_interface: bool, authenticated: bool| QBittorrentConfig {
+            enabled: true,
+            url: server.url(),
+            username: authenticated.then(|| "admin".to_string()),
+            password: authenticated.then(|| "adminadmin".to_string()),
+            bind_interface,
+        };
+
+        let mut client = QBittorrentClient::new(&base(true, true));
         client.login().expect("login should succeed");
-        assert_eq!(client.cookie.as_deref(), Some("mock_session_123"));
+        assert_eq!(
+            client.cookie.as_deref(),
+            Some(MockQBittorrentWebUi::SESSION_COOKIE),
+            "the session cookie must be taken from Set-Cookie"
+        );
 
-        let version = client.app_version().expect("version should fetch");
-        assert_eq!(version, "v4.6.3");
+        assert_eq!(
+            client.app_version().expect("version should fetch"),
+            "v5.0.3"
+        );
 
-        let sync_res = client
+        let synced = client
             .sync_port(55432, Some("wg0"))
             .expect("sync should succeed");
-        assert_eq!(sync_res.previous_port, Some(40000));
-        assert_eq!(sync_res.new_port, 55432);
-        assert_eq!(sync_res.bound_interface.as_deref(), Some("wg0"));
+        assert_eq!(
+            synced.previous_port,
+            Some(MockQBittorrentWebUi::INITIAL_LISTEN_PORT)
+        );
+        assert_eq!(synced.new_port, 55432);
+        assert_eq!(synced.bound_interface.as_deref(), Some("wg0"));
 
-        // Combination 2: bind_interface = false
-        let mut client_nobind = QBittorrentClient::new(&QBittorrentConfig {
-            enabled: true,
-            url: format!("http://127.0.0.1:{port}"),
-            username: None,
-            password: None,
-            bind_interface: false,
-        });
-        let sync_nobind = client_nobind
+        // Binding is opt-in, so an interface offered while it is off is ignored.
+        let no_bind = QBittorrentClient::new(&base(false, false))
             .sync_port(55433, Some("wg0"))
             .expect("sync should succeed without bind");
-        assert_eq!(sync_nobind.new_port, 55433);
-        assert_eq!(sync_nobind.bound_interface, None);
+        assert_eq!(no_bind.new_port, 55433);
+        assert_eq!(no_bind.bound_interface, None);
 
-        // Combination 3: bind_interface = true but interface_name = None
-        let mut client_noiface = QBittorrentClient::new(&QBittorrentConfig {
-            enabled: true,
-            url: format!("http://127.0.0.1:{port}"),
-            username: None,
-            password: None,
-            bind_interface: true,
-        });
-        let sync_noiface = client_noiface
+        // ...and asking to bind with no interface to bind to is not an error.
+        let no_interface = QBittorrentClient::new(&base(true, false))
             .sync_port(55434, None)
             .expect("sync should succeed when interface is None");
-        assert_eq!(sync_noiface.new_port, 55434);
-        assert_eq!(sync_noiface.bound_interface, None);
-
-        done.store(true, Ordering::Relaxed);
-        let _ = handle.join();
+        assert_eq!(no_interface.new_port, 55434);
+        assert_eq!(no_interface.bound_interface, None);
     }
 }

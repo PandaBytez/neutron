@@ -14,7 +14,7 @@
 //! implemented directly rather than shelling out to `natpmpc`, which is not
 //! installed by default on most distributions. The wire format lives in
 //! [`build_map_request`] / [`parse_map_response`], which are pure and unit
-//! tested; only [`request_mapping`] touches a socket.
+//! tested; only [`request_mapping_from`] touches a socket.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
@@ -153,11 +153,6 @@ fn describe_result_code(code: u16) -> String {
 /// Both UDP and TCP are mapped because providers hand out one port for the
 /// pair, and a caller asking for "the forwarded port" expects both protocols to
 /// work. The UDP mapping decides the port; the TCP request reuses it.
-pub fn request_mapping(gateway: Ipv4Addr) -> AppResult<u16> {
-    request_mapping_from(None, gateway)
-}
-
-/// Ask `gateway` to forward a port using an optional `local_ip` source bind.
 pub fn request_mapping_from(local_ip: Option<Ipv4Addr>, gateway: Ipv4Addr) -> AppResult<u16> {
     let port = map_protocol(local_ip, gateway, OP_MAP_UDP, 0)?;
     // Best effort: a provider that only forwards UDP still gives a usable port.

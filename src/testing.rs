@@ -174,6 +174,7 @@ pub struct MockNmClient {
     fail_disconnect: bool,
     strict_disconnect: bool,
     no_tunnel_address: bool,
+    no_tunnel_interface: bool,
     unhealthy: bool,
     calls: Arc<Mutex<Vec<String>>>,
     attempted: Arc<Mutex<Vec<String>>>,
@@ -378,6 +379,14 @@ impl MockNmClient {
     /// configured.
     pub fn without_tunnel_address(mut self) -> Self {
         self.no_tunnel_address = true;
+        self
+    }
+
+    /// Consume this mock and return one whose `tunnel_interface` always returns
+    /// `None`, as the real client does when NetworkManager has no interface name
+    /// configured for a profile.
+    pub fn without_tunnel_interface(mut self) -> Self {
+        self.no_tunnel_interface = true;
         self
     }
 
@@ -592,6 +601,14 @@ impl NmClient for MockNmClient {
         }
     }
 
+    fn tunnel_interface(&self, _uuid: &str) -> Option<String> {
+        if self.no_tunnel_interface {
+            None
+        } else {
+            Some("wg0".to_string())
+        }
+    }
+
     fn tunnel_dns(&self, _uuid: &str) -> Option<String> {
         Some("10.2.0.1".to_string())
     }
@@ -650,4 +667,125 @@ impl FirewallClient for MockNmClient {
 
         Ok(())
     }
+}
+
+/// A qBittorrent WebUI stub for exercising the port-sync integration.
+///
+/// Answers the calls [`crate::portforward::qbittorrent::QBittorrentClient::sync_port`]
+/// makes and records the preferences it was handed, so a test can assert on what
+/// actually reached qBittorrent rather than merely that a push was attempted.
+///
+/// Lives here rather than beside any one test module because all three layers
+/// that push a port -- the TUI, the tray daemon and the CLI -- need it.
+#[cfg(feature = "qbittorrent")]
+pub struct MockQBittorrentWebUi {
+    port: u16,
+    set_preferences: Arc<Mutex<String>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "qbittorrent")]
+impl MockQBittorrentWebUi {
+    /// The session cookie the stub hands out on a successful login.
+    pub const SESSION_COOKIE: &'static str = "mock_session";
+
+    /// The `listen_port` the stub reports before a push replaces it.
+    pub const INITIAL_LISTEN_PORT: u16 = 40000;
+
+    /// Start the stub on an ephemeral loopback port.
+    pub fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+
+        let set_preferences = Arc::new(Mutex::new(String::new()));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let recorded = set_preferences.clone();
+        let stop = done.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0u8; 2048];
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+
+                    // Login is answered even though the default config sends no
+                    // credentials: without it, merely configuring a username
+                    // would turn every test into a confusing 404.
+                    let response = if request.contains("/api/v2/auth/login") {
+                        "HTTP/1.1 200 OK\r\nSet-Cookie: SID=mock_session; Path=/\r\nContent-Length: 3\r\n\r\nOk."
+                    } else if request.contains("/api/v2/app/version") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nv5.0.3"
+                    } else if request.contains("/api/v2/app/preferences") {
+                        "HTTP/1.1 200 OK\r\n\r\n{\"listen_port\": 40000}"
+                    } else if request.contains("/api/v2/app/setPreferences") {
+                        if let Ok(mut slot) = recorded.lock() {
+                            *slot = request;
+                        }
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\n\r\n"
+                    };
+
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        Self {
+            port,
+            set_preferences,
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    /// The base URL to point a [`crate::config::QBittorrentConfig`] at.
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The raw `setPreferences` request last received, empty if none was.
+    pub fn last_set_preferences(&self) -> String {
+        self.set_preferences
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(feature = "qbittorrent")]
+impl Drop for MockQBittorrentWebUi {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A WebUI address with nothing listening on it, so a push fails immediately
+/// with a connection refusal instead of waiting out a timeout. Port 1 is
+/// reserved and never bindable by an unprivileged service.
+#[cfg(feature = "qbittorrent")]
+pub fn unreachable_qbittorrent_url() -> String {
+    "http://127.0.0.1:1".to_string()
+}
+
+/// Whether `curl` is available, which the qBittorrent client shells out to.
+///
+/// Tests that reach the WebUI skip themselves when it is absent rather than
+/// reporting a failure that says nothing about the code under test.
+#[cfg(feature = "qbittorrent")]
+pub fn curl_available() -> bool {
+    std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_ok()
 }
