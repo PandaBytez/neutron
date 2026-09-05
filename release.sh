@@ -11,6 +11,17 @@ NC='\033[0m' # No Color
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAP_DIR="$(cd "$ROOT_DIR/../homebrew-tap" 2>/dev/null && pwd || true)"
 
+# Enable in-memory credential caching for this session so credentials
+# are entered at most once and shared across neutron and homebrew-tap pushes.
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0="credential.helper"
+export GIT_CONFIG_VALUE_0="cache --timeout=900"
+
+# Pre-seed credentials if GITHUB_TOKEN is available in the environment
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    printf "protocol=https\nhost=github.com\nusername=PandaBytez\npassword=%s\n\n" "$GITHUB_TOKEN" | git credential approve 2>/dev/null || true
+fi
+
 if [ $# -lt 1 ]; then
     echo -e "${RED}Error:${NC} Version/tag argument required."
     echo "Usage: ./release.sh <tag> (e.g. ./release.sh v0.1.0 or ./release --v0.1.0)"
@@ -51,14 +62,13 @@ if [ "$CURRENT_CARGO_VER" != "$VERSION" ]; then
     git commit -m "chore: bump version to $VERSION"
 fi
 
-# 3. Push main branch
-echo -e "${BLUE}==>${NC} Pushing main branch to origin..."
-git push origin main
-
-# 4. Tag release
+# 3. Tag release locally
 echo -e "${BLUE}==>${NC} Tagging ${TAG}..."
 git tag -fa "$TAG" -m "Release $TAG"
-git push origin "$TAG" --force
+
+# 4. Push main branch AND tag together in a single network operation
+echo -e "${BLUE}==>${NC} Pushing main branch and ${TAG} to origin..."
+git push origin main "$TAG" --force
 
 # 5. Calculate SHA256 of the release archive
 TARBALL_URL="https://github.com/PandaBytez/neutron/archive/refs/tags/${TAG}.tar.gz"
