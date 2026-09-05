@@ -85,23 +85,25 @@ Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles wit
 neutron restart
 ```
 
-📖 **Complete documentation & keybindings:** See the full [**Usage Guide (TUI & CLI)**](docs/usage.md).
+📖 **Complete documentation & keybindings:** See the official documentation at [**pandabytez.github.io/neutron**](https://pandabytez.github.io/neutron/).
 
 ---
 
-## Documentation & Wiki
+## Documentation
 
-Explore detailed architectural and technical documentation in the [`docs/`](docs/) directory:
+Comprehensive guides, system architecture, keybindings, and configuration references are published on GitHub Pages:
 
-- [**Usage Guide (TUI & CLI)**](docs/usage.md)
-- [**Wiki Index**](docs/README.md)
-- [**System Architecture & Decoupled Engine**](docs/architecture.md)
-- [**NetworkManager Integration**](docs/networkmanager.md)
-- [**Security: Kill Switch & Lockdown Netfilter**](docs/security.md)
-- [**Split Tunneling (IP & Domain Routing)**](docs/split-tunneling.md)
-- [**NAT-PMP Port Forwarding Engine**](docs/port-forwarding.md)
-- [**User Configuration & Theming (`config.toml`)**](docs/configuration.md)
-- [**Packaging & Universal Distribution**](docs/packaging-distribution.md)
+🌐 **[https://pandabytez.github.io/neutron/](https://pandabytez.github.io/neutron/)**
+
+Key topics covered in the documentation:
+- **Interactive TUI Keybindings & Scriptable CLI**
+- **System Architecture & Engine**
+- **NetworkManager Integration**
+- **Security: Kill Switch & Always-On Netfilter Lockdown**
+- **Split Tunneling: Subnet & Domain Routing**
+- **NAT-PMP Dynamic Port Forwarding & qBittorrent WebUI Sync**
+- **User Configuration & Color Theming (`config.toml`)**
+- **Packaging & Universal Distribution**
 
 ---
 
