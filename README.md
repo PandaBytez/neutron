@@ -26,31 +26,55 @@ Distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
 
 ## Quick Start
 
-### Interactive Terminal User Interface (Recommended)
+### 1. One-Line Install
 
-Launch the interactive TUI:
+Install via Homebrew:
+
+```bash
+brew install pandabytez/tap/neutron
+```
+
+*(Or via Cargo: `cargo install --git https://github.com/PandaBytez/neutron.git`)*
+
+### 2. Import Profiles
+
+Copy your WireGuard configuration files (`*.conf`) into the profile drop directory:
+
+```bash
+mkdir -p ~/.config/neutron/profiles
+cp *.conf ~/.config/neutron/profiles/
+```
+
+> **Note:** If you already have WireGuard profiles loaded in NetworkManager, you can skip this step — Neutron detects and manages all existing NetworkManager profiles automatically.
+
+### 3. Launch TUI & Useful Commands
+
+#### Interactive Terminal UI (Recommended)
+
+Launch the full interactive TUI:
 
 ```bash
 neutron
 ```
 
-Browse profiles, connect/disconnect with `Space` or `Enter`, switch tunnels with `s`, open split tunneling with `t`, toggle the kill switch with `k`, or press `Ctrl+P` for the command palette.
+Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles with `s`, configure split tunneling with `t`, toggle the kill switch with `k`, or press `Ctrl+P` for the command palette.
 
-### Quick CLI Commands
-
-Neutron can also be controlled directly from scripts or your terminal:
+#### Useful CLI Commands
 
 ```bash
-# Connect, switch, or disconnect profiles
-neutron connect "My-Server"
-neutron switch "Work-Profile"
-neutron disconnect
+# Sync and batch-import new/updated profiles from the drop directory
+neutron sync
 
-# List all WireGuard profiles and status
+# Restart background daemon and refresh system tray state
+neutron restart
+
+# List all WireGuard profiles with active status and pool eligibility
 neutron list
 
-# Sync profile drop directory (~/.config/neutron/profiles) with NetworkManager
-neutron sync
+# Connect, switch, or disconnect profiles
+neutron connect "Profile-Name"
+neutron switch "Other-Profile"
+neutron disconnect
 ```
 
 📖 **Complete documentation & keybindings:** See the full [**Usage Guide (TUI & CLI)**](docs/usage.md).
@@ -73,22 +97,13 @@ Explore detailed architectural and technical documentation in the [`docs/`](docs
 
 ---
 
-## Building & Installation
-
-### Homebrew (Linuxbrew)
+## Building from Source
 
 ```bash
-brew tap pandabytez/tap
-brew install neutron
-```
-
-### Build from Source (Cargo)
-
-```bash
-# Build release binary
+# Build standard release binary
 cargo build --release
 
-# Statically linked musl binary (zero dynamic dependencies)
+# Statically-linked musl binary (zero dynamic dependencies)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
