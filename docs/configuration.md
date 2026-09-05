@@ -1,6 +1,6 @@
 # User Configuration & Theming (`config.toml`)
 
-Neutron VPN uses a human-readable, self-documenting **TOML** configuration file located at `~/.config/neutron-vpn/config.toml`.
+Neutron uses a human-readable, self-documenting **TOML** configuration file located at `~/.config/neutron/config.toml`.
 
 ---
 
@@ -8,13 +8,13 @@ Neutron VPN uses a human-readable, self-documenting **TOML** configuration file 
 
 ```toml
 # ==============================================================================
-# Neutron VPN Configuration (~/.config/neutron-vpn/config.toml)
+# Neutron Configuration (~/.config/neutron/config.toml)
 # ==============================================================================
 
 [general]
 # Directory monitored for WireGuard .conf files.
 # Dropping, copying, or git-cloning profiles here automatically imports them to NetworkManager.
-profiles_dir = "~/.config/neutron-vpn/profiles"
+profiles_dir = "~/.config/neutron/profiles"
 
 # Automatically import new/updated .conf files from profiles_dir on launch
 auto_sync_profiles = true
@@ -22,7 +22,7 @@ auto_sync_profiles = true
 # Connect a random eligible profile when logging in
 autoconnect_at_login = true
 
-# Default interface when launching `neutron-vpn` with no arguments: "tui" or "gui"
+# Default interface when launching `neutron` with no arguments: "tui" or "gui"
 default_ui = "tui"
 
 # ==============================================================================
@@ -32,7 +32,7 @@ default_ui = "tui"
 # NetworkManager policy routing (drops traffic if tunnel fails; exclusive DNS priority)
 kill_switch = false
 
-# Always-on Netfilter firewall via firewalld (blocks non-VPN traffic even when disconnected)
+# Always-on Netfilter firewall via firewalld (blocks non-tunnel traffic even when disconnected)
 lockdown = false
 
 # ==============================================================================
@@ -87,7 +87,7 @@ transfer_tx = "#ebcb8b"
 # Port Forwarding (NAT-PMP)
 # ==============================================================================
 [port_forwarding]
-# Lease an incoming port from the VPN gateway and keep renewing it.
+# Lease an incoming port from the tunnel gateway and keep renewing it.
 # Also togglable live from the TUI with `f`. Off by default: the lease is
 # renewed on a timer against the provider, so it is only requested on request.
 enabled = false
@@ -133,7 +133,7 @@ Neutron manages a dedicated profile drop directory at `~/.config/neutron/profile
 ### Workflow:
 1. **Drop / Copy Profiles**: Users can simply copy `.conf` files into the directory:
    ```bash
-   cp ~/Downloads/VPN_configs/*.conf ~/.config/neutron/profiles/
+   cp ~/Downloads/wireguard_configs/*.conf ~/.config/neutron/profiles/
    ```
 2. **Auto-Sync on Launch**: Whenever the TUI or CLI runs, Neutron scans the folder, compares content checksums against NetworkManager, and batch-imports new profiles in milliseconds.
 3. **Manual Sync Command**: You can trigger an instant sync via CLI or within the TUI:

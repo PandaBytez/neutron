@@ -1,5 +1,5 @@
 [Unit]
-Description=Neutron VPN startup random profile selector
+Description=Neutron startup random profile selector
 Documentation=https://github.com/PandaBytez/neutron
 
 # OPTIONAL. Boot-time connection does not need this unit: the app arms exactly
@@ -24,10 +24,9 @@ Type=oneshot
 # already-online system reports instantly and a slow one may still succeed.
 ExecStartPre=-/usr/bin/nm-online -s -q --timeout=60
 
-# Set to wherever the binary lives. `%h/.local/bin/neutron-vpn` suits
-# `cargo install --root "$HOME/.local"`; an AppImage install needs its own
-# absolute path (the AppRun entrypoint forwards arguments through).
-ExecStart=%h/.local/bin/neutron-vpn startup-random
+# Set to wherever the binary lives. `%h/.local/bin/neutron` suits
+# `cargo install --root "$HOME/.local"`.
+ExecStart=%h/.local/bin/neutron startup-random
 
 [Install]
 WantedBy=default.target

@@ -34,7 +34,7 @@ fn main() {
 
 fn print_help() {
     println!(
-        "Neutron VPN Custom Cargo Tasks (xtask)\n\n\
+        "Neutron Custom Cargo Tasks (xtask)\n\n\
         USAGE:\n  \
           cargo xtask <TASK> [OPTIONS]\n  \
           cargo <ALIAS> [OPTIONS]\n\n\

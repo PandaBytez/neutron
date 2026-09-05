@@ -1,12 +1,12 @@
 # NetworkManager Integration
 
-Neutron VPN relies on **NetworkManager** as the source of truth for all WireGuard network configurations.
+Neutron relies on **NetworkManager** as the source of truth for all WireGuard network configurations.
 
 ---
 
 ## Why NetworkManager?
 
-Direct usage of `wg-quick` creates ad-hoc network interfaces and routing tables outside the system networking daemon, often causing conflicts with system DNS (`systemd-resolved`), VPN reconnects, Wi-Fi switching, and desktop status integration.
+Direct usage of `wg-quick` creates ad-hoc network interfaces and routing tables outside the system networking daemon, often causing conflicts with system DNS (`systemd-resolved`), connection reconnects, Wi-Fi switching, and desktop status integration.
 
 By integrating directly with NetworkManager:
 1. **System Consistency**: Profiles integrate cleanly with GNOME Shell, desktop networking indicators, and D-Bus network monitors.

@@ -180,7 +180,7 @@ pub fn execute_action<C: ActionClient>(
             let name = state
                 .active_profile_name
                 .clone()
-                .unwrap_or_else(|| "VPN".to_string());
+                .unwrap_or_else(|| "profile".to_string());
             if let Some(ref tx) = state.connect_tx {
                 state.connecting = Some(crate::tui::state::ConnectingState {
                     uuid: String::new(),
@@ -191,7 +191,7 @@ pub fn execute_action<C: ActionClient>(
                 let _ = tx.send((String::new(), name, false));
             } else {
                 client.disconnect_active()?;
-                state.set_status("Disconnected active VPN.");
+                state.set_status("Disconnected active profile.");
                 reload_profiles(state, client)?;
             }
         }
@@ -325,8 +325,9 @@ pub fn execute_action<C: ActionClient>(
                 None if state.lease.is_none() => {
                     state.set_status("No forwarded port: the background daemon is not running.")
                 }
-                None => state
-                    .set_status("No forwarded port yet (connect to a VPN that offers NAT-PMP)."),
+                None => state.set_status(
+                    "No forwarded port yet (connect to a profile that offers NAT-PMP).",
+                ),
             }
         }
         #[cfg(feature = "qbittorrent")]

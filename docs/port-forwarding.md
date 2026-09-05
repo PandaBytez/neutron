@@ -1,6 +1,6 @@
 # NAT-PMP Dynamic Port Forwarding Engine
 
-Neutron VPN includes a native, pure Rust NAT-PMP (RFC 6886) client designed for VPN providers that support dynamic port forwarding (such as Proton VPN, Mullvad, and PIA).
+Neutron includes a native, pure Rust NAT-PMP (RFC 6886) client designed for WireGuard endpoints and providers that support dynamic port forwarding (such as Proton, Mullvad, and PIA).
 
 ---
 
@@ -10,7 +10,7 @@ NAT-PMP (Port Mapping Protocol) allows clients behind a NAT gateway to request d
 
 ```text
 ┌──────────────┐                            ┌──────────────┐
-│  Neutron VPN │                            │  VPN Gateway │
+│   Neutron    │                            │Tunnel Gateway│
 │   (Client)   │                            │ (NAT Router) │
 └──────┬───────┘                            └──────┬───────┘
        │                                           │
@@ -37,7 +37,7 @@ NAT-PMP (Port Mapping Protocol) allows clients behind a NAT gateway to request d
 
 WireGuard profile interfaces obtain private IPv4 addresses (e.g. `10.2.0.2/32` or `100.96.0.4/32`).
 
-Neutron VPN derives the default NAT-PMP gateway IP automatically:
+Neutron derives the default NAT-PMP gateway IP automatically:
 1. Extracts the primary tunnel IPv4 address via `nmcli -g ipv4.addresses connection show <uuid>`.
 2. Replaces the host octet with `.1` (e.g. `10.2.0.2` $\rightarrow$ `10.2.0.1`).
 3. Dispatches the NAT-PMP packet to UDP port `5351` at that gateway address.
@@ -88,7 +88,7 @@ neutron qbit status
 # Test WebUI credentials and fetch current listening port
 neutron qbit test
 
-# Immediately forward the active VPN port to qBittorrent
+# Immediately forward the active leased port to qBittorrent
 neutron qbit sync
 
 # Enable / disable automated background port synchronization

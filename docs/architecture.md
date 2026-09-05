@@ -1,6 +1,6 @@
 # System Architecture & Design Principles
 
-Neutron VPN is designed with a strictly decoupled architecture where all networking, security, and state logic exist in pure Rust modules that can be driven by any UI frontend (CLI, TUI, or GUI).
+Neutron is designed with a strictly decoupled architecture where all networking, security, and state logic exist in pure Rust modules that can be driven by any UI frontend (CLI, TUI, or GUI).
 
 ---
 
@@ -44,18 +44,18 @@ Neutron VPN is designed with a strictly decoupled architecture where all network
 
 ### 2. `firewall/` — Always-On Lockdown Netfilter Engine
 - Trait `FirewallClient` manages permanent direct `OUTPUT` chain rules in `firewalld`.
-- Protects traffic while disconnected by rejecting all non-VPN traffic except loopback, established connections, DNS, tunnel interfaces, and peer handshake endpoints.
+- Protects traffic while disconnected by rejecting all non-tunnel traffic except loopback, established connections, DNS, tunnel interfaces, and peer handshake endpoints.
 - All rules are tagged with a unique comment (`neutron-lockdown`) ensuring surgical removal without modifying user-defined firewall rules.
 - Privilege escalation is consolidated into a single `pkexec /bin/sh` transaction.
 
 ### 3. `portforward/` — NAT-PMP Dynamic Port Leasing & App Integrations
 - Implements RFC 6886 NAT-PMP client directly over `std::net::UdpSocket`.
-- Derives the VPN gateway address from the local tunnel IPv4 address (`10.x.x.x` / `100.x.x.x`).
+- Derives the gateway address from the local tunnel IPv4 address (`10.x.x.x` / `100.x.x.x`).
 - Acquires dynamic UDP/TCP port mappings and schedules automatic lease renewals before expiration.
 - Integrates `portforward::qbittorrent` Web API bridge to automatically synchronize dynamic listening ports to qBittorrent (native, Flatpak, containerized).
 
 ### 4. `config/` — Configuration & State Persistence
-- Manages `AppConfig` serialized as JSON in `~/.config/neutron-vpn/config.json`.
+- Manages `AppConfig` serialized as TOML in `~/.config/neutron/config.toml`.
 - Implements atomic file writes (`fs::rename` with fallback across filesystem boundaries) with strict `0o600` permissions.
 - Stores global split-tunnel rules, startup eligibility exclusions, kill-switch intent, and window geometry.
 
@@ -68,7 +68,7 @@ Neutron VPN is designed with a strictly decoupled architecture where all network
 
 ## Frontend & Resource Comparison Matrix
 
-| Metric | GTK4 / Libadwaita (GUI)`UNRELEASED` | Pure Rust TUI (`ratatui`) | Background Daemon / CLI | Electron / Web VPN Clients |
+| Metric | GTK4 / Libadwaita (GUI)`UNRELEASED` | Pure Rust TUI (`ratatui`) | Background Daemon / CLI | Electron / Web Clients |
 | :--- |:-----------------------------------:| :---: | :---: | :---: |
 | **Binary Size** |   ~15–30 MB (or AppImage bundle)    | **~3–5 MB** (Static musl binary) | **~3 MB** | 150–250 MB |
 | **Active RAM (RSS)** |          **~70 – 110 MB**           | **~10 – 15 MB** | **~3 – 6 MB** | 250 – 450 MB |

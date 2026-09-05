@@ -549,7 +549,10 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         if let Some(dns) = info.and_then(|i| i.tunnel_dns.as_ref()) {
             lines.push(Line::from(vec![
                 Span::styled("DNS Resolver:  ", theme.label_dim),
-                Span::styled(format!("{dns} (VPN Priority -1500)"), theme.text_secondary),
+                Span::styled(
+                    format!("{dns} (Exclusive Priority -1500)"),
+                    theme.text_secondary,
+                ),
             ]));
         }
 
@@ -1202,7 +1205,7 @@ fn render_split_tunnel_modal(
         let warn_line = Line::from(vec![
             Span::styled(" ⚠ Lockdown Active: ", theme.warning),
             Span::styled(
-                "All non-VPN traffic is blocked while disconnected. Excluded traffic will not route without an active tunnel.",
+                "All non-tunnel traffic is blocked while disconnected. Excluded traffic will not route without an active tunnel.",
                 theme.text_secondary,
             ),
         ]);
@@ -1730,7 +1733,7 @@ mod render_tests {
     #[test]
     fn the_toast_notification_renders_when_active() {
         let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
-        state.set_status("VPN connected successfully");
+        state.set_status("Tunnel connected successfully");
 
         let mut terminal =
             Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
@@ -1752,7 +1755,7 @@ mod render_tests {
 
         let toast_line = rendered
             .lines()
-            .find(|l| l.contains("VPN connected successfully"))
+            .find(|l| l.contains("Tunnel connected successfully"))
             .expect("toast must render");
         assert!(
             !toast_line.contains("Notification"),

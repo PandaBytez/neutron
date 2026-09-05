@@ -1,4 +1,4 @@
-# Neutron VPN
+# Neutron
 
 N E U T R O N<br>
 ---==[ ⚛ ]==---<br>
@@ -7,7 +7,7 @@ N E U T R O N<br>
 A high-performance WireGuard manager for Linux built in Rust, utilizing NetworkManager as the underlying networking
 control plane.
 
-Branded as **Neutron VPN** (`io.github.pandabytez.neutron`), distributed via **Homebrew Formula**, **AUR**, and
+Branded as **Neutron** (`io.github.pandabytez.neutron`), distributed via **Homebrew Formula**, **AUR**, and
 standalone static binaries.
 
 ---
@@ -19,8 +19,8 @@ standalone static binaries.
 - **Connection Management**: Instant manual connect, disconnect, and switch between WireGuard profiles.
 - **Random Profile on Boot**: Automatically picks and connects a random eligible profile at login/boot, avoiding
   immediate repeats.
-- **Global Split Tunneling**: Route only specific subnets/domains through the VPN (*Include mode*) or bypass the VPN for
-  selected traffic (*Exclude mode*) using NetworkManager policy routing.
+- **Global Split Tunneling**: Route only specific subnets/domains through the WireGuard tunnel (*Include mode*) or bypass the
+  tunnel for selected traffic (*Exclude mode*) using NetworkManager policy routing.
 - **Dynamic NAT-PMP Port Forwarding & qBittorrent Sync**: Automatic gateway discovery, port lease requests, periodic
   background renewals, and seamless automatic port synchronization with **qBittorrent** (native, Flatpak, and
   containers) via its local Web API.
@@ -37,7 +37,7 @@ standalone static binaries.
 
 ## Frontend & Resource Comparison
 
-| Metric                  |    GTK4 / Libadwaita (GUI)     |    Pure Rust TUI (`ratatui`)     |  Background Daemon / CLI  | Electron / Web VPN Clients  |
+| Metric                  |    GTK4 / Libadwaita (GUI)     |    Pure Rust TUI (`ratatui`)     |  Background Daemon / CLI  | Electron / Web Clients      |
 |:------------------------|:------------------------------:|:--------------------------------:|:-------------------------:|:---------------------------:|
 | **Binary Size**         | ~15–30 MB (or AppImage bundle) | **~3–5 MB** (Static musl binary) |         **~3 MB**         |         150–250 MB          |
 | **Active RAM (RSS)**    |        **~70 – 110 MB**        |         **~10 – 15 MB**          |       **~3 – 6 MB**       |        250 – 450 MB         |
@@ -229,7 +229,7 @@ cargo test --test active_connection_policies
   full-tunnel profiles (a peer with `0.0.0.0/0` / `::/0` allowed IPs). No firewall rules or privileged helper are
   involved.
 - Lockdown is an optional always-on firewall that closes the kill switch's one gap: the kill switch only protects
-  traffic *while a tunnel is active*, whereas lockdown blocks all non-VPN traffic even while disconnected and across
+  traffic *while a tunnel is active*, whereas lockdown blocks all non-tunnel traffic even while disconnected and across
   reboots. It installs permanent `firewalld` direct rules on the OUTPUT chain (both IPv4 and IPv6) that allow only
   loopback, established connections, DNS, the WireGuard tunnel interfaces, and the peer endpoints (so the *encrypted*
   handshake can still leave); everything else is rejected by a `neutron-lockdown`-tagged rule. Because it touches the

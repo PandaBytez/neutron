@@ -127,12 +127,12 @@ impl StatusNotifierItem {
 
     #[zbus(property)]
     fn id(&self) -> &str {
-        "neutron-vpn"
+        "neutron"
     }
 
     #[zbus(property)]
     fn title(&self) -> &str {
-        "Neutron VPN"
+        "Neutron"
     }
 
     #[zbus(property)]
@@ -192,15 +192,15 @@ impl StatusNotifierItem {
                     .map(|p| format!(" (Port: {p})"))
                     .unwrap_or_default();
                 (
-                    "Neutron VPN".to_string(),
+                    "Neutron".to_string(),
                     format!("Connected: {name}{port_str}"),
                 )
             } else {
-                ("Neutron VPN".to_string(), "Disconnected".to_string())
+                ("Neutron".to_string(), "Disconnected".to_string())
             }
         } else {
             (
-                "Neutron VPN".to_string(),
+                "Neutron".to_string(),
                 "Neutron WireGuard Manager".to_string(),
             )
         };
@@ -961,13 +961,13 @@ mod tests {
     fn tool_tip_formats_active_profile_and_port() {
         let sni = make_sni(Some("wg-fast".to_string()), Some(51820));
         let (_, _, title, desc) = sni.tool_tip();
-        assert_eq!(title, "Neutron VPN");
+        assert_eq!(title, "Neutron");
         assert!(desc.contains("Connected: wg-fast"));
         assert!(desc.contains("Port: 51820"));
 
         let sni_disconnected = make_sni(None, None);
         let (_, _, title, desc) = sni_disconnected.tool_tip();
-        assert_eq!(title, "Neutron VPN");
+        assert_eq!(title, "Neutron");
         assert_eq!(desc, "Disconnected");
     }
 

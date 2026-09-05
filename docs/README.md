@@ -1,8 +1,8 @@
-# Neutron VPN Documentation Wiki
+# Neutron Documentation Wiki
 
-Welcome to the **Neutron VPN** technical documentation and developer wiki.
+Welcome to the **Neutron** technical documentation and developer wiki.
 
-Neutron VPN is a high-performance WireGuard manager for Linux written in Rust, leveraging NetworkManager as the system-native networking control plane.
+Neutron is a high-performance WireGuard manager for Linux written in Rust, leveraging NetworkManager as the system-native networking control plane.
 
 ---
 
@@ -12,7 +12,7 @@ Neutron VPN is a high-performance WireGuard manager for Linux written in Rust, l
 Detailed overview of the decoupled subsystem architecture, module boundaries, data flows, thread model, and comparative analysis of UI frontends (CLI, TUI, GUI, Electron).
 
 ### 2. [NetworkManager Integration](networkmanager.md)
-How Neutron VPN interfaces with NetworkManager, `nmcli` command execution, batch error aggregation, profile discovery, interface comment extraction, and connection lifecycle.
+How Neutron interfaces with NetworkManager, `nmcli` command execution, batch error aggregation, profile discovery, interface comment extraction, and connection lifecycle.
 
 ### 3. [Security Architecture (Kill Switch & Lockdown)](security.md)
 Comprehensive explanation of the two security layers: Layer 3 NetworkManager policy routing (`fwmark`, exclusive DNS priorities) and Netfilter/Firewalld always-on OUTPUT filtering.

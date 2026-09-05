@@ -120,7 +120,7 @@ impl CommandPaletteState {
             CommandPaletteItem {
                 id: "split_tunnel",
                 title: "Split Tunneling: Open Manager",
-                description: "Choose which subnets and domains use the VPN",
+                description: "Choose which subnets and domains use the WireGuard tunnel",
                 shortcut: Some("t"),
             },
             CommandPaletteItem {
@@ -138,7 +138,7 @@ impl CommandPaletteState {
             CommandPaletteItem {
                 id: "port_forwarding",
                 title: "Port Forward: Toggle NAT-PMP",
-                description: "Lease an incoming port from the VPN gateway and keep renewing it",
+                description: "Lease an incoming port from the tunnel gateway and keep renewing it",
                 shortcut: Some("o"),
             },
             CommandPaletteItem {
@@ -157,7 +157,7 @@ impl CommandPaletteState {
             CommandPaletteItem {
                 id: "qbit_sync",
                 title: "qBittorrent: Sync Forwarded Port Now",
-                description: "Push active VPN NAT-PMP port to local qBittorrent WebUI",
+                description: "Push active NAT-PMP port to local qBittorrent WebUI",
                 shortcut: None,
             },
             #[cfg(feature = "qbittorrent")]

@@ -1,13 +1,13 @@
 # Split Tunneling (IP & Domain Routing)
 
-Neutron VPN provides **Global Split Tunneling**, allowing users to specify exact subnets, IPs, and domain names that should route through or bypass the VPN tunnel.
+Neutron provides **Global Split Tunneling**, allowing users to specify exact subnets, IPs, and domain names that should route through or bypass the WireGuard tunnel.
 
 ---
 
 ## Routing Modes
 
-### 1. `Include` Mode (Route Only Listed Destinations via VPN)
-* **Behavior**: Default internet browsing bypasses the VPN over your physical interface, while only specified subnets and domain IPs are routed securely through the WireGuard tunnel.
+### 1. `Include` Mode (Route Only Listed Destinations via Tunnel)
+* **Behavior**: Default internet browsing bypasses the tunnel over your physical interface, while only specified subnets and domain IPs are routed securely through the WireGuard tunnel.
 * **NetworkManager Mechanism**:
   ```bash
   nmcli connection modify <uuid> \
@@ -16,10 +16,10 @@ Neutron VPN provides **Global Split Tunneling**, allowing users to specify exact
       ipv4.routes "10.0.0.0/8, 192.168.10.0/24" \
       ipv6.routes "2001:db8::/32"
   ```
-* **Use Case**: Work VPN access where corporate subnets must route through the company tunnel while streaming, gaming, and personal browsing remain on high-speed unthrottled physical internet.
+* **Use Case**: Remote network access where corporate/homelab subnets must route through the WireGuard tunnel while streaming, gaming, and personal browsing remain on high-speed unthrottled physical internet.
 
-### 2. `Exclude` Mode (Bypass VPN for Listed Destinations)
-* **Behavior**: All general traffic routes through the encrypted VPN tunnel, while specified subnets or domains bypass the VPN directly to your local physical gateway.
+### 2. `Exclude` Mode (Bypass Tunnel for Listed Destinations)
+* **Behavior**: All general traffic routes through the encrypted WireGuard tunnel, while specified subnets or domains bypass the tunnel directly to your local physical gateway.
 * **NetworkManager Mechanism**: `never-default = yes` with the **complement** of the listed destinations installed as tunnel routes.
 
   Adding an excluded range to `ipv4.routes` would route it *into* the tunnel — the opposite of excluding it. There is no "bypass route" to install, because every route on a WireGuard connection points at the WireGuard device. So Neutron inverts the selection instead: it computes every CIDR *except* the listed ones and routes those through the tunnel, leaving the excluded ranges to the physical default route.
@@ -33,7 +33,7 @@ Neutron VPN provides **Global Split Tunneling**, allowing users to specify exact
       ipv6.routes "::/0"
   ```
   The complement is computed by `nm::split_tunnel::complement_routes`, which recursively splits the address space into the smallest set of aligned CIDRs that covers everything but the exclusions. Excluding nothing yields a full tunnel (`0.0.0.0/0`); excluding `0.0.0.0/0` yields no routes at all.
-* **Use Case**: Privacy browsing with exclusions for local services, banking portals, or gaming servers that block VPN exit nodes.
+* **Use Case**: Privacy browsing with exclusions for local services, banking portals, or gaming servers that block remote tunnel endpoints.
 
 ### 3. `Disabled` Mode (Standard Full-Tunnel)
 * Restores `never-default = no` and clears all custom static routes.

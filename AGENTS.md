@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## Project Intent
 
-This project (Neutron VPN) is a Rust desktop app to manage WireGuard connections via NetworkManager.
+This project (Neutron) is a Rust desktop app to manage WireGuard connections via NetworkManager.
 
 Primary goals:
 - Use NetworkManager as the control plane.

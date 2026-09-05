@@ -1,18 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.pandabytez.neutron</id>
-  <name>Neutron VPN</name>
-  <summary>Manage VPN connections with NetworkManager</summary>
+  <name>Neutron</name>
+  <summary>Manage WireGuard connections with NetworkManager</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <developer id="io.github.pandabytez">
-    <name>Neutron VPN</name>
+    <name>Neutron</name>
   </developer>
   <description>
     <p>
-      Neutron VPN is a provider-agnostic desktop tool for managing VPN connections
-      through NetworkManager. It currently supports WireGuard profiles, with
-      additional protocols planned.
+      Neutron is a lightweight tool for managing WireGuard connections
+      through NetworkManager.
     </p>
     <p>Features:</p>
     <ul>
@@ -20,7 +19,7 @@
       <li>Import WireGuard configuration files as NetworkManager profiles</li>
       <li>Select a random profile once per boot from an eligible pool</li>
       <li>Enable a global NetworkManager-native kill switch for all profiles</li>
-      <li>Enable an always-on lockdown firewall that blocks all non-VPN traffic, even while disconnected</li>
+      <li>Enable an always-on lockdown firewall that blocks all non-tunnel traffic, even while disconnected</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.github.pandabytez.neutron.desktop</launchable>
@@ -43,7 +42,7 @@
   </screenshots>
   <content_rating type="oars-1.1" />
   <provides>
-    <binary>neutron-vpn</binary>
+    <binary>neutron</binary>
   </provides>
   <releases>
     <release version="0.1.0" date="2026-06-07">

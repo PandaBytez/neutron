@@ -1,6 +1,6 @@
 # Packaging & Universal Distribution
 
-Neutron VPN is designed for easy distribution across all major Linux packaging ecosystems.
+Neutron is designed for easy distribution across all major Linux packaging ecosystems.
 
 ---
 
@@ -8,7 +8,7 @@ Neutron VPN is designed for easy distribution across all major Linux packaging e
 
 | Format | Target Platform | Dependencies | Standalone? | Build Command |
 | :--- | :--- | :--- | :---: | :--- |
-| **Homebrew** | macOS / Linuxbrew | Zero (Pure Rust TUI/CLI) | Yes | `brew install neutron-vpn` |
+| **Homebrew** | Linux / Linuxbrew | Zero (Pure Rust TUI/CLI) | Yes | `brew install neutron` |
 | **Static Musl** | Headless Servers, SSH | Zero (Static musl binary) | Yes | `cargo build --target x86_64-unknown-linux-musl` |
 | **Arch AUR** | Arch Linux, Manjaro | System dependencies | Native | `makepkg -si` |
 
@@ -65,7 +65,7 @@ rustup target add x86_64-unknown-linux-musl
 # Build static binary
 cargo build --release --target x86_64-unknown-linux-musl
 ```
-The resulting binary (`target/x86_64-unknown-linux-musl/release/neutron-vpn`) runs on Alpine Linux, Debian, RHEL, Ubuntu, and any minimal Linux environment.
+The resulting binary (`target/x86_64-unknown-linux-musl/release/neutron`) runs on Alpine Linux, Debian, RHEL, Ubuntu, and any minimal Linux environment.
 
 ---
 
@@ -74,18 +74,19 @@ The resulting binary (`target/x86_64-unknown-linux-musl/release/neutron-vpn`) ru
 Sample `PKGBUILD` for Arch Linux:
 
 ```bash
-pkgname=neutron-vpn-bin
+pkgname=neutron-bin
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="High-performance WireGuard manager via NetworkManager"
+pkgdesc="Fast WireGuard manager via NetworkManager"
 arch=('x86_64' 'aarch64')
 url="https://github.com/PandaBytez/neutron"
 license=('GPL-3.0-or-later')
 depends=('networkmanager')
-source_x86_64=("https://github.com/PandaBytez/neutron/releases/download/v${pkgver}/neutron-vpn-linux-amd64.tar.gz")
+source_x86_64=("https://github.com/PandaBytez/neutron/releases/download/v${pkgver}/neutron-linux-amd64.tar.gz")
 sha256sums_x86_64=('SKIP')
 
 package() {
-    install -Dm755 neutron-vpn "${pkgdir}/usr/bin/neutron-vpn"
+    install -Dm755 neutron "${pkgdir}/usr/bin/neutron"
+    ln -s neutron "${pkgdir}/usr/bin/neutron-vpn"
 }
 ```

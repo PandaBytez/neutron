@@ -1,7 +1,7 @@
 [book]
-title = "Neutron VPN Documentation"
+title = "Neutron Documentation"
 authors = ["Neutron Team"]
-description = "Technical documentation for Neutron VPN WireGuard Manager"
+description = "Technical documentation for Neutron - WireGuard manager via NetworkManager"
 language = "en"
 multilingual = false
 src = "docs"

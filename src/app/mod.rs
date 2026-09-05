@@ -125,7 +125,7 @@ enum QbitCommands {
     Status,
     /// Test connection to the qBittorrent WebUI
     Test,
-    /// Sync active VPN forwarded port to qBittorrent immediately
+    /// Sync active forwarded port to qBittorrent immediately
     Sync,
     /// Enable automatic port forwarding sync with qBittorrent
     Enable,
@@ -564,7 +564,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
             let profiles = client.list_wireguard_profiles()?;
             let active = profiles.iter().find(|p| p.is_active());
             if let Some(profile) = active {
-                println!("Active VPN Tunnel: {}", profile.name);
+                println!("Active WireGuard Tunnel: {}", profile.name);
                 if let Some(addr) = client.tunnel_address(&profile.uuid) {
                     // Asked of the gateway rather than read from
                     // `service::lease`, unlike the TUI. A one-shot command owns
@@ -583,7 +583,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
                     }
                 }
             } else {
-                println!("Active VPN Tunnel: None (Disconnected)");
+                println!("Active WireGuard Tunnel: None (Disconnected)");
             }
 
             println!();

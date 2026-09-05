@@ -1,6 +1,6 @@
 # Security Architecture (Kill Switch & Lockdown)
 
-Neutron VPN implements a two-tier defense model designed to prevent IP, routing, and DNS leaks under all connection states.
+Neutron implements a two-tier defense model designed to prevent IP, routing, and DNS leaks under all connection states.
 
 ---
 
@@ -10,7 +10,7 @@ Neutron VPN implements a two-tier defense model designed to prevent IP, routing,
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                             Defense Tier 1:                                 │
 │                   Kill Switch (Layer 3 Routing Plane)                       │
-│  • Active while VPN tunnel is UP                                            │
+│  • Active while WireGuard tunnel is UP                                      │
 │  • NetworkManager Policy Routing (`wireguard.ip4-auto-default-route = yes`) │
 │  • Dedicated routing table + `fwmark` + `suppress_prefixlength 0`           │
 │  • Exclusive DNS priority (`ipv4.dns-priority = -1500`)                     │
@@ -21,7 +21,7 @@ Neutron VPN implements a two-tier defense model designed to prevent IP, routing,
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                             Defense Tier 2:                                 │
 │                   Lockdown Mode (Netfilter Firewall Plane)                  │
-│  • Active 24/7 (Even when VPN is DISCONNECTED or RECONNECTING)             │
+│  • Active 24/7 (Even when tunnel is DISCONNECTED or RECONNECTING)           │
 │  • Permanent `firewalld` direct OUTPUT filter rules (IPv4 & IPv6)           │
 │  • Allows: Loopback, Established/Related, DNS (53), Tunnel Interfaces (wg*) │
 │  • Allows: Peer Handshake Endpoints (Host:Port)                             │
@@ -54,7 +54,7 @@ nmcli connection modify <uuid> \
 ## 2. Always-On Lockdown Firewall
 
 ### Why Lockdown is Needed
-The Kill Switch only protects traffic while a VPN connection is actively established. When disconnected, traffic flows normally over the physical interface.
+The Kill Switch only protects traffic while a tunnel connection is actively established. When disconnected, traffic flows normally over the physical interface.
 
 **Lockdown closes that gap** by installing permanent `firewalld` direct rules on the `OUTPUT` chain via `pkexec`.
 
