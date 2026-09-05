@@ -338,12 +338,12 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 64];
             while !done_clone.load(Ordering::Relaxed) {
-                if let Ok((len, src)) = responder.recv_from(&mut buf) {
-                    if len >= 12 {
-                        let opcode = buf[1];
-                        let reply = response(opcode, 0, 48888);
-                        let _ = responder.send_to(&reply, src);
-                    }
+                if let Ok((len, src)) = responder.recv_from(&mut buf)
+                    && len >= 12
+                {
+                    let opcode = buf[1];
+                    let reply = response(opcode, 0, 48888);
+                    let _ = responder.send_to(&reply, src);
                 }
             }
         });
@@ -353,7 +353,9 @@ mod tests {
         client_socket
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        client_socket.send_to(&request, ("127.0.0.1", port)).unwrap();
+        client_socket
+            .send_to(&request, ("127.0.0.1", port))
+            .unwrap();
 
         let mut reply = [0u8; RESPONSE_LEN];
         let (len, _) = client_socket.recv_from(&mut reply).unwrap();

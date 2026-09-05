@@ -246,10 +246,9 @@ where
         // Draw frame (ignore transient interrupted errors)
         if let Err(err) = terminal.draw(|frame| {
             ui::render(frame, state);
-        }) {
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                tracing::warn!("terminal draw error: {err}");
-            }
+        }) && err.kind() != std::io::ErrorKind::Interrupted
+        {
+            tracing::warn!("terminal draw error: {err}");
         }
 
         // Check if NetworkManager emitted connection change events

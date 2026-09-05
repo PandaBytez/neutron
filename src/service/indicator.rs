@@ -293,7 +293,7 @@ where
             for (idx, (_uuid, name)) in favorites.iter().enumerate() {
                 let is_active = prof.as_deref() == Some(name.as_str());
                 let label = if is_active {
-                    format!("● {name} (Active)")
+                    format!("{name} (Active)")
                 } else {
                     name.clone()
                 };
