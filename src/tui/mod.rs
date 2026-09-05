@@ -8,7 +8,7 @@ pub mod ui;
 use std::io::stdout;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -50,9 +50,10 @@ where
     let app_cfg = config::load(&config_path)?;
     let mut state = TuiState::new(config_path, app_cfg);
 
-    // Channel for async public IP updates
+    // Channel for async public IP updates (in-flight atomic prevents thread storms - BUG-037)
     let (ip_tx, ip_rx) = std::sync::mpsc::channel();
-    spawn_public_ip_lookup(ip_tx.clone());
+    let ip_lookup_in_flight = Arc::new(AtomicBool::new(false));
+    spawn_public_ip_lookup(ip_tx.clone(), ip_lookup_in_flight.clone());
 
     // Channel for async latency updates
     let (lat_tx, lat_rx) = std::sync::mpsc::channel();
@@ -161,6 +162,7 @@ where
         &client,
         &ip_tx,
         &ip_rx,
+        &ip_lookup_in_flight,
         &lat_rx,
         &cache_rx,
         &conn_res_rx,
@@ -210,6 +212,7 @@ fn run_event_loop<C, B>(
     client: &C,
     ip_tx: &std::sync::mpsc::Sender<crate::nm::network_info::PublicIpInfo>,
     ip_rx: &std::sync::mpsc::Receiver<crate::nm::network_info::PublicIpInfo>,
+    ip_lookup_in_flight: &Arc<AtomicBool>,
     lat_rx: &std::sync::mpsc::Receiver<u32>,
     cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
     conn_res_rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
@@ -246,7 +249,7 @@ where
                 Ok(()) => {
                     if is_connect {
                         state.set_status(format!("Connected '{name}'."));
-                        spawn_public_ip_lookup(ip_tx.clone());
+                        spawn_public_ip_lookup(ip_tx.clone(), ip_lookup_in_flight.clone());
                     } else {
                         state.set_status(format!("Disconnected '{name}'."));
                     }
@@ -305,8 +308,12 @@ where
         let current_nm_event = monitor_events.load(Ordering::Relaxed);
         if current_nm_event != last_seen_event {
             last_seen_event = current_nm_event;
+            let prev_active = state.active_profile_name.clone();
             let _ = events::reload_profiles(state, client);
-            spawn_public_ip_lookup(ip_tx.clone());
+            // Only trigger public IP lookup if the active tunnel connection actually changed (BUG-037)
+            if state.active_profile_name != prev_active {
+                spawn_public_ip_lookup(ip_tx.clone(), ip_lookup_in_flight.clone());
+            }
         }
 
         // Poll for user keyboard input with 50ms timeout (smooth 20 FPS refresh)
@@ -367,10 +374,32 @@ fn start_nm_monitor_loop(events: Arc<AtomicU64>, slot: MonitorChild) {
     }
 }
 
-fn spawn_public_ip_lookup(tx: std::sync::mpsc::Sender<crate::nm::network_info::PublicIpInfo>) {
+fn spawn_public_ip_lookup(
+    tx: std::sync::mpsc::Sender<crate::nm::network_info::PublicIpInfo>,
+    in_flight: Arc<AtomicBool>,
+) {
+    if in_flight.swap(true, Ordering::SeqCst) {
+        return;
+    }
     thread::spawn(move || {
         if let Some(info) = crate::nm::network_info::fetch_public_ip_info() {
             let _ = tx.send(info);
         }
+        in_flight.store(false, Ordering::SeqCst);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_guard_prevents_concurrent_ip_lookups() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_public_ip_lookup(tx, in_flight.clone());
+        // With in_flight initially true, swap returns true and drops immediately
+        assert!(rx.try_recv().is_err());
+        assert!(in_flight.load(Ordering::SeqCst));
+    }
 }

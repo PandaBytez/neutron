@@ -362,7 +362,10 @@ impl NmClient for CliNmClient {
         uuid: &str,
         is_active: bool,
     ) -> AppResult<ProfileDiagnostics> {
-        let settings = parse_peer_settings(&run_nmcli(&["-s", "connection", "show", uuid])?);
+        // Plain `connection show` without `-s` provides `connection.interface-name` and
+        // `wireguard.peers` without triggering NetworkManager's SecretAgent queries or
+        // emitting `connection profile changed` monitor cascades (BUG-037).
+        let settings = parse_peer_settings(&run_nmcli(&["connection", "show", uuid])?);
         let interface_name = settings
             .interface_name
             .clone()
