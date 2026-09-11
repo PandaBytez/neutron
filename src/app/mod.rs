@@ -762,10 +762,6 @@ pub fn kill_other_neutron_processes() {
                 let Ok(pid) = pid_str.parse::<u32>() else {
                     continue;
                 };
-                if pid == current_pid || pid <= 1 {
-                    continue;
-                }
-
                 let exe_path = entry.path().join("exe");
                 let is_same_binary = match (&my_exe, std::fs::read_link(&exe_path)) {
                     (Some(my), Ok(target)) => target == *my,
@@ -776,7 +772,7 @@ pub fn kill_other_neutron_processes() {
                     .map(|comm| comm.trim() == "neutron")
                     .unwrap_or(false);
 
-                if is_same_binary || is_neutron_comm {
+                if should_terminate_process(pid, current_pid, is_same_binary, is_neutron_comm) {
                     unsafe {
                         let _ = kill(pid as i32, 15); // SIGTERM
                     }
@@ -784,6 +780,15 @@ pub fn kill_other_neutron_processes() {
             }
         }
     }
+}
+
+fn should_terminate_process(
+    pid: u32,
+    current_pid: u32,
+    is_same_binary: bool,
+    is_neutron_comm: bool,
+) -> bool {
+    pid > 1 && pid != current_pid && (is_same_binary || is_neutron_comm)
 }
 
 fn resolve_profile_id(
@@ -857,9 +862,20 @@ mod tests {
     }
 
     #[test]
-    fn kill_other_neutron_processes_does_not_panic() {
-        // Safe to call when no other processes exist or in test environments
-        kill_other_neutron_processes();
+    fn termination_selection_excludes_self_system_and_unrelated_processes() {
+        for (pid, same_binary, neutron_comm, expected) in [
+            (0, true, true, false),
+            (1, true, true, false),
+            (42, true, true, false),
+            (43, false, false, false),
+            (43, true, false, true),
+            (43, false, true, true),
+        ] {
+            assert_eq!(
+                should_terminate_process(pid, 42, same_binary, neutron_comm),
+                expected
+            );
+        }
     }
 
     #[test]
