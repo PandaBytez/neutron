@@ -23,6 +23,30 @@
 use std::net::{IpAddr, ToSocketAddrs};
 
 use crate::config::SplitTunnelMode;
+use crate::error::{AppError, AppResult};
+
+/// Resolve activation/import policy without silently dropping invalid targets.
+pub(crate) fn routes_for_checked(
+    mode: SplitTunnelMode,
+    cidrs: &[String],
+    domains: &[String],
+) -> AppResult<(Vec<String>, Vec<String>)> {
+    let mut targets = Vec::new();
+    for cidr in cidrs {
+        let (normalized, _) = parse_and_normalize_cidr(cidr).map_err(AppError::Config)?;
+        targets.push(normalized);
+    }
+    for domain in domains {
+        let ips = resolve_domain_ips(domain);
+        if ips.is_empty() {
+            return Err(AppError::Config(format!(
+                "could not resolve split-tunnel domain '{domain}'; policy was not applied"
+            )));
+        }
+        targets.extend(ips.into_iter().map(|ip| ip.to_string()));
+    }
+    Ok(routes_for(mode, &targets, &[]))
+}
 
 /// Resolve a domain name to a list of IP addresses.
 ///

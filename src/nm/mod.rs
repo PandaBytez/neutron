@@ -289,13 +289,9 @@ impl NmClient for CliNmClient {
             .to_str()
             .ok_or_else(|| AppError::Config("import path is not valid UTF-8".to_string()))?;
 
-        let before_profiles = match self.list_wireguard_profiles() {
-            Ok(profiles) => profiles,
-            Err(e) => {
-                tracing::warn!("failed to list profiles before import of {path_str}: {e}");
-                Vec::new()
-            }
-        };
+        let config_path = crate::config::default_config_path()?;
+        let mut app_cfg = crate::config::load(&config_path)?;
+        let before_profiles = self.list_wireguard_profiles()?;
         let before_uuids: std::collections::HashSet<String> =
             before_profiles.into_iter().map(|p| p.uuid).collect();
 
@@ -308,62 +304,31 @@ impl NmClient for CliNmClient {
             path_str,
         ])?;
 
-        let after_profiles = match self.list_wireguard_profiles() {
-            Ok(profiles) => profiles,
-            Err(e) => {
-                tracing::warn!("failed to list profiles after import of {path_str}: {e}");
-                Vec::new()
-            }
-        };
-        let mut new_uuid = None;
-        for p in after_profiles {
-            if !before_uuids.contains(&p.uuid) {
-                new_uuid = Some(p.uuid);
-                break;
-            }
+        let after_profiles = self.list_wireguard_profiles()?;
+        let mut imported = after_profiles
+            .iter()
+            .filter(|p| !before_uuids.contains(&p.uuid));
+        let profile = imported.next().filter(|_| imported.next().is_none()).ok_or_else(|| {
+            AppError::Config("import completed but the new profile could not be uniquely identified; inspect NetworkManager profiles before retrying".into())
+        })?;
+        let uuid = &profile.uuid;
+
+        // Stop automatic activation before preparing the imported profile. A
+        // failure must reach the caller so the source file is retained for repair.
+        run_nmcli_owned(&autoconnect::set_args(uuid, false))?;
+        if self
+            .list_wireguard_profiles()?
+            .iter()
+            .any(|p| p.uuid == *uuid && p.is_active())
+        {
+            run_nmcli(&["connection", "down", uuid])?;
         }
+        prepare_profile(uuid, &app_cfg, &mut run_nmcli)?;
 
-        if let Some(uuid) = new_uuid {
-            // `nmcli connection import` auto-activates the freshly imported
-            // WireGuard connection (autoconnect defaults on). That hijacks an
-            // already-active tunnel and flips the new profile's toggle on
-            // without the user asking. Bring it straight back down so importing
-            // only adds the profile; the user activates it explicitly.
-            let _ = run_nmcli(&["connection", "down", uuid.as_str()]);
-
-            // NetworkManager's `autoconnect=yes` default would also bring this
-            // profile (and every other) up automatically at the next boot,
-            // defeating the startup-random selector. Disable it so activation
-            // stays user- and selector-driven. Best-effort: a failure here must
-            // not fail the import (the selector re-applies this on every run).
-            let _ = run_nmcli_owned(&autoconnect::set_args(uuid.as_str(), false));
-
-            let comments = extract_interface_comments(path);
-            if let Ok(config_path) = crate::config::default_config_path()
-                && let Ok(mut app_cfg) = crate::config::load(&config_path)
-            {
-                if !comments.is_empty() {
-                    app_cfg.profile_custom_info.insert(uuid.clone(), comments);
-                }
-                if app_cfg.global_split_tunnel.mode.is_enabled() {
-                    let (v4, v6) = split_tunnel::routes_for(
-                        app_cfg.global_split_tunnel.mode,
-                        &app_cfg.global_split_tunnel.cidrs,
-                        &app_cfg.global_split_tunnel.domains,
-                    );
-                    let _ = run_nmcli_owned(&split_tunnel::set_args(
-                        uuid.as_str(),
-                        app_cfg.global_split_tunnel.mode,
-                        &v4,
-                        &v6,
-                    ));
-                }
-                if app_cfg.kill_switch_enabled {
-                    let has_ipv6 = profile_has_ipv6(&uuid);
-                    let _ = run_nmcli_owned(&kill_switch::set_args(uuid.as_str(), true, has_ipv6));
-                }
-                let _ = crate::config::save(&config_path, &app_cfg);
-            }
+        let comments = extract_interface_comments(path);
+        if !comments.is_empty() {
+            app_cfg.profile_custom_info.insert(uuid.clone(), comments);
+            crate::config::save(&config_path, &app_cfg)?;
         }
 
         Ok(output)
@@ -914,54 +879,59 @@ fn parse_nmcli_fields(line: &str) -> Vec<String> {
 /// reporting success. Pinning it here means any profile repairs itself the first
 /// time it is used; see [`tunnel_routing`].
 ///
-/// The pin is best-effort: if NetworkManager rejects the change the activation
-/// still proceeds, because refusing to connect at all is worse than connecting
-/// with whatever routing NetworkManager chooses. The failure is logged so the
-/// cause is visible.
-///
-/// Once up, the tunnel is verified (see [`health`]) and taken back down if the
-/// peer never completes a handshake. Now that a full tunnel owns the default
-/// route, a peer that never answers would otherwise swallow every packet while
-/// the UI reported a working connection.
+/// Policy/configuration failures prevent activation. Once up, the tunnel is
+/// verified (see [`health`]) and taken back down if the peer does not answer.
 fn activate(uuid: &str) -> AppResult<()> {
-    let has_ipv6 = profile_has_ipv6(uuid);
-    if let Err(error) = run_nmcli_owned(&tunnel_routing::set_args(uuid, has_ipv6)) {
-        tracing::warn!("could not pin automatic default-route handling on {uuid}: {error}");
+    activate_with(uuid, &crate::config::default_config_path()?, &mut run_nmcli)
+}
+
+/// Shared checked policy preparation for import and every activation path.
+fn prepare_profile(
+    uuid: &str,
+    config: &crate::config::AppConfig,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<()> {
+    let method = run(&["-g", "ipv6.method", "connection", "show", uuid])?;
+    let has_ipv6 = !matches!(method.trim(), "" | "--" | "disabled" | "ignore");
+    // The kill-switch builder already pins routing in both toggle states.
+    let mut args = kill_switch::set_args(uuid, config.kill_switch_enabled, has_ipv6);
+    args.extend(autoconnect::set_args(uuid, false).into_iter().skip(3));
+    if config.global_split_tunnel.mode.is_enabled() {
+        let split = &config.global_split_tunnel;
+        let (v4, v6) = split_tunnel::routes_for_checked(split.mode, &split.cidrs, &split.domains)?;
+        args.extend(
+            split_tunnel::set_args(uuid, split.mode, &v4, &v6)
+                .into_iter()
+                .skip(3),
+        );
     }
-    // Also apply global kill switch setting and refresh split-tunnel routes (BUG-016, BUG-017)
-    if let Ok(config_path) = crate::config::default_config_path()
-        && let Ok(app_cfg) = crate::config::load(&config_path)
-    {
-        let _ = run_nmcli_owned(&kill_switch::set_args(
-            uuid,
-            app_cfg.kill_switch_enabled,
-            has_ipv6,
-        ));
-        if app_cfg.global_split_tunnel.mode.is_enabled() {
-            let (v4, v6) = split_tunnel::routes_for(
-                app_cfg.global_split_tunnel.mode,
-                &app_cfg.global_split_tunnel.cidrs,
-                &app_cfg.global_split_tunnel.domains,
-            );
-            let _ = run_nmcli_owned(&split_tunnel::set_args(
-                uuid,
-                app_cfg.global_split_tunnel.mode,
-                &v4,
-                &v6,
-            ));
-        }
-    }
+    run(&args.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|error| {
+        AppError::Config(format!(
+            "could not apply routing/DNS policy to {uuid}; activation refused: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn activate_with(
+    uuid: &str,
+    config_path: &std::path::Path,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<()> {
+    let config = crate::config::load(config_path)?;
+    prepare_profile(uuid, &config, run)?;
+    let settings = parse_peer_settings(&run(&["connection", "show", uuid])?);
     // Whether the interface already exists is sampled *before* activation: a
     // fresh one starts its receive counter at zero, which is what makes that
     // counter a handshake signal. See `health`.
-    let interface = tunnel_interface_name(uuid);
-    let existed = interface
-        .as_deref()
-        .map(health::interface_exists)
-        .unwrap_or(false);
+    let interface = settings.interface_name.as_deref();
+    let existed = interface.map(health::interface_exists).unwrap_or(false);
 
-    run_nmcli(&["connection", "up", uuid])?;
-    verify_or_disconnect(uuid, interface.as_deref(), existed)
+    run(&["connection", "up", uuid])?;
+    if config.general.verify_tunnel_on_connect {
+        verify_or_disconnect(uuid, interface, existed, run)?;
+    }
+    Ok(())
 }
 
 /// The interface name configured on profile `uuid`, if it has a usable one.
@@ -977,16 +947,6 @@ fn tunnel_interface_name(uuid: &str) -> Option<String> {
     .and_then(|value| parse_interface_name(&value))
 }
 
-/// Whether the health check is enabled. Defaults to on, including when the
-/// config cannot be read -- a missing config must not silently disable a safety
-/// check.
-fn health_check_enabled() -> bool {
-    crate::config::default_config_path()
-        .and_then(|path| crate::config::load(&path))
-        .map(|config| config.general.verify_tunnel_on_connect)
-        .unwrap_or(true)
-}
-
 /// Confirm the peer behind `uuid` completed a handshake, deactivating the
 /// tunnel and reporting an error when it did not.
 ///
@@ -995,11 +955,8 @@ fn verify_or_disconnect(
     uuid: &str,
     interface: Option<&str>,
     existed_before: bool,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
 ) -> AppResult<()> {
-    if !health_check_enabled() {
-        return Ok(());
-    }
-
     // Without an interface name there is nothing to sample; treat that as
     // healthy rather than tearing down a connection on a technicality.
     let Some(interface) = interface else {
@@ -1021,7 +978,7 @@ fn verify_or_disconnect(
     // Roll the activation back so the dead tunnel stops owning the default
     // route. Best-effort: report the diagnosis even if the teardown fails,
     // since that is the actionable part.
-    if let Err(error) = run_nmcli(&["connection", "down", uuid]) {
+    if let Err(error) = run(&["connection", "down", uuid]) {
         tracing::warn!("could not deactivate unhealthy tunnel {uuid}: {error}");
     }
 
@@ -1050,6 +1007,110 @@ fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_refuses_config_and_policy_failures_before_connection_up() {
+        use crate::config::{self, AppConfig, SplitTunnelMode};
+
+        let path = crate::testing::temp_toml_config_path("activation-policy");
+        let mut config = AppConfig {
+            kill_switch_enabled: true,
+            ..AppConfig::default()
+        };
+        config.global_split_tunnel.mode = SplitTunnelMode::Include;
+        config.global_split_tunnel.cidrs = vec!["10.0.0.0/8".into()];
+        config::save(&path, &config).unwrap();
+
+        for fail_at in 0..3 {
+            let mut calls = Vec::new();
+            let result = activate_with("uuid-1", &path, &mut |args| {
+                calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                if calls.len() == fail_at + 1 {
+                    return Err(AppError::CommandFailed("permission denied".into()));
+                }
+                Ok("auto".into())
+            });
+            assert!(result.is_err());
+            assert!(
+                !calls
+                    .iter()
+                    .any(|args| args.starts_with(&["connection".into(), "up".into()]))
+            );
+        }
+
+        // Configuration and route-resolution failures must not become defaults
+        // or a partial Include policy, even if NetworkManager would accept up.
+        for (cidrs, domains) in [(vec!["bad/cidr".into()], vec![]), (vec![], vec!["".into()])] {
+            config.global_split_tunnel.cidrs = cidrs;
+            config.global_split_tunnel.domains = domains;
+            config::save(&path, &config).unwrap();
+            assert!(
+                activate_with("uuid-1", &path, &mut |args| {
+                    assert_eq!(args, ["-g", "ipv6.method", "connection", "show", "uuid-1"]);
+                    Ok("auto".into())
+                })
+                .is_err()
+            );
+        }
+        std::fs::write(&path, "[malformed").unwrap();
+        assert!(
+            activate_with("uuid-1", &path, &mut |_| panic!(
+                "config failure must precede NM work"
+            ))
+            .is_err()
+        );
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn activation_applies_policy_before_connection_up() {
+        use crate::config::{self, AppConfig, SplitTunnelMode};
+
+        let path = crate::testing::temp_toml_config_path("on-demand");
+        let mut config = AppConfig {
+            kill_switch_enabled: true,
+            ..AppConfig::default()
+        };
+        config.general.verify_tunnel_on_connect = false;
+        config.global_split_tunnel.mode = SplitTunnelMode::Include;
+        config.global_split_tunnel.cidrs = vec!["10.0.0.0/8".into()];
+        config::save(&path, &config).unwrap();
+
+        for keepalive in ["", " persistent-keepalive=0"] {
+            let mut modified = false;
+            let mut activated = false;
+            activate_with("uuid-1", &path, &mut |args| {
+                match args {
+                    ["-g", "ipv6.method", "connection", "show", "uuid-1"] => Ok("auto".into()),
+                    ["connection", "modify", "uuid-1", settings @ ..] => {
+                        for pair in [
+                            ["connection.autoconnect", "no"],
+                            ["wireguard.ip4-auto-default-route", "yes"],
+                            ["wireguard.ip6-auto-default-route", "yes"],
+                            ["ipv4.dns-priority", "-1500"],
+                            ["ipv6.dns-priority", "-1500"],
+                            ["ipv4.routes", "10.0.0.0/8"],
+                        ] {
+                            assert!(settings.chunks_exact(2).any(|p| p == pair), "missing {pair:?}");
+                        }
+                        modified = true;
+                        Ok(String::new())
+                    }
+                    ["connection", "show", "uuid-1"] => Ok(format!(
+                        "connection.interface-name: ns-idle-test\nwireguard.peers: KEY= endpoint=127.0.0.1:51820 allowed-ips=10.0.0.0/8{keepalive}"
+                    )),
+                    ["connection", "up", "uuid-1"] => {
+                        assert!(modified);
+                        activated = true;
+                        Ok(String::new())
+                    }
+                    _ => panic!("on-demand activation must not tear down the tunnel: {args:?}"),
+                }
+            }).unwrap();
+            assert!(activated);
+        }
+        crate::testing::remove_temp_config(&path);
+    }
 
     fn profile(name: &str, uuid: &str) -> WireguardProfile {
         WireguardProfile {

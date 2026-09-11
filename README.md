@@ -170,6 +170,9 @@ cargo xtask container-shell
   owner-only access (`0o600`). No private keys or secrets are ever stored here; those remain in NetworkManager.
 - All `nmcli` invocations run with a 30-second timeout and surface the command exit code on failure, so a stuck
   NetworkManager call cannot hang the CLI or GUI indefinitely.
+- Activation requires successful configuration loading and routing/DNS policy preparation. Invalid split-tunnel
+  targets or rejected NetworkManager modifications stop activation with an error. Imported profiles receive the same
+  checked policy; import preparation failures are reported rather than treated as success.
 - The kill switch is global and NetworkManager-native: it is a single on/off policy, remembered in app config, that is
   applied to every WireGuard profile. Enabling it forces each WireGuard connection's automatic default-route policy
   routing on (`wireguard.ip4/ip6-auto-default-route`) and gives the tunnel exclusive DNS priority. NetworkManager then
