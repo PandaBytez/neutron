@@ -46,6 +46,11 @@
 //! and on routes having converged in time. None of those are properties of this
 //! tunnel, and the combination disconnected healthy tunnels roughly ten seconds
 //! after connecting. There is no reachability probe any more.
+//!
+//! Zero RX alone does not establish failure for an on-demand tunnel: without
+//! keepalive or user traffic, no handshake need have been attempted. Activation
+//! only uses this probe to trigger teardown when endpoint and keepalive settings
+//! indicate that the tunnel initiates a handshake automatically (BUG-034).
 
 use std::thread;
 use std::time::Duration;
@@ -60,7 +65,7 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// Sized against WireGuard's own handshake schedule rather than a round number:
 /// the kernel retries an unanswered handshake every `REKEY_TIMEOUT` (5s), so
 /// this window covers three attempts. A peer that has answered none of them is
-/// not going to, while a peer that answers any of them moves the counter and
+/// not responding in this window, while a peer that answers any of them moves the counter and
 /// short-circuits within milliseconds.
 const PROBE_WINDOW: Duration = Duration::from_secs(15);
 
@@ -105,7 +110,7 @@ where
 /// verified: its counter is about to start from zero, so any growth is this
 /// session's handshake. An interface that is already present carries traffic
 /// from an activation that is not the one being checked, and [`probe`] must not
-/// be pointed at it -- see [`verify`] in `crate::nm`.
+/// be pointed at it.
 pub fn interface_exists(interface: &str) -> bool {
     network_info::interface_receive_bytes(interface).is_some()
 }

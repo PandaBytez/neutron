@@ -879,8 +879,9 @@ fn parse_nmcli_fields(line: &str) -> Vec<String> {
 /// reporting success. Pinning it here means any profile repairs itself the first
 /// time it is used; see [`tunnel_routing`].
 ///
-/// Policy/configuration failures prevent activation. Once up, the tunnel is
-/// verified (see [`health`]) and taken back down if the peer does not answer.
+/// Policy/configuration failures prevent activation. Handshake verification is
+/// only destructive when keepalive is configured to initiate a handshake;
+/// on-demand tunnels can legitimately remain idle until their first packet.
 fn activate(uuid: &str) -> AppResult<()> {
     activate_with(uuid, &crate::config::default_config_path()?, &mut run_nmcli)
 }
@@ -928,7 +929,13 @@ fn activate_with(
     let existed = interface.map(health::interface_exists).unwrap_or(false);
 
     run(&["connection", "up", uuid])?;
-    if config.general.verify_tunnel_on_connect {
+    let initiates_handshake = settings.endpoint.is_some()
+        && settings
+            .keepalive
+            .as_deref()
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|value| value > 0);
+    if config.general.verify_tunnel_on_connect && initiates_handshake {
         verify_or_disconnect(uuid, interface, existed, run)?;
     }
     Ok(())
@@ -1063,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_applies_policy_before_connection_up() {
+    fn activation_applies_policy_and_preserves_idle_on_demand_tunnels() {
         use crate::config::{self, AppConfig, SplitTunnelMode};
 
         let path = crate::testing::temp_toml_config_path("on-demand");
@@ -1071,7 +1078,6 @@ mod tests {
             kill_switch_enabled: true,
             ..AppConfig::default()
         };
-        config.general.verify_tunnel_on_connect = false;
         config.global_split_tunnel.mode = SplitTunnelMode::Include;
         config.global_split_tunnel.cidrs = vec!["10.0.0.0/8".into()];
         config::save(&path, &config).unwrap();
