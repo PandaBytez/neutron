@@ -43,6 +43,24 @@ fn normalize_autoconnect<C: NmClient>(client: &C) {
     }
 }
 
+fn lock_selector(path: &Path) -> AppResult<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".selector.lock");
+    let lock = options.open(Path::new(&lock_path))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 fn run_startup_random_with_selector<C, F>(
     client: &C,
     path: &Path,
@@ -52,6 +70,7 @@ where
     C: NmClient,
     F: FnMut(usize) -> usize,
 {
+    let _selector_lock = lock_selector(path)?;
     let app_cfg = config::load(path)?;
 
     let profiles = client.list_wireguard_profiles()?;
@@ -90,6 +109,15 @@ where
 
     let mut last_connect_error = None;
     for selected in candidates {
+        // Re-check connection state before activating: another selector or manual action
+        // may have connected an eligible tunnel while waiting on teardown/locks.
+        if let Ok(current) = client.list_wireguard_profiles() {
+            let active: Vec<_> = current.iter().filter(|p| p.is_active()).collect();
+            if active.len() == 1 && !app_cfg.excluded_profile_ids.contains(&active[0].uuid) {
+                return Ok(StartupRandomResult::SkippedAlreadyActive);
+            }
+        }
+
         match client.connect(&selected.uuid) {
             Ok(()) => {
                 if let Err(error) = config::update(path, |cfg| {
@@ -225,6 +253,26 @@ mod tests {
     use crate::testing::MockNmClient;
 
     use super::*;
+
+    #[test]
+    fn overlapping_startup_selectors_activate_at_most_one_tunnel() {
+        let client = MockNmClient::new(vec![
+            profile("wg-us", "uuid-1", ProfileState::Inactive),
+            profile("wg-eu", "uuid-2", ProfileState::Inactive),
+        ]);
+        let config_path = unique_test_config_path();
+        write_config(&config_path, AppConfig::default());
+
+        let res1 = run_startup_random_with_path(&client, &config_path).unwrap();
+        assert!(matches!(res1, StartupRandomResult::Connected(_)));
+
+        // Second overlapping/immediate selector run must skip because a tunnel is now active
+        let res2 = run_startup_random_with_path(&client, &config_path).unwrap();
+        assert!(matches!(res2, StartupRandomResult::SkippedAlreadyActive));
+
+        assert_eq!(client.connected_profiles().len(), 1);
+        cleanup_test_artifacts(&config_path);
+    }
 
     #[test]
     fn returns_error_when_profile_already_active() {
