@@ -684,6 +684,7 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
         .map(|row| (row.uuid.clone(), row.name.clone()))
         .unzip();
     state.active_profile_name = active_name;
+    state.active_profile_uuid = active_uuid.clone();
 
     if state.selected_index >= state.rows.len() {
         state.selected_index = state.rows.len().saturating_sub(1);

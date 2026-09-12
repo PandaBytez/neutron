@@ -425,6 +425,7 @@ pub struct TuiState {
     pub selected_index: usize,
     pub selected_info: Option<CachedProfileInfo>,
     pub active_profile_name: Option<String>,
+    pub active_profile_uuid: Option<String>,
     /// The forwarded-port lease as last published by the tray daemon, or `None`
     /// when it is not publishing one.
     ///
@@ -492,6 +493,7 @@ impl TuiState {
             selected_index: 0,
             selected_info: None,
             active_profile_name: None,
+            active_profile_uuid: None,
             lease: None,
             public_ip_info: None,
             download_rate: 0,

@@ -63,8 +63,8 @@ where
 
     // Channel for async public IP updates (in-flight atomic prevents thread storms - BUG-037)
     let (ip_tx, ip_rx) = std::sync::mpsc::channel();
-    let ip_lookup_in_flight = Arc::new(AtomicBool::new(false));
-    spawn_public_ip_lookup(ip_tx.clone(), ip_lookup_in_flight.clone());
+    let ip_coord = PublicIpLookupCoordinator::new(ip_tx);
+    ip_coord.request_refresh();
 
     let (lat_tx, lat_rx) = std::sync::mpsc::channel();
     let lat_tx_clone = lat_tx.clone();
@@ -77,12 +77,11 @@ where
         }
     });
 
-    if state.config.general.auto_sync_profiles {
-        if let Ok(report) = crate::app::sync::sync_profiles_dir(&client, &state.config)
-            && !report.errors.is_empty()
-        {
-            state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
-        }
+    if state.config.general.auto_sync_profiles
+        && let Ok(report) = crate::app::sync::sync_profiles_dir(&client, &state.config)
+        && !report.errors.is_empty()
+    {
+        state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
     }
     let _ = events::reload_profiles(&mut state, &client);
     // Read once up front so the first frame shows the daemon's lease rather than
@@ -238,9 +237,8 @@ where
         &mut terminal,
         &mut state,
         &client,
-        &ip_tx,
+        &ip_coord,
         &ip_rx,
-        &ip_lookup_in_flight,
         &lat_rx,
         &cache_rx,
         &conn_res_rx,
@@ -294,9 +292,8 @@ fn run_event_loop<C, B>(
     terminal: &mut Terminal<B>,
     state: &mut TuiState,
     client: &C,
-    ip_tx: &std::sync::mpsc::Sender<crate::nm::network_info::PublicIpInfo>,
-    ip_rx: &std::sync::mpsc::Receiver<crate::nm::network_info::PublicIpInfo>,
-    ip_lookup_in_flight: &Arc<AtomicBool>,
+    ip_coord: &PublicIpLookupCoordinator,
+    ip_rx: &std::sync::mpsc::Receiver<(u64, Option<crate::nm::network_info::PublicIpInfo>)>,
     lat_rx: &std::sync::mpsc::Receiver<u32>,
     cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
     conn_res_rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
@@ -313,9 +310,11 @@ where
     let mut last_domain_refresh = std::time::Instant::now();
 
     while !state.should_quit {
-        // Drain any incoming public IP updates from background worker
-        while let Ok(info) = ip_rx.try_recv() {
-            state.public_ip_info = Some(info);
+        // Drain any incoming public IP updates from background worker, checking generation (BUG-037)
+        while let Ok((generation_id, info)) = ip_rx.try_recv() {
+            if generation_id == ip_coord.generation.load(Ordering::SeqCst) {
+                state.public_ip_info = info;
+            }
         }
 
         // Drain any incoming latency updates
@@ -342,10 +341,11 @@ where
                 Ok(()) => {
                     if is_connect {
                         state.set_status(format!("Connected '{name}'."));
-                        spawn_public_ip_lookup(ip_tx.clone(), ip_lookup_in_flight.clone());
                     } else {
                         state.set_status(format!("Disconnected '{name}'."));
+                        state.public_ip_info = None;
                     }
+                    ip_coord.request_refresh();
                     let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                     let _ = events::reload_profiles(state, client);
                     events::update_diagnostics(state, client);
@@ -506,11 +506,14 @@ where
         let current_nm_event = monitor_events.load(Ordering::Relaxed);
         if current_nm_event != last_seen_event {
             last_seen_event = current_nm_event;
-            let prev_active = state.active_profile_name.clone();
+            let prev_active_uuid = state.active_profile_uuid.clone();
             let _ = events::reload_profiles(state, client);
             // Only trigger public IP lookup if the active tunnel connection actually changed (BUG-037)
-            if state.active_profile_name != prev_active {
-                spawn_public_ip_lookup(ip_tx.clone(), ip_lookup_in_flight.clone());
+            if state.active_profile_uuid != prev_active_uuid {
+                if state.active_profile_uuid.is_none() {
+                    state.public_ip_info = None;
+                }
+                ip_coord.request_refresh();
             }
         }
 
@@ -582,19 +585,50 @@ fn start_nm_monitor_loop(events: Arc<AtomicU64>, slot: MonitorChild) {
     }
 }
 
-fn spawn_public_ip_lookup(
-    tx: std::sync::mpsc::Sender<crate::nm::network_info::PublicIpInfo>,
+#[derive(Clone)]
+pub(crate) struct PublicIpLookupCoordinator {
+    tx: std::sync::mpsc::Sender<(u64, Option<crate::nm::network_info::PublicIpInfo>)>,
+    generation: Arc<AtomicU64>,
     in_flight: Arc<AtomicBool>,
-) {
-    if in_flight.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    thread::spawn(move || {
-        if let Some(info) = crate::nm::network_info::fetch_public_ip_info() {
-            let _ = tx.send(info);
+    pending: Arc<AtomicBool>,
+}
+
+impl PublicIpLookupCoordinator {
+    fn new(
+        tx: std::sync::mpsc::Sender<(u64, Option<crate::nm::network_info::PublicIpInfo>)>,
+    ) -> Self {
+        Self {
+            tx,
+            generation: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(AtomicBool::new(false)),
         }
-        in_flight.store(false, Ordering::SeqCst);
-    });
+    }
+
+    fn request_refresh(&self) {
+        let current_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.in_flight.swap(true, Ordering::SeqCst) {
+            self.pending.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        let coord = self.clone();
+        thread::spawn(move || {
+            let mut generation_id = current_gen;
+            loop {
+                let info = crate::nm::network_info::fetch_public_ip_info();
+                if generation_id == coord.generation.load(Ordering::SeqCst) {
+                    let _ = coord.tx.send((generation_id, info));
+                }
+                if coord.pending.swap(false, Ordering::SeqCst) {
+                    generation_id = coord.generation.load(Ordering::SeqCst);
+                } else {
+                    break;
+                }
+            }
+            coord.in_flight.store(false, Ordering::SeqCst);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -603,12 +637,44 @@ mod tests {
 
     #[test]
     fn in_flight_guard_prevents_concurrent_ip_lookups() {
-        let in_flight = Arc::new(AtomicBool::new(true));
         let (tx, rx) = std::sync::mpsc::channel();
-        spawn_public_ip_lookup(tx, in_flight.clone());
-        // With in_flight initially true, swap returns true and drops immediately
+        let coord = PublicIpLookupCoordinator::new(tx);
+        // Simulate in-flight worker
+        coord.in_flight.store(true, Ordering::SeqCst);
+        coord.request_refresh();
+        // Request marked pending without spawning extra concurrent worker
+        assert!(coord.pending.load(Ordering::SeqCst));
         assert!(rx.try_recv().is_err());
-        assert!(in_flight.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn delayed_lookup_coalesces_and_discards_stale_replies() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let coord = PublicIpLookupCoordinator::new(tx.clone());
+
+        // Generation 1 starts
+        let gen1 = coord.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Two rapid changes occur while gen1 was "in flight"
+        let _gen2 = coord.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen3 = coord.generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Simulate gen1 worker finishing late: sends reply for gen 1
+        let _ = tx.send((gen1, None));
+        // Simulate coalesced gen3 worker completing: sends reply for gen 3
+        let _ = tx.send((gen3, None));
+
+        // When draining:
+        let (first_gen, _) = rx.recv().unwrap();
+        assert!(
+            first_gen < coord.generation.load(Ordering::SeqCst),
+            "gen1 is stale and should be rejected"
+        );
+        let (second_gen, _) = rx.recv().unwrap();
+        assert_eq!(
+            second_gen,
+            coord.generation.load(Ordering::SeqCst),
+            "gen3 is fresh and accepted"
+        );
     }
 
     #[test]
