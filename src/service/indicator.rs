@@ -29,8 +29,10 @@ const DISCONNECTED_24_ARGB32: &[u8] =
 #[derive(Debug, Clone, Default)]
 pub struct IndicatorSharedState {
     pub active_profile: Option<String>,
+    pub active_uuid: Option<String>,
     pub forwarded_port: Option<u16>,
     pub favorite_profiles: Vec<(String, String)>,
+    pub favorite_id_map: HashMap<i32, String>,
     pub menu_revision: u32,
 }
 
@@ -259,15 +261,19 @@ where
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> MenuLayoutResult<'_> {
-        let (prof, port_opt, favorites, rev) = if let Ok(st) = self.state.lock() {
-            (
-                st.active_profile.clone(),
-                st.forwarded_port,
-                st.favorite_profiles.clone(),
-                st.menu_revision,
-            )
+        let (prof, active_uuid, port_opt, favorites, rev) = if let Ok(mut st) = self.state.lock() {
+            let active_prof = st.active_profile.clone();
+            let active_id = st.active_uuid.clone();
+            let port = st.forwarded_port;
+            let favs = st.favorite_profiles.clone();
+            let rev = st.menu_revision;
+            st.favorite_id_map.clear();
+            for (idx, (uuid, _)) in favs.iter().enumerate() {
+                st.favorite_id_map.insert(100 + idx as i32, uuid.clone());
+            }
+            (active_prof, active_id, port, favs, rev)
         } else {
-            (None, None, Vec::new(), 1)
+            (None, None, None, Vec::new(), 1)
         };
 
         let mut children = Vec::new();
@@ -291,8 +297,8 @@ where
             fav_sep.insert("visible".to_string(), Value::from(true));
             children.push(Value::from((10i32, fav_sep, Vec::<Value<'_>>::new())));
 
-            for (idx, (_uuid, name)) in favorites.iter().enumerate() {
-                let is_active = prof.as_deref() == Some(name.as_str());
+            for (idx, (uuid, name)) in favorites.iter().enumerate() {
+                let is_active = active_uuid.as_deref() == Some(uuid.as_str());
                 let label = if is_active {
                     format!("{name} (Active)")
                 } else {
@@ -373,12 +379,11 @@ where
                 std::process::exit(0);
             }
             item_id if item_id >= 100 => {
-                let idx = (item_id - 100) as usize;
                 let target_uuid = self
                     .state
                     .lock()
                     .ok()
-                    .and_then(|st| st.favorite_profiles.get(idx).map(|(u, _)| u.clone()));
+                    .and_then(|st| st.favorite_id_map.get(&item_id).cloned());
                 if let Some(uuid) = target_uuid
                     && let Err(err) = self.client.switch_to(&uuid)
                 {
@@ -887,10 +892,12 @@ where
 
         if let Ok(mut st) = state.lock()
             && (st.active_profile != active_name
+                || st.active_uuid != active_uuid
                 || st.forwarded_port != lease.port
                 || st.favorite_profiles != favorites)
         {
             st.active_profile = active_name;
+            st.active_uuid = active_uuid.clone();
             st.forwarded_port = lease.port;
             st.favorite_profiles = favorites;
             st.menu_revision += 1;
@@ -912,6 +919,7 @@ mod tests {
             forwarded_port: port,
             favorite_profiles: Vec::new(),
             menu_revision: 1,
+            ..Default::default()
         }));
         StatusNotifierItem { state }
     }
@@ -922,6 +930,7 @@ mod tests {
             forwarded_port: port,
             favorite_profiles: Vec::new(),
             menu_revision: 1,
+            ..Default::default()
         }));
         let client = MockNmClient::default();
         DBusMenu { client, state }
@@ -972,6 +981,7 @@ mod tests {
             forwarded_port: None,
             favorite_profiles: vec![("uuid-fav".to_string(), "Favorite 1".to_string())],
             menu_revision: 1,
+            ..Default::default()
         }));
         let client = MockNmClient::new(vec![profile(
             "Favorite 1",
@@ -988,6 +998,44 @@ mod tests {
             state.try_lock().is_ok(),
             "shared state lock must remain available during/after favorite switch"
         );
+    }
+
+    #[test]
+    fn favorite_menu_ids_map_to_stable_uuids_and_check_active_by_uuid() {
+        use crate::testing::profile;
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: Some("WireGuard".to_string()),
+            active_uuid: Some("uuid-1".to_string()),
+            forwarded_port: None,
+            favorite_profiles: vec![
+                ("uuid-1".to_string(), "WireGuard".to_string()),
+                ("uuid-2".to_string(), "WireGuard".to_string()),
+            ],
+            ..Default::default()
+        }));
+        let client = MockNmClient::new(vec![
+            profile("WireGuard", "uuid-1", ProfileState::Active),
+            profile("WireGuard", "uuid-2", ProfileState::Inactive),
+        ]);
+        let menu = DBusMenu {
+            client: client.clone(),
+            state: state.clone(),
+        };
+
+        // Render layout: populates favorite_id_map and checks active state by UUID
+        let (_, layout) = menu.get_layout(0, -1, vec![]);
+        let (id, _, children) = layout;
+        assert_eq!(id, 0);
+        // Children: toggle(2), sep(10), fav 100, fav 101, sep(12), quit(4)
+        assert_eq!(children.len(), 6);
+
+        // Click item 101 -> maps to uuid-2
+        menu.event(101, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(client.calls(), vec!["switch:uuid-2"]);
+
+        // Non-existent item 199 is a no-op
+        menu.event(199, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(client.calls(), vec!["switch:uuid-2"]);
     }
 
     #[test]
@@ -1210,6 +1258,7 @@ mod tests {
                 ("uuid-backup".to_string(), "wg-backup".to_string()),
             ],
             menu_revision: 1,
+            ..Default::default()
         }));
         let client = MockNmClient::default();
         let menu = DBusMenu { client, state };
