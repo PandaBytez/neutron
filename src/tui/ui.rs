@@ -343,7 +343,7 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         Span::styled(split_val, split_val_style),
     ]);
 
-    let title = Line::from(vec![Span::styled(" 🛡  Policies ", theme.title)]);
+    let title = Line::from(vec![Span::styled(" 🛡  Saved Policies ", theme.title)]);
 
     let policies_widget = Paragraph::new(vec![line1, line2, line3])
         .wrap(Wrap { trim: true })
@@ -570,7 +570,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             lines.push(Line::from(vec![
                 Span::styled("DNS Resolver:  ", theme.label_dim),
                 Span::styled(
-                    format!("{dns} (Exclusive Priority -1500)"),
+                    format!("{dns} (configured DNS; live priority not verified)"),
                     theme.text_secondary,
                 ),
             ]));
@@ -1554,6 +1554,8 @@ mod render_tests {
     #[test]
     fn the_policies_panel_shows_consistent_spaced_policy_names() {
         let off = rendered_policies(AppConfig::default()).join("\n");
+        assert!(off.contains("Saved Policies"));
+        assert!(!off.contains("reconnect"));
         assert!(
             off.contains("[a] Auto Connect:") && off.contains("OFF"),
             "Auto Connect must use space and render: {off}"

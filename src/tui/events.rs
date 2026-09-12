@@ -243,7 +243,7 @@ pub fn execute_action<C: ActionClient>(
                 .remove(&crate::error::Policy::KillSwitch);
             state.config.kill_switch_enabled = enable;
             state.set_status(format!(
-                "{} Kill Switch (all profiles).",
+                "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
                 enabled_verb(enable)
             ));
         }
@@ -682,6 +682,20 @@ mod tests {
     use super::*;
     use crate::config::SplitTunnelMode;
     use crate::tui::state::CommandPaletteState;
+
+    #[test]
+    fn routing_changes_show_reconnect_toasts() {
+        let path = crate::testing::temp_config_path("reconnect-toast");
+        let client = crate::testing::MockNmClient::default();
+        let mut state = TuiState::new(path.clone(), config::AppConfig::default());
+        execute_action(&mut state, &client, "kill_switch").unwrap();
+        assert!(state.active_toast().unwrap().message.contains("reconnect"));
+        state
+            .apply_split_tunnel(&client, config::SplitTunnelConfig::default())
+            .unwrap();
+        assert!(state.active_toast().unwrap().message.contains("reconnect"));
+        crate::testing::remove_temp_config(&path);
+    }
 
     #[test]
     fn every_action_the_key_map_produces_is_offered_by_the_palette() {

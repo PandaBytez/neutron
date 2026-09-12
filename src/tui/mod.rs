@@ -267,7 +267,7 @@ where
         while let Ok((_cfg, res)) = st_res_rx.try_recv() {
             match res {
                 Ok(()) => {
-                    state.set_status("Split tunneling applied & saved.");
+                    state.set_status("Split tunneling saved; reconnect to apply routing changes.");
                     state
                         .uncertain_policies
                         .remove(&crate::error::Policy::SplitTunnel);

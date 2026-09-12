@@ -498,6 +498,7 @@ impl TuiState {
             )?;
             self.uncertain_policies
                 .remove(&crate::error::Policy::SplitTunnel);
+            self.set_status("Split tunneling saved; reconnect to apply routing changes.");
             Ok(())
         }
     }

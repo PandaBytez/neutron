@@ -201,6 +201,8 @@ cargo xtask container-shell
 - Policy errors distinguish partial application from successful application followed by failed saving. The current
   TUI session displays affected policies as `UNKNOWN` until a successful retry; a config refresh cannot clear that
   warning. CLI lockdown status explicitly reports saved intent, not verified effective firewall state.
+  Action toasts warn that routing/DNS changes require reconnect; the policy panel shows saved settings. Configured DNS
+  servers are displayed without claiming a verified live priority.
 - Profile import runs `nmcli connection import type wireguard file <path>`, so NetworkManager stays the single source of
   truth — no local copy of the `.conf` is kept.
 - The application binary is named **Neutron** (`neutron`) with zero runtime shared library dependencies when compiled
