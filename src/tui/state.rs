@@ -448,6 +448,8 @@ pub struct TuiState {
     pub connecting: Option<ConnectingState>,
     pub connect_tx: Option<std::sync::mpsc::Sender<(String, String, bool)>>,
     pub split_tunnel_tx: Option<std::sync::mpsc::Sender<SplitTunnelConfig>>,
+    pub pending_split: Option<SplitTunnelConfig>,
+    pub profile_refresh_requested: bool,
     pub action_tx: Option<std::sync::mpsc::Sender<AsyncAction>>,
     pub diag_tx: Option<std::sync::mpsc::Sender<(String, bool)>>,
     pub modal: ActiveModal,
@@ -506,6 +508,8 @@ impl TuiState {
             connecting: None,
             connect_tx: None,
             split_tunnel_tx: None,
+            pending_split: None,
+            profile_refresh_requested: false,
             action_tx: None,
             diag_tx: None,
             modal: ActiveModal::None,
@@ -520,7 +524,10 @@ impl TuiState {
     ) -> crate::error::AppResult<()> {
         self.config.global_split_tunnel = new_cfg.clone();
         if let Some(ref tx) = self.split_tunnel_tx {
-            let _ = tx.send(new_cfg);
+            tx.send(new_cfg.clone()).map_err(|_| {
+                crate::error::AppError::Config("split policy worker stopped".into())
+            })?;
+            self.pending_split = Some(new_cfg);
             Ok(())
         } else {
             crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
@@ -532,6 +539,42 @@ impl TuiState {
                 .remove(&crate::error::Policy::SplitTunnel);
             self.set_status("Split tunneling saved; reconnect to apply routing changes.");
             Ok(())
+        }
+    }
+
+    pub fn finish_split(
+        &mut self,
+        applied: SplitTunnelConfig,
+        result: crate::error::AppResult<()>,
+    ) {
+        if self
+            .pending_split
+            .as_ref()
+            .is_some_and(|pending| pending != &applied)
+        {
+            // An older reply must not replace a newer edit still queued.
+            if let Err(error) = result {
+                self.set_error(&error);
+            }
+            return;
+        }
+        self.pending_split = None;
+        match result {
+            Ok(()) => {
+                self.config.global_split_tunnel = applied;
+                self.uncertain_policies
+                    .remove(&crate::error::Policy::SplitTunnel);
+                self.set_status("Split tunneling saved; reconnect to apply routing changes.");
+            }
+            Err(error) => {
+                self.set_error(&error);
+                if let Ok(saved) = crate::config::load(&self.config_path) {
+                    self.config.global_split_tunnel = saved.global_split_tunnel;
+                }
+            }
+        }
+        if let ActiveModal::SplitTunnel(ref mut modal) = self.modal {
+            *modal = SplitTunnelModalState::from_config(&self.config.global_split_tunnel);
         }
     }
 

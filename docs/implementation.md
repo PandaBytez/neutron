@@ -55,6 +55,21 @@ than content comparison. Interface comments are retained as application metadata
 
 ## Saved Intent and Effective Policy
 
+The long-lived indicator refreshes domain routes every 30 seconds and reapplies
+them to active NetworkManager devices. Automatic firewall reconciliation and
+domain refresh share coordination with explicit policy changes; failed firewall
+reconciliation is retried. DNS rotation still has a polling interval, not a
+per-query routing guarantee.
+
+TUI profile refresh and startup sync run in background workers. Transient profile
+read failures retry with a delay, and public-IP requests coalesce without losing
+the last request during worker shutdown. Favorite menu IDs remain tied to UUIDs
+across layout refreshes; clicks on removed items are ignored.
+
+Port leases renew at half the granted lifetime (capped at 45 seconds). Failed
+qBittorrent synchronization retries after 45 seconds, while changed configuration
+can trigger an immediate attempt.
+
 Routing/DNS changes to saved NetworkManager profiles require reconnect. Action
 toasts explain this; the policy panel shows saved settings. DNS details do not
 claim a verified live priority.

@@ -163,13 +163,22 @@ fn malformed_config_fails_cleanly_at_startup() {
     let config_path = config_dir.join("config.toml");
     std::fs::write(&config_path, "invalid toml content [[[").unwrap();
 
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
-
-    let client = MockNmClient::new(vec![]);
-    let res = neutron::tui::run(client);
-    assert!(res.is_err(), "malformed config must fail run()");
-
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
+        .arg("tui")
+        .env("XDG_CONFIG_HOME", &sandbox)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "malformed config must fail startup"
+    );
+    assert!(
+        !output
+            .stdout
+            .windows(8)
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "startup must not enter the alternate screen"
+    );
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
@@ -272,6 +281,15 @@ fn split_worker_failure_reconciles_modal_and_pending_state() {
         state.config.global_split_tunnel.cidrs,
         vec!["192.168.1.0/24".to_string()]
     );
+
+    state.finish_split(pending, Err(AppError::CommandFailed("rejected".into())));
+    assert!(state.pending_split.is_none());
+    assert!(state.config.global_split_tunnel.cidrs.is_empty());
+    if let neutron::tui::state::ActiveModal::SplitTunnel(modal) = &state.modal {
+        assert!(modal.cidrs.is_empty());
+    } else {
+        panic!("modal should remain open");
+    }
 
     testing::remove_temp_config(&path);
 }

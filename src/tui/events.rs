@@ -664,16 +664,31 @@ pub fn fetch_profile_info<C: NmClient>(
 }
 
 pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResult<()> {
+    if state.diag_tx.is_some() {
+        state.profile_refresh_requested = true;
+        return Ok(());
+    }
     let profiles = client.list_wireguard_profiles()?;
     let app_cfg = config::load(&state.config_path)?;
 
+    apply_profile_snapshot(state, profiles, app_cfg);
+    update_diagnostics(state, client);
+    Ok(())
+}
+
+pub(crate) fn apply_profile_snapshot(
+    state: &mut TuiState,
+    profiles: Vec<crate::nm::WireguardProfile>,
+    app_cfg: config::AppConfig,
+) {
     state.rows = crate::app::profile_list::build_rows(
         &profiles,
         &app_cfg.excluded_profile_ids,
         &app_cfg.favorite_profile_ids,
         &app_cfg.profile_custom_info,
     );
-    let preserve_split = matches!(state.modal, ActiveModal::SplitTunnel(_));
+    let preserve_split =
+        state.pending_split.is_some() || matches!(state.modal, ActiveModal::SplitTunnel(_));
     let pending_split = state.config.global_split_tunnel.clone();
     state.config = app_cfg;
     if preserve_split {
@@ -700,9 +715,6 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
     if let Some(uuid) = active_uuid {
         state.profile_cache.remove(&uuid);
     }
-
-    update_diagnostics(state, client);
-    Ok(())
 }
 
 pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {

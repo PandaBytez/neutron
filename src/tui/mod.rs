@@ -5,10 +5,25 @@ pub mod state;
 pub mod theme;
 pub mod ui;
 
+fn spawn_worker<T: Send + 'static, R: Send + 'static>(
+    mut work: impl FnMut(T) -> R + Send + 'static,
+) -> (std::sync::mpsc::Sender<T>, std::sync::mpsc::Receiver<R>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(request) = rx.recv() {
+            if result_tx.send(work(request)).is_err() {
+                break;
+            }
+        }
+    });
+    (tx, result_rx)
+}
+
 use std::io::stdout;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -77,22 +92,7 @@ where
         }
     });
 
-    if state.config.general.auto_sync_profiles
-        && let Ok(report) = crate::app::sync::sync_profiles_dir(&client, &state.config)
-    {
-        if !report.errors.is_empty() {
-            state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
-        }
-        if !report.imported.is_empty() {
-            let _ = crate::app::rebuild_lockdown_if_enabled(&client, &state.config_path);
-        }
-    }
-    let _ = crate::service::reconcile_autoconnect_at_login(&state.config_path);
-    let mut initial_refresh_needed = false;
-    if let Err(err) = events::reload_profiles(&mut state, &client) {
-        state.set_error(&err);
-        initial_refresh_needed = true;
-    }
+    let initial_refresh_needed = true;
     // Read once up front so the first frame shows the daemon's lease rather than
     // reporting it missing until the first periodic tick.
     events::refresh_lease(&mut state);
@@ -138,6 +138,10 @@ where
     let client_for_action = client.clone();
     let config_path_for_action = state.config_path.clone();
     thread::spawn(move || {
+        if let Err(error) = crate::service::reconcile_autoconnect_at_login(&config_path_for_action)
+        {
+            let _ = action_res_tx.send(crate::tui::state::AsyncActionResult::Sync(Err(error)));
+        }
         while let Ok(action) = action_rx.recv() {
             let res = match action {
                 crate::tui::state::AsyncAction::KillSwitch(enable) => {
@@ -191,12 +195,18 @@ where
             let _ = action_res_tx.send(res);
         }
     });
+    if state.config.general.auto_sync_profiles
+        && let Some(tx) = &state.action_tx
+    {
+        let _ = tx.send(crate::tui::state::AsyncAction::Sync);
+    }
 
     let (connect_tx, connect_rx) = std::sync::mpsc::channel::<(String, String, bool)>();
     let (conn_res_tx, conn_res_rx) = std::sync::mpsc::channel::<(String, AppResult<()>, bool)>();
     state.connect_tx = Some(connect_tx);
 
     let client_for_conn = client.clone();
+    let path_for_conn = state.config_path.clone();
     thread::spawn(move || {
         while let Ok((uuid, name, is_connect)) = connect_rx.recv() {
             let res = if is_connect {
@@ -204,6 +214,9 @@ where
             } else {
                 client_for_conn.disconnect_active()
             };
+            let reconciliation =
+                crate::app::rebuild_lockdown_if_enabled(&client_for_conn, &path_for_conn);
+            let res = res.and(reconciliation);
             let _ = conn_res_tx.send((name, res, is_connect));
         }
     });
@@ -338,7 +351,15 @@ where
     let mut last_seen_event = 0_u64;
     let mut needs_profile_refresh = initial_refresh_needed;
     let mut last_diag_sample = std::time::Instant::now();
-    let mut last_domain_refresh = std::time::Instant::now();
+    let refresh_client = client.clone();
+    let refresh_path = state.config_path.clone();
+    let (refresh_tx, snapshot_rx) = spawn_worker(move |()| {
+        refresh_client
+            .list_wireguard_profiles()
+            .and_then(|profiles| config::load(&refresh_path).map(|cfg| (profiles, cfg)))
+    });
+    let mut refresh_in_flight = false;
+    let mut retry_at = std::time::Instant::now();
 
     while !state.should_quit {
         // Drain any incoming public IP updates from background worker, checking generation (BUG-037)
@@ -377,40 +398,18 @@ where
                         state.public_ip_info = None;
                     }
                     ip_coord.request_refresh();
-                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
-                    let _ = events::reload_profiles(state, client);
-                    events::update_diagnostics(state, client);
+                    needs_profile_refresh = true;
                 }
                 Err(err) => {
                     state.set_error(&err);
-                    let _ = events::reload_profiles(state, client);
+                    needs_profile_refresh = true;
                 }
             }
         }
 
         // Drain any incoming background split tunneling application results (BUG-063)
         while let Ok((applied_cfg, res)) = st_res_rx.try_recv() {
-            match res {
-                Ok(()) => {
-                    state.config.global_split_tunnel = applied_cfg.clone();
-                    state.set_status("Split tunneling saved; reconnect to apply routing changes.");
-                    state
-                        .uncertain_policies
-                        .remove(&crate::error::Policy::SplitTunnel);
-                }
-                Err(err) => {
-                    state.set_error(&err);
-                    if let Ok(persisted) = crate::config::load(&state.config_path) {
-                        state.config.global_split_tunnel = persisted.global_split_tunnel.clone();
-                        if let crate::tui::state::ActiveModal::SplitTunnel(ref mut st) = state.modal
-                        {
-                            *st = crate::tui::state::SplitTunnelModalState::from_config(
-                                &persisted.global_split_tunnel,
-                            );
-                        }
-                    }
-                }
-            }
+            state.finish_split(applied_cfg, res);
         }
 
         // Drain any incoming background action results
@@ -471,7 +470,7 @@ where
                 }
                 crate::tui::state::AsyncActionResult::Sync(result) => match result {
                     Ok(report) => {
-                        let _ = events::reload_profiles(state, client);
+                        needs_profile_refresh = true;
                         if !report.errors.is_empty() {
                             state.set_error(&crate::error::AppError::Config(
                                 report.errors.join("; "),
@@ -490,7 +489,7 @@ where
                 crate::tui::state::AsyncActionResult::Delete(result) => match result {
                     Ok(_) => {
                         state.set_status("Profile deleted.");
-                        let _ = events::reload_profiles(state, client);
+                        needs_profile_refresh = true;
                     }
                     Err(err) => state.set_error(&err),
                 },
@@ -516,19 +515,6 @@ where
             }
         }
 
-        if last_domain_refresh.elapsed() >= Duration::from_secs(30) {
-            last_domain_refresh = std::time::Instant::now();
-            if state.rows.iter().any(|r| r.is_active)
-                && state.config.global_split_tunnel.mode.is_enabled()
-                && !state.config.global_split_tunnel.domains.is_empty()
-            {
-                let _ = crate::app::split_tunnel::refresh_active_domain_routes(
-                    client,
-                    &state.config_path,
-                );
-            }
-        }
-
         // Update real-time bandwidth throughput rates (1.5s sampling)
         state.update_throughput();
 
@@ -542,16 +528,21 @@ where
 
         // Check if NetworkManager emitted connection change events
         let current_nm_event = monitor_events.load(Ordering::Relaxed);
+        if std::mem::take(&mut state.profile_refresh_requested) {
+            needs_profile_refresh = true;
+        }
         if current_nm_event != last_seen_event {
             last_seen_event = current_nm_event;
             needs_profile_refresh = true;
         }
 
-        if needs_profile_refresh {
+        while let Ok(result) = snapshot_rx.try_recv() {
+            refresh_in_flight = false;
             let prev_active_uuid = state.active_profile_uuid.clone();
-            match events::reload_profiles(state, client) {
-                Ok(()) => {
-                    needs_profile_refresh = false;
+            match result {
+                Ok((profiles, cfg)) => {
+                    events::apply_profile_snapshot(state, profiles, cfg);
+                    events::update_diagnostics(state, client);
                     if state.active_profile_uuid != prev_active_uuid {
                         if state.active_profile_uuid.is_none() {
                             state.public_ip_info = None;
@@ -562,8 +553,18 @@ where
                 Err(err) => {
                     // Do not drop the refresh requirement on transient errors (BUG-048)
                     state.set_error(&err);
+                    needs_profile_refresh = true;
+                    retry_at = std::time::Instant::now() + Duration::from_secs(1);
                 }
             }
+        }
+        if needs_profile_refresh
+            && !refresh_in_flight
+            && std::time::Instant::now() >= retry_at
+            && refresh_tx.send(()).is_ok()
+        {
+            needs_profile_refresh = false;
+            refresh_in_flight = true;
         }
 
         // Poll for user keyboard input with 50ms timeout (smooth 20 FPS refresh)
@@ -638,8 +639,7 @@ fn start_nm_monitor_loop(events: Arc<AtomicU64>, slot: MonitorChild) {
 pub(crate) struct PublicIpLookupCoordinator {
     tx: std::sync::mpsc::Sender<(u64, Option<crate::nm::network_info::PublicIpInfo>)>,
     generation: Arc<AtomicU64>,
-    in_flight: Arc<AtomicBool>,
-    pending: Arc<AtomicBool>,
+    worker_state: Arc<Mutex<(bool, bool)>>,
 }
 
 impl PublicIpLookupCoordinator {
@@ -649,33 +649,43 @@ impl PublicIpLookupCoordinator {
         Self {
             tx,
             generation: Arc::new(AtomicU64::new(0)),
-            in_flight: Arc::new(AtomicBool::new(false)),
-            pending: Arc::new(AtomicBool::new(false)),
+            worker_state: Arc::new(Mutex::new((false, false))),
         }
     }
 
     fn request_refresh(&self) {
+        self.request_with(crate::nm::network_info::fetch_public_ip_info);
+    }
+
+    fn request_with(
+        &self,
+        mut fetch: impl FnMut() -> Option<crate::nm::network_info::PublicIpInfo> + Send + 'static,
+    ) {
+        let mut state = self.worker_state.lock().expect("IP worker state poisoned");
         let current_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.in_flight.swap(true, Ordering::SeqCst) {
-            self.pending.store(true, Ordering::SeqCst);
+        if state.0 {
+            state.1 = true;
             return;
         }
+        state.0 = true;
 
         let coord = self.clone();
         thread::spawn(move || {
             let mut generation_id = current_gen;
             loop {
-                let info = crate::nm::network_info::fetch_public_ip_info();
+                let info = fetch();
                 if generation_id == coord.generation.load(Ordering::SeqCst) {
                     let _ = coord.tx.send((generation_id, info));
                 }
-                if coord.pending.swap(false, Ordering::SeqCst) {
+                let mut state = coord.worker_state.lock().expect("IP worker state poisoned");
+                if state.1 {
+                    state.1 = false;
                     generation_id = coord.generation.load(Ordering::SeqCst);
                 } else {
+                    state.0 = false;
                     break;
                 }
             }
-            coord.in_flight.store(false, Ordering::SeqCst);
         });
     }
 }
@@ -685,45 +695,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_worker_can_block_while_ui_processes_input_and_then_retry() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut first = true;
+        let (tx, rx) = spawn_worker(move |()| -> AppResult<()> {
+            if first {
+                first = false;
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(crate::error::AppError::CommandFailed(
+                    "transient failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        tx.send(()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let path = crate::testing::temp_config_path("blocked-worker");
+        let mut state = TuiState::new(path, config::AppConfig::default());
+        events::handle_key_event(
+            &mut state,
+            &crate::testing::MockNmClient::default(),
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .unwrap();
+        assert!(state.should_quit);
+        assert!(rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+        tx.send(()).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+    }
+
+    #[test]
     fn in_flight_guard_prevents_concurrent_ip_lookups() {
         let (tx, rx) = std::sync::mpsc::channel();
         let coord = PublicIpLookupCoordinator::new(tx);
         // Simulate in-flight worker
-        coord.in_flight.store(true, Ordering::SeqCst);
+        coord.worker_state.lock().unwrap().0 = true;
         coord.request_refresh();
         // Request marked pending without spawning extra concurrent worker
-        assert!(coord.pending.load(Ordering::SeqCst));
+        assert!(coord.worker_state.lock().unwrap().1);
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn delayed_lookup_coalesces_and_discards_stale_replies() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let coord = PublicIpLookupCoordinator::new(tx.clone());
-
-        // Generation 1 starts
-        let gen1 = coord.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        // Two rapid changes occur while gen1 was "in flight"
-        let _gen2 = coord.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let gen3 = coord.generation.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Simulate gen1 worker finishing late: sends reply for gen 1
-        let _ = tx.send((gen1, None));
-        // Simulate coalesced gen3 worker completing: sends reply for gen 3
-        let _ = tx.send((gen3, None));
-
-        // When draining:
-        let (first_gen, _) = rx.recv().unwrap();
-        assert!(
-            first_gen < coord.generation.load(Ordering::SeqCst),
-            "gen1 is stale and should be rejected"
-        );
-        let (second_gen, _) = rx.recv().unwrap();
-        assert_eq!(
-            second_gen,
-            coord.generation.load(Ordering::SeqCst),
-            "gen3 is fresh and accepted"
-        );
+        let coord = PublicIpLookupCoordinator::new(tx);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut first = true;
+        coord.request_with(move || {
+            if first {
+                first = false;
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            None
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        coord.request_with(|| panic!("must coalesce into existing worker"));
+        coord.request_with(|| panic!("must coalesce into existing worker"));
+        release_tx.send(()).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().0, 3);
+        // Repeated requests racing worker completion must each eventually finish.
+        for _ in 0..100 {
+            coord.request_with(|| None);
+            let generation = coord.generation.load(Ordering::SeqCst);
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap().0,
+                generation
+            );
+        }
     }
 
     #[test]
