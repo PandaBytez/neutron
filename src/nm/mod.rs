@@ -154,9 +154,13 @@ fn imported_uuid(output: &str) -> AppResult<&str> {
     let uuid = confirmations
         .next()
         .filter(|_| confirmations.next().is_none());
-    uuid.ok_or_else(|| AppError::NmParseFailed(
-        "import completed without a unique UUID confirmation; inspect NetworkManager profiles before retrying".into()
-    ))
+    uuid.ok_or_else(|| {
+        AppError::NmParseFailed(
+            "import completed without a unique UUID confirmation; \
+        inspect NetworkManager profiles before retrying"
+                .into(),
+        )
+    })
 }
 
 fn extract_interface_comments(path: &std::path::Path) -> String {
@@ -1134,7 +1138,8 @@ mod tests {
         let message = format!("Connection 'office' ({uuid}) successfully added.");
         assert_eq!(imported_uuid(&message).unwrap(), uuid);
         let hostile_name = format!(
-            "Connection 'name' (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa) successfully added.' ({uuid}) successfully added."
+            "Connection 'name' (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa) successfully added.' ({uuid})\
+             successfully added."
         );
         assert_eq!(imported_uuid(&hostile_name).unwrap(), uuid);
         for invalid in [
@@ -1216,34 +1221,37 @@ mod tests {
         for keepalive in ["", " persistent-keepalive=0"] {
             let mut modified = false;
             let mut activated = false;
-            activate_with("uuid-1", &path, &mut |args| {
-                match args {
-                    ["-g", "ipv6.method", "connection", "show", "uuid-1"] => Ok("auto".into()),
-                    ["connection", "modify", "uuid-1", settings @ ..] => {
-                        for pair in [
-                            ["connection.autoconnect", "no"],
-                            ["wireguard.ip4-auto-default-route", "yes"],
-                            ["wireguard.ip6-auto-default-route", "yes"],
-                            ["ipv4.dns-priority", "-1500"],
-                            ["ipv6.dns-priority", "-1500"],
-                            ["ipv4.routes", "10.0.0.0/8"],
-                        ] {
-                            assert!(settings.chunks_exact(2).any(|p| p == pair), "missing {pair:?}");
-                        }
-                        modified = true;
-                        Ok(String::new())
+            activate_with("uuid-1", &path, &mut |args| match args {
+                ["-g", "ipv6.method", "connection", "show", "uuid-1"] => Ok("auto".into()),
+                ["connection", "modify", "uuid-1", settings @ ..] => {
+                    for pair in [
+                        ["connection.autoconnect", "no"],
+                        ["wireguard.ip4-auto-default-route", "yes"],
+                        ["wireguard.ip6-auto-default-route", "yes"],
+                        ["ipv4.dns-priority", "-1500"],
+                        ["ipv6.dns-priority", "-1500"],
+                        ["ipv4.routes", "10.0.0.0/8"],
+                    ] {
+                        assert!(
+                            settings.as_chunks::<2>().0.iter().any(|p| *p == pair),
+                            "missing {pair:?}"
+                        );
                     }
-                    ["connection", "show", "uuid-1"] => Ok(format!(
-                        "connection.interface-name: ns-idle-test\nwireguard.peers: KEY= endpoint=127.0.0.1:51820 allowed-ips=10.0.0.0/8{keepalive}"
-                    )),
-                    ["connection", "up", "uuid-1"] => {
-                        assert!(modified);
-                        activated = true;
-                        Ok(String::new())
-                    }
-                    _ => panic!("on-demand activation must not tear down the tunnel: {args:?}"),
+                    modified = true;
+                    Ok(String::new())
                 }
-            }).unwrap();
+                ["connection", "show", "uuid-1"] => Ok(format!(
+                    "connection.interface-name: ns-idle-test\nwireguard.peers: \
+                        KEY= endpoint=127.0.0.1:51820 allowed-ips=10.0.0.0/8{keepalive}"
+                )),
+                ["connection", "up", "uuid-1"] => {
+                    assert!(modified);
+                    activated = true;
+                    Ok(String::new())
+                }
+                _ => panic!("on-demand activation must not tear down the tunnel: {args:?}"),
+            })
+            .unwrap();
             assert!(activated);
         }
         crate::testing::remove_temp_config(&path);
@@ -1412,7 +1420,8 @@ mod tests {
         // trailing backslash, failed to parse as an IP, and was treated as a
         // hostname -- which lockdown could only allow by port, opening
         // UDP/51820 to every host instead of just the VPN peer.
-        let raw = "KEY= allowed-ips=0.0.0.0/0;\\:\\:/0 endpoint=79.127.154.1\\:51820 persistent-keepalive=25";
+        let raw = "KEY= allowed-ips=0.0.0.0/0;\\:\\:/0 endpoint=79.127.154.1\\:51820\
+         persistent-keepalive=25";
 
         let endpoints = extract_endpoints(raw);
 
