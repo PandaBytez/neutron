@@ -200,13 +200,15 @@ pub fn execute_action<C: ActionClient>(
                 return Ok(());
             };
             let (uuid, name, new_eligible) = (row.uuid.clone(), row.name.clone(), !row.eligible);
-            let mut app_cfg = config::load(&state.config_path)?;
-            if eligibility::set_profile_eligible(
-                &mut app_cfg.excluded_profile_ids,
-                &uuid,
-                new_eligible,
-            ) {
-                config::save(&state.config_path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&state.config_path, |cfg| {
+                changed = eligibility::set_profile_eligible(
+                    &mut cfg.excluded_profile_ids,
+                    &uuid,
+                    new_eligible,
+                );
+            })?;
+            if changed {
                 let verb = if new_eligible { "Eligible" } else { "Excluded" };
                 state.set_status(format!("{verb} '{name}' for startup pool."));
                 reload_profiles(state, client)?;
@@ -217,13 +219,13 @@ pub fn execute_action<C: ActionClient>(
                 return Ok(());
             };
             let (uuid, name, was_fav) = (row.uuid.clone(), row.name.clone(), row.is_favorite);
-            let mut app_cfg = config::load(&state.config_path)?;
-            if was_fav {
-                app_cfg.favorite_profile_ids.remove(&uuid);
-            } else {
-                app_cfg.favorite_profile_ids.insert(uuid.clone());
-            }
-            config::save(&state.config_path, &app_cfg)?;
+            let app_cfg = config::update(&state.config_path, |app_cfg| {
+                if was_fav {
+                    app_cfg.favorite_profile_ids.remove(&uuid);
+                } else {
+                    app_cfg.favorite_profile_ids.insert(uuid.clone());
+                }
+            })?;
             state.config = app_cfg;
             reload_profiles(state, client)?;
             let msg = if was_fav {
@@ -258,9 +260,9 @@ pub fn execute_action<C: ActionClient>(
             let enable = !state.config.port_forwarding.enabled;
             // Persisted before the reload below, which re-reads the config from
             // disk into `state.config` and would otherwise revert the toggle.
-            let mut app_cfg = config::load(&state.config_path)?;
-            app_cfg.port_forwarding.enabled = enable;
-            config::save(&state.config_path, &app_cfg)?;
+            config::update(&state.config_path, |cfg| {
+                cfg.port_forwarding.enabled = enable
+            })?;
             state.config.port_forwarding.enabled = enable;
 
             // Nothing local to drop: the daemon owns the lease and picks the
@@ -333,9 +335,7 @@ pub fn execute_action<C: ActionClient>(
         #[cfg(feature = "qbittorrent")]
         "qbit_toggle" => {
             let enable = !state.config.qbittorrent.enabled;
-            let mut app_cfg = config::load(&state.config_path)?;
-            app_cfg.qbittorrent.enabled = enable;
-            config::save(&state.config_path, &app_cfg)?;
+            config::update(&state.config_path, |cfg| cfg.qbittorrent.enabled = enable)?;
             state.config.qbittorrent.enabled = enable;
             state.set_status(format!(
                 "{} qBittorrent Port Forward Auto-Sync.",
@@ -429,10 +429,16 @@ fn handle_theme_picker_key(state: &mut TuiState, key: KeyEvent) {
             let selected = tp.themes.get(tp.selected_index).copied();
             state.modal = ActiveModal::None;
             if let Some((preset, label)) = selected {
-                state.config.theme.preset = preset.to_string();
-                let _ = config::save(&state.config_path, &state.config);
-                state.theme = crate::tui::theme::Theme::from_config(&state.config.theme);
-                state.set_status(format!("Applied theme: {label}"));
+                match config::update(&state.config_path, |cfg| {
+                    cfg.theme.preset = preset.to_string()
+                }) {
+                    Ok(saved) => {
+                        state.config = saved;
+                        state.theme = crate::tui::theme::Theme::from_config(&state.config.theme);
+                        state.set_status(format!("Applied theme: {label}"));
+                    }
+                    Err(error) => state.set_error(&error),
+                }
             }
         }
         _ => {}
@@ -945,6 +951,23 @@ mod tests {
         .unwrap();
         assert_eq!(state.modal, ActiveModal::None);
         assert_eq!(state.config.theme.preset, "osaka-jade");
+
+        // Another process changes security intent while this TUI holds an old
+        // snapshot and unsubmitted split edits. A theme edit must save neither.
+        state.config.global_split_tunnel.mode = crate::config::SplitTunnelMode::Include;
+        config::update(&path, |cfg| cfg.lockdown_enabled = true).unwrap();
+        state.modal = ActiveModal::ThemePicker(ThemePickerState::default());
+        handle_theme_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let saved = config::load(&path).unwrap();
+        assert!(saved.lockdown_enabled);
+        assert!(state.config.lockdown_enabled);
+        assert_eq!(
+            saved.global_split_tunnel.mode,
+            crate::config::SplitTunnelMode::Disabled
+        );
 
         crate::testing::remove_temp_config(&path);
     }

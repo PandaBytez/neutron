@@ -239,7 +239,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
 
 fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -> AppResult<()> {
     let path = config::default_config_path()?;
-    let mut app_cfg = config::load(&path)?;
+    let app_cfg = config::load(&path)?;
     let profiles = client.list_wireguard_profiles()?;
 
     match command {
@@ -262,12 +262,15 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
         EligibleCommands::Add { profile } => {
             // "Add to eligible" clears any exclusion for the profile.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if eligibility::set_profile_eligible(
-                &mut app_cfg.excluded_profile_ids,
-                &profile_id,
-                true,
-            ) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = eligibility::set_profile_eligible(
+                    &mut cfg.excluded_profile_ids,
+                    &profile_id,
+                    true,
+                )
+            })?;
+            if changed {
                 println!("Profile is now eligible for startup-random: {profile} ({profile_id})");
             } else {
                 println!("Profile already eligible: {profile} ({profile_id})");
@@ -276,12 +279,15 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
         EligibleCommands::Remove { profile } => {
             // "Remove from eligible" excludes the profile from startup-random.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if eligibility::set_profile_eligible(
-                &mut app_cfg.excluded_profile_ids,
-                &profile_id,
-                false,
-            ) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = eligibility::set_profile_eligible(
+                    &mut cfg.excluded_profile_ids,
+                    &profile_id,
+                    false,
+                )
+            })?;
+            if changed {
                 println!("Profile excluded from startup-random: {profile} ({profile_id})");
             } else {
                 println!("Profile already excluded: {profile} ({profile_id})");
@@ -294,7 +300,7 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
 
 fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -> AppResult<()> {
     let path = config::default_config_path()?;
-    let mut app_cfg = config::load(&path)?;
+    let app_cfg = config::load(&path)?;
     let profiles = client.list_wireguard_profiles()?;
 
     match command {
@@ -307,8 +313,11 @@ fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -
         }
         FavoriteCommands::Add { profile } => {
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if app_cfg.favorite_profile_ids.insert(profile_id.clone()) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = cfg.favorite_profile_ids.insert(profile_id.clone())
+            })?;
+            if changed {
                 println!("Starred profile as favorite: {profile} ({profile_id})");
             } else {
                 println!("Profile already in favorites: {profile} ({profile_id})");
@@ -316,8 +325,11 @@ fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -
         }
         FavoriteCommands::Remove { profile } => {
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if app_cfg.favorite_profile_ids.remove(&profile_id) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = cfg.favorite_profile_ids.remove(&profile_id)
+            })?;
+            if changed {
                 println!("Removed profile from favorites: {profile} ({profile_id})");
             } else {
                 println!("Profile not in favorites: {profile} ({profile_id})");
@@ -665,15 +677,11 @@ fn handle_qbit_command_with_path<C: NmClient>(
             }
         }
         QbitCommands::Enable => {
-            let mut app_cfg = config::load(path)?;
-            app_cfg.qbittorrent.enabled = true;
-            config::save(path, &app_cfg)?;
+            config::update(path, |cfg| cfg.qbittorrent.enabled = true)?;
             println!("qBittorrent automatic port forwarding sync enabled.");
         }
         QbitCommands::Disable => {
-            let mut app_cfg = config::load(path)?;
-            app_cfg.qbittorrent.enabled = false;
-            config::save(path, &app_cfg)?;
+            config::update(path, |cfg| cfg.qbittorrent.enabled = false)?;
             println!("qBittorrent automatic port forwarding sync disabled.");
         }
         QbitCommands::Config {
@@ -682,24 +690,24 @@ fn handle_qbit_command_with_path<C: NmClient>(
             password,
             bind,
         } => {
-            let mut app_cfg = config::load(path)?;
-            if let Some(u) = url {
-                app_cfg.qbittorrent.url = u;
-            }
-            if let Some(user) = username {
-                app_cfg.qbittorrent.username = if user.trim().is_empty() {
-                    None
-                } else {
-                    Some(user)
-                };
-            }
-            if let Some(pass) = password {
-                app_cfg.qbittorrent.password = if pass.is_empty() { None } else { Some(pass) };
-            }
-            if let Some(b) = bind {
-                app_cfg.qbittorrent.bind_interface = b;
-            }
-            config::save(path, &app_cfg)?;
+            let app_cfg = config::update(path, |app_cfg| {
+                if let Some(u) = url {
+                    app_cfg.qbittorrent.url = u;
+                }
+                if let Some(user) = username {
+                    app_cfg.qbittorrent.username = if user.trim().is_empty() {
+                        None
+                    } else {
+                        Some(user)
+                    };
+                }
+                if let Some(pass) = password {
+                    app_cfg.qbittorrent.password = if pass.is_empty() { None } else { Some(pass) };
+                }
+                if let Some(b) = bind {
+                    app_cfg.qbittorrent.bind_interface = b;
+                }
+            })?;
             println!("qBittorrent configuration updated.");
             println!("URL:            {}", app_cfg.qbittorrent.url);
             println!(

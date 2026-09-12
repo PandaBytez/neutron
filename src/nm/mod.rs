@@ -290,7 +290,7 @@ impl NmClient for CliNmClient {
             .ok_or_else(|| AppError::Config("import path is not valid UTF-8".to_string()))?;
 
         let config_path = crate::config::default_config_path()?;
-        let mut app_cfg = crate::config::load(&config_path)?;
+        let app_cfg = crate::config::load(&config_path)?;
         let before_profiles = self.list_wireguard_profiles()?;
         let before_uuids: std::collections::HashSet<String> =
             before_profiles.into_iter().map(|p| p.uuid).collect();
@@ -327,8 +327,9 @@ impl NmClient for CliNmClient {
 
         let comments = extract_interface_comments(path);
         if !comments.is_empty() {
-            app_cfg.profile_custom_info.insert(uuid.clone(), comments);
-            crate::config::save(&config_path, &app_cfg)?;
+            crate::config::update(&config_path, |cfg| {
+                cfg.profile_custom_info.insert(uuid.clone(), comments);
+            })?;
         }
 
         Ok(output)
@@ -405,13 +406,10 @@ impl NmClient for CliNmClient {
         // Drop any Neutron-side metadata keyed by this UUID so it doesn't linger
         // after the profile is gone. Best-effort: a config failure here must not
         // mask the successful deletion.
-        if let Ok(config_path) = crate::config::default_config_path()
-            && let Ok(mut app_cfg) = crate::config::load(&config_path)
-        {
-            let changed = crate::config::forget_profile(&mut app_cfg, uuid);
-            if changed {
-                let _ = crate::config::save(&config_path, &app_cfg);
-            }
+        if let Ok(config_path) = crate::config::default_config_path() {
+            let _ = crate::config::update(&config_path, |cfg| {
+                crate::config::forget_profile(cfg, uuid);
+            });
         }
 
         Ok(())

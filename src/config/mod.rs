@@ -238,6 +238,39 @@ pub fn load(path: &Path) -> AppResult<AppConfig> {
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
+    let _lock = lock_config(path)?;
+    save_unlocked(path, config)
+}
+
+/// Serialize narrow read-modify-write edits across threads and Neutron processes.
+/// Lock a stable sidecar, since atomic replacement changes the config's inode.
+pub fn update(path: &Path, edit: impl FnOnce(&mut AppConfig)) -> AppResult<AppConfig> {
+    let _lock = lock_config(path)?;
+    let mut config = load(path)?;
+    edit(&mut config);
+    save_unlocked(path, &config)?;
+    Ok(config)
+}
+
+fn lock_config(path: &Path) -> AppResult<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = options.open(PathBuf::from(lock_path))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn save_unlocked(path: &Path, config: &AppConfig) -> AppResult<()> {
     let body = if path.extension().and_then(|e| e.to_str()) == Some("json") {
         serde_json::to_string_pretty(config)?
     } else {
@@ -353,6 +386,26 @@ pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_narrow_updates_preserve_every_writer() {
+        let path = unique_path("concurrent-updates");
+        save(&path, &AppConfig::default()).unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let path = &path;
+                scope.spawn(move || {
+                    update(path, |cfg| {
+                        cfg.favorite_profile_ids.insert(format!("uuid-{i}"));
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(load(&path).unwrap().favorite_profile_ids.len(), 16);
+        cleanup(&path);
+    }
 
     #[test]
     fn roundtrips_toml_config() {

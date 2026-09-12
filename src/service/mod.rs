@@ -57,7 +57,7 @@ where
     C: NmClient,
     F: FnMut(usize) -> usize,
 {
-    let mut app_cfg = config::load(path)?;
+    let app_cfg = config::load(path)?;
 
     let profiles = client.list_wireguard_profiles()?;
 
@@ -97,8 +97,9 @@ where
     for selected in candidates {
         match client.connect(&selected.uuid) {
             Ok(()) => {
-                app_cfg.last_random_profile_id = Some(selected.uuid.clone());
-                if let Err(error) = config::save(path, &app_cfg) {
+                if let Err(error) = config::update(path, |cfg| {
+                    cfg.last_random_profile_id = Some(selected.uuid.clone());
+                }) {
                     warn!(
                         "startup random connected profile '{}' but failed to persist state: {error}",
                         selected.uuid
@@ -189,9 +190,7 @@ fn set_autoconnect_at_login_in<C: NmClient>(
 
     // Persist last: the caller reverts its switch when this errors, so saving
     // before the work could leave the stored state disagreeing with the UI.
-    let mut app_cfg = config::load(path)?;
-    app_cfg.general.autoconnect_at_login = enable;
-    config::save(path, &app_cfg)
+    config::update(path, |cfg| cfg.general.autoconnect_at_login = enable).map(|_| ())
 }
 
 #[cfg(test)]
@@ -290,6 +289,22 @@ mod tests {
         let persisted = config::load(&config_path).expect("config should be readable");
         assert_eq!(persisted.last_random_profile_id.as_deref(), Some("uuid-1"));
         cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn startup_selection_preserves_settings_changed_after_its_snapshot() {
+        let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)]);
+        let path = unique_test_config_path();
+        write_config(&path, AppConfig::default());
+        run_startup_random_with_selector(&client, &path, |_| {
+            config::update(&path, |cfg| cfg.lockdown_enabled = true).unwrap();
+            0
+        })
+        .unwrap();
+        let saved = config::load(&path).unwrap();
+        assert!(saved.lockdown_enabled);
+        assert_eq!(saved.last_random_profile_id.as_deref(), Some("uuid-1"));
+        cleanup_test_artifacts(&path);
     }
 
     #[test]

@@ -169,6 +169,8 @@ cargo xtask container-shell
   a preferred profile, the randomizer cleanly skips selection, ensuring they complement each other perfectly.
 - Application config (excluded-profile set and last random selection) is written atomically and, on Unix, restricted to
   owner-only access (`0o600`). No private keys or secrets are ever stored here; those remain in NetworkManager.
+  Neutron updates individual settings under a shared file lock, so theme changes and delayed startup saves preserve
+  newer settings written by another Neutron process.
 - All `nmcli` invocations run with a 30-second timeout and surface the command exit code on failure, so a stuck
   NetworkManager call cannot hang the CLI or GUI indefinitely.
 - Activation requires successful configuration loading and routing/DNS policy preparation. Invalid split-tunnel
