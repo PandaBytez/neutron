@@ -935,9 +935,12 @@ fn activate_with(
     config_path: &std::path::Path,
     run: &mut impl FnMut(&[&str]) -> AppResult<String>,
 ) -> AppResult<()> {
-    let config = crate::config::load(config_path)?;
-    prepare_profile(uuid, &config, run)?;
-    let settings = parse_peer_settings(&run(&["connection", "show", uuid])?);
+    let (config, settings) = crate::config::coordinate_policy(config_path, || {
+        let config = crate::config::load(config_path)?;
+        prepare_profile(uuid, &config, run)?;
+        let settings = parse_peer_settings(&run(&["connection", "show", uuid])?);
+        Ok((config, settings))
+    })?;
     // Whether the interface already exists is sampled *before* activation: a
     // fresh one starts its receive counter at zero, which is what makes that
     // counter a handshake signal. See `health`.

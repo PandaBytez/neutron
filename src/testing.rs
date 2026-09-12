@@ -195,6 +195,8 @@ pub struct MockNmClient {
     /// NetworkManager can bring several WireGuard profiles up at once -- each
     /// is its own interface, so they never compete for a device.
     active: Arc<Mutex<Vec<String>>>,
+    config_path: Option<PathBuf>,
+    sweep_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
 }
 
 impl MockNmClient {
@@ -210,6 +212,18 @@ impl MockNmClient {
             active: Arc::new(Mutex::new(active)),
             ..Self::default()
         }
+    }
+
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
+    }
+
+    pub fn with_sweep_barrier(self, barrier: Arc<std::sync::Barrier>) -> Self {
+        if let Ok(mut slot) = self.sweep_barrier.lock() {
+            *slot = Some(barrier);
+        }
+        self
     }
 
     /// Replay one `nmcli connection modify <uuid> <key> <value>...` batch into
@@ -232,6 +246,11 @@ impl MockNmClient {
     where
         F: Fn(&str) -> Vec<String>,
     {
+        if let Ok(mut slot) = self.sweep_barrier.lock()
+            && let Some(barrier) = slot.take()
+        {
+            barrier.wait();
+        }
         for uuid in self.uuids() {
             self.apply_args(&build(&uuid));
         }
@@ -480,29 +499,36 @@ impl NmClient for MockNmClient {
             profile_identifier,
             true,
         ));
-        if let Ok(config_path) = crate::config::default_config_path()
-            && let Ok(app_cfg) = crate::config::load(&config_path)
-        {
-            if app_cfg.kill_switch_enabled {
-                self.apply_args(&crate::nm::kill_switch::set_args(
-                    profile_identifier,
-                    true,
-                    true,
-                ));
-            }
-            if app_cfg.global_split_tunnel.mode.is_enabled() {
-                let (v4, v6) = crate::nm::split_tunnel::routes_for(
-                    app_cfg.global_split_tunnel.mode,
-                    &app_cfg.global_split_tunnel.cidrs,
-                    &app_cfg.global_split_tunnel.domains,
-                );
-                self.apply_args(&crate::nm::split_tunnel::set_args(
-                    profile_identifier,
-                    app_cfg.global_split_tunnel.mode,
-                    &v4,
-                    &v6,
-                ));
-            }
+        let cfg_path = self
+            .config_path
+            .clone()
+            .or_else(|| crate::config::default_config_path().ok());
+        if let Some(config_path) = cfg_path {
+            let _ = crate::config::coordinate_policy(&config_path, || {
+                if let Ok(app_cfg) = crate::config::load(&config_path) {
+                    if app_cfg.kill_switch_enabled {
+                        self.apply_args(&crate::nm::kill_switch::set_args(
+                            profile_identifier,
+                            true,
+                            true,
+                        ));
+                    }
+                    if app_cfg.global_split_tunnel.mode.is_enabled() {
+                        let (v4, v6) = crate::nm::split_tunnel::routes_for(
+                            app_cfg.global_split_tunnel.mode,
+                            &app_cfg.global_split_tunnel.cidrs,
+                            &app_cfg.global_split_tunnel.domains,
+                        );
+                        self.apply_args(&crate::nm::split_tunnel::set_args(
+                            profile_identifier,
+                            app_cfg.global_split_tunnel.mode,
+                            &v4,
+                            &v6,
+                        ));
+                    }
+                }
+                Ok(())
+            });
         }
         if self.unhealthy {
             // As the real client does: the tunnel came up but carries no

@@ -260,6 +260,42 @@ pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
     save_unlocked(path, config)
 }
 
+static IN_PROCESS_POLICY_LOCKS: std::sync::Mutex<
+    Option<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::Mutex::new(None);
+
+fn path_policy_mutex(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let mut lock = IN_PROCESS_POLICY_LOCKS.lock().unwrap();
+    let map = lock.get_or_insert_with(std::collections::HashMap::new);
+    map.entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Coordinate global policy sweeps and activation so concurrent workers cannot
+/// interleave profile changes and overwrite settings with stale configurations.
+pub fn coordinate_policy<R>(path: &Path, f: impl FnOnce() -> AppResult<R>) -> AppResult<R> {
+    let mutex = path_policy_mutex(path);
+    let _mem_lock = mutex
+        .lock()
+        .map_err(|_| AppError::Config("policy coordination mutex poisoned".to_string()))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".policy.lock");
+    let lock = options.open(PathBuf::from(lock_path))?;
+    lock.lock()?;
+    f()
+}
+
 /// Serialize narrow read-modify-write edits across threads and Neutron processes.
 /// Lock a stable sidecar, since atomic replacement changes the config's inode.
 pub fn update(path: &Path, edit: impl FnOnce(&mut AppConfig)) -> AppResult<AppConfig> {

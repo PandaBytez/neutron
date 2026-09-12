@@ -402,18 +402,20 @@ pub(crate) fn apply_and_save_policy(
     apply: impl FnOnce() -> AppResult<()>,
     edit: impl FnOnce(&mut config::AppConfig),
 ) -> AppResult<()> {
-    apply().map_err(|source| AppError::PolicyUpdate {
-        policy,
-        outcome: "application failed and may be partial; effective state is unknown",
-        source: Box::new(source),
-    })?;
-    config::update(path, edit)
-        .map(|_| ())
-        .map_err(|source| AppError::PolicyUpdate {
+    config::coordinate_policy(path, || {
+        apply().map_err(|source| AppError::PolicyUpdate {
             policy,
-            outcome: "application completed but saving failed",
+            outcome: "application failed and may be partial; effective state is unknown",
             source: Box::new(source),
-        })
+        })?;
+        config::update(path, edit)
+            .map(|_| ())
+            .map_err(|source| AppError::PolicyUpdate {
+                policy,
+                outcome: "application completed but saving failed",
+                source: Box::new(source),
+            })
+    })
 }
 
 fn handle_lockdown_command<C: NmClient + FirewallClient>(
