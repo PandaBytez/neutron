@@ -551,14 +551,24 @@ mod tests {
     }
 
     #[test]
-    fn connect_at_login_defaults_to_on_for_a_fresh_install() {
-        // No config file at all: the app's headline feature must be active out
-        // of the box rather than silently disabled by a derived `false`.
+    fn connect_at_login_defaults_to_off_unless_explicitly_enabled() {
         let config_path = unique_test_config_path();
 
         let app_cfg = config::load(&config_path).expect("a missing config should load defaults");
 
-        assert!(app_cfg.general.autoconnect_at_login);
+        assert!(!app_cfg.general.autoconnect_at_login);
+        for input in ["", "[general]\n", "[general]\nautoconnect_at_login = false"] {
+            let cfg: AppConfig = toml::from_str(input).unwrap();
+            assert!(!cfg.general.autoconnect_at_login);
+        }
+        for key in ["autoconnect_at_login", "autoconnect_at_boot"] {
+            let cfg: AppConfig = toml::from_str(&format!("[general]\n{key} = true")).unwrap();
+            assert!(cfg.general.autoconnect_at_login);
+        }
+        for input in [r#"{}"#, r#"{"general":{}}"#] {
+            let cfg: AppConfig = serde_json::from_str(input).unwrap();
+            assert!(!cfg.general.autoconnect_at_login);
+        }
     }
 
     #[test]

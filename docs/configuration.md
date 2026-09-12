@@ -19,8 +19,8 @@ profiles_dir = "~/.config/neutron/profiles"
 # Automatically import new/updated .conf files from profiles_dir on launch
 auto_sync_profiles = true
 
-# Connect a random eligible profile when logging in
-autoconnect_at_login = true
+# Opt in to connecting a random eligible profile at login
+autoconnect_at_login = false
 
 # Default interface when launching `neutron` with no arguments: "tui" or "gui"
 default_ui = "tui"

@@ -84,7 +84,7 @@ pub struct GeneralConfig {
     /// what the UI renders. An earlier top-level `autoconnect_at_boot` field
     /// duplicated it and drifted, so it is deliberately not reintroduced; the
     /// alias keeps configs written by those versions loading correctly.
-    #[serde(default = "default_true", alias = "autoconnect_at_boot")]
+    #[serde(default, alias = "autoconnect_at_boot")]
     pub autoconnect_at_login: bool,
     /// Verify fresh tunnels with an endpoint and persistent keepalive; disconnect
     /// if no authenticated traffic arrives. Idle on-demand tunnels are exempt.
@@ -101,7 +101,7 @@ impl Default for GeneralConfig {
         Self {
             profiles_dir: default_profiles_dir(),
             auto_sync_profiles: default_true(),
-            autoconnect_at_login: default_true(),
+            autoconnect_at_login: false,
             verify_tunnel_on_connect: default_true(),
         }
     }
