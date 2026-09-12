@@ -47,6 +47,8 @@ On-demand profiles remain active while idle so their first packet can initiate
 the handshake.
 
 Imports use `nmcli connection import type wireguard file <path>`. The profile
+UUID comes from that command's validated C-locale confirmation, rather than
+guessing from concurrent profile-list changes. The profile
 inbox consumes source files after successful import; source removal is
 best-effort, and matching filenames are currently skipped by profile name rather
 than content comparison. Interface comments are retained as application metadata.

@@ -120,6 +120,30 @@ pub trait NmClient {
     ) -> AppResult<()>;
 }
 
+fn imported_uuid(output: &str) -> AppResult<&str> {
+    let mut confirmations = output.lines().filter_map(|line| {
+        let line = line
+            .strip_prefix("Connection '")?
+            .strip_suffix(") successfully added.")?;
+        let (_, uuid) = line.rsplit_once("' (")?;
+        (uuid.len() == 36
+            && uuid.bytes().enumerate().all(|(i, byte)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }))
+        .then_some(uuid)
+    });
+    let uuid = confirmations
+        .next()
+        .filter(|_| confirmations.next().is_none());
+    uuid.ok_or_else(|| AppError::NmParseFailed(
+        "import completed without a unique UUID confirmation; inspect NetworkManager profiles before retrying".into()
+    ))
+}
+
 fn extract_interface_comments(path: &std::path::Path) -> String {
     use std::io::BufRead;
     let mut comments = Vec::new();
@@ -287,27 +311,25 @@ impl NmClient for CliNmClient {
 
         let config_path = crate::config::default_config_path()?;
         let app_cfg = crate::config::load(&config_path)?;
-        let before_profiles = self.list_wireguard_profiles()?;
-        let before_uuids: std::collections::HashSet<String> =
-            before_profiles.into_iter().map(|p| p.uuid).collect();
-
-        let output = run_nmcli(&[
-            "connection",
-            "import",
-            "type",
-            "wireguard",
-            "file",
-            path_str,
-        ])?;
-
-        let after_profiles = self.list_wireguard_profiles()?;
-        let mut imported = after_profiles
-            .iter()
-            .filter(|p| !before_uuids.contains(&p.uuid));
-        let profile = imported.next().filter(|_| imported.next().is_none()).ok_or_else(|| {
-            AppError::Config("import completed but the new profile could not be uniquely identified; inspect NetworkManager profiles before retrying".into())
-        })?;
-        let uuid = &profile.uuid;
+        // The confirmation UUID identifies this import, even during concurrent
+        // profile changes. Pin the locale because nmcli translates this message.
+        let output = crate::process::run_with_timeout(
+            "env",
+            &[
+                "LC_ALL=C",
+                "nmcli",
+                "--colors",
+                "no",
+                "connection",
+                "import",
+                "type",
+                "wireguard",
+                "file",
+                path_str,
+            ],
+            NMCLI_TIMEOUT,
+        )?;
+        let uuid = imported_uuid(&output)?;
 
         // Stop automatic activation before preparing the imported profile. A
         // failure must reach the caller so the source file is retained for repair.
@@ -315,7 +337,7 @@ impl NmClient for CliNmClient {
         if self
             .list_wireguard_profiles()?
             .iter()
-            .any(|p| p.uuid == *uuid && p.is_active())
+            .any(|p| p.uuid == uuid && p.is_active())
         {
             run_nmcli(&["connection", "down", uuid])?;
         }
@@ -324,7 +346,7 @@ impl NmClient for CliNmClient {
         let comments = extract_interface_comments(path);
         if !comments.is_empty() {
             crate::config::update(&config_path, |cfg| {
-                cfg.profile_custom_info.insert(uuid.clone(), comments);
+                cfg.profile_custom_info.insert(uuid.to_string(), comments);
             })?;
         }
 
@@ -1008,6 +1030,24 @@ fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_identity_comes_only_from_the_confirmation_uuid() {
+        let uuid = "12345678-1234-1234-1234-123456789abc";
+        let message = format!("Connection 'office' ({uuid}) successfully added.");
+        assert_eq!(imported_uuid(&message).unwrap(), uuid);
+        let hostile_name = format!(
+            "Connection 'name' (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa) successfully added.' ({uuid}) successfully added."
+        );
+        assert_eq!(imported_uuid(&hostile_name).unwrap(), uuid);
+        for invalid in [
+            String::new(),
+            "Connection 'x' (not-a-uuid) successfully added.".into(),
+            format!("{message}\n{message}"),
+        ] {
+            assert!(imported_uuid(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn activation_refuses_config_and_policy_failures_before_connection_up() {
