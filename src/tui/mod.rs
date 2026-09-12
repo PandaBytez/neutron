@@ -78,7 +78,11 @@ where
     });
 
     if state.config.general.auto_sync_profiles {
-        let _ = crate::app::sync::sync_profiles_dir(&client, &state.config);
+        if let Ok(report) = crate::app::sync::sync_profiles_dir(&client, &state.config)
+            && !report.errors.is_empty()
+        {
+            state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+        }
     }
     let _ = events::reload_profiles(&mut state, &client);
     // Read once up front so the first frame shows the daemon's lease rather than
@@ -430,7 +434,11 @@ where
                 crate::tui::state::AsyncActionResult::Sync(result) => match result {
                     Ok(report) => {
                         let _ = events::reload_profiles(state, client);
-                        if report.imported.is_empty() {
+                        if !report.errors.is_empty() {
+                            state.set_error(&crate::error::AppError::Config(
+                                report.errors.join("; "),
+                            ));
+                        } else if report.imported.is_empty() {
                             state.set_status("Refreshed profiles.");
                         } else {
                             state.set_status(format!(

@@ -317,7 +317,9 @@ pub fn execute_action<C: ActionClient>(
                 // blocked by the terminal DROP.
                 crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
                 reload_profiles(state, client)?;
-                if report.imported.is_empty() {
+                if !report.errors.is_empty() {
+                    state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+                } else if report.imported.is_empty() {
                     state.set_status("Refreshed profiles.");
                 } else {
                     state.set_status(format!(

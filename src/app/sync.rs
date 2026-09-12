@@ -83,8 +83,10 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
                 .to_string();
 
             if existing_names.contains(&stem) {
-                // Matching uses the filename stem, not a content comparison.
-                let _ = fs::remove_file(&path);
+                report.errors.push(format!(
+                    "{}: a profile named '{stem}' already exists in NetworkManager; preserved to prevent data loss",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
                 report.skipped += 1;
                 continue;
             }
@@ -92,7 +94,12 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
             match client.import_wireguard_profile(&path) {
                 Ok(_) => {
                     report.imported.push(stem);
-                    let _ = fs::remove_file(&path);
+                    if let Err(err) = fs::remove_file(&path) {
+                        report.errors.push(format!(
+                            "Failed to remove imported inbox file {}: {err}",
+                            path.display()
+                        ));
+                    }
                 }
                 Err(err) => {
                     report.errors.push(format!(
@@ -151,13 +158,14 @@ mod tests {
 
         assert_eq!(report.skipped, 1);
         assert_eq!(report.imported, vec!["profile2".to_string()]);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors.len(), 1);
 
-        // Both .conf files should be removed from inbox (consumed into NM)
+        // conf1 should be preserved to prevent overwriting existing profile data
         assert!(
-            !conf1.exists(),
-            "already existing profile in NM should be consumed from inbox"
+            conf1.exists(),
+            "already existing profile in NM should be preserved from deletion"
         );
+        // Newly imported conf2 consumed from inbox
         assert!(
             !conf2.exists(),
             "newly imported profile should be consumed from inbox"
