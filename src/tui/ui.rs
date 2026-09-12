@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::config::SplitTunnelMode;
 use crate::nm::network_info::format_speed;
@@ -484,7 +484,9 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
             .title(title),
     );
 
-    frame.render_widget(list_widget, area);
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected_index));
+    frame.render_stateful_widget(list_widget, area, &mut list_state);
 }
 
 fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -996,7 +998,9 @@ fn render_command_palette_modal(
             .border_style(theme.border)
             .title(format!(" Actions ({}) ", filtered.len())),
     );
-    frame.render_widget(list_widget, chunks[1]);
+    let mut list_state = ListState::default();
+    list_state.select(Some(cp.selected_index));
+    frame.render_stateful_widget(list_widget, chunks[1], &mut list_state);
 
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("[↑/↓] ", theme.keybinding),
@@ -1080,7 +1084,9 @@ fn render_theme_picker_modal(
             .border_style(theme.active_border)
             .title(" Available Color Palettes "),
     );
-    frame.render_widget(list_widget, chunks[0]);
+    let mut list_state = ListState::default();
+    list_state.select(Some(tp.selected_index));
+    frame.render_stateful_widget(list_widget, chunks[0], &mut list_state);
 
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("[↑/↓] ", theme.keybinding),
@@ -1384,7 +1390,11 @@ fn render_entry_column(
             .border_style(list_style)
             .title(params.title),
     );
-    frame.render_widget(list_widget, box_chunks[1]);
+    let mut list_state = ListState::default();
+    if params.is_list_focused {
+        list_state.select(Some(params.selected_idx));
+    }
+    frame.render_stateful_widget(list_widget, box_chunks[1], &mut list_state);
 }
 
 fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state: &TuiState) {
@@ -1528,6 +1538,20 @@ mod render_tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn selection_beyond_viewport_scrolls_into_view() {
+        let rows: Vec<_> = (0..10)
+            .map(|i| row(&format!("profile-{i}"), false))
+            .collect();
+        // Viewport height 6 has 4 visible content rows. Select index 9 (last item).
+        let lines = rendered_list(rows, 9);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("profile-9"),
+            "selected row 9 must be visible in scrolled viewport:\n{joined}"
+        );
     }
 
     #[test]
