@@ -34,14 +34,18 @@ pub fn apply_and_persist_global_split_tunnel<C: NmClient>(
 /// Re-resolve split-tunnel domains and reapply routing rules to NetworkManager if
 /// resolved IP endpoints changed during an active session (record rotation).
 pub fn refresh_active_domain_routes<C: NmClient>(client: &C, path: &Path) -> AppResult<bool> {
-    let app_cfg = config::load(path)?;
-    let split = &app_cfg.global_split_tunnel;
-    if !split.mode.is_enabled() || split.domains.is_empty() {
-        return Ok(false);
-    }
-    let (v4, v6) = nm::split_tunnel::routes_for_checked(split.mode, &split.cidrs, &split.domains)?;
-    client.apply_split_tunnel_all(split.mode, &v4, &v6)?;
-    Ok(true)
+    config::coordinate_policy(path, || {
+        let app_cfg = config::load(path)?;
+        let split = &app_cfg.global_split_tunnel;
+        if !split.mode.is_enabled() || split.domains.is_empty() {
+            return Ok(false);
+        }
+        let (v4, v6) =
+            nm::split_tunnel::routes_for_checked(split.mode, &split.cidrs, &split.domains)?;
+        client.apply_split_tunnel_all(split.mode, &v4, &v6)?;
+        client.reapply_active_routes()?;
+        Ok(true)
+    })
 }
 
 /// Load the global split-tunnel config, apply `edit` to it, and persist the
@@ -190,6 +194,42 @@ mod tests {
     use super::*;
     use crate::nm::{ProfileState, WireguardProfile};
     use crate::testing::{self, MockNmClient};
+
+    #[test]
+    fn refresh_reads_intent_only_after_policy_writer_releases_lock() {
+        let path = testing::temp_config_path("refresh-coordination");
+        let mut cfg = AppConfig::default();
+        cfg.global_split_tunnel.mode = SplitTunnelMode::Include;
+        cfg.global_split_tunnel.domains = vec!["localhost".into()];
+        config::save(&path, &cfg).unwrap();
+        let client = MockNmClient::new(vec![test_profile()]);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = config::coordinate_policy(&path, || {
+                let worker = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    let result = refresh_active_domain_routes(&client, &path);
+                    done_tx.send(result).unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_millis(30))
+                        .is_err()
+                );
+                config::update(&path, |cfg| {
+                    cfg.global_split_tunnel.mode = SplitTunnelMode::Disabled
+                })?;
+                Ok(worker)
+            })
+            .unwrap();
+            worker.join().unwrap();
+        });
+        assert!(!done_rx.recv().unwrap().unwrap());
+        assert!(client.split_tunnel_calls().is_empty());
+        testing::remove_temp_config(&path);
+    }
 
     fn test_profile() -> WireguardProfile {
         WireguardProfile {

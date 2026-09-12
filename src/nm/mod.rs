@@ -119,6 +119,20 @@ pub trait NmClient {
         v4_routes: &[String],
         v6_routes: &[String],
     ) -> AppResult<()>;
+    /// Apply saved routes to currently active devices without reconnecting.
+    fn reapply_active_routes(&self) -> AppResult<()>;
+}
+
+fn confirm_teardown(
+    result: AppResult<()>,
+    still_active: impl FnOnce() -> AppResult<bool>,
+) -> AppResult<()> {
+    if let Err(error) = result
+        && still_active()?
+    {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn imported_uuid(output: &str) -> AppResult<&str> {
@@ -255,14 +269,16 @@ impl NmClient for CliNmClient {
         }
 
         for profile in profiles.iter().filter(|p| p.is_active()) {
-            if let Err(error) = run_nmcli(&["connection", "down", &profile.uuid])
-                && let Ok(current_profiles) = self.list_wireguard_profiles()
-                && current_profiles
-                    .iter()
-                    .any(|p| p.uuid == profile.uuid && p.is_active())
-            {
-                return Err(error);
-            }
+            confirm_teardown(
+                run_nmcli(&["connection", "down", &profile.uuid]).map(|_| ()),
+                || {
+                    self.list_wireguard_profiles().map(|profiles| {
+                        profiles
+                            .iter()
+                            .any(|p| p.uuid == profile.uuid && p.is_active())
+                    })
+                },
+            )?;
         }
 
         activate(&target.uuid)
@@ -451,6 +467,23 @@ impl NmClient for CliNmClient {
         let profiles = self.list_wireguard_profiles()?;
         let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
         apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
+    }
+
+    fn reapply_active_routes(&self) -> AppResult<()> {
+        for profile in self
+            .list_wireguard_profiles()?
+            .iter()
+            .filter(|p| p.is_active())
+        {
+            let interface = tunnel_interface_name(&profile.uuid).ok_or_else(|| {
+                AppError::Config(format!(
+                    "missing interface for active profile {}",
+                    profile.uuid
+                ))
+            })?;
+            run_nmcli(&["device", "reapply", &interface])?;
+        }
+        Ok(())
     }
 }
 
@@ -908,7 +941,39 @@ fn parse_nmcli_fields(line: &str) -> Vec<String> {
 /// only destructive when keepalive is configured to initiate a handshake;
 /// on-demand tunnels can legitimately remain idle until their first packet.
 fn activate(uuid: &str) -> AppResult<()> {
-    activate_with(uuid, &crate::config::default_config_path()?, &mut run_nmcli)
+    use crate::firewall::FirewallClient;
+    let path = crate::config::default_config_path()?;
+    crate::config::coordinate_policy(&path, || {
+        let config = crate::config::load(&path)?;
+        prepare_profile(uuid, &config, &mut run_nmcli)?;
+        let settings = parse_peer_settings(&run_nmcli(&["connection", "show", uuid])?);
+        if config.lockdown_enabled {
+            let mut tunnels = CliNmClient.wireguard_tunnels()?;
+            // Install the target interface and connected DNS policy before up.
+            let interface = tunnel_interface_name(uuid);
+            for tunnel in &mut tunnels {
+                if tunnel.interface == interface {
+                    tunnel.is_active = true;
+                }
+            }
+            CliNmClient.enable_lockdown(&tunnels)?;
+        }
+        let result = activate_prepared(
+            uuid,
+            config.general.verify_tunnel_on_connect,
+            settings,
+            &mut run_nmcli,
+        );
+        if config.lockdown_enabled {
+            let reconciliation = CliNmClient
+                .wireguard_tunnels()
+                .and_then(|tunnels| CliNmClient.enable_lockdown(&tunnels));
+            if result.is_ok() {
+                reconciliation?;
+            }
+        }
+        result
+    })
 }
 
 /// Shared checked policy preparation for import and every activation path.
@@ -939,17 +1004,24 @@ fn prepare_profile(
     Ok(())
 }
 
+#[cfg(test)]
 fn activate_with(
     uuid: &str,
     config_path: &std::path::Path,
     run: &mut impl FnMut(&[&str]) -> AppResult<String>,
 ) -> AppResult<()> {
-    let (config, settings) = crate::config::coordinate_policy(config_path, || {
-        let config = crate::config::load(config_path)?;
-        prepare_profile(uuid, &config, run)?;
-        let settings = parse_peer_settings(&run(&["connection", "show", uuid])?);
-        Ok((config, settings))
-    })?;
+    let config = crate::config::load(config_path)?;
+    prepare_profile(uuid, &config, run)?;
+    let settings = parse_peer_settings(&run(&["connection", "show", uuid])?);
+    activate_prepared(uuid, config.general.verify_tunnel_on_connect, settings, run)
+}
+
+fn activate_prepared(
+    uuid: &str,
+    verify: bool,
+    settings: PeerSettings,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<()> {
     // Whether the interface already exists is sampled *before* activation: a
     // fresh one starts its receive counter at zero, which is what makes that
     // counter a handshake signal. See `health`.
@@ -963,7 +1035,7 @@ fn activate_with(
             .as_deref()
             .and_then(|value| value.parse::<u16>().ok())
             .is_some_and(|value| value > 0);
-    if config.general.verify_tunnel_on_connect && initiates_handshake {
+    if verify && initiates_handshake {
         verify_or_disconnect(uuid, interface, existed, run)?;
     }
     Ok(())
@@ -1042,6 +1114,19 @@ fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_teardown_requires_positive_inactive_confirmation() {
+        let failure = || Err(AppError::CommandFailed("down denied".into()));
+        assert!(confirm_teardown(failure(), || Ok(false)).is_ok());
+        assert!(confirm_teardown(failure(), || Ok(true)).is_err());
+        assert!(
+            confirm_teardown(failure(), || Err(AppError::CommandFailed(
+                "list failed".into()
+            )))
+            .is_err()
+        );
+    }
 
     #[test]
     fn import_identity_comes_only_from_the_confirmation_uuid() {

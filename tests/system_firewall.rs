@@ -228,6 +228,30 @@ fn teardown_leaves_foreign_rules_untouched() {
 fn teardown_and_rebuild_preserve_runtime_only_foreign_rules() {
     require_sandbox();
     let _guard = Lockdown;
+    let rich = "rule family=ipv4 source address=198.51.100.9 reject";
+    let command = |args: &[&str]| {
+        let output = std::process::Command::new("firewall-cmd")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    };
+    command(&["--direct", "--add-chain", "ipv4", "filter", "FOREIGN_TEST"]);
+    command(&[
+        "--direct",
+        "--add-rule",
+        "ipv4",
+        "filter",
+        "FOREIGN_TEST",
+        "0",
+        "-m",
+        "comment",
+        "--comment",
+        "foreign comment with spaces",
+        "-j",
+        "DROP",
+    ]);
+    command(&["--zone=public", "--add-rich-rule", rich]);
 
     let foreign_runtime = [
         "--direct",
@@ -284,6 +308,50 @@ fn teardown_and_rebuild_preserve_runtime_only_foreign_rules() {
         runtime_str_after.contains("foreign-runtime-rule"),
         "foreign runtime rule was lost after lockdown disable:\n{runtime_str_after}"
     );
+    command(&[
+        "--direct",
+        "--query-chain",
+        "ipv4",
+        "filter",
+        "FOREIGN_TEST",
+    ]);
+    command(&[
+        "--direct",
+        "--query-rule",
+        "ipv4",
+        "filter",
+        "FOREIGN_TEST",
+        "0",
+        "-m",
+        "comment",
+        "--comment",
+        "foreign comment with spaces",
+        "-j",
+        "DROP",
+    ]);
+    command(&["--zone=public", "--query-rich-rule", rich]);
+    command(&["--zone=public", "--remove-rich-rule", rich]);
+    command(&[
+        "--direct",
+        "--remove-rule",
+        "ipv4",
+        "filter",
+        "FOREIGN_TEST",
+        "0",
+        "-m",
+        "comment",
+        "--comment",
+        "foreign comment with spaces",
+        "-j",
+        "DROP",
+    ]);
+    command(&[
+        "--direct",
+        "--remove-chain",
+        "ipv4",
+        "filter",
+        "FOREIGN_TEST",
+    ]);
 
     // Clean up
     let mut remove = vec!["--direct", "--remove-rule"];

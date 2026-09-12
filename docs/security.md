@@ -70,14 +70,14 @@ filter-table established-connection accepts on both firewalld backends.
 | Priority | Match Criteria | Target | Purpose |
 | :---: | :--- | :---: | :--- |
 | **0** | `-o lo` | `ACCEPT` | Allow local loopback communication |
-| **1** | `-p udp/tcp --dport 53` | `ACCEPT` | Allow DNS when the supplied tunnel list is empty |
+| **1** | `-p udp/tcp --dport 53` | `ACCEPT` / `DROP` | Allow bootstrap DNS when disconnected; block non-tunnel DNS when connected |
 | **1** | `-d <LAN_SUBNETS>` | `ACCEPT` | Keep local LAN devices reachable (Router, Printer, NAS) |
-| **1** | `-o <TUNNEL_IFACE>` | `ACCEPT` | Allow decrypted traffic through active WireGuard tunnels |
+| **0** | `-o <TUNNEL_IFACE>` | `ACCEPT` | Allow first traffic on configured WireGuard interfaces |
 | **1** | `-p udp -d <PEER_HOST> --dport <PEER_PORT>` | `ACCEPT` | Allow encrypted WireGuard handshake packets out |
 | **10** | All remaining packets | `DROP` | Block other outbound traffic before filter-table accepts |
 
-The supplied list contains configured tunnels, not just active ones. LAN
-allowances also permit DNS to LAN resolvers. An `ACCEPT` here finishes this
+Activation installs the target interface and connected DNS policy before bringing
+the tunnel up. DNS drops precede LAN allowances. An `ACCEPT` here finishes this
 table; it does not bypass other firewall policy.
 
 ### Surgical Teardown Guarantee
@@ -85,15 +85,15 @@ Every single rule installed by Lockdown carries a marker:
 `-m comment --comment neutron-lockdown`
 
 When disabling Lockdown:
-1. Unprivileged reads enumerate permanent tagged rules in both mangle and legacy filter OUTPUT.
-2. A single privileged batch removes those rules individually and reloads firewalld.
-3. Foreign permanent direct rules are preserved. The global reload can still discard unrelated runtime-only configuration.
+1. Unprivileged reads enumerate permanent and runtime tagged rules in both mangle and legacy filter OUTPUT.
+2. A single privileged batch removes those rules individually, without reloading firewalld.
+3. Foreign runtime/permanent rules, custom chains, and rich rules are left untouched.
 4. Disable requires successful firewall authorization and execution; failures are reported.
 
 ### Rebuild Recovery
 
 Rebuilds install tagged priority `-1` DROP guards for both address families before
-replacing old permanent rules. Guards are removed only after the replacement is
+replacing rules in each of the permanent and runtime configurations. Guards are removed only after the replacement is
 complete. An interruption therefore remains fail-closed after reload or reboot,
 but can block all outbound traffic. Retry enabling lockdown or explicitly disable
 it to remove the guards and recover.

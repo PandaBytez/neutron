@@ -107,16 +107,14 @@ impl FirewallClient for crate::nm::CliNmClient {
         //
         // Permanent fail-closed guards protect every intermediate rebuild state.
         let mut batches = lockdown_rebuild_batches(marked_removal_batches()?, tunnels);
-        batches.extend(read_foreign_runtime_rules().unwrap_or_default());
+        batches.extend(runtime_rebuild_batches(tunnels)?);
         run_privileged_batches(&batches)
     }
 
     fn disable_lockdown(&self) -> AppResult<()> {
-        // Collect surgical removals from an unprivileged read of each family,
-        // then remove them and reload in a single privileged batch (one prompt).
+        // Remove only Neutron rules from permanent and runtime configuration.
         let mut batches = marked_removal_batches()?;
-        batches.push(reload_batch());
-        batches.extend(read_foreign_runtime_rules().unwrap_or_default());
+        batches.extend(runtime_removal_batches()?);
         run_privileged_batches(&batches)?;
 
         // Strictly scoped teardown: only our own tagged rules are ever removed,
@@ -183,55 +181,46 @@ fn read_direct_all_rules(permanent: bool) -> AppResult<String> {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
 
-    Ok(String::new())
-}
-
-/// Query foreign runtime-only direct rules so they can be re-applied after
-/// `firewall-cmd --reload` flushes them (BUG-042).
-fn read_foreign_runtime_rules() -> AppResult<Vec<Vec<String>>> {
-    let runtime_str = read_direct_all_rules(false)?;
-    let permanent_str = read_direct_all_rules(true)?;
-    Ok(parse_foreign_runtime_preservations(
-        &runtime_str,
-        &permanent_str,
+    Err(AppError::Firewall(
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
     ))
 }
 
-/// Parse foreign runtime direct rules not present in permanent rules into
-/// `--direct --add-rule` batches. Neutron-marked rules are skipped.
-pub(crate) fn parse_foreign_runtime_preservations(
-    runtime_listing: &str,
-    permanent_listing: &str,
-) -> Vec<Vec<String>> {
-    let permanent_set: std::collections::HashSet<&str> = permanent_listing
+fn runtime_removal_batches() -> AppResult<Vec<Vec<String>>> {
+    Ok(read_direct_all_rules(false)?
         .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+        .filter(|line| line_is_marked(line))
+        .filter_map(|line| {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            if parts.len() < 5
+                || !FAMILIES.contains(&parts[0])
+                || !MANAGED_TABLES.contains(&parts[1])
+                || parts[2] != "OUTPUT"
+            {
+                return None;
+            }
+            let mut batch = vec!["--direct".into(), "--remove-rule".into()];
+            batch.extend(parts.into_iter().map(str::to_string));
+            Some(batch)
+        })
+        .collect())
+}
 
-    let mut batches = Vec::new();
-    for line in runtime_listing.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || line_is_marked(trimmed) || permanent_set.contains(trimmed) {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        // Line format from --get-all-rules: <family> <table> <chain> <priority> <args...>
-        if parts.len() < 4 {
-            continue;
-        }
-        let mut batch = vec![
-            "--direct".to_string(),
-            "--add-rule".to_string(),
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts[2].to_string(),
-            parts[3].to_string(),
-        ];
-        batch.extend(parts[4..].iter().map(|p| p.to_string()));
-        batches.push(batch);
-    }
-    batches
+fn runtime_rebuild_batches(tunnels: &[WireguardTunnel]) -> AppResult<Vec<Vec<String>>> {
+    let removals = runtime_removal_batches()?
+        .into_iter()
+        .map(|mut batch| {
+            batch.insert(0, "--permanent".into());
+            batch
+        })
+        .collect();
+    Ok(lockdown_rebuild_batches(removals, tunnels)
+        .into_iter()
+        .map(|mut batch| {
+            batch.remove(0);
+            batch
+        })
+        .collect())
 }
 
 /// Execute every `firewall-cmd` batch in a *single* `pkexec` invocation, so the
@@ -319,15 +308,12 @@ fn shell_quote(arg: &str) -> String {
     quoted
 }
 
-/// All `firewall-cmd` batches that install the lockdown ruleset: the IPv4 and
-/// IPv6 allow/drop rules followed by a `--reload` that makes the permanent
-/// rules live.
+/// Permanent IPv4/IPv6 rules; runtime rules are updated separately without reload.
 fn lockdown_enable_batches(tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
     let mut batches = Vec::new();
     for family in FAMILIES {
         batches.extend(lockdown_family_batches(family, tunnels));
     }
-    batches.push(reload_batch());
     batches
 }
 
@@ -358,11 +344,9 @@ fn lockdown_rebuild_batches(
             .into_iter()
             .filter(|batch| !guard_removals.contains(batch)),
     );
-    let mut replacement = lockdown_enable_batches(tunnels);
-    replacement.pop(); // Reload only after both guards are removed.
+    let replacement = lockdown_enable_batches(tunnels);
     batches.extend(replacement);
     batches.extend(guard_removals);
-    batches.push(reload_batch());
     batches
 }
 
@@ -437,6 +421,13 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
     let mut batches = vec![add_rule(family, 0, &["-o", "lo", "-j", "ACCEPT"])];
 
     let any_active = tunnels.iter().any(|t| t.is_active);
+    // Permit first traffic on configured tunnel interfaces before activation
+    // completes. The DNS exception below still depends on connection state.
+    for tunnel in tunnels {
+        if let Some(interface) = &tunnel.interface {
+            batches.push(add_rule(family, 0, &["-o", interface, "-j", "ACCEPT"]));
+        }
+    }
 
     // When disconnected (no tunnels active), allow broad DNS so peer endpoints
     // can resolve before connecting. When a tunnel is active, DNS travels through
@@ -453,11 +444,6 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
             &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
         ));
     } else {
-        for tunnel in tunnels.iter().filter(|t| t.is_active) {
-            if let Some(interface) = &tunnel.interface {
-                batches.push(add_rule(family, 0, &["-o", interface, "-j", "ACCEPT"]));
-            }
-        }
         // Block external/LAN-bound DNS while connected so queries cannot leak to LAN resolvers.
         batches.push(add_rule(
             family,
@@ -596,6 +582,7 @@ fn add_rule(family: &str, priority: i32, rule: &[&str]) -> Vec<String> {
     batch
 }
 
+#[cfg(test)]
 fn reload_batch() -> Vec<String> {
     vec!["--reload".to_string()]
 }
@@ -661,7 +648,7 @@ mod tests {
             .find(|(_, b)| b[2] == "--add-rule")
             .unwrap()
             .0;
-        for stop in [first_add, first_add + 3, batches.len() - 3] {
+        for stop in [first_add, first_add + 3, batches.len() - 2] {
             client.enable_lockdown(&tunnels).unwrap();
             run_privileged_batches(&batches[..stop]).unwrap();
             run_privileged_batches(&[reload_batch()]).unwrap();
@@ -743,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_batches_cover_both_families_and_reload_last() {
+    fn enable_batches_cover_both_families_without_global_reload() {
         let batches = lockdown_enable_batches(&[]);
 
         assert!(
@@ -756,7 +743,7 @@ mod tests {
                 .iter()
                 .any(|batch| batch.contains(&"ipv6".to_string()))
         );
-        assert_eq!(batches.last().expect("non-empty"), &reload_batch());
+        assert!(!batches.iter().any(|b| b == &reload_batch()));
     }
 
     #[test]
@@ -1133,41 +1120,5 @@ mod tests {
     #[test]
     fn build_firewall_script_of_no_batches_is_just_the_guard() {
         assert_eq!(build_firewall_script(&[]), "set -e\n");
-    }
-
-    #[test]
-    fn parse_foreign_runtime_preservations_captures_unmarked_runtime_only_rules() {
-        let runtime = "ipv4 filter OUTPUT 0 -p tcp --dport 8080 -j DROP\n\
-                       ipv4 mangle OUTPUT -1 -m comment --comment neutron-lockdown -j DROP\n\
-                       ipv6 filter OUTPUT 10 -j ACCEPT\n";
-        let permanent = "ipv6 filter OUTPUT 10 -j ACCEPT\n";
-
-        let batches = parse_foreign_runtime_preservations(runtime, permanent);
-        assert_eq!(batches.len(), 1);
-        assert_eq!(
-            batches[0],
-            vec![
-                "--direct",
-                "--add-rule",
-                "ipv4",
-                "filter",
-                "OUTPUT",
-                "0",
-                "-p",
-                "tcp",
-                "--dport",
-                "8080",
-                "-j",
-                "DROP",
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_foreign_runtime_preservations_ignores_empty_or_all_permanent() {
-        let runtime = "ipv4 filter OUTPUT 0 -j DROP\n";
-        let permanent = "ipv4 filter OUTPUT 0 -j DROP\n";
-        assert!(parse_foreign_runtime_preservations(runtime, permanent).is_empty());
-        assert!(parse_foreign_runtime_preservations("", "").is_empty());
     }
 }

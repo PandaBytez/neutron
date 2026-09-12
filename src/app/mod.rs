@@ -484,6 +484,31 @@ pub fn set_global_lockdown<C: NmClient + FirewallClient>(
     path: &std::path::Path,
     enable: bool,
 ) -> AppResult<()> {
+    if !enable {
+        let disable = || -> AppResult<()> {
+            client
+                .disable_lockdown()
+                .map_err(|source| AppError::PolicyUpdate {
+                    policy: crate::error::Policy::Lockdown,
+                    outcome: "disable failed; effective state is unknown",
+                    source: Box::new(source),
+                })?;
+            config::update(path, |cfg| cfg.lockdown_enabled = false)
+                .map(|_| ())
+                .map_err(|source| AppError::PolicyUpdate {
+                    policy: crate::error::Policy::Lockdown,
+                    outcome: "application completed but saving failed",
+                    source: Box::new(source),
+                })
+        };
+        let mut entered = false;
+        let result = config::coordinate_policy(path, || {
+            entered = true;
+            disable()
+        });
+        // If coordination storage is unavailable, still permit emergency removal.
+        return if entered { result } else { disable() };
+    }
     apply_and_save_policy(
         path,
         crate::error::Policy::Lockdown,
@@ -784,11 +809,13 @@ pub fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
     client: &C,
     path: &std::path::Path,
 ) -> AppResult<()> {
-    if !config::load(path)?.lockdown_enabled {
-        return Ok(());
-    }
-    let tunnels = client.wireguard_tunnels()?;
-    client.enable_lockdown(&tunnels)
+    config::coordinate_policy(path, || {
+        if !config::load(path)?.lockdown_enabled {
+            return Ok(());
+        }
+        let tunnels = client.wireguard_tunnels()?;
+        client.enable_lockdown(&tunnels)
+    })
 }
 
 /// Terminate all running neutron processes on the system except the current process.
@@ -853,6 +880,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn automatic_rebuild_rechecks_disabled_intent_after_coordination() {
+        let path = crate::testing::temp_config_path("rebuild-coordination");
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let client = crate::testing::MockNmClient::default();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = config::coordinate_policy(&path, || {
+                let worker = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    done_tx
+                        .send(rebuild_lockdown_if_enabled(&client, &path))
+                        .unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_millis(30))
+                        .is_err()
+                );
+                config::update(&path, |cfg| cfg.lockdown_enabled = false)?;
+                Ok(worker)
+            })
+            .unwrap();
+            worker.join().unwrap();
+        });
+        done_rx.recv().unwrap().unwrap();
+        assert!(client.lockdown_calls().is_empty());
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
     fn policy_success_then_save_failure_reports_uncertain_state() {
         use crate::error::Policy;
         let path = crate::testing::temp_config_path("policy-save-failure");
@@ -870,6 +936,7 @@ mod tests {
         let lock = format!("{}.lock", path.display());
         std::fs::remove_file(&lock).unwrap();
         std::fs::rename(format!("{}.blocked", path.display()), &lock).unwrap();
+        std::fs::create_dir(format!("{}.policy.lock", path.display())).unwrap();
         let client = crate::testing::MockNmClient::default();
         let error = set_global_lockdown(&client, &path, false).unwrap_err();
         assert!(
@@ -884,6 +951,7 @@ mod tests {
         state.set_error(&error);
         state.set_status("unrelated action");
         assert!(state.uncertain_policies.contains(&Policy::Lockdown));
+        std::fs::remove_dir(format!("{}.policy.lock", path.display())).unwrap();
         let backend_error = apply_and_save_policy(
             &path,
             Policy::KillSwitch,

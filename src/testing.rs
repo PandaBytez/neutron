@@ -468,6 +468,10 @@ impl MockNmClient {
 }
 
 impl NmClient for MockNmClient {
+    fn reapply_active_routes(&self) -> AppResult<()> {
+        record(&self.calls, "reapply-active-routes".into());
+        Ok(())
+    }
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
         if self.fail_list
             || self
