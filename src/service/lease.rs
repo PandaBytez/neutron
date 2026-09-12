@@ -150,11 +150,11 @@ pub fn path() -> Option<PathBuf> {
 ///
 /// Best effort and infallible: this runs on every daemon poll, and failing to
 /// tell the TUI about a lease must never take down the loop that renews it.
-pub fn publish(state: &LeaseState) {
+pub fn publish(state: &LeaseState) -> bool {
     let Some(path) = path() else {
-        return;
+        return false;
     };
-    publish_to(&path, state);
+    publish_to(&path, state)
 }
 
 /// The lease the daemon currently holds, or `None` when it is not publishing
@@ -182,10 +182,10 @@ pub fn live_owner() -> Option<u32> {
 /// Split out from [`publish`] so the round trip can be exercised against a
 /// temporary file. A test that wrote to [`path`] would clobber the lease of a
 /// daemon actually running on the developer's machine.
-pub fn publish_to(path: &std::path::Path, state: &LeaseState) {
+pub fn publish_to(path: &std::path::Path, state: &LeaseState) -> bool {
     let own_pid = std::process::id();
     if live_owner_of(path).is_some_and(|owner| owner != own_pid) {
-        return;
+        return false;
     }
 
     let stamped = LeaseState {
@@ -200,6 +200,9 @@ pub fn publish_to(path: &std::path::Path, state: &LeaseState) {
     if let Ok(body) = serde_json::to_string(&stamped) {
         // Atomic, because the TUI reads this file while the daemon rewrites it.
         let _ = crate::config::write_atomically(path, &body);
+        true
+    } else {
+        false
     }
 }
 

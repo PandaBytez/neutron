@@ -291,6 +291,8 @@ fn switching_fails_when_active_profile_teardown_fails() {
     );
 }
 
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
     let sandbox = std::env::temp_dir().join(format!(
@@ -316,7 +318,6 @@ fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
         ..Default::default()
     };
     config::save(&config_path, &config).expect("config should save");
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
 
     let client = MockNmClient::new(vec![]);
     let report = neutron::app::sync::sync_profiles_dir(&client, &config).unwrap();
@@ -328,12 +329,12 @@ fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
         "importing must rebuild lockdown allowances"
     );
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
 #[test]
 fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
     let sandbox = std::env::temp_dir().join(format!(
         "neutron-import-test-{}",
         std::time::SystemTime::now()
@@ -391,6 +392,7 @@ fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
 
 #[test]
 fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
     let sandbox = std::env::temp_dir().join(format!(
         "neutron-activate-test-{}",
         std::time::SystemTime::now()

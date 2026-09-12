@@ -755,12 +755,42 @@ fn active_profile<C: NmClient>(client: &C) -> Option<crate::nm::WireguardProfile
 /// connection change within a second or two.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+pub fn acquire_indicator_lock_in(dir: &std::path::Path) -> Option<std::fs::File> {
+    let lock_path = dir.join("indicator.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path).ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => None,
+    }
+}
+
+pub fn acquire_indicator_lock() -> Option<std::fs::File> {
+    let path = crate::config::default_config_path().ok()?;
+    let parent = path.parent()?;
+    acquire_indicator_lock_in(parent)
+}
+
 /// Run standalone persistent indicator daemon in the foreground.
 pub fn run_standalone_indicator<C>(client: C) -> AppResult<()>
 where
     C: NmClient + crate::firewall::FirewallClient + Clone + Send + Sync + 'static,
 {
     install_status_icons();
+
+    let _indicator_lock = match acquire_indicator_lock() {
+        Some(file) => file,
+        None => {
+            debug!("Another indicator daemon holds the lock, exiting.");
+            return Ok(());
+        }
+    };
 
     if is_indicator_running() {
         debug!("Indicator daemon already active, exiting.");
@@ -835,7 +865,10 @@ where
 
         // Republished every poll even when nothing changed: the timestamp is how
         // a reader tells a held lease from one left behind by a dead daemon.
-        crate::service::lease::publish(&lease.publication(active_uuid.clone()));
+        if !crate::service::lease::publish(&lease.publication(active_uuid.clone())) {
+            warn!("Lease publication rejected by active owner, exiting duplicate indicator.");
+            return Ok(());
+        }
 
         if let Ok(mut st) = state.lock()
             && (st.active_profile != active_name
@@ -884,6 +917,36 @@ mod tests {
             port,
             lifetime_secs: crate::portforward::LIFETIME,
         }
+    }
+
+    #[test]
+    fn indicator_lock_excludes_concurrent_instance() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "neutron-indicator-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let lock1 = acquire_indicator_lock_in(&temp_dir);
+        assert!(lock1.is_some(), "first instance should acquire the lock");
+
+        let lock2 = acquire_indicator_lock_in(&temp_dir);
+        assert!(
+            lock2.is_none(),
+            "second concurrent instance must be denied the lock"
+        );
+
+        drop(lock1);
+        let lock3 = acquire_indicator_lock_in(&temp_dir);
+        assert!(
+            lock3.is_some(),
+            "after first instance drops, successor can acquire"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
