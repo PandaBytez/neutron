@@ -58,7 +58,13 @@ where
     let mut st_cfg = config::load(path)?.global_split_tunnel;
     let changed = edit(&mut st_cfg)?;
     if changed {
-        apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+        if st_cfg.mode.is_enabled() {
+            apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+        } else {
+            // When split tunneling is disabled, editing the list does not affect routing;
+            // persist the list directly without modifying NetworkManager profiles (BUG-062).
+            config::update(path, |cfg| cfg.global_split_tunnel = st_cfg.clone())?;
+        }
     }
     Ok((st_cfg, changed))
 }
@@ -69,13 +75,10 @@ pub fn set_global_mode<C: NmClient>(
     path: &Path,
     mode: SplitTunnelMode,
 ) -> AppResult<SplitTunnelConfig> {
-    let (cfg, _) = mutate_global(client, path, |st_cfg| {
-        st_cfg.mode = mode;
-        // Always reapplied: the mode decides how the existing routes are
-        // interpreted, so it must reach NetworkManager even when unchanged.
-        Ok(true)
-    })?;
-    Ok(cfg)
+    let mut st_cfg = config::load(path)?.global_split_tunnel;
+    st_cfg.mode = mode;
+    apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+    Ok(st_cfg)
 }
 
 /// Add a CIDR or IP to the global split tunnel config.
@@ -317,6 +320,34 @@ mod tests {
         let refreshed = refresh_active_domain_routes(&client, &path).unwrap();
         assert!(refreshed);
         assert_eq!(client.split_tunnel_calls().len(), 1);
+
+        testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn editing_disabled_split_list_does_not_sweep_nm_profiles() {
+        let profile = test_profile();
+        let client = MockNmClient::new(vec![profile]);
+        let path = testing::temp_config_path("st-disabled-edit");
+
+        let app_cfg = AppConfig {
+            global_split_tunnel: SplitTunnelConfig {
+                mode: SplitTunnelMode::Disabled,
+                cidrs: Vec::new(),
+                domains: Vec::new(),
+            },
+            ..Default::default()
+        };
+        config::save(&path, &app_cfg).unwrap();
+
+        // Adding a CIDR while disabled must update config without sweeping NM
+        let (updated, changed) = add_global_cidr(&client, &path, "10.0.0.0/8").unwrap();
+        assert!(changed);
+        assert_eq!(updated.cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert!(
+            client.split_tunnel_calls().is_empty(),
+            "editing disabled split list must not call apply_split_tunnel_all"
+        );
 
         testing::remove_temp_config(&path);
     }
