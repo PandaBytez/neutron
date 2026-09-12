@@ -87,7 +87,11 @@ where
             let _ = crate::app::rebuild_lockdown_if_enabled(&client, &state.config_path);
         }
     }
-    let _ = events::reload_profiles(&mut state, &client);
+    let mut initial_refresh_needed = false;
+    if let Err(err) = events::reload_profiles(&mut state, &client) {
+        state.set_error(&err);
+        initial_refresh_needed = true;
+    }
     // Read once up front so the first frame shows the daemon's lease rather than
     // reporting it missing until the first periodic tick.
     events::refresh_lease(&mut state);
@@ -249,6 +253,7 @@ where
         &st_res_rx,
         &action_res_rx,
         &monitor_events,
+        initial_refresh_needed,
     );
 
     stop_nm_monitor(&monitor_child);
@@ -304,12 +309,14 @@ fn run_event_loop<C, B>(
     st_res_rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
     action_res_rx: &std::sync::mpsc::Receiver<crate::tui::state::AsyncActionResult>,
     monitor_events: &Arc<AtomicU64>,
+    initial_refresh_needed: bool,
 ) -> AppResult<()>
 where
     C: NmClient + FirewallClient + Clone + Send + Sync + 'static,
     B: ratatui::backend::Backend,
 {
     let mut last_seen_event = 0_u64;
+    let mut needs_profile_refresh = initial_refresh_needed;
     let mut last_diag_sample = std::time::Instant::now();
     let mut last_domain_refresh = std::time::Instant::now();
 
@@ -510,14 +517,25 @@ where
         let current_nm_event = monitor_events.load(Ordering::Relaxed);
         if current_nm_event != last_seen_event {
             last_seen_event = current_nm_event;
+            needs_profile_refresh = true;
+        }
+
+        if needs_profile_refresh {
             let prev_active_uuid = state.active_profile_uuid.clone();
-            let _ = events::reload_profiles(state, client);
-            // Only trigger public IP lookup if the active tunnel connection actually changed (BUG-037)
-            if state.active_profile_uuid != prev_active_uuid {
-                if state.active_profile_uuid.is_none() {
-                    state.public_ip_info = None;
+            match events::reload_profiles(state, client) {
+                Ok(()) => {
+                    needs_profile_refresh = false;
+                    if state.active_profile_uuid != prev_active_uuid {
+                        if state.active_profile_uuid.is_none() {
+                            state.public_ip_info = None;
+                        }
+                        ip_coord.request_refresh();
+                    }
                 }
-                ip_coord.request_refresh();
+                Err(err) => {
+                    // Do not drop the refresh requirement on transient errors (BUG-048)
+                    state.set_error(&err);
+                }
             }
         }
 

@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -162,6 +163,7 @@ pub struct MockNmClient {
     profiles: Vec<WireguardProfile>,
     tunnels: Vec<WireguardTunnel>,
     fail_list: bool,
+    fail_list_count: Arc<AtomicUsize>,
     fail_ids: HashSet<String>,
     fail_kill_switch: bool,
     fail_autoconnect: bool,
@@ -316,6 +318,12 @@ impl MockNmClient {
         }
     }
 
+    /// A mock whose `list_wireguard_profiles` fails `count` times transiently.
+    pub fn with_transient_list_failure(self, count: usize) -> Self {
+        self.fail_list_count.store(count, Ordering::SeqCst);
+        self
+    }
+
     /// A mock that returns the given profiles but fails `connect` for any of the
     /// supplied profile ids.
     pub fn with_failures(profiles: Vec<WireguardProfile>, fail_ids: &[&str]) -> Self {
@@ -461,7 +469,14 @@ impl MockNmClient {
 
 impl NmClient for MockNmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-        if self.fail_list {
+        if self.fail_list
+            || self
+                .fail_list_count
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                    if c > 0 { Some(c - 1) } else { None }
+                })
+                .is_ok()
+        {
             return Err(AppError::CommandFailed("simulated".to_string()));
         }
         let active = self.active_uuids();

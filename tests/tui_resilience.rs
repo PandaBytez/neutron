@@ -215,3 +215,28 @@ fn async_actions_do_not_block_event_loop_when_backend_blocks() {
 
     testing::remove_temp_config(&path);
 }
+
+#[test]
+fn transient_list_failure_retains_refresh_and_eventually_reloads() {
+    let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)])
+        .with_transient_list_failure(1);
+    let path = testing::temp_config_path("tui-transient-list");
+    config::save(&path, &AppConfig::default()).unwrap();
+    let mut state = TuiState::new(path.clone(), AppConfig::default());
+
+    // First reload fails transiently
+    let first = neutron::tui::events::reload_profiles(&mut state, &client);
+    assert!(first.is_err(), "first reload should fail transiently");
+    state.set_error(&first.unwrap_err());
+    assert!(state.status_is_error, "error surfaced on failure");
+
+    // Without any new external event, retrying reload succeeds
+    let second = neutron::tui::events::reload_profiles(&mut state, &client);
+    assert!(
+        second.is_ok(),
+        "second reload should succeed after transient error clears"
+    );
+    assert_eq!(state.rows.len(), 1, "profile list recovered");
+
+    testing::remove_temp_config(&path);
+}

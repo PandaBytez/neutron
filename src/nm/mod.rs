@@ -255,14 +255,13 @@ impl NmClient for CliNmClient {
         }
 
         for profile in profiles.iter().filter(|p| p.is_active()) {
-            if let Err(error) = run_nmcli(&["connection", "down", &profile.uuid]) {
-                if let Ok(current_profiles) = self.list_wireguard_profiles()
-                    && current_profiles
-                        .iter()
-                        .any(|p| p.uuid == profile.uuid && p.is_active())
-                {
-                    return Err(error);
-                }
+            if let Err(error) = run_nmcli(&["connection", "down", &profile.uuid])
+                && let Ok(current_profiles) = self.list_wireguard_profiles()
+                && current_profiles
+                    .iter()
+                    .any(|p| p.uuid == profile.uuid && p.is_active())
+            {
+                return Err(error);
             }
         }
 
