@@ -223,9 +223,9 @@ where
 
     let monitor_events = Arc::new(AtomicU64::new(0));
     let monitor_events_clone = monitor_events.clone();
-    let monitor_child: MonitorChild = Arc::new(Mutex::new(None));
+    let monitor_child: MonitorChild = Arc::new(Mutex::new(MonitorSlot::Unset));
     let monitor_child_for_thread = monitor_child.clone();
-    let _monitor_thread = thread::spawn(move || {
+    let monitor_thread = thread::spawn(move || {
         start_nm_monitor_loop(monitor_events_clone, monitor_child_for_thread);
     });
 
@@ -246,22 +246,32 @@ where
     );
 
     stop_nm_monitor(&monitor_child);
+    let _ = monitor_thread.join();
     restore_terminal(&mut terminal);
     outcome
 }
 
-/// The `nmcli monitor` child, shared so the main thread can stop it on exit.
-type MonitorChild = Arc<Mutex<Option<std::process::Child>>>;
+/// The `nmcli monitor` child state, shared so shutdown is synchronized without leaking.
+#[derive(Default)]
+enum MonitorSlot {
+    #[default]
+    Unset,
+    Active(std::process::Child),
+    Shutdown,
+}
 
-/// Kill the `nmcli monitor` child and reap it.
+type MonitorChild = Arc<Mutex<MonitorSlot>>;
+
+/// Kill the `nmcli monitor` child and reap it, or mark shutdown so a late spawn aborts.
 fn stop_nm_monitor(child: &MonitorChild) {
-    if let Ok(mut slot) = child.lock()
-        && let Some(mut child) = slot.take()
-    {
-        let _ = child.kill();
-        // Reaped rather than just killed, so the process does not linger as a
-        // zombie for as long as the parent lives.
-        let _ = child.wait();
+    if let Ok(mut slot) = child.lock() {
+        let prev = std::mem::replace(&mut *slot, MonitorSlot::Shutdown);
+        if let MonitorSlot::Active(mut process) = prev {
+            let _ = process.kill();
+            // Reaped rather than just killed, so the process does not linger as a
+            // zombie for as long as the parent lives.
+            let _ = process.wait();
+        }
     }
 }
 
@@ -536,14 +546,24 @@ fn start_nm_monitor_loop(events: Arc<AtomicU64>, slot: MonitorChild) {
         Err(_) => return,
     };
 
-    let Some(stdout) = child.stdout.take() else {
-        return;
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
     };
 
-    // Hand the child to the main thread so it can be killed on exit. This
-    // thread only owns the pipe from here on.
-    if let Ok(mut slot) = slot.lock() {
-        *slot = Some(child);
+    // Hand the child to the main thread so it can be killed on exit. If the
+    // main thread has already initiated shutdown, kill and reap immediately.
+    if let Ok(mut lock) = slot.lock() {
+        if matches!(*lock, MonitorSlot::Shutdown) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        *lock = MonitorSlot::Active(child);
     }
 
     let reader = BufReader::new(stdout);
@@ -581,5 +601,34 @@ mod tests {
         // With in_flight initially true, swap returns true and drops immediately
         assert!(rx.try_recv().is_err());
         assert!(in_flight.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shutdown_before_monitor_publication_reaps_child() {
+        let slot: MonitorChild = Arc::new(Mutex::new(MonitorSlot::Unset));
+        // Main thread requests shutdown first
+        stop_nm_monitor(&slot);
+
+        // Child process spawns subsequently
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .expect("sleep should spawn");
+
+        if let Ok(mut lock) = slot.lock() {
+            if matches!(*lock, MonitorSlot::Shutdown) {
+                let _ = child.kill();
+                let _ = child.wait();
+            } else {
+                *lock = MonitorSlot::Active(child);
+                return;
+            }
+        }
+
+        // Verify child was killed and waited on (reaped)
+        match child.try_wait() {
+            Ok(Some(status)) => assert!(!status.success()),
+            other => panic!("expected child to be reaped, got {other:?}"),
+        }
     }
 }
