@@ -30,6 +30,7 @@ Distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
 - **Dynamic NAT-PMP Port Forwarding & qBittorrent Sync**: Automatic gateway discovery, port lease requests, periodic
   background renewals, and seamless automatic port synchronization with **qBittorrent** (native, Flatpak, and
   containers) via its local Web API.
+  Failed mapping attempts wait the full 45-second retry interval rather than retrying on every tray poll.
 - **NetworkManager-Native Kill Switch**: Strict routing table isolation (`fwmark` + `suppress_prefixlength 0`) with
   negative DNS priorities to eliminate DNS and routing leaks.
 - **Always-On Lockdown Firewall**: Permanent `firewalld` Netfilter rules via `pkexec` blocking all physical traffic

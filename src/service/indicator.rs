@@ -629,10 +629,9 @@ struct LeaseTracker {
     tunnel_uuid: Option<String>,
     /// The port the gateway mapped.
     port: Option<u16>,
-    /// When the mapping last succeeded. Advanced only on success, so a transient
-    /// failure retries on the next poll rather than waiting out another
-    /// [`crate::portforward::RENEW_INTERVAL`] and letting the lease lapse.
-    leased_at: Option<std::time::Instant>,
+    /// Last mapping attempt, including failures. Independent of lease validity
+    /// so unsupported gateways are not retried on every poll (BUG-033).
+    attempted_at: Option<std::time::Instant>,
     /// What became of the last push to qBittorrent.
     qbit_sync: QbitSyncStatus,
 }
@@ -649,20 +648,25 @@ impl LeaseTracker {
         if self.tunnel_uuid != *active_uuid {
             self.tunnel_uuid = active_uuid.clone();
             self.release();
+            self.attempted_at = None;
         }
     }
 
     /// Give up the lease and everything said about it.
     fn release(&mut self) {
         self.port = None;
-        self.leased_at = None;
         self.qbit_sync = QbitSyncStatus::Pending;
     }
 
     /// Whether the mapping should be renewed on this poll.
     fn is_due(&self) -> bool {
-        self.leased_at
-            .is_none_or(|at| at.elapsed() >= crate::portforward::RENEW_INTERVAL)
+        self.is_due_at(std::time::Instant::now())
+    }
+
+    fn is_due_at(&self, now: std::time::Instant) -> bool {
+        self.attempted_at.is_none_or(|at| {
+            now.saturating_duration_since(at) >= crate::portforward::RENEW_INTERVAL
+        })
     }
 
     /// Record the outcome of a renewal, reporting whether qBittorrent should now
@@ -674,7 +678,7 @@ impl LeaseTracker {
     /// the user has no way to clear. A previous failure is therefore retried on
     /// every renewal.
     fn record(&mut self, mapped: Option<u16>) -> bool {
-        self.leased_at = Some(std::time::Instant::now());
+        self.attempted_at = Some(std::time::Instant::now());
 
         let Some(mapped) = mapped else {
             self.release();
@@ -920,6 +924,28 @@ mod tests {
         assert!(!lease.record(None), "there is no port to push");
         assert_eq!(lease.port, None);
         assert_eq!(lease.qbit_sync, QbitSyncStatus::Pending);
+    }
+
+    #[test]
+    fn failed_mapping_keeps_backoff_until_interval_or_tunnel_change() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".into()));
+        for mapped in [Some(51820), None, None] {
+            lease.record(mapped);
+            let attempted = lease.attempted_at.unwrap();
+            lease.release();
+            assert_eq!(lease.port, None);
+            assert!(!lease.is_due_at(attempted + POLL_INTERVAL));
+            assert!(!lease.is_due_at(
+                attempted + crate::portforward::RENEW_INTERVAL - Duration::from_nanos(1)
+            ));
+            assert!(lease.is_due_at(attempted + crate::portforward::RENEW_INTERVAL));
+        }
+        lease.follow_tunnel(&Some("uuid-new".into()));
+        assert!(
+            lease.is_due(),
+            "a new tunnel should get its first attempt immediately"
+        );
     }
 
     #[test]
