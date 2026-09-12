@@ -196,12 +196,10 @@ fn map_protocol_at(
     opcode: u8,
     requested_port: u16,
 ) -> AppResult<u16> {
-    let socket = if let Some(local) = local_ip {
-        UdpSocket::bind((local, 0)).or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))
-    } else {
-        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-    }
-    .map_err(|error| AppError::PortForward(format!("could not open a socket: {error}")))?;
+    let local = local_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let socket = UdpSocket::bind((local, 0)).map_err(|error| {
+        AppError::PortForward(format!("could not bind NAT-PMP socket to {local}: {error}"))
+    })?;
     socket
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|error| AppError::PortForward(format!("could not set a timeout: {error}")))?;
@@ -229,6 +227,20 @@ fn map_protocol_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_source_address_sends_no_fallback_request() {
+        let gateway = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        gateway
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, gateway.local_addr().unwrap().port());
+        let error = map_protocol_at(Some(Ipv4Addr::new(192, 0, 2, 254)), address, OP_MAP_UDP, 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("could not bind NAT-PMP socket"));
+        let mut packet = [0; 32];
+        assert!(gateway.recv_from(&mut packet).is_err());
+    }
 
     #[test]
     fn response_validates_version_size_and_internal_port() {

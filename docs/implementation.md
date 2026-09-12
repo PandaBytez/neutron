@@ -72,7 +72,8 @@ For permanent rebuild guards and recovery, see
 
 NAT-PMP sockets accept replies only from the requested gateway address and port.
 Replies must match the protocol version, length, opcode and internal port (with
-the provider's zero-port allocation convention supported).
+the provider's zero-port allocation convention supported). Failure to bind the
+requested tunnel address aborts the request instead of falling back to another source.
 
 The executable is named `neutron`. The musl target produces a statically linked
 binary; system tools and services such as NetworkManager are still required.
