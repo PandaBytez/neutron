@@ -638,6 +638,8 @@ struct LeaseTracker {
     lifetime: std::time::Duration,
     /// What became of the last push to qBittorrent.
     qbit_sync: QbitSyncStatus,
+    /// Last qBittorrent configuration associated with the sync verdict (BUG-055).
+    last_qbit_config: Option<crate::config::QBittorrentConfig>,
 }
 
 impl LeaseTracker {
@@ -662,6 +664,7 @@ impl LeaseTracker {
         self.expires_at = None;
         self.lifetime = std::time::Duration::ZERO;
         self.qbit_sync = QbitSyncStatus::Pending;
+        self.last_qbit_config = None;
     }
 
     /// Expire the lease if its granted lifetime has passed.
@@ -695,14 +698,7 @@ impl LeaseTracker {
         })
     }
 
-    /// Record the outcome of a renewal, reporting whether qBittorrent should now
-    /// be told about the port.
-    ///
-    /// A renewal normally returns the same port, so a push gated only on the port
-    /// *changing* would never retry: qBittorrent started after a failed first
-    /// attempt would stay unsynced for the life of the tunnel, showing a failure
-    /// the user has no way to clear. A previous failure is therefore retried on
-    /// every renewal.
+    /// Record the outcome of a renewal, reporting whether the mapped port changed.
     fn record(&mut self, mapped: Option<crate::portforward::PortMapping>) -> bool {
         self.record_at(mapped, std::time::Instant::now())
     }
@@ -725,7 +721,21 @@ impl LeaseTracker {
 
         let changed = self.port != Some(mapped.port);
         self.port = Some(mapped.port);
+        if changed {
+            self.qbit_sync = QbitSyncStatus::Pending;
+        }
         changed || self.qbit_sync == QbitSyncStatus::Failed
+    }
+
+    /// Whether qBittorrent synchronization is required (BUG-055).
+    fn sync_needed(&self, current_cfg: &crate::config::QBittorrentConfig) -> bool {
+        if self.port.is_none() || !current_cfg.enabled {
+            return false;
+        }
+        if self.last_qbit_config.as_ref() != Some(current_cfg) {
+            return true;
+        }
+        self.qbit_sync == QbitSyncStatus::Failed || self.qbit_sync == QbitSyncStatus::Pending
     }
 
     /// The lease as published for the TUI.
@@ -846,20 +856,23 @@ where
 
         if !app_cfg.port_forwarding.enabled {
             lease.release();
-        } else if let Some(profile) = active
-            && lease.is_due()
-        {
-            if let Some(address) = client.tunnel_address(&profile.uuid) {
-                let mapped = crate::portforward::mapping_for_tunnel_address(&address);
-                if lease.record(mapped) {
-                    lease.qbit_sync = sync_qbittorrent_port(
-                        &client,
-                        &profile.uuid,
-                        lease.port.unwrap_or_default(),
-                    );
+        } else if let Some(profile) = active {
+            if lease.is_due() {
+                if let Some(address) = client.tunnel_address(&profile.uuid) {
+                    let mapped = crate::portforward::mapping_for_tunnel_address(&address);
+                    lease.record(mapped);
+                } else {
+                    lease.attempted_at = Some(std::time::Instant::now());
                 }
-            } else {
-                lease.attempted_at = Some(std::time::Instant::now());
+            }
+
+            if lease.sync_needed(&app_cfg.qbittorrent) {
+                lease.last_qbit_config = Some(app_cfg.qbittorrent.clone());
+                lease.qbit_sync = sync_qbittorrent_port(
+                    &client,
+                    &profile.uuid,
+                    lease.port.unwrap_or_default(),
+                );
             }
         }
 
@@ -1025,6 +1038,41 @@ mod tests {
         assert!(
             lease.record(Some(test_mapping(51820))),
             "a failure must be retried even though the port is unchanged"
+        );
+    }
+
+    #[test]
+    fn qbit_config_change_invalidates_sync_and_triggers_push() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(test_mapping(51820)));
+
+        let mut cfg_disabled = crate::config::QBittorrentConfig::default();
+        cfg_disabled.enabled = false;
+        assert!(
+            !lease.sync_needed(&cfg_disabled),
+            "no sync needed when integration is disabled"
+        );
+
+        // Transition: disabled -> enabled with stable port
+        let mut cfg_enabled = crate::config::QBittorrentConfig::default();
+        cfg_enabled.enabled = true;
+        assert!(
+            lease.sync_needed(&cfg_enabled),
+            "enabling integration requires sync even if port is unchanged"
+        );
+        lease.last_qbit_config = Some(cfg_enabled.clone());
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+        assert!(
+            !lease.sync_needed(&cfg_enabled),
+            "already synchronized with same config requires no push"
+        );
+
+        // Transition: configuration URL / binding changes with stable port
+        cfg_enabled.url = "http://10.0.0.1:8080".to_string();
+        assert!(
+            lease.sync_needed(&cfg_enabled),
+            "config modification invalidates sync and triggers push"
         );
     }
 
