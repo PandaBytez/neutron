@@ -229,20 +229,12 @@ impl QBittorrentClient {
     }
 
     fn http_get(&self, url: &str) -> AppResult<HttpResponse> {
-        let args = build_get_args(self.timeout, url, self.cookie.as_deref());
-        let output = std::process::Command::new("curl")
-            .args(&args)
-            .output()
-            .map_err(|err| AppError::QBittorrent(format!("curl failed to query {url}: {err}")))?;
-
-        if !output.status.success() {
-            return Err(AppError::QBittorrent(format!(
-                "qBittorrent WebUI unreachable at {}",
-                self.base_url
-            )));
-        }
-
-        parse_http_response(&String::from_utf8_lossy(&output.stdout))
+        run_curl(&request_config(
+            self.timeout,
+            url,
+            None,
+            self.cookie.as_deref(),
+        )?)
     }
 
     fn http_post_urlencoded(
@@ -250,64 +242,94 @@ impl QBittorrentClient {
         url: &str,
         form_data: &[(&str, &str)],
     ) -> AppResult<HttpResponse> {
-        let args = build_post_args(self.timeout, url, form_data, self.cookie.as_deref());
-        let output = std::process::Command::new("curl")
-            .args(&args)
-            .output()
-            .map_err(|err| AppError::QBittorrent(format!("curl failed to post to {url}: {err}")))?;
-
-        if !output.status.success() {
-            return Err(AppError::QBittorrent(format!(
-                "qBittorrent WebUI unreachable at {}",
-                self.base_url
-            )));
-        }
-
-        parse_http_response(&String::from_utf8_lossy(&output.stdout))
+        run_curl(&request_config(
+            self.timeout,
+            url,
+            Some(form_data),
+            self.cookie.as_deref(),
+        )?)
     }
 }
 
-pub(crate) fn build_get_args(timeout: Duration, url: &str, cookie: Option<&str>) -> Vec<String> {
-    let timeout_str = format_curl_timeout(timeout);
-    let mut args = vec![
-        "-s".to_string(),
-        "-i".to_string(),
-        "--max-time".to_string(),
-        timeout_str,
-        url.to_string(),
-    ];
-    if let Some(cookie) = cookie {
-        args.push("-H".to_string());
-        args.push(format!("Cookie: SID={cookie}"));
-    }
-    args
-}
-
-pub(crate) fn build_post_args(
+fn request_config(
     timeout: Duration,
     url: &str,
-    form_data: &[(&str, &str)],
+    form_data: Option<&[(&str, &str)]>,
     cookie: Option<&str>,
-) -> Vec<String> {
-    let timeout_str = format_curl_timeout(timeout);
-    let mut args = vec![
-        "-s".to_string(),
-        "-i".to_string(),
-        "--max-time".to_string(),
-        timeout_str,
-        "-X".to_string(),
-        "POST".to_string(),
-        url.to_string(),
-    ];
-    for (key, val) in form_data {
-        args.push("--data-urlencode".to_string());
-        args.push(format!("{key}={val}"));
+) -> AppResult<String> {
+    let mut config = format!(
+        "silent\ninclude\nmax-time = {}\nurl = {}\n",
+        format_curl_timeout(timeout),
+        curl_quote(url)
+    );
+    if let Some(form_data) = form_data {
+        config.push_str("request = POST\n");
+        for (key, val) in form_data {
+            config.push_str(&format!(
+                "data-urlencode = {}\n",
+                curl_quote(&format!("{key}={val}"))
+            ));
+        }
     }
     if let Some(cookie) = cookie {
-        args.push("-H".to_string());
-        args.push(format!("Cookie: SID={cookie}"));
+        if cookie.chars().any(char::is_control) {
+            return Err(AppError::QBittorrent("invalid session cookie".into()));
+        }
+        config.push_str(&format!(
+            "header = {}\n",
+            curl_quote(&format!("Cookie: SID={cookie}"))
+        ));
     }
-    args
+    Ok(config)
+}
+
+/// curl config uses quoted strings with C-style escapes, not shell quoting.
+fn curl_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\r', "\\r")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+            .replace('\u{b}', "\\v")
+    )
+}
+
+fn curl_command() -> std::process::Command {
+    let mut command = std::process::Command::new("curl");
+    // -q must be first: a user's curlrc must not enable tracing of credentials.
+    command.args(["-q", "--config", "-"]);
+    command
+}
+
+fn run_curl(config: &str) -> AppResult<HttpResponse> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = curl_command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(config.as_bytes()),
+        None => Err(std::io::Error::other("curl stdin unavailable")),
+    };
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(AppError::QBittorrent(format!(
+            "failed to send curl request: {error}"
+        )));
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(AppError::QBittorrent(
+            "qBittorrent WebUI request failed".into(),
+        ));
+    }
+    parse_http_response(&String::from_utf8_lossy(&output.stdout))
 }
 
 pub(crate) fn format_curl_timeout(timeout: Duration) -> String {
@@ -478,69 +500,28 @@ mod tests {
     }
 
     #[test]
-    fn build_get_args_formats_curl_command_with_and_without_cookie() {
-        let args_no_cookie = build_get_args(
-            Duration::from_secs(3),
-            "http://127.0.0.1:8080/api/v2/app/version",
-            None,
-        );
-        assert_eq!(
-            args_no_cookie,
-            vec![
-                "-s",
-                "-i",
-                "--max-time",
-                "3",
-                "http://127.0.0.1:8080/api/v2/app/version"
-            ]
-        );
-
-        let args_cookie = build_get_args(
+    fn credentials_only_enter_stdin_and_config_values_cannot_inject_options() {
+        let config = request_config(
             Duration::from_millis(1500),
-            "http://127.0.0.1:8080/api/v2/app/version",
-            Some("session123"),
-        );
-        assert_eq!(
-            args_cookie,
-            vec![
-                "-s",
-                "-i",
-                "--max-time",
-                "1.5",
-                "http://127.0.0.1:8080/api/v2/app/version",
-                "-H",
-                "Cookie: SID=session123"
-            ]
-        );
-    }
-
-    #[test]
-    fn build_post_args_formats_data_urlencoded_and_headers() {
-        let form_data = [("username", "admin"), ("password", "secret&123=")];
-        let args = build_post_args(
-            Duration::from_secs(5),
-            "http://127.0.0.1:8080/api/v2/auth/login",
-            &form_data,
-            Some("old_sid"),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "-s",
-                "-i",
-                "--max-time",
-                "5",
-                "-X",
-                "POST",
-                "http://127.0.0.1:8080/api/v2/auth/login",
-                "--data-urlencode",
-                "username=admin",
-                "--data-urlencode",
-                "password=secret&123=",
-                "-H",
-                "Cookie: SID=old_sid"
-            ]
+            "http://localhost/",
+            Some(&[("password", "secret\"\\\noutput = /tmp/stolen")]),
+            Some("sentinel_sid"),
+        )
+        .unwrap();
+        assert!(config.contains("max-time = 1.5"));
+        assert!(config.contains("sentinel_sid"));
+        assert!(!config.lines().any(|line| line.starts_with("output")));
+        let command = curl_command();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["-q", "--config", "-"]);
+        assert!(
+            request_config(
+                DEFAULT_TIMEOUT,
+                "http://localhost/",
+                None,
+                Some("bad\r\nheader")
+            )
+            .is_err()
         );
     }
 
@@ -592,7 +573,6 @@ mod tests {
         assert_eq!(no_bind.new_port, 55433);
         assert_eq!(no_bind.bound_interface, None);
 
-        // ...and asking to bind with no interface to bind to is not an error.
         let no_interface = QBittorrentClient::new(&base(true, false))
             .sync_port(55434, None)
             .expect("sync should succeed when interface is None");
