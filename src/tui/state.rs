@@ -447,8 +447,36 @@ pub struct TuiState {
     pub connecting: Option<ConnectingState>,
     pub connect_tx: Option<std::sync::mpsc::Sender<(String, String, bool)>>,
     pub split_tunnel_tx: Option<std::sync::mpsc::Sender<SplitTunnelConfig>>,
+    pub action_tx: Option<std::sync::mpsc::Sender<AsyncAction>>,
+    pub diag_tx: Option<std::sync::mpsc::Sender<(String, bool)>>,
     pub modal: ActiveModal,
     pub should_quit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AsyncAction {
+    KillSwitch(bool),
+    Lockdown(bool),
+    Autoconnect(bool),
+    Sync,
+    Delete(String),
+}
+
+pub enum AsyncActionResult {
+    KillSwitch {
+        enable: bool,
+        result: crate::error::AppResult<()>,
+    },
+    Lockdown {
+        enable: bool,
+        result: crate::error::AppResult<()>,
+    },
+    Autoconnect {
+        enable: bool,
+        result: crate::error::AppResult<()>,
+    },
+    Sync(crate::error::AppResult<crate::app::sync::SyncReport>),
+    Delete(crate::error::AppResult<String>),
 }
 
 impl TuiState {
@@ -476,6 +504,8 @@ impl TuiState {
             connecting: None,
             connect_tx: None,
             split_tunnel_tx: None,
+            action_tx: None,
+            diag_tx: None,
             modal: ActiveModal::None,
             should_quit: false,
         }

@@ -14,7 +14,7 @@ use crate::app::sync;
 use crate::config;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
-use crate::nm::{self, NmClient};
+use crate::nm::{self, NmClient, ProfileDiagnostics};
 use crate::tui::state::{
     ActiveModal, CachedProfileInfo, CommandPaletteState, SplitTunnelFocus, ThemePickerState,
     TuiState, wrap_next, wrap_prev,
@@ -114,6 +114,7 @@ pub fn execute_action<C: ActionClient>(
     client: &C,
     id: &str,
 ) -> AppResult<()> {
+    let action_tx = state.action_tx.clone();
     match id {
         "palette" => state.modal = ActiveModal::CommandPalette(CommandPaletteState::default()),
         "theme" => state.modal = ActiveModal::ThemePicker(ThemePickerState::default()),
@@ -240,30 +241,54 @@ pub fn execute_action<C: ActionClient>(
         }
         "kill_switch" => {
             let enable = !state.config.kill_switch_enabled;
-            crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
-            state
-                .uncertain_policies
-                .remove(&crate::error::Policy::KillSwitch);
-            state.config.kill_switch_enabled = enable;
-            state.set_status(format!(
-                "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
-                enabled_verb(enable)
-            ));
+            if let Some(ref tx) = action_tx {
+                state.set_status(format!(
+                    "{} Kill Switch policy...",
+                    if enable { "Enabling" } else { "Disabling" }
+                ));
+                let _ = tx.send(crate::tui::state::AsyncAction::KillSwitch(enable));
+            } else {
+                crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
+                state
+                    .uncertain_policies
+                    .remove(&crate::error::Policy::KillSwitch);
+                state.config.kill_switch_enabled = enable;
+                state.set_status(format!(
+                    "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
+                    enabled_verb(enable)
+                ));
+            }
         }
         "lockdown" => {
             let enable = !state.config.lockdown_enabled;
-            crate::app::set_global_lockdown(client, &state.config_path, enable)?;
-            state
-                .uncertain_policies
-                .remove(&crate::error::Policy::Lockdown);
-            state.config.lockdown_enabled = enable;
-            state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
+            if let Some(ref tx) = action_tx {
+                state.set_status(format!(
+                    "{} Lockdown Mode...",
+                    if enable { "Enabling" } else { "Disabling" }
+                ));
+                let _ = tx.send(crate::tui::state::AsyncAction::Lockdown(enable));
+            } else {
+                crate::app::set_global_lockdown(client, &state.config_path, enable)?;
+                state
+                    .uncertain_policies
+                    .remove(&crate::error::Policy::Lockdown);
+                state.config.lockdown_enabled = enable;
+                state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
+            }
         }
         "autoconnect" => {
             let enable = !state.config.general.autoconnect_at_login;
-            crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
-            state.config.general.autoconnect_at_login = enable;
-            state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+            if let Some(ref tx) = action_tx {
+                state.set_status(format!(
+                    "{} Auto Connect at Login...",
+                    if enable { "Enabling" } else { "Disabling" }
+                ));
+                let _ = tx.send(crate::tui::state::AsyncAction::Autoconnect(enable));
+            } else {
+                crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
+                state.config.general.autoconnect_at_login = enable;
+                state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+            }
         }
         "port_forwarding" => {
             let enable = !state.config.port_forwarding.enabled;
@@ -282,19 +307,24 @@ pub fn execute_action<C: ActionClient>(
             state.set_status(format!("{} NAT-PMP Port Forwarding.", enabled_verb(enable)));
         }
         "sync" => {
-            let report = sync::sync_profiles_dir(client, &state.config)?;
-            // The profile set may have changed, so the lockdown allow-list is
-            // stale: a freshly imported profile has no rule and would be
-            // blocked by the terminal DROP.
-            crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
-            reload_profiles(state, client)?;
-            if report.imported.is_empty() {
-                state.set_status("Refreshed profiles.");
+            if let Some(ref tx) = action_tx {
+                state.set_status("Syncing profiles in background...");
+                let _ = tx.send(crate::tui::state::AsyncAction::Sync);
             } else {
-                state.set_status(format!(
-                    "Synced drop directory: imported {} profiles.",
-                    report.imported.len()
-                ));
+                let report = sync::sync_profiles_dir(client, &state.config)?;
+                // The profile set may have changed, so the lockdown allow-list is
+                // stale: a freshly imported profile has no rule and would be
+                // blocked by the terminal DROP.
+                crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
+                reload_profiles(state, client)?;
+                if report.imported.is_empty() {
+                    state.set_status("Refreshed profiles.");
+                } else {
+                    state.set_status(format!(
+                        "Imported {} new profile(s).",
+                        report.imported.len()
+                    ));
+                }
             }
         }
         #[cfg(feature = "qbittorrent")]
@@ -373,7 +403,7 @@ pub fn execute_action<C: ActionClient>(
     Ok(())
 }
 
-fn enabled_verb(enabled: bool) -> &'static str {
+pub fn enabled_verb(enabled: bool) -> &'static str {
     if enabled { "Enabled" } else { "Disabled" }
 }
 
@@ -462,12 +492,18 @@ fn handle_delete_key<C: ActionClient>(
 ) -> AppResult<()> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-            client.delete_profile(uuid)?;
+            let action_tx = state.action_tx.clone();
             state.modal = ActiveModal::None;
-            state.set_status("Profile deleted.");
-            // The deleted profile's interface and endpoint rules are now stale.
-            crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
-            reload_profiles(state, client)?;
+            if let Some(ref tx) = action_tx {
+                state.set_status("Deleting profile in background...");
+                let _ = tx.send(crate::tui::state::AsyncAction::Delete(uuid.to_string()));
+            } else {
+                client.delete_profile(uuid)?;
+                state.set_status("Profile deleted.");
+                // The deleted profile's interface and endpoint rules are now stale.
+                crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
+                reload_profiles(state, client)?;
+            }
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             state.modal = ActiveModal::None;
@@ -670,9 +706,19 @@ pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
     let info = match state.profile_cache.get(&uuid) {
         Some(cached) => cached.clone(),
         None => {
-            let fetched = fetch_profile_info(client, &uuid, is_active);
-            state.profile_cache.insert(uuid, fetched.clone());
-            fetched
+            if let Some(ref tx) = state.diag_tx {
+                let _ = tx.send((uuid.clone(), is_active));
+                CachedProfileInfo {
+                    diagnostics: ProfileDiagnostics::default(),
+                    tunnel_address: None,
+                    tunnel_dns: None,
+                    gateway: None,
+                }
+            } else {
+                let fetched = fetch_profile_info(client, &uuid, is_active);
+                state.profile_cache.insert(uuid, fetched.clone());
+                fetched
+            }
         }
     };
 

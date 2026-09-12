@@ -93,6 +93,7 @@ where
     events::update_diagnostics(&mut state, &client);
 
     let (cache_tx, cache_rx) = std::sync::mpsc::channel();
+    let cache_tx_for_rows = cache_tx.clone();
     let client_for_cache = client.clone();
     let rows_to_cache: Vec<(String, bool)> = state
         .rows
@@ -102,7 +103,80 @@ where
     thread::spawn(move || {
         for (uuid, is_active) in rows_to_cache {
             let info = events::fetch_profile_info(&client_for_cache, &uuid, is_active);
-            let _ = cache_tx.send((uuid, info));
+            let _ = cache_tx_for_rows.send((uuid, info));
+        }
+    });
+
+    let (diag_req_tx, diag_req_rx) = std::sync::mpsc::channel::<(String, bool)>();
+    state.diag_tx = Some(diag_req_tx);
+    let client_for_diag = client.clone();
+    let cache_tx_for_diag = cache_tx.clone();
+    thread::spawn(move || {
+        while let Ok((uuid, is_active)) = diag_req_rx.recv() {
+            let info = events::fetch_profile_info(&client_for_diag, &uuid, is_active);
+            let _ = cache_tx_for_diag.send((uuid, info));
+        }
+    });
+
+    let (action_tx, action_rx) = std::sync::mpsc::channel::<crate::tui::state::AsyncAction>();
+    let (action_res_tx, action_res_rx) =
+        std::sync::mpsc::channel::<crate::tui::state::AsyncActionResult>();
+    state.action_tx = Some(action_tx);
+
+    let client_for_action = client.clone();
+    let config_path_for_action = state.config_path.clone();
+    thread::spawn(move || {
+        while let Ok(action) = action_rx.recv() {
+            let res = match action {
+                crate::tui::state::AsyncAction::KillSwitch(enable) => {
+                    let r = crate::app::set_global_kill_switch(
+                        &client_for_action,
+                        &config_path_for_action,
+                        enable,
+                    );
+                    crate::tui::state::AsyncActionResult::KillSwitch { enable, result: r }
+                }
+                crate::tui::state::AsyncAction::Lockdown(enable) => {
+                    let r = crate::app::set_global_lockdown(
+                        &client_for_action,
+                        &config_path_for_action,
+                        enable,
+                    );
+                    crate::tui::state::AsyncActionResult::Lockdown { enable, result: r }
+                }
+                crate::tui::state::AsyncAction::Autoconnect(enable) => {
+                    let r = crate::service::set_autoconnect_at_login(
+                        &client_for_action,
+                        &config_path_for_action,
+                        enable,
+                    );
+                    crate::tui::state::AsyncActionResult::Autoconnect { enable, result: r }
+                }
+                crate::tui::state::AsyncAction::Sync => {
+                    let r = (|| {
+                        let cfg = crate::config::load(&config_path_for_action)?;
+                        let report = crate::app::sync::sync_profiles_dir(&client_for_action, &cfg)?;
+                        crate::app::rebuild_lockdown_if_enabled(
+                            &client_for_action,
+                            &config_path_for_action,
+                        )?;
+                        Ok(report)
+                    })();
+                    crate::tui::state::AsyncActionResult::Sync(r)
+                }
+                crate::tui::state::AsyncAction::Delete(uuid) => {
+                    let r = (|| {
+                        client_for_action.delete_profile(&uuid)?;
+                        crate::app::rebuild_lockdown_if_enabled(
+                            &client_for_action,
+                            &config_path_for_action,
+                        )?;
+                        Ok(uuid)
+                    })();
+                    crate::tui::state::AsyncActionResult::Delete(r)
+                }
+            };
+            let _ = action_res_tx.send(res);
         }
     });
 
@@ -167,6 +241,7 @@ where
         &cache_rx,
         &conn_res_rx,
         &st_res_rx,
+        &action_res_rx,
         &monitor_events,
     );
 
@@ -212,6 +287,7 @@ fn run_event_loop<C, B>(
     cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
     conn_res_rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
     st_res_rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
+    action_res_rx: &std::sync::mpsc::Receiver<crate::tui::state::AsyncActionResult>,
     monitor_events: &Arc<AtomicU64>,
 ) -> AppResult<()>
 where
@@ -235,7 +311,14 @@ where
 
         // Drain any background profile cache updates
         while let Ok((uuid, info)) = cache_rx.try_recv() {
-            state.profile_cache.entry(uuid).or_insert(info);
+            let matches_sel = state
+                .selected_identity()
+                .map(|(u, _, _)| u == uuid)
+                .unwrap_or(false);
+            if matches_sel {
+                state.selected_info = Some(info.clone());
+            }
+            state.profile_cache.insert(uuid, info);
         }
 
         // Drain any incoming background connection/disconnection results
@@ -278,6 +361,86 @@ where
             }
         }
 
+        // Drain any incoming background action results
+        while let Ok(action_res) = action_res_rx.try_recv() {
+            match action_res {
+                crate::tui::state::AsyncActionResult::KillSwitch { enable, result } => match result
+                {
+                    Ok(()) => {
+                        state
+                            .uncertain_policies
+                            .remove(&crate::error::Policy::KillSwitch);
+                        state.config.kill_switch_enabled = enable;
+                        state.set_status(format!(
+                            "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
+                            events::enabled_verb(enable)
+                        ));
+                    }
+                    Err(err) => {
+                        state.set_error(&err);
+                        if let Ok(persisted) = crate::config::load(&state.config_path) {
+                            state.config.kill_switch_enabled = persisted.kill_switch_enabled;
+                        }
+                    }
+                },
+                crate::tui::state::AsyncActionResult::Lockdown { enable, result } => match result {
+                    Ok(()) => {
+                        state
+                            .uncertain_policies
+                            .remove(&crate::error::Policy::Lockdown);
+                        state.config.lockdown_enabled = enable;
+                        state
+                            .set_status(format!("{} Lockdown Mode.", events::enabled_verb(enable)));
+                    }
+                    Err(err) => {
+                        state.set_error(&err);
+                        if let Ok(persisted) = crate::config::load(&state.config_path) {
+                            state.config.lockdown_enabled = persisted.lockdown_enabled;
+                        }
+                    }
+                },
+                crate::tui::state::AsyncActionResult::Autoconnect { enable, result } => {
+                    match result {
+                        Ok(()) => {
+                            state.config.general.autoconnect_at_login = enable;
+                            state.set_status(format!(
+                                "{} Auto Connect at Login.",
+                                events::enabled_verb(enable)
+                            ));
+                        }
+                        Err(err) => {
+                            state.set_error(&err);
+                            if let Ok(persisted) = crate::config::load(&state.config_path) {
+                                state.config.general.autoconnect_at_login =
+                                    persisted.general.autoconnect_at_login;
+                            }
+                        }
+                    }
+                }
+                crate::tui::state::AsyncActionResult::Sync(result) => match result {
+                    Ok(report) => {
+                        let _ = events::reload_profiles(state, client);
+                        if report.imported.is_empty() {
+                            state.set_status("Refreshed profiles.");
+                        } else {
+                            state.set_status(format!(
+                                "Imported {} new profile(s).",
+                                report.imported.len()
+                            ));
+                        }
+                    }
+                    Err(err) => state.set_error(&err),
+                },
+                crate::tui::state::AsyncActionResult::Delete(result) => match result {
+                    Ok(_) => {
+                        state.set_status("Profile deleted.");
+                        let _ = events::reload_profiles(state, client);
+                    }
+                    Err(err) => state.set_error(&err),
+                },
+            }
+        }
+
         // Periodically refresh active profile diagnostics / total data every 1.5s in sync with throughput rates
         if last_diag_sample.elapsed() >= Duration::from_millis(1500) {
             last_diag_sample = std::time::Instant::now();
@@ -288,8 +451,12 @@ where
             events::refresh_lease(state);
 
             if let Some((uuid, _, true)) = state.selected_identity() {
-                state.profile_cache.remove(&uuid);
-                events::update_diagnostics(state, client);
+                if let Some(ref tx) = state.diag_tx {
+                    let _ = tx.send((uuid, true));
+                } else {
+                    state.profile_cache.remove(&uuid);
+                    events::update_diagnostics(state, client);
+                }
             }
         }
 

@@ -172,3 +172,46 @@ fn malformed_config_fails_cleanly_at_startup() {
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+#[test]
+fn async_actions_do_not_block_event_loop_when_backend_blocks() {
+    let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)]);
+    let (mut state, path) = state_for(&client, "tui-async-no-block");
+
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    state.action_tx = Some(action_tx);
+
+    // Trigger kill-switch toggle - must not block on any backend call
+    press(&mut state, &client, KeyCode::Char('k')).expect("action should succeed");
+    assert!(
+        state.status_message.contains("Kill Switch policy"),
+        "status must report in-flight async action"
+    );
+    // Verify task arrived on channel
+    let task = action_rx
+        .try_recv()
+        .expect("task must be dispatched to worker channel");
+    match task {
+        neutron::tui::state::AsyncAction::KillSwitch(enable) => assert!(enable),
+        other => panic!("expected KillSwitch task, got {other:?}"),
+    }
+
+    // Trigger lockdown toggle
+    press(&mut state, &client, KeyCode::Char('l')).expect("action should succeed");
+    let task2 = action_rx
+        .try_recv()
+        .expect("task must be dispatched to worker channel");
+    match task2 {
+        neutron::tui::state::AsyncAction::Lockdown(enable) => assert!(enable),
+        other => panic!("expected Lockdown task, got {other:?}"),
+    }
+
+    // Interface remains responsive to quit
+    press(&mut state, &client, KeyCode::Char('q')).expect("quit should succeed");
+    assert!(
+        state.should_quit,
+        "event loop processes quit without waiting for blocked worker"
+    );
+
+    testing::remove_temp_config(&path);
+}
