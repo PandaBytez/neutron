@@ -6,46 +6,16 @@
 //! full tunnel owns the default route, every packet then disappears into it.
 //! The user sees "Connected" and total loss of connectivity.
 //!
-//! # Why the receive counter is the handshake
+//! `/proc/net/dev` exposes authenticated receive traffic without the privileges
+//! required by `wg show latest-handshakes`. Treat RX as a nonzero latch on a
+//! freshly created interface, not a rate: an established idle tunnel may never
+//! receive another packet. Sampling only after activation can miss the initial
+//! response. Third-party reachability probes cannot establish tunnel health.
 //!
-//! The native way to answer "did this tunnel handshake?" is
-//! `wg show <interface> latest-handshakes`, which is what `wg-quick` and every
-//! WireGuard monitoring tool read. It needs `CAP_NET_ADMIN`, so an unprivileged
-//! desktop app cannot use it, and Neutron will not escalate privileges for a
-//! status read.
-//!
-//! The interface's **receive byte counter** carries the same guarantee, and is
-//! readable from `/proc/net/dev` by any user. WireGuard accounts a packet only
-//! after it has been decrypted and authenticated, so a peer that never
-//! completes a handshake can never move that counter -- no stray or hostile
-//! traffic can forge it. Crucially the handshake *response itself* is
-//! accounted, so the counter moves within milliseconds of the peer answering.
-//!
-//! Measured on two real WireGuard peers (`testing/`, two interfaces peered over
-//! loopback):
-//!
-//! ```text
-//! peer answers:       rx 0 -> 92 within ~0.3s, latest-handshakes set
-//! peer never answers: rx 0 forever,            latest-handshakes 0
-//! ```
-//!
-//! # Why the counter is only read once, from zero
-//!
-//! That same measurement showed an established but **idle** tunnel does not
-//! move its receive counter at all -- it sat at 92 bytes across 30 seconds.
-//! `PersistentKeepalive` does not help: it makes *us* send to the peer, and the
-//! peer only sends back if it independently chose to configure a keepalive
-//! toward us, which a VPN provider generally does not.
-//!
-//! So the counter must be treated as a **one-shot latch, baselined from before
-//! the interface existed**, never as a rate. An earlier version baselined it
-//! *after* activation -- capturing the handshake response it was meant to
-//! detect -- and then demanded further growth that an idle tunnel never
-//! produced. That left the decision to a `ping 1.1.1.1` fallback which depended
-//! on a third party answering ICMP, on ICMP not being filtered along the path,
-//! and on routes having converged in time. None of those are properties of this
-//! tunnel, and the combination disconnected healthy tunnels roughly ten seconds
-//! after connecting. There is no reachability probe any more.
+//! Zero RX alone does not establish failure for an on-demand tunnel: without
+//! keepalive or user traffic, no handshake need have been attempted. Activation
+//! only uses this probe to trigger teardown when endpoint and keepalive settings
+//! indicate that the tunnel initiates a handshake automatically (BUG-034).
 
 use std::thread;
 use std::time::Duration;
@@ -57,11 +27,7 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long to wait for the peer to answer before declaring the tunnel dead.
 ///
-/// Sized against WireGuard's own handshake schedule rather than a round number:
-/// the kernel retries an unanswered handshake every `REKEY_TIMEOUT` (5s), so
-/// this window covers three attempts. A peer that has answered none of them is
-/// not going to, while a peer that answers any of them moves the counter and
-/// short-circuits within milliseconds.
+/// Covers three of WireGuard's five-second handshake retry intervals.
 const PROBE_WINDOW: Duration = Duration::from_secs(15);
 
 /// Number of samples taken across [`PROBE_WINDOW`].
@@ -105,7 +71,7 @@ where
 /// verified: its counter is about to start from zero, so any growth is this
 /// session's handshake. An interface that is already present carries traffic
 /// from an activation that is not the one being checked, and [`probe`] must not
-/// be pointed at it -- see [`verify`] in `crate::nm`.
+/// be pointed at it.
 pub fn interface_exists(interface: &str) -> bool {
     network_info::interface_receive_bytes(interface).is_some()
 }

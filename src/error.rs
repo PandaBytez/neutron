@@ -2,8 +2,34 @@ use std::io;
 
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Policy {
+    Lockdown,
+    KillSwitch,
+    SplitTunnel,
+}
+
+impl std::fmt::Display for Policy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Lockdown => "lockdown",
+            Self::KillSwitch => "kill switch",
+            Self::SplitTunnel => "split tunneling",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error(
+        "{policy}: {outcome}; saved intent may differ from effective protection. Retry the policy action to reconcile: {source}"
+    )]
+    PolicyUpdate {
+        policy: Policy,
+        outcome: &'static str,
+        #[source]
+        source: Box<AppError>,
+    },
     #[error("command failed: {0}")]
     CommandFailed(String),
     #[error("firewall command failed: {0}")]

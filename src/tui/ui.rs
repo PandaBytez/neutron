@@ -4,7 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 use crate::config::SplitTunnelMode;
 use crate::nm::network_info::format_speed;
@@ -277,6 +279,22 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let (auto_val, auto_val_style) = toggle_status(state.config.general.autoconnect_at_login);
     let (kill_val, kill_val_style) = toggle_status(state.config.kill_switch_enabled);
     let (lock_val, lock_val_style) = toggle_status(state.config.lockdown_enabled);
+    let (kill_val, kill_val_style) = if state
+        .uncertain_policies
+        .contains(&crate::error::Policy::KillSwitch)
+    {
+        ("UNKNOWN", theme.accent)
+    } else {
+        (kill_val, kill_val_style)
+    };
+    let (lock_val, lock_val_style) = if state
+        .uncertain_policies
+        .contains(&crate::error::Policy::Lockdown)
+    {
+        ("UNKNOWN", theme.accent)
+    } else {
+        (lock_val, lock_val_style)
+    };
     let (pf_val, pf_val_style) = toggle_status(state.config.port_forwarding.enabled);
 
     let split_count = state.config.global_split_tunnel.cidrs.len()
@@ -286,6 +304,14 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         SplitTunnelMode::Disabled => ("OFF".to_string(), theme.label_dim),
         SplitTunnelMode::Include => (format!("Include ({split_count})"), theme.accent),
         SplitTunnelMode::Exclude => (format!("Exclude ({split_count})"), theme.accent),
+    };
+    let (split_val, split_val_style) = if state
+        .uncertain_policies
+        .contains(&crate::error::Policy::SplitTunnel)
+    {
+        ("UNKNOWN".to_string(), theme.accent)
+    } else {
+        (split_val, split_val_style)
     };
 
     let col1_w = 34_usize;
@@ -319,7 +345,7 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         Span::styled(split_val, split_val_style),
     ]);
 
-    let title = Line::from(vec![Span::styled(" 🛡  Policies ", theme.title)]);
+    let title = Line::from(vec![Span::styled(" 🛡  Saved Policies ", theme.title)]);
 
     let policies_widget = Paragraph::new(vec![line1, line2, line3])
         .wrap(Wrap { trim: true })
@@ -374,14 +400,10 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
             // Inactive rows get blank space rather than a marker, so only the
             // connected profile carries a glyph. The width matches "✔ " to keep
             // the name column aligned. While connecting, a live spinner cycles here.
-            let is_connecting_row = state
-                .connecting
-                .as_ref()
-                .map(|c| c.uuid == row.uuid)
-                .unwrap_or(false);
+            let is_connecting = state.connecting.as_ref().filter(|c| c.uuid == row.uuid);
 
-            let (icon, icon_style) = if is_connecting_row {
-                let elapsed = state.connecting.as_ref().unwrap().started_at.elapsed();
+            let (icon, icon_style) = if let Some(conn) = is_connecting {
+                let elapsed = conn.started_at.elapsed();
                 const SPINNER_FRAMES: [&str; 10] =
                     ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
                 let spinner =
@@ -464,7 +486,9 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
             .title(title),
     );
 
-    frame.render_widget(list_widget, area);
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected_index));
+    frame.render_stateful_widget(list_widget, area, &mut list_state);
 }
 
 fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -550,7 +574,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             lines.push(Line::from(vec![
                 Span::styled("DNS Resolver:  ", theme.label_dim),
                 Span::styled(
-                    format!("{dns} (Exclusive Priority -1500)"),
+                    format!("{dns} (configured DNS; live priority not verified)"),
                     theme.text_secondary,
                 ),
             ]));
@@ -976,7 +1000,9 @@ fn render_command_palette_modal(
             .border_style(theme.border)
             .title(format!(" Actions ({}) ", filtered.len())),
     );
-    frame.render_widget(list_widget, chunks[1]);
+    let mut list_state = ListState::default();
+    list_state.select(Some(cp.selected_index));
+    frame.render_stateful_widget(list_widget, chunks[1], &mut list_state);
 
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("[↑/↓] ", theme.keybinding),
@@ -1060,7 +1086,9 @@ fn render_theme_picker_modal(
             .border_style(theme.active_border)
             .title(" Available Color Palettes "),
     );
-    frame.render_widget(list_widget, chunks[0]);
+    let mut list_state = ListState::default();
+    list_state.select(Some(tp.selected_index));
+    frame.render_stateful_widget(list_widget, chunks[0], &mut list_state);
 
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("[↑/↓] ", theme.keybinding),
@@ -1364,7 +1392,11 @@ fn render_entry_column(
             .border_style(list_style)
             .title(params.title),
     );
-    frame.render_widget(list_widget, box_chunks[1]);
+    let mut list_state = ListState::default();
+    if params.is_list_focused {
+        list_state.select(Some(params.selected_idx));
+    }
+    frame.render_stateful_widget(list_widget, box_chunks[1], &mut list_state);
 }
 
 fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state: &TuiState) {
@@ -1487,13 +1519,16 @@ mod render_tests {
     /// Render just the policies panel and return its rows as plain strings.
     fn rendered_policies(config: AppConfig) -> Vec<String> {
         let state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
+        rendered_policy_state(&state)
+    }
 
+    fn rendered_policy_state(state: &TuiState) -> Vec<String> {
         let mut terminal =
             Terminal::new(TestBackend::new(78, 5)).expect("test terminal should build");
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_policies_panel(frame, area, &state);
+                render_policies_panel(frame, area, state);
             })
             .expect("draw should succeed");
 
@@ -1508,8 +1543,45 @@ mod render_tests {
     }
 
     #[test]
+    fn selection_beyond_viewport_scrolls_into_view() {
+        let rows: Vec<_> = (0..10)
+            .map(|i| row(&format!("profile-{i}"), false))
+            .collect();
+        // Viewport height 6 has 4 visible content rows. Select index 9 (last item).
+        let lines = rendered_list(rows, 9);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("profile-9"),
+            "selected row 9 must be visible in scrolled viewport:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn uncertain_policy_never_renders_saved_on_as_effective_protection() {
+        let mut state = TuiState::new(
+            "/tmp/x".into(),
+            AppConfig {
+                lockdown_enabled: true,
+                ..Default::default()
+            },
+        );
+        state.set_error(&crate::error::AppError::PolicyUpdate {
+            policy: crate::error::Policy::Lockdown,
+            outcome: "application completed but saving failed",
+            source: Box::new(crate::error::AppError::Config("read-only directory".into())),
+        });
+        let rendered = rendered_policy_state(&state).join("\n");
+        assert!(
+            rendered.contains("Lockdown Mode (root): UNKNOWN"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn the_policies_panel_shows_consistent_spaced_policy_names() {
         let off = rendered_policies(AppConfig::default()).join("\n");
+        assert!(off.contains("Saved Policies"));
+        assert!(!off.contains("reconnect"));
         assert!(
             off.contains("[a] Auto Connect:") && off.contains("OFF"),
             "Auto Connect must use space and render: {off}"

@@ -29,10 +29,13 @@ struct Fixture {
 impl Fixture {
     /// Import a fresh profile and return a handle to it.
     fn import(label: &str, address: &str, dns: &str) -> Self {
+        Self::import_config(label, &sample_wireguard_config(address, dns))
+    }
+
+    fn import_config(label: &str, config: &str) -> Self {
         let name = sandbox_profile_name(label);
         let path = std::env::temp_dir().join(format!("{name}.conf"));
-        std::fs::write(&path, sample_wireguard_config(address, dns))
-            .expect("fixture config should be writable");
+        std::fs::write(&path, config).expect("fixture config should be writable");
 
         let client = CliNmClient;
         client
@@ -69,6 +72,185 @@ impl Drop for Fixture {
             .output();
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn idle_on_demand_tunnel_stays_active_and_carries_its_first_packet() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    require_sandbox();
+    fn public_key(private_key: &str) -> String {
+        let mut child = Command::new("wg")
+            .arg("pubkey")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(private_key.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+    let a_key = "OMHVnT2Gm0ZBb3xF2Cq0hZ0jVQ1z3T0lQ0Z0YQ0Z0X8=";
+    let b_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=";
+    let peer = Fixture::import_config(
+        "idlepeer",
+        &format!(
+            "[Interface]\nPrivateKey = {a_key}\nAddress = 10.253.34.1/32\nListenPort = 51834\n\n[Peer]\nPublicKey = {}\nAllowedIPs = 10.253.34.2/32\n",
+            public_key(b_key)
+        ),
+    );
+    let client = Fixture::import_config(
+        "idleclient",
+        &format!(
+            "[Interface]\nPrivateKey = {b_key}\nAddress = 10.253.34.2/32\n\n[Peer]\nPublicKey = {}\nAllowedIPs = 10.253.34.3/32\nEndpoint = 127.0.0.1:51834\n",
+            public_key(a_key)
+        ),
+    );
+    CliNmClient
+        .connect(&peer.uuid)
+        .expect("passive responder should stay active");
+    CliNmClient
+        .connect(&client.uuid)
+        .expect("idle on-demand client should stay active");
+    std::thread::sleep(std::time::Duration::from_secs(16));
+    for fixture in [&peer, &client] {
+        assert!(
+            CliNmClient
+                .list_wireguard_profiles()
+                .unwrap()
+                .iter()
+                .any(|p| p.uuid == fixture.uuid && p.is_active())
+        );
+    }
+    assert_eq!(
+        neutron::nm::network_info::interface_receive_bytes(&client.name),
+        Some(0)
+    );
+    // Use a non-local destination so the local routing table cannot bypass the
+    // tunnel. The responder authenticates the packet even without a service at .3.
+    let socket = std::net::UdpSocket::bind("10.253.34.2:0").unwrap();
+    socket
+        .send_to(b"first on-demand packet", "10.253.34.3:12345")
+        .unwrap();
+    for _ in 0..30 {
+        if neutron::nm::network_info::interface_receive_bytes(&client.name).unwrap_or(0) > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let rx = neutron::nm::network_info::interface_receive_bytes(&client.name).unwrap();
+    assert!(
+        rx > 0,
+        "first packet should trigger authenticated tunnel traffic"
+    );
+    assert!(neutron::nm::network_info::interface_receive_bytes(&peer.name).unwrap() > 0);
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn refreshed_routes_reach_the_active_device_without_reconnecting() {
+    require_sandbox();
+    let config = sample_wireguard_config("10.253.36.2/32", "10.253.36.1")
+        .replace("0.0.0.0/0, ::/0", "198.18.0.0/16")
+        .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0");
+    let fixture = Fixture::import_config("refresh", &config);
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    let path = neutron::testing::temp_toml_config_path("live-route-refresh");
+    let mut cfg = neutron::config::AppConfig::default();
+    cfg.global_split_tunnel.mode = SplitTunnelMode::Include;
+    // Numeric DNS targets give a deterministic resolver answer without external DNS.
+    cfg.global_split_tunnel.domains = vec!["198.18.1.2".into()];
+    neutron::config::save(&path, &cfg).unwrap();
+    neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
+    neutron::config::update(&path, |cfg| {
+        cfg.global_split_tunnel.domains = vec!["198.18.1.3".into()]
+    })
+    .unwrap();
+    neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
+    let output = std::process::Command::new("ip")
+        .args(["-4", "route", "show", "dev", &fixture.name])
+        .output()
+        .unwrap();
+    let routes = String::from_utf8_lossy(&output.stdout);
+    assert!(routes.contains("198.18.1.3"), "{routes}");
+    assert!(!routes.contains("198.18.1.2"), "{routes}");
+    assert!(
+        CliNmClient
+            .list_wireguard_profiles()
+            .unwrap()
+            .iter()
+            .any(|p| p.uuid == fixture.uuid && p.is_active())
+    );
+    neutron::testing::remove_temp_config(&path);
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn activation_prepares_connected_lockdown_before_first_traffic() {
+    use neutron::firewall::FirewallClient;
+    require_sandbox();
+    let path = neutron::config::default_config_path().unwrap();
+    let original = neutron::config::load(&path).unwrap();
+    struct Restore(neutron::config::AppConfig, PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = CliNmClient.disable_lockdown();
+            let _ = neutron::config::save(&self.1, &self.0);
+        }
+    }
+    let _restore = Restore(original, path.clone());
+    let config = sample_wireguard_config("10.253.37.2/32", "10.253.37.1")
+        .replace("0.0.0.0/0, ::/0", "198.19.0.0/16")
+        .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0");
+    let fixture = Fixture::import_config("locked", &config);
+    neutron::app::set_global_lockdown(&CliNmClient, &path, true).unwrap();
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    let output = std::process::Command::new("firewall-cmd")
+        .args(["--direct", "--get-all-rules"])
+        .output()
+        .unwrap();
+    let rules = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rules
+            .lines()
+            .any(|l| l.contains(&fixture.name) && l.contains("ACCEPT")),
+        "{rules}"
+    );
+    assert!(
+        !rules
+            .lines()
+            .any(|l| l.contains("--dport 53") && l.contains("ACCEPT")),
+        "{rules}"
+    );
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn keepalive_tunnel_with_unreachable_peer_is_still_rejected() {
+    require_sandbox();
+    let config = sample_wireguard_config("10.253.35.2/32", "10.253.35.1")
+        .replace("0.0.0.0/0, ::/0", "10.253.35.1/32")
+        .replace("192.0.2.1:51820", "127.0.0.1:51835");
+    let fixture = Fixture::import_config("silent", &config);
+    assert!(matches!(
+        CliNmClient.connect(&fixture.uuid),
+        Err(neutron::error::AppError::TunnelUnhealthy(_))
+    ));
+    assert!(
+        CliNmClient
+            .list_wireguard_profiles()
+            .unwrap()
+            .iter()
+            .any(|p| p.uuid == fixture.uuid && !p.is_active())
+    );
 }
 
 #[test]

@@ -21,15 +21,31 @@ pub fn apply_and_persist_global_split_tunnel<C: NmClient>(
     st_cfg: &SplitTunnelConfig,
 ) -> AppResult<()> {
     let (v4_routes, v6_routes) =
-        nm::split_tunnel::routes_for(st_cfg.mode, &st_cfg.cidrs, &st_cfg.domains);
+        nm::split_tunnel::routes_for_checked(st_cfg.mode, &st_cfg.cidrs, &st_cfg.domains)?;
 
-    client.apply_split_tunnel_all(st_cfg.mode, &v4_routes, &v6_routes)?;
+    crate::app::apply_and_save_policy(
+        path,
+        crate::error::Policy::SplitTunnel,
+        || client.apply_split_tunnel_all(st_cfg.mode, &v4_routes, &v6_routes),
+        |cfg| cfg.global_split_tunnel = st_cfg.clone(),
+    )
+}
 
-    let mut app_cfg = config::load(path)?;
-    app_cfg.global_split_tunnel = st_cfg.clone();
-    config::save(path, &app_cfg)?;
-
-    Ok(())
+/// Re-resolve split-tunnel domains and reapply routing rules to NetworkManager if
+/// resolved IP endpoints changed during an active session (record rotation).
+pub fn refresh_active_domain_routes<C: NmClient>(client: &C, path: &Path) -> AppResult<bool> {
+    config::coordinate_policy(path, || {
+        let app_cfg = config::load(path)?;
+        let split = &app_cfg.global_split_tunnel;
+        if !split.mode.is_enabled() || split.domains.is_empty() {
+            return Ok(false);
+        }
+        let (v4, v6) =
+            nm::split_tunnel::routes_for_checked(split.mode, &split.cidrs, &split.domains)?;
+        client.apply_split_tunnel_all(split.mode, &v4, &v6)?;
+        client.reapply_active_routes()?;
+        Ok(true)
+    })
 }
 
 /// Load the global split-tunnel config, apply `edit` to it, and persist the
@@ -46,7 +62,13 @@ where
     let mut st_cfg = config::load(path)?.global_split_tunnel;
     let changed = edit(&mut st_cfg)?;
     if changed {
-        apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+        if st_cfg.mode.is_enabled() {
+            apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+        } else {
+            // When split tunneling is disabled, editing the list does not affect routing;
+            // persist the list directly without modifying NetworkManager profiles (BUG-062).
+            config::update(path, |cfg| cfg.global_split_tunnel = st_cfg.clone())?;
+        }
     }
     Ok((st_cfg, changed))
 }
@@ -57,13 +79,10 @@ pub fn set_global_mode<C: NmClient>(
     path: &Path,
     mode: SplitTunnelMode,
 ) -> AppResult<SplitTunnelConfig> {
-    let (cfg, _) = mutate_global(client, path, |st_cfg| {
-        st_cfg.mode = mode;
-        // Always reapplied: the mode decides how the existing routes are
-        // interpreted, so it must reach NetworkManager even when unchanged.
-        Ok(true)
-    })?;
-    Ok(cfg)
+    let mut st_cfg = config::load(path)?.global_split_tunnel;
+    st_cfg.mode = mode;
+    apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+    Ok(st_cfg)
 }
 
 /// Add a CIDR or IP to the global split tunnel config.
@@ -176,6 +195,42 @@ mod tests {
     use crate::nm::{ProfileState, WireguardProfile};
     use crate::testing::{self, MockNmClient};
 
+    #[test]
+    fn refresh_reads_intent_only_after_policy_writer_releases_lock() {
+        let path = testing::temp_config_path("refresh-coordination");
+        let mut cfg = AppConfig::default();
+        cfg.global_split_tunnel.mode = SplitTunnelMode::Include;
+        cfg.global_split_tunnel.domains = vec!["localhost".into()];
+        config::save(&path, &cfg).unwrap();
+        let client = MockNmClient::new(vec![test_profile()]);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = config::coordinate_policy(&path, || {
+                let worker = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    let result = refresh_active_domain_routes(&client, &path);
+                    done_tx.send(result).unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_millis(30))
+                        .is_err()
+                );
+                config::update(&path, |cfg| {
+                    cfg.global_split_tunnel.mode = SplitTunnelMode::Disabled
+                })?;
+                Ok(worker)
+            })
+            .unwrap();
+            worker.join().unwrap();
+        });
+        assert!(!done_rx.recv().unwrap().unwrap());
+        assert!(client.split_tunnel_calls().is_empty());
+        testing::remove_temp_config(&path);
+    }
+
     fn test_profile() -> WireguardProfile {
         WireguardProfile {
             name: "test-wg".to_string(),
@@ -265,5 +320,75 @@ mod tests {
         assert!(status.contains("include"));
         assert!(status.contains("10.0.0.0/8"));
         assert!(status.contains("example.com"));
+    }
+
+    #[test]
+    fn apply_and_persist_rejects_unresolvable_domain() {
+        let profile = test_profile();
+        let client = MockNmClient::new(vec![profile]);
+        let path = testing::temp_config_path("st-unresolvable");
+
+        let st_cfg = SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            cidrs: vec!["10.0.0.0/8".to_string()],
+            domains: vec!["unresolvable-test-domain-xyz.invalid".to_string()],
+        };
+
+        let res = apply_and_persist_global_split_tunnel(&client, &path, &st_cfg);
+        assert!(res.is_err());
+        assert!(client.split_tunnel_calls().is_empty());
+
+        testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn refresh_active_domain_routes_updates_rules_when_enabled() {
+        let profile = test_profile();
+        let client = MockNmClient::new(vec![profile]);
+        let path = testing::temp_config_path("st-refresh");
+
+        let app_cfg = AppConfig {
+            global_split_tunnel: SplitTunnelConfig {
+                mode: SplitTunnelMode::Include,
+                cidrs: vec!["10.0.0.0/8".to_string()],
+                domains: vec!["localhost".to_string()],
+            },
+            ..Default::default()
+        };
+        config::save(&path, &app_cfg).unwrap();
+
+        let refreshed = refresh_active_domain_routes(&client, &path).unwrap();
+        assert!(refreshed);
+        assert_eq!(client.split_tunnel_calls().len(), 1);
+
+        testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn editing_disabled_split_list_does_not_sweep_nm_profiles() {
+        let profile = test_profile();
+        let client = MockNmClient::new(vec![profile]);
+        let path = testing::temp_config_path("st-disabled-edit");
+
+        let app_cfg = AppConfig {
+            global_split_tunnel: SplitTunnelConfig {
+                mode: SplitTunnelMode::Disabled,
+                cidrs: Vec::new(),
+                domains: Vec::new(),
+            },
+            ..Default::default()
+        };
+        config::save(&path, &app_cfg).unwrap();
+
+        // Adding a CIDR while disabled must update config without sweeping NM
+        let (updated, changed) = add_global_cidr(&client, &path, "10.0.0.0/8").unwrap();
+        assert!(changed);
+        assert_eq!(updated.cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert!(
+            client.split_tunnel_calls().is_empty(),
+            "editing disabled split list must not call apply_split_tunnel_all"
+        );
+
+        testing::remove_temp_config(&path);
     }
 }

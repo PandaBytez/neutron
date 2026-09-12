@@ -35,17 +35,30 @@ pub fn run_startup_random_with_path<C: NmClient>(
 /// profile is its own interface they never compete for a device -- left alone,
 /// NM activates *every* profile at boot.
 ///
-/// Selecting a profile by arming one with `autoconnect` was tried and removed:
-/// it made NM a second activation authority that could not see what the app had
-/// already connected, so an armed profile would come up *alongside* the active
-/// one. Activation is now always an explicit `connection up` issued here.
-///
 /// Best-effort: failures are logged, since callers must still work on a system
 /// where the flag could not be cleared.
 fn normalize_autoconnect<C: NmClient>(client: &C) {
     if let Err(error) = client.set_autoconnect_all(false) {
         warn!("failed to disable NetworkManager autoconnect: {error}");
     }
+}
+
+fn lock_selector(path: &Path) -> AppResult<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".selector.lock");
+    let lock = options.open(Path::new(&lock_path))?;
+    lock.lock()?;
+    Ok(lock)
 }
 
 fn run_startup_random_with_selector<C, F>(
@@ -57,7 +70,8 @@ where
     C: NmClient,
     F: FnMut(usize) -> usize,
 {
-    let mut app_cfg = config::load(path)?;
+    let _selector_lock = lock_selector(path)?;
+    let app_cfg = config::load(path)?;
 
     let profiles = client.list_wireguard_profiles()?;
 
@@ -78,6 +92,9 @@ where
         return Ok(StartupRandomResult::SkippedAlreadyActive);
     }
 
+    // Validate a replacement exists before disturbing any working tunnel.
+    let candidates = ordered_candidates(&profiles, &app_cfg, &mut select_index)?;
+
     // If multiple profiles are active, or the only active profile was excluded,
     // tear down active profiles so we can cleanly select and connect an eligible profile.
     if !active_profiles.is_empty() {
@@ -90,14 +107,22 @@ where
         }
     }
 
-    let candidates = ordered_candidates(&profiles, &app_cfg, &mut select_index)?;
-
     let mut last_connect_error = None;
     for selected in candidates {
+        // Re-check connection state before activating: another selector or manual action
+        // may have connected an eligible tunnel while waiting on teardown/locks.
+        if let Ok(current) = client.list_wireguard_profiles() {
+            let active: Vec<_> = current.iter().filter(|p| p.is_active()).collect();
+            if active.len() == 1 && !app_cfg.excluded_profile_ids.contains(&active[0].uuid) {
+                return Ok(StartupRandomResult::SkippedAlreadyActive);
+            }
+        }
+
         match client.connect(&selected.uuid) {
             Ok(()) => {
-                app_cfg.last_random_profile_id = Some(selected.uuid.clone());
-                if let Err(error) = config::save(path, &app_cfg) {
+                if let Err(error) = config::update(path, |cfg| {
+                    cfg.last_random_profile_id = Some(selected.uuid.clone());
+                }) {
                     warn!(
                         "startup random connected profile '{}' but failed to persist state: {error}",
                         selected.uuid
@@ -157,8 +182,7 @@ where
 
 /// Turn "connect a random profile at login" on or off, and persist the choice.
 ///
-/// Enabling installs the autostart entry that relaunches the app hidden at
-/// login; that launch is what performs the connection. Disabling removes it.
+/// Enabling installs a `startup-random` desktop entry; disabling removes it.
 /// Neither direction disturbs a tunnel that is already up -- an active profile
 /// is a deliberate connection, and toggling a preference is not a request to
 /// drop traffic.
@@ -168,6 +192,26 @@ pub fn set_autoconnect_at_login<C: NmClient>(
     enable: bool,
 ) -> AppResult<()> {
     set_autoconnect_at_login_in(client, path, &autostart::dir()?, enable)
+}
+
+pub fn reconcile_autoconnect_at_login(config_path: &Path) -> AppResult<()> {
+    if let Ok(autostart_dir) = autostart::dir() {
+        reconcile_autoconnect_at_login_in(config_path, &autostart_dir)?;
+    }
+    Ok(())
+}
+
+pub fn reconcile_autoconnect_at_login_in(
+    config_path: &Path,
+    autostart_dir: &Path,
+) -> AppResult<()> {
+    let cfg = config::load(config_path)?;
+    if cfg.general.autoconnect_at_login {
+        autostart::install_in(autostart_dir)?;
+    } else {
+        autostart::uninstall_in(autostart_dir)?;
+    }
+    Ok(())
 }
 
 fn set_autoconnect_at_login_in<C: NmClient>(
@@ -186,11 +230,15 @@ fn set_autoconnect_at_login_in<C: NmClient>(
         autostart::uninstall_in(autostart_dir)?;
     }
 
-    // Persist last: the caller reverts its switch when this errors, so saving
-    // before the work could leave the stored state disagreeing with the UI.
-    let mut app_cfg = config::load(path)?;
-    app_cfg.general.autoconnect_at_login = enable;
-    config::save(path, &app_cfg)
+    if let Err(err) = config::update(path, |cfg| cfg.general.autoconnect_at_login = enable) {
+        if enable {
+            let _ = autostart::uninstall_in(autostart_dir);
+        } else {
+            let _ = autostart::install_in(autostart_dir);
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -205,6 +253,37 @@ mod tests {
     use crate::testing::MockNmClient;
 
     use super::*;
+
+    #[test]
+    fn overlapping_startup_selectors_activate_at_most_one_tunnel() {
+        let client = MockNmClient::new(vec![
+            profile("wg-us", "uuid-1", ProfileState::Inactive),
+            profile("wg-eu", "uuid-2", ProfileState::Inactive),
+        ]);
+        let config_path = unique_test_config_path();
+        write_config(&config_path, AppConfig::default());
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        run_startup_random_with_path(&client, &config_path).unwrap()
+                    })
+                })
+                .collect();
+            let connected = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|r| matches!(r, StartupRandomResult::Connected(_)))
+                .count();
+            assert_eq!(connected, 1);
+        });
+
+        assert_eq!(client.connected_profiles().len(), 1);
+        cleanup_test_artifacts(&config_path);
+    }
 
     #[test]
     fn returns_error_when_profile_already_active() {
@@ -241,6 +320,38 @@ mod tests {
     }
 
     #[test]
+    fn empty_pool_preserves_existing_tunnels() {
+        for count in [1, 2] {
+            let profiles: Vec<_> = (0..count)
+                .map(|i| profile("excluded", &format!("uuid-{i}"), ProfileState::Active))
+                .collect();
+            let config = AppConfig {
+                excluded_profile_ids: profiles.iter().map(|p| p.uuid.clone()).collect(),
+                ..AppConfig::default()
+            };
+            let client = MockNmClient::new(profiles);
+            let path = unique_test_config_path();
+            write_config(&path, config);
+            assert!(matches!(
+                run_startup_random_with_path(&client, &path),
+                Err(AppError::NoEligibleProfile)
+            ));
+            assert!(!client.calls().iter().any(|call| call == "disconnect"));
+            assert!(client.attempted_profiles().is_empty());
+            assert_eq!(
+                client
+                    .list_wireguard_profiles()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.is_active())
+                    .count(),
+                count
+            );
+            cleanup_test_artifacts(&path);
+        }
+    }
+
+    #[test]
     fn connects_and_persists_selected_profile() {
         let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)]);
         let config_path = unique_test_config_path();
@@ -257,6 +368,22 @@ mod tests {
         let persisted = config::load(&config_path).expect("config should be readable");
         assert_eq!(persisted.last_random_profile_id.as_deref(), Some("uuid-1"));
         cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn startup_selection_preserves_settings_changed_after_its_snapshot() {
+        let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)]);
+        let path = unique_test_config_path();
+        write_config(&path, AppConfig::default());
+        run_startup_random_with_selector(&client, &path, |_| {
+            config::update(&path, |cfg| cfg.lockdown_enabled = true).unwrap();
+            0
+        })
+        .unwrap();
+        let saved = config::load(&path).unwrap();
+        assert!(saved.lockdown_enabled);
+        assert_eq!(saved.last_random_profile_id.as_deref(), Some("uuid-1"));
+        cleanup_test_artifacts(&path);
     }
 
     #[test]
@@ -375,8 +502,7 @@ mod tests {
 
     #[test]
     fn still_connects_when_arming_fails() {
-        // Arming sets up the *next* boot; it is incidental to connecting now,
-        // so a rejection from NetworkManager must not fail the connection.
+        // Autoconnect normalization is best-effort; explicit selection still runs.
         let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)])
             .fail_autoconnect();
         let config_path = unique_test_config_path();
@@ -510,14 +636,24 @@ mod tests {
     }
 
     #[test]
-    fn connect_at_login_defaults_to_on_for_a_fresh_install() {
-        // No config file at all: the app's headline feature must be active out
-        // of the box rather than silently disabled by a derived `false`.
+    fn connect_at_login_defaults_to_off_unless_explicitly_enabled() {
         let config_path = unique_test_config_path();
 
         let app_cfg = config::load(&config_path).expect("a missing config should load defaults");
 
-        assert!(app_cfg.general.autoconnect_at_login);
+        assert!(!app_cfg.general.autoconnect_at_login);
+        for input in ["", "[general]\n", "[general]\nautoconnect_at_login = false"] {
+            let cfg: AppConfig = toml::from_str(input).unwrap();
+            assert!(!cfg.general.autoconnect_at_login);
+        }
+        for key in ["autoconnect_at_login", "autoconnect_at_boot"] {
+            let cfg: AppConfig = toml::from_str(&format!("[general]\n{key} = true")).unwrap();
+            assert!(cfg.general.autoconnect_at_login);
+        }
+        for input in [r#"{}"#, r#"{"general":{}}"#] {
+            let cfg: AppConfig = serde_json::from_str(input).unwrap();
+            assert!(!cfg.general.autoconnect_at_login);
+        }
     }
 
     #[test]
@@ -570,6 +706,48 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&autostart_dir);
         cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn reconcile_autoconnect_keeps_desktop_file_and_config_synchronized() {
+        let config_path = unique_test_config_path();
+        let autostart_dir = autostart_test_dir();
+        let mut cfg = AppConfig::default();
+        cfg.general.autoconnect_at_login = true;
+        write_config(&config_path, cfg);
+
+        // Before reconcile: desktop file missing
+        assert!(!autostart::is_installed_in(&autostart_dir));
+        reconcile_autoconnect_at_login_in(&config_path, &autostart_dir).unwrap();
+        // After reconcile: installed
+        assert!(autostart::is_installed_in(&autostart_dir));
+
+        // When config changes to false:
+        let mut cfg2 = AppConfig::default();
+        cfg2.general.autoconnect_at_login = false;
+        write_config(&config_path, cfg2);
+        reconcile_autoconnect_at_login_in(&config_path, &autostart_dir).unwrap();
+        // After reconcile: uninstalled
+        assert!(!autostart::is_installed_in(&autostart_dir));
+
+        let _ = std::fs::remove_dir_all(&autostart_dir);
+        cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn failed_persistence_rolls_back_desktop_entry() {
+        let client = MockNmClient::new(vec![]);
+        let bad_config_path = PathBuf::from("/nonexistent/directory/config.toml");
+        let autostart_dir = autostart_test_dir();
+
+        let res = set_autoconnect_at_login_in(&client, &bad_config_path, &autostart_dir, true);
+        assert!(res.is_err(), "config update to bad path should fail");
+        assert!(
+            !autostart::is_installed_in(&autostart_dir),
+            "entry must be uninstalled on persistence failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&autostart_dir);
     }
 
     /// A throwaway autostart directory, so these tests never write into the

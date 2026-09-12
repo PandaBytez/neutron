@@ -20,17 +20,66 @@
 //! In **Disabled** mode `never-default` is restored to `no` and both route
 //! lists are cleared, so the tunnel is a normal full-tunnel default route.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::Mutex;
 
 use crate::config::SplitTunnelMode;
+use crate::error::{AppError, AppResult};
+
+/// Resolve activation/import policy without silently dropping invalid targets.
+pub(crate) fn routes_for_checked(
+    mode: SplitTunnelMode,
+    cidrs: &[String],
+    domains: &[String],
+) -> AppResult<(Vec<String>, Vec<String>)> {
+    if !mode.is_enabled() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut targets = Vec::new();
+    for cidr in cidrs {
+        let (normalized, _) = parse_and_normalize_cidr(cidr).map_err(AppError::Config)?;
+        targets.push(normalized);
+    }
+    for domain in domains {
+        let ips = resolve_domain_ips(domain);
+        if ips.is_empty() {
+            return Err(AppError::Config(format!(
+                "could not resolve split-tunnel domain '{domain}'; policy was not applied"
+            )));
+        }
+        targets.extend(ips.into_iter().map(|ip| ip.to_string()));
+    }
+    Ok(routes_for(mode, &targets, &[]))
+}
+
+static LAST_KNOWN_GOOD: Mutex<Option<HashMap<String, Vec<IpAddr>>>> = Mutex::new(None);
 
 /// Resolve a domain name to a list of IP addresses.
 ///
 /// Returns an empty list if resolution fails or the domain is invalid.
+/// Retains last-known-good resolutions to avoid dropping split-tunnel routes
+/// on transient DNS failure (which would fail open in Include mode).
 pub fn resolve_domain_ips(domain: &str) -> Vec<IpAddr> {
-    let host = domain.trim();
+    let host = domain.trim().to_lowercase();
     if host.is_empty() {
         return Vec::new();
+    }
+    // RFC 6761 special-use loopback domain handling
+    match host.as_str() {
+        "localhost" => {
+            return vec![
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ];
+        }
+        "ip6-localhost" | "ip6-loopback" | "ipv6-localhost" | "ipv6-loopback" => {
+            return vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)];
+        }
+        "ip4-localhost" | "ip4-loopback" | "ipv4-localhost" | "ipv4-loopback" => {
+            return vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        }
+        _ => {}
     }
     let target = format!("{host}:0");
     match target.to_socket_addrs() {
@@ -42,12 +91,54 @@ pub fn resolve_domain_ips(domain: &str) -> Vec<IpAddr> {
                     ips.push(ip);
                 }
             }
-            ips
+            if !ips.is_empty() {
+                if let Ok(mut lock) = LAST_KNOWN_GOOD.lock() {
+                    lock.get_or_insert_with(HashMap::new)
+                        .insert(host.clone(), ips.clone());
+                }
+                return ips;
+            }
         }
         Err(e) => {
             tracing::warn!("failed to resolve domain '{domain}': {e}");
-            Vec::new()
         }
+    }
+
+    if let Ok(lock) = LAST_KNOWN_GOOD.lock()
+        && let Some(cache) = lock.as_ref()
+        && let Some(cached) = cache.get(&host)
+    {
+        tracing::warn!("using retained last-known-good resolution for '{domain}': {cached:?}");
+        return cached.clone();
+    }
+
+    Vec::new()
+}
+
+#[cfg(test)]
+pub fn set_last_known_good_domain_ips(domain: &str, ips: Vec<IpAddr>) {
+    let host = domain.trim().to_lowercase();
+    if let Ok(mut lock) = LAST_KNOWN_GOOD.lock() {
+        lock.get_or_insert_with(HashMap::new).insert(host, ips);
+    }
+}
+
+#[cfg(test)]
+pub fn remove_last_known_good_domain_ips(domain: &str) {
+    let host = domain.trim().to_lowercase();
+    if let Ok(mut lock) = LAST_KNOWN_GOOD.lock()
+        && let Some(cache) = lock.as_mut()
+    {
+        cache.remove(&host);
+    }
+}
+
+#[cfg(test)]
+pub fn clear_last_known_good_domain_ips() {
+    if let Ok(mut lock) = LAST_KNOWN_GOOD.lock()
+        && let Some(cache) = lock.as_mut()
+    {
+        cache.clear();
     }
 }
 
@@ -353,13 +444,20 @@ pub fn set_args(
 }
 
 /// Whether one address family should be barred from taking the tunnel's default
-/// route: only when split tunneling is on *and* that family has routes of its
-/// own to use instead.
+/// route: in Exclude mode, always (an empty route list means the entire family
+/// was excluded and must exit via physical routing - BUG-009); in Include mode,
+/// only when routes are installed to carry that family instead of the default route.
 fn never_default_for(mode: SplitTunnelMode, routes: &[String]) -> &'static str {
-    if mode.is_enabled() && !routes.is_empty() {
-        "yes"
-    } else {
-        "no"
+    match mode {
+        SplitTunnelMode::Disabled => "no",
+        SplitTunnelMode::Include => {
+            if routes.is_empty() {
+                "no"
+            } else {
+                "yes"
+            }
+        }
+        SplitTunnelMode::Exclude => "yes",
     }
 }
 
@@ -511,13 +609,11 @@ mod tests {
 
     #[test]
     fn no_family_is_ever_barred_from_routing_with_an_empty_route_list() {
-        // The invariant behind the bug, checked across every mode: a family may
-        // only be barred from the default route if it has somewhere else to go.
-        for mode in [
-            SplitTunnelMode::Disabled,
-            SplitTunnelMode::Include,
-            SplitTunnelMode::Exclude,
-        ] {
+        // The invariant behind BUG-012, checked for Disabled and Include modes:
+        // an un-split family may only be barred from the default route if it has
+        // routes of its own. In Exclude mode, an empty route list means the whole
+        // family was intentionally excluded and must use physical routing (BUG-009).
+        for mode in [SplitTunnelMode::Disabled, SplitTunnelMode::Include] {
             for (v4, v6) in [
                 (vec![], vec![]),
                 (vec!["10.0.0.0/8".to_string()], vec![]),
@@ -541,6 +637,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exclude_mode_whole_family_exclusion_sets_never_default_yes() {
+        // BUG-009: When 0.0.0.0/0 is excluded, routes_for produces an empty v4 list.
+        // set_args must still set ipv4.never-default = yes so NetworkManager does
+        // not re-install the tunnel default route and send excluded traffic into the VPN.
+        let (v4, v6) = routes_for(
+            SplitTunnelMode::Exclude,
+            &["0.0.0.0/0".to_string(), "::/0".to_string()],
+            &[],
+        );
+        assert!(v4.is_empty());
+        assert!(v6.is_empty());
+
+        let args = set_args("test-uuid", SplitTunnelMode::Exclude, &v4, &v6);
+        assert_eq!(
+            args[4], "yes",
+            "ipv4.never-default must be yes when all ipv4 is excluded"
+        );
+        assert_eq!(
+            args[6], "yes",
+            "ipv6.never-default must be yes when all ipv6 is excluded"
+        );
+        assert_eq!(args[8], "", "ipv4.routes must be empty");
+        assert_eq!(args[10], "", "ipv6.routes must be empty");
     }
 
     #[test]
@@ -749,5 +871,39 @@ mod tests {
         assert!(v6.contains(&"2001:db8::/32".to_string()));
         // localhost resolves to 127.0.0.1 and/or ::1
         assert!(v4.contains(&"127.0.0.1/32".to_string()) || v6.contains(&"::1/128".to_string()));
+    }
+
+    #[test]
+    fn last_known_good_resolution_retained_on_dns_failure() {
+        let domain = "nonexistent.vpn.test";
+        let fake_ip = "192.0.2.123".parse::<IpAddr>().unwrap();
+        remove_last_known_good_domain_ips(domain);
+
+        // Initially no cache: resolve fails and returns empty
+        assert!(resolve_domain_ips(domain).is_empty());
+
+        // Prime last known good cache
+        set_last_known_good_domain_ips(domain, vec![fake_ip]);
+
+        // When resolution fails, retained last-known-good IP is returned instead of empty
+        let ips = resolve_domain_ips(domain);
+        assert_eq!(ips, vec![fake_ip]);
+
+        // routes_for_checked uses the retained resolution and succeeds
+        let (v4, _) = routes_for_checked(SplitTunnelMode::Include, &[], &[domain.to_string()])
+            .expect("should use last-known-good resolution");
+        assert_eq!(v4, vec!["192.0.2.123/32".to_string()]);
+
+        remove_last_known_good_domain_ips(domain);
+    }
+
+    #[test]
+    fn routes_for_checked_rejects_unresolved_domain_without_cache() {
+        let domain = "unresolvable-domain-1234567.invalid";
+        remove_last_known_good_domain_ips(domain);
+        let res = routes_for_checked(SplitTunnelMode::Include, &[], &[domain.to_string()]);
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("could not resolve split-tunnel domain"));
     }
 }

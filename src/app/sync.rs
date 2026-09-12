@@ -21,7 +21,7 @@ pub struct SyncReport {
     pub errors: Vec<String>,
 }
 
-/// Ensure the profiles directory exists with secure user-only permissions (0700 on Unix).
+/// Create the profiles directory, attempting owner-only permissions on Unix.
 pub fn ensure_profiles_dir(dir: &Path) -> std::io::Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir)?;
@@ -34,8 +34,7 @@ pub fn ensure_profiles_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ensure the application directories (~/.config/neutron and profiles inbox) exist
-/// with secure user-only permissions (0700 on Unix).
+/// Create the config and inbox directories using [`ensure_profiles_dir`].
 pub fn ensure_app_dirs(config: &AppConfig) -> std::io::Result<()> {
     if let Ok(config_path) = config::default_config_path()
         && let Some(parent) = config_path.parent()
@@ -49,8 +48,7 @@ pub fn ensure_app_dirs(config: &AppConfig) -> std::io::Result<()> {
 
 /// Scan the configured `profiles_dir` inbox and import any new `.conf` files into NetworkManager.
 ///
-/// Successfully imported or already-existing profiles are removed from the inbox directory so that
-/// NetworkManager remains the sole source of truth and profile deletions are never overridden.
+/// Source removal is best-effort after import or a matching profile name.
 pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResult<SyncReport> {
     let dir = config::resolve_profiles_dir(config);
     let _ = ensure_profiles_dir(&dir);
@@ -85,9 +83,10 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
                 .to_string();
 
             if existing_names.contains(&stem) {
-                // Already managed by NetworkManager; consume from the inbox
-                // so it doesn't linger and resurrect if deleted later.
-                let _ = fs::remove_file(&path);
+                report.errors.push(format!(
+                    "{}: a profile named '{stem}' already exists in NetworkManager; preserved to prevent data loss",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
                 report.skipped += 1;
                 continue;
             }
@@ -95,8 +94,12 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
             match client.import_wireguard_profile(&path) {
                 Ok(_) => {
                     report.imported.push(stem);
-                    // Consumed on successful import: NetworkManager is now the source of truth.
-                    let _ = fs::remove_file(&path);
+                    if let Err(err) = fs::remove_file(&path) {
+                        report.errors.push(format!(
+                            "Failed to remove imported inbox file {}: {err}",
+                            path.display()
+                        ));
+                    }
                 }
                 Err(err) => {
                     report.errors.push(format!(
@@ -155,13 +158,14 @@ mod tests {
 
         assert_eq!(report.skipped, 1);
         assert_eq!(report.imported, vec!["profile2".to_string()]);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors.len(), 1);
 
-        // Both .conf files should be removed from inbox (consumed into NM)
+        // conf1 should be preserved to prevent overwriting existing profile data
         assert!(
-            !conf1.exists(),
-            "already existing profile in NM should be consumed from inbox"
+            conf1.exists(),
+            "already existing profile in NM should be preserved from deletion"
         );
+        // Newly imported conf2 consumed from inbox
         assert!(
             !conf2.exists(),
             "newly imported profile should be consumed from inbox"

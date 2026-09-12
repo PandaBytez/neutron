@@ -9,3 +9,5 @@
 - [NAT-PMP Port Forwarding](port-forwarding.md)
 - [Configuration & Themes](configuration.md)
 - [Packaging & Distribution](packaging-distribution.md)
+- [Implementation Notes](implementation.md)
+- [Testing & Quality Checks](testing.md)

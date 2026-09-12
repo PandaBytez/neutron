@@ -148,3 +148,148 @@ fn a_failed_connection_leaves_no_profile_marked_active() {
 
     testing::remove_temp_config(&path);
 }
+
+#[test]
+fn malformed_config_fails_cleanly_at_startup() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "tui-malformed-config-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = sandbox.join("neutron");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    std::fs::write(&config_path, "invalid toml content [[[").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
+        .arg("tui")
+        .env("XDG_CONFIG_HOME", &sandbox)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "malformed config must fail startup"
+    );
+    assert!(
+        !output
+            .stdout
+            .windows(8)
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "startup must not enter the alternate screen"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn async_actions_do_not_block_event_loop_when_backend_blocks() {
+    let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)]);
+    let (mut state, path) = state_for(&client, "tui-async-no-block");
+
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    state.action_tx = Some(action_tx);
+
+    // Trigger kill-switch toggle - must not block on any backend call
+    press(&mut state, &client, KeyCode::Char('k')).expect("action should succeed");
+    assert!(
+        state.status_message.contains("Kill Switch policy"),
+        "status must report in-flight async action"
+    );
+    // Verify task arrived on channel
+    let task = action_rx
+        .try_recv()
+        .expect("task must be dispatched to worker channel");
+    match task {
+        neutron::tui::state::AsyncAction::KillSwitch(enable) => assert!(enable),
+        other => panic!("expected KillSwitch task, got {other:?}"),
+    }
+
+    // Trigger lockdown toggle
+    press(&mut state, &client, KeyCode::Char('l')).expect("action should succeed");
+    let task2 = action_rx
+        .try_recv()
+        .expect("task must be dispatched to worker channel");
+    match task2 {
+        neutron::tui::state::AsyncAction::Lockdown(enable) => assert!(enable),
+        other => panic!("expected Lockdown task, got {other:?}"),
+    }
+
+    // Interface remains responsive to quit
+    press(&mut state, &client, KeyCode::Char('q')).expect("quit should succeed");
+    assert!(
+        state.should_quit,
+        "event loop processes quit without waiting for blocked worker"
+    );
+
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn transient_list_failure_retains_refresh_and_eventually_reloads() {
+    let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)])
+        .with_transient_list_failure(1);
+    let path = testing::temp_config_path("tui-transient-list");
+    config::save(&path, &AppConfig::default()).unwrap();
+    let mut state = TuiState::new(path.clone(), AppConfig::default());
+
+    // First reload fails transiently
+    let first = neutron::tui::events::reload_profiles(&mut state, &client);
+    assert!(first.is_err(), "first reload should fail transiently");
+    state.set_error(&first.unwrap_err());
+    assert!(state.status_is_error, "error surfaced on failure");
+
+    // Without any new external event, retrying reload succeeds
+    let second = neutron::tui::events::reload_profiles(&mut state, &client);
+    assert!(
+        second.is_ok(),
+        "second reload should succeed after transient error clears"
+    );
+    assert_eq!(state.rows.len(), 1, "profile list recovered");
+
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn split_worker_failure_reconciles_modal_and_pending_state() {
+    let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)]);
+    let path = testing::temp_config_path("tui-split-reconcile");
+    let initial_cfg = AppConfig::default();
+    config::save(&path, &initial_cfg).unwrap();
+    let mut state = TuiState::new(path.clone(), initial_cfg);
+
+    let (st_tx, st_rx) = std::sync::mpsc::channel();
+    state.split_tunnel_tx = Some(st_tx);
+
+    // Open modal with default config
+    state.modal = neutron::tui::state::ActiveModal::SplitTunnel(
+        neutron::tui::state::SplitTunnelModalState::from_config(&state.config.global_split_tunnel),
+    );
+
+    // Apply a new config that will fail in the worker
+    let mut rejected_cfg = state.config.global_split_tunnel.clone();
+    rejected_cfg.mode = neutron::config::SplitTunnelMode::Include;
+    rejected_cfg.cidrs.push("192.168.1.0/24".to_string());
+
+    state.apply_split_tunnel(&client, rejected_cfg).unwrap();
+    let pending = st_rx.recv().unwrap();
+    assert_eq!(pending.cidrs, vec!["192.168.1.0/24".to_string()]);
+
+    // Background reload happens while modal is open - must preserve modal edit state
+    neutron::tui::events::reload_profiles(&mut state, &client).unwrap();
+    assert_eq!(
+        state.config.global_split_tunnel.cidrs,
+        vec!["192.168.1.0/24".to_string()]
+    );
+
+    state.finish_split(pending, Err(AppError::CommandFailed("rejected".into())));
+    assert!(state.pending_split.is_none());
+    assert!(state.config.global_split_tunnel.cidrs.is_empty());
+    if let neutron::tui::state::ActiveModal::SplitTunnel(modal) = &state.modal {
+        assert!(modal.cidrs.is_empty());
+    } else {
+        panic!("modal should remain open");
+    }
+
+    testing::remove_temp_config(&path);
+}
