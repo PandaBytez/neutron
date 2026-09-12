@@ -220,6 +220,7 @@ where
 {
     let mut last_seen_event = 0_u64;
     let mut last_diag_sample = std::time::Instant::now();
+    let mut last_domain_refresh = std::time::Instant::now();
 
     while !state.should_quit {
         // Drain any incoming public IP updates from background worker
@@ -288,6 +289,19 @@ where
             if let Some((uuid, _, true)) = state.selected_identity() {
                 state.profile_cache.remove(&uuid);
                 events::update_diagnostics(state, client);
+            }
+        }
+
+        if last_domain_refresh.elapsed() >= Duration::from_secs(30) {
+            last_domain_refresh = std::time::Instant::now();
+            if state.rows.iter().any(|r| r.is_active)
+                && state.config.global_split_tunnel.mode.is_enabled()
+                && !state.config.global_split_tunnel.domains.is_empty()
+            {
+                let _ = crate::app::split_tunnel::refresh_active_domain_routes(
+                    client,
+                    &state.config_path,
+                );
             }
         }
 
