@@ -292,6 +292,47 @@ fn switching_fails_when_active_profile_teardown_fails() {
 }
 
 #[test]
+fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "neutron-sync-lockdown-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = sandbox.join("neutron");
+    let profiles_dir = config_dir.join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    let conf = profiles_dir.join("test-sync.conf");
+    std::fs::write(&conf, "[Interface]\nPrivateKey = a\n").unwrap();
+
+    let config_path = config_dir.join("config.toml");
+    let config = AppConfig {
+        general: config::GeneralConfig {
+            profiles_dir: profiles_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        lockdown_enabled: true,
+        ..Default::default()
+    };
+    config::save(&config_path, &config).expect("config should save");
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
+
+    let client = MockNmClient::new(vec![]);
+    let report = neutron::app::sync::sync_profiles_dir(&client, &config).unwrap();
+    assert_eq!(report.imported, vec!["test-sync".to_string()]);
+    neutron::app::rebuild_lockdown_if_enabled(&client, &config_path).unwrap();
+
+    assert!(
+        !client.lockdown_calls().is_empty(),
+        "importing must rebuild lockdown allowances"
+    );
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
 fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
     let sandbox = std::env::temp_dir().join(format!(
         "neutron-import-test-{}",

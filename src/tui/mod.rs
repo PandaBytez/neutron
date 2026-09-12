@@ -79,9 +79,13 @@ where
 
     if state.config.general.auto_sync_profiles
         && let Ok(report) = crate::app::sync::sync_profiles_dir(&client, &state.config)
-        && !report.errors.is_empty()
     {
-        state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+        if !report.errors.is_empty() {
+            state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+        }
+        if !report.imported.is_empty() {
+            let _ = crate::app::rebuild_lockdown_if_enabled(&client, &state.config_path);
+        }
     }
     let _ = events::reload_profiles(&mut state, &client);
     // Read once up front so the first frame shows the daemon's lease rather than
