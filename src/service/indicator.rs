@@ -374,10 +374,15 @@ where
             }
             item_id if item_id >= 100 => {
                 let idx = (item_id - 100) as usize;
-                if let Ok(st) = self.state.lock()
-                    && let Some((uuid, _)) = st.favorite_profiles.get(idx)
+                let target_uuid = self
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|st| st.favorite_profiles.get(idx).map(|(u, _)| u.clone()));
+                if let Some(uuid) = target_uuid
+                    && let Err(err) = self.client.switch_to(&uuid)
                 {
-                    let _ = self.client.switch_to(uuid);
+                    warn!("Failed to switch to favorite profile '{uuid}': {err}");
                 }
             }
             _ => {}
@@ -868,11 +873,8 @@ where
 
             if lease.sync_needed(&app_cfg.qbittorrent) {
                 lease.last_qbit_config = Some(app_cfg.qbittorrent.clone());
-                lease.qbit_sync = sync_qbittorrent_port(
-                    &client,
-                    &profile.uuid,
-                    lease.port.unwrap_or_default(),
-                );
+                lease.qbit_sync =
+                    sync_qbittorrent_port(&client, &profile.uuid, lease.port.unwrap_or_default());
             }
         }
 
@@ -963,6 +965,32 @@ mod tests {
     }
 
     #[test]
+    fn favorite_switch_does_not_hold_shared_state_lock() {
+        use crate::testing::profile;
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: None,
+            forwarded_port: None,
+            favorite_profiles: vec![("uuid-fav".to_string(), "Favorite 1".to_string())],
+            menu_revision: 1,
+        }));
+        let client = MockNmClient::new(vec![profile(
+            "Favorite 1",
+            "uuid-fav",
+            ProfileState::Inactive,
+        )]);
+        let menu = DBusMenu {
+            client,
+            state: state.clone(),
+        };
+
+        menu.event(100, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert!(
+            state.try_lock().is_ok(),
+            "shared state lock must remain available during/after favorite switch"
+        );
+    }
+
+    #[test]
     fn a_lease_survives_a_poll_that_finds_the_same_tunnel() {
         let mut lease = LeaseTracker::default();
         let eu = Some("uuid-eu".to_string());
@@ -1047,16 +1075,20 @@ mod tests {
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
         lease.record(Some(test_mapping(51820)));
 
-        let mut cfg_disabled = crate::config::QBittorrentConfig::default();
-        cfg_disabled.enabled = false;
+        let cfg_disabled = crate::config::QBittorrentConfig {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(
             !lease.sync_needed(&cfg_disabled),
             "no sync needed when integration is disabled"
         );
 
         // Transition: disabled -> enabled with stable port
-        let mut cfg_enabled = crate::config::QBittorrentConfig::default();
-        cfg_enabled.enabled = true;
+        let mut cfg_enabled = crate::config::QBittorrentConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(
             lease.sync_needed(&cfg_enabled),
             "enabling integration requires sync even if port is unchanged"
