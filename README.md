@@ -32,6 +32,7 @@ Distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
   containers) via its local Web API.
   Failed mapping attempts wait the full 45-second retry interval rather than retrying on every tray poll.
   WebUI credentials and cookies are passed to curl through stdin.
+  When interface binding is enabled, a missing tunnel interface aborts synchronization without changing preferences.
 - **NetworkManager-Native Kill Switch**: Strict routing table isolation (`fwmark` + `suppress_prefixlength 0`) with
   negative DNS priorities to eliminate DNS and routing leaks.
 - **Always-On Lockdown Firewall**: Permanent `firewalld` Netfilter rules via `pkexec` blocking all physical traffic

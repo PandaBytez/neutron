@@ -169,6 +169,7 @@ impl QBittorrentClient {
 
     /// Update listening port and optionally bind network interface.
     pub fn set_listen_port(&mut self, port: u16, interface_name: Option<&str>) -> AppResult<()> {
+        self.validate_binding(interface_name)?;
         self.ensure_authenticated()?;
         let url = self.endpoint_url("api/v2/app/setPreferences");
 
@@ -201,6 +202,7 @@ impl QBittorrentClient {
         port: u16,
         interface_name: Option<&str>,
     ) -> AppResult<QBittorrentSyncReport> {
+        self.validate_binding(interface_name)?;
         let version = self.app_version().ok();
         let current_prefs = self.get_preferences().ok();
         let previous_port = current_prefs.as_ref().map(|p| p.listen_port);
@@ -235,6 +237,15 @@ impl QBittorrentClient {
             None,
             self.cookie.as_deref(),
         )?)
+    }
+
+    fn validate_binding(&self, interface: Option<&str>) -> AppResult<()> {
+        if self.bind_interface && interface.is_none_or(|name| name.trim().is_empty()) {
+            return Err(AppError::QBittorrent(
+                "interface binding is enabled but the tunnel interface is unavailable; preferences were not changed".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn http_post_urlencoded(
@@ -573,10 +584,17 @@ mod tests {
         assert_eq!(no_bind.new_port, 55433);
         assert_eq!(no_bind.bound_interface, None);
 
-        let no_interface = QBittorrentClient::new(&base(true, false))
-            .sync_port(55434, None)
-            .expect("sync should succeed when interface is None");
-        assert_eq!(no_interface.new_port, 55434);
-        assert_eq!(no_interface.bound_interface, None);
+        for previously_bound in [false, true] {
+            QBittorrentClient::new(&base(previously_bound, false))
+                .set_listen_port(55433, Some("wg-old"))
+                .unwrap();
+            let before = server.last_set_preferences();
+            for interface in [None, Some(""), Some(" ")] {
+                let mut client = QBittorrentClient::new(&base(true, false));
+                assert!(client.sync_port(55434, interface).is_err());
+                assert!(client.set_listen_port(55434, interface).is_err());
+                assert_eq!(server.last_set_preferences(), before);
+            }
+        }
     }
 }
