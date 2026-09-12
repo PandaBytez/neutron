@@ -263,12 +263,23 @@ mod tests {
         let config_path = unique_test_config_path();
         write_config(&config_path, AppConfig::default());
 
-        let res1 = run_startup_random_with_path(&client, &config_path).unwrap();
-        assert!(matches!(res1, StartupRandomResult::Connected(_)));
-
-        // Second overlapping/immediate selector run must skip because a tunnel is now active
-        let res2 = run_startup_random_with_path(&client, &config_path).unwrap();
-        assert!(matches!(res2, StartupRandomResult::SkippedAlreadyActive));
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        run_startup_random_with_path(&client, &config_path).unwrap()
+                    })
+                })
+                .collect();
+            let connected = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|r| matches!(r, StartupRandomResult::Connected(_)))
+                .count();
+            assert_eq!(connected, 1);
+        });
 
         assert_eq!(client.connected_profiles().len(), 1);
         cleanup_test_artifacts(&config_path);
