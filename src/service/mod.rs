@@ -78,6 +78,9 @@ where
         return Ok(StartupRandomResult::SkippedAlreadyActive);
     }
 
+    // Validate a replacement exists before disturbing any working tunnel.
+    let candidates = ordered_candidates(&profiles, &app_cfg, &mut select_index)?;
+
     // If multiple profiles are active, or the only active profile was excluded,
     // tear down active profiles so we can cleanly select and connect an eligible profile.
     if !active_profiles.is_empty() {
@@ -89,8 +92,6 @@ where
             }
         }
     }
-
-    let candidates = ordered_candidates(&profiles, &app_cfg, &mut select_index)?;
 
     let mut last_connect_error = None;
     for selected in candidates {
@@ -238,6 +239,38 @@ mod tests {
         assert!(matches!(result, Err(AppError::NoEligibleProfile)));
         assert!(client.connected_profiles().is_empty());
         cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn empty_pool_preserves_existing_tunnels() {
+        for count in [1, 2] {
+            let profiles: Vec<_> = (0..count)
+                .map(|i| profile("excluded", &format!("uuid-{i}"), ProfileState::Active))
+                .collect();
+            let config = AppConfig {
+                excluded_profile_ids: profiles.iter().map(|p| p.uuid.clone()).collect(),
+                ..AppConfig::default()
+            };
+            let client = MockNmClient::new(profiles);
+            let path = unique_test_config_path();
+            write_config(&path, config);
+            assert!(matches!(
+                run_startup_random_with_path(&client, &path),
+                Err(AppError::NoEligibleProfile)
+            ));
+            assert!(!client.calls().iter().any(|call| call == "disconnect"));
+            assert!(client.attempted_profiles().is_empty());
+            assert_eq!(
+                client
+                    .list_wireguard_profiles()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.is_active())
+                    .count(),
+                count
+            );
+            cleanup_test_artifacts(&path);
+        }
     }
 
     #[test]

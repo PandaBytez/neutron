@@ -24,7 +24,7 @@ Distributed via **Homebrew Formula**, **AUR**, and standalone static binaries.
   `wg-quick` scripts.
 - **Connection Management**: Instant manual connect, disconnect, and switch between WireGuard profiles.
 - **Random Profile on Boot**: Automatically picks and connects a random eligible profile at login/boot, avoiding
-  immediate repeats.
+  immediate repeats. An empty eligible pool returns an error without disconnecting existing tunnels.
 - **Global Split Tunneling**: Route only specific subnets/domains through the WireGuard tunnel (*Include mode*) or
   bypass the tunnel for selected traffic (*Exclude mode*) using NetworkManager policy routing.
 - **Dynamic NAT-PMP Port Forwarding & qBittorrent Sync**: Automatic gateway discovery, port lease requests, periodic
