@@ -1138,7 +1138,7 @@ mod tests {
         let message = format!("Connection 'office' ({uuid}) successfully added.");
         assert_eq!(imported_uuid(&message).unwrap(), uuid);
         let hostile_name = format!(
-            "Connection 'name' (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa) successfully added.' ({uuid})\
+            "Connection 'name' (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa) successfully added.' ({uuid}) \
              successfully added."
         );
         assert_eq!(imported_uuid(&hostile_name).unwrap(), uuid);
@@ -1420,7 +1420,7 @@ mod tests {
         // trailing backslash, failed to parse as an IP, and was treated as a
         // hostname -- which lockdown could only allow by port, opening
         // UDP/51820 to every host instead of just the VPN peer.
-        let raw = "KEY= allowed-ips=0.0.0.0/0;\\:\\:/0 endpoint=79.127.154.1\\:51820\
+        let raw = "KEY= allowed-ips=0.0.0.0/0;\\:\\:/0 endpoint=79.127.154.1\\:51820 \
          persistent-keepalive=25";
 
         let endpoints = extract_endpoints(raw);
