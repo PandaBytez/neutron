@@ -148,3 +148,27 @@ fn a_failed_connection_leaves_no_profile_marked_active() {
 
     testing::remove_temp_config(&path);
 }
+
+#[test]
+fn malformed_config_fails_cleanly_at_startup() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "tui-malformed-config-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = sandbox.join("neutron");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    std::fs::write(&config_path, "invalid toml content [[[").unwrap();
+
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
+
+    let client = MockNmClient::new(vec![]);
+    let res = neutron::tui::run(client);
+    assert!(res.is_err(), "malformed config must fail run()");
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

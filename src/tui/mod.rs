@@ -27,11 +27,28 @@ use crate::firewall::FirewallClient;
 use crate::nm::NmClient;
 use crate::tui::state::TuiState;
 
+/// RAII guard ensuring raw mode and alternate screen are restored on any exit path.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+    }
+}
+
 pub fn run<C>(client: C) -> AppResult<()>
 where
     C: NmClient + FirewallClient + Clone + Send + Sync + 'static,
 {
+    // Load config before modifying terminal attributes so malformed config
+    // returns early without touching terminal mode (BUG-013).
+    let config_path = config::default_config_path()?;
+    let app_cfg = config::load(&config_path)?;
+    let mut state = TuiState::new(config_path, app_cfg);
+
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, Hide)?;
     let backend = CrosstermBackend::new(out);
@@ -43,10 +60,6 @@ where
         let _ = execute!(stdout(), LeaveAlternateScreen, Show);
         default_panic(info);
     }));
-
-    let config_path = config::default_config_path()?;
-    let app_cfg = config::load(&config_path)?;
-    let mut state = TuiState::new(config_path, app_cfg);
 
     // Channel for async public IP updates (in-flight atomic prevents thread storms - BUG-037)
     let (ip_tx, ip_rx) = std::sync::mpsc::channel();
