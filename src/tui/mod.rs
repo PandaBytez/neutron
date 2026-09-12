@@ -268,6 +268,9 @@ where
             match res {
                 Ok(()) => {
                     state.set_status("Split tunneling applied & saved.");
+                    state
+                        .uncertain_policies
+                        .remove(&crate::error::Policy::SplitTunnel);
                 }
                 Err(err) => {
                     state.set_error(&err);

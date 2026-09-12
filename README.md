@@ -198,6 +198,9 @@ cargo xtask container-shell
   password at most once), and the disable path always tears the ruleset down so the user can never be permanently locked
   out. Rule builders are unit-tested, and isolated sandbox tests exercise real firewall operations and established
   IPv4/IPv6 packet egress on both firewalld backends.
+- Policy errors distinguish partial application from successful application followed by failed saving. The current
+  TUI session displays affected policies as `UNKNOWN` until a successful retry; a config refresh cannot clear that
+  warning. CLI lockdown status explicitly reports saved intent, not verified effective firewall state.
 - Profile import runs `nmcli connection import type wireguard file <path>`, so NetworkManager stays the single source of
   truth — no local copy of the `.conf` is kept.
 - The application binary is named **Neutron** (`neutron`) with zero runtime shared library dependencies when compiled

@@ -9,7 +9,6 @@ pub mod sync;
 use clap::{Parser, Subcommand};
 
 use crate::config;
-#[cfg(feature = "qbittorrent")]
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
@@ -391,10 +390,34 @@ pub fn set_global_kill_switch<C: NmClient>(
     path: &std::path::Path,
     enable: bool,
 ) -> AppResult<()> {
-    client.set_kill_switch_all(enable)?;
-    let mut app_cfg = config::load(path)?;
-    app_cfg.kill_switch_enabled = enable;
-    config::save(path, &app_cfg)
+    apply_and_save_policy(
+        path,
+        crate::error::Policy::KillSwitch,
+        || client.set_kill_switch_all(enable),
+        |cfg| cfg.kill_switch_enabled = enable,
+    )
+}
+
+/// Preserve emergency disable even when configuration is unreadable/unwritable,
+/// but distinguish backend failure from successful application with failed saving.
+pub(crate) fn apply_and_save_policy(
+    path: &std::path::Path,
+    policy: crate::error::Policy,
+    apply: impl FnOnce() -> AppResult<()>,
+    edit: impl FnOnce(&mut config::AppConfig),
+) -> AppResult<()> {
+    apply().map_err(|source| AppError::PolicyUpdate {
+        policy,
+        outcome: "application failed and may be partial; effective state is unknown",
+        source: Box::new(source),
+    })?;
+    config::update(path, edit)
+        .map(|_| ())
+        .map_err(|source| AppError::PolicyUpdate {
+            policy,
+            outcome: "application completed but saving failed",
+            source: Box::new(source),
+        })
 }
 
 fn handle_lockdown_command<C: NmClient + FirewallClient>(
@@ -418,7 +441,7 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
             } else {
                 "off"
             };
-            println!("Lockdown (always-on firewall): {label}");
+            println!("Lockdown saved intent: {label} (effective firewall state is not verified)");
         }
         LockdownCommands::Enable => {
             set_global_lockdown(client, path, true)?;
@@ -448,15 +471,20 @@ pub fn set_global_lockdown<C: NmClient + FirewallClient>(
     path: &std::path::Path,
     enable: bool,
 ) -> AppResult<()> {
-    if enable {
-        let tunnels = client.wireguard_tunnels()?;
-        client.enable_lockdown(&tunnels)?;
-    } else {
-        client.disable_lockdown()?;
-    }
-    let mut app_cfg = config::load(path)?;
-    app_cfg.lockdown_enabled = enable;
-    config::save(path, &app_cfg)
+    apply_and_save_policy(
+        path,
+        crate::error::Policy::Lockdown,
+        || {
+            if enable {
+                let tunnels = client.wireguard_tunnels()?;
+                client.enable_lockdown(&tunnels)?;
+            } else {
+                client.disable_lockdown()?;
+            }
+            Ok(())
+        },
+        |cfg| cfg.lockdown_enabled = enable,
+    )
 }
 
 fn handle_split_tunnel_command<C: NmClient>(
@@ -810,6 +838,49 @@ fn resolve_profile_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_success_then_save_failure_reports_uncertain_state() {
+        use crate::error::Policy;
+        let path = crate::testing::temp_config_path("policy-save-failure");
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A directory at the stable lock path deterministically prevents saving,
+        // including when tests run as root. Reading the config still succeeds.
+        std::fs::create_dir(format!("{}.blocked", path.display())).unwrap();
+        let lock = format!("{}.lock", path.display());
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::rename(format!("{}.blocked", path.display()), &lock).unwrap();
+        let client = crate::testing::MockNmClient::default();
+        let error = set_global_lockdown(&client, &path, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("application completed but saving failed")
+        );
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:off"]);
+        let saved = config::load(&path).unwrap();
+        assert!(saved.lockdown_enabled);
+        let mut state = crate::tui::state::TuiState::new(path.clone(), saved);
+        state.set_error(&error);
+        state.set_status("unrelated action");
+        assert!(state.uncertain_policies.contains(&Policy::Lockdown));
+        let backend_error = apply_and_save_policy(
+            &path,
+            Policy::KillSwitch,
+            || Err(AppError::CommandFailed("second profile rejected".into())),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(backend_error.to_string().contains("may be partial"));
+        crate::testing::remove_temp_config(&path);
+    }
     use crate::error::AppError;
 
     fn profile(name: &str, uuid: &str) -> WireguardProfile {
@@ -968,7 +1039,13 @@ mod tests {
         let result =
             handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path);
 
-        assert!(matches!(result, Err(AppError::CommandFailed(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::KillSwitch,
+                ..
+            })
+        ));
         // The change was attempted, but because NetworkManager rejected it the
         // enabled intent must not be persisted.
         assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:on"]);
@@ -994,7 +1071,13 @@ mod tests {
         let result =
             handle_kill_switch_command_with_path(&client, KillSwitchCommands::Disable, &path);
 
-        assert!(matches!(result, Err(AppError::CommandFailed(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::KillSwitch,
+                ..
+            })
+        ));
         // A failed disable must leave the previously-enabled state intact.
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.kill_switch_enabled);
@@ -1146,7 +1229,13 @@ mod tests {
 
         let result = handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path);
 
-        assert!(matches!(result, Err(AppError::Firewall(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::Lockdown,
+                ..
+            })
+        ));
         // The change was attempted, but because the firewall rejected it the
         // enabled intent must not be persisted.
         assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
@@ -1171,7 +1260,13 @@ mod tests {
 
         let result = handle_lockdown_command_with_path(&client, LockdownCommands::Disable, &path);
 
-        assert!(matches!(result, Err(AppError::Firewall(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::Lockdown,
+                ..
+            })
+        ));
         // A failed disable must leave the previously-enabled state intact.
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.lockdown_enabled);

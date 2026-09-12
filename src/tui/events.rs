@@ -238,6 +238,9 @@ pub fn execute_action<C: ActionClient>(
         "kill_switch" => {
             let enable = !state.config.kill_switch_enabled;
             crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
+            state
+                .uncertain_policies
+                .remove(&crate::error::Policy::KillSwitch);
             state.config.kill_switch_enabled = enable;
             state.set_status(format!(
                 "{} Kill Switch (all profiles).",
@@ -247,6 +250,9 @@ pub fn execute_action<C: ActionClient>(
         "lockdown" => {
             let enable = !state.config.lockdown_enabled;
             crate::app::set_global_lockdown(client, &state.config_path, enable)?;
+            state
+                .uncertain_policies
+                .remove(&crate::error::Policy::Lockdown);
             state.config.lockdown_enabled = enable;
             state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
         }

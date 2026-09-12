@@ -23,13 +23,12 @@ pub fn apply_and_persist_global_split_tunnel<C: NmClient>(
     let (v4_routes, v6_routes) =
         nm::split_tunnel::routes_for(st_cfg.mode, &st_cfg.cidrs, &st_cfg.domains);
 
-    client.apply_split_tunnel_all(st_cfg.mode, &v4_routes, &v6_routes)?;
-
-    let mut app_cfg = config::load(path)?;
-    app_cfg.global_split_tunnel = st_cfg.clone();
-    config::save(path, &app_cfg)?;
-
-    Ok(())
+    crate::app::apply_and_save_policy(
+        path,
+        crate::error::Policy::SplitTunnel,
+        || client.apply_split_tunnel_all(st_cfg.mode, &v4_routes, &v6_routes),
+        |cfg| cfg.global_split_tunnel = st_cfg.clone(),
+    )
 }
 
 /// Load the global split-tunnel config, apply `edit` to it, and persist the

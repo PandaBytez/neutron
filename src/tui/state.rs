@@ -416,6 +416,9 @@ pub struct CachedProfileInfo {
 pub struct TuiState {
     pub config_path: PathBuf,
     pub config: AppConfig,
+    /// Failed operations can leave applied policy different from saved intent.
+    /// Reloading config or dismissing a toast must not clear this uncertainty.
+    pub uncertain_policies: std::collections::BTreeSet<crate::error::Policy>,
     pub theme: Theme,
     pub rows: Vec<ProfileListRow>,
     pub profile_cache: std::collections::HashMap<String, CachedProfileInfo>,
@@ -454,6 +457,7 @@ impl TuiState {
         Self {
             config_path,
             config,
+            uncertain_policies: Default::default(),
             theme,
             rows: Vec::new(),
             profile_cache: std::collections::HashMap::new(),
@@ -491,7 +495,10 @@ impl TuiState {
                 client,
                 &self.config_path,
                 &new_cfg,
-            )
+            )?;
+            self.uncertain_policies
+                .remove(&crate::error::Policy::SplitTunnel);
+            Ok(())
         }
     }
 
@@ -526,6 +533,9 @@ impl TuiState {
     /// Report a failed action in a toast notification. Kept distinct from
     /// [`Self::set_status`] so an error cannot be mistaken for a success.
     pub fn set_error(&mut self, error: &crate::error::AppError) {
+        if let crate::error::AppError::PolicyUpdate { policy, .. } = error {
+            self.uncertain_policies.insert(*policy);
+        }
         let msg = error.to_string();
         self.status_message = msg.clone();
         self.status_is_error = true;

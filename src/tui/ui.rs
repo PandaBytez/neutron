@@ -277,6 +277,22 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     let (auto_val, auto_val_style) = toggle_status(state.config.general.autoconnect_at_login);
     let (kill_val, kill_val_style) = toggle_status(state.config.kill_switch_enabled);
     let (lock_val, lock_val_style) = toggle_status(state.config.lockdown_enabled);
+    let (kill_val, kill_val_style) = if state
+        .uncertain_policies
+        .contains(&crate::error::Policy::KillSwitch)
+    {
+        ("UNKNOWN", theme.accent)
+    } else {
+        (kill_val, kill_val_style)
+    };
+    let (lock_val, lock_val_style) = if state
+        .uncertain_policies
+        .contains(&crate::error::Policy::Lockdown)
+    {
+        ("UNKNOWN", theme.accent)
+    } else {
+        (lock_val, lock_val_style)
+    };
     let (pf_val, pf_val_style) = toggle_status(state.config.port_forwarding.enabled);
 
     let split_count = state.config.global_split_tunnel.cidrs.len()
@@ -286,6 +302,14 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         SplitTunnelMode::Disabled => ("OFF".to_string(), theme.label_dim),
         SplitTunnelMode::Include => (format!("Include ({split_count})"), theme.accent),
         SplitTunnelMode::Exclude => (format!("Exclude ({split_count})"), theme.accent),
+    };
+    let (split_val, split_val_style) = if state
+        .uncertain_policies
+        .contains(&crate::error::Policy::SplitTunnel)
+    {
+        ("UNKNOWN".to_string(), theme.accent)
+    } else {
+        (split_val, split_val_style)
     };
 
     let col1_w = 34_usize;
@@ -1483,13 +1507,16 @@ mod render_tests {
     /// Render just the policies panel and return its rows as plain strings.
     fn rendered_policies(config: AppConfig) -> Vec<String> {
         let state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
+        rendered_policy_state(&state)
+    }
 
+    fn rendered_policy_state(state: &TuiState) -> Vec<String> {
         let mut terminal =
             Terminal::new(TestBackend::new(78, 5)).expect("test terminal should build");
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_policies_panel(frame, area, &state);
+                render_policies_panel(frame, area, state);
             })
             .expect("draw should succeed");
 
@@ -1501,6 +1528,27 @@ mod render_tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn uncertain_policy_never_renders_saved_on_as_effective_protection() {
+        let mut state = TuiState::new(
+            "/tmp/x".into(),
+            AppConfig {
+                lockdown_enabled: true,
+                ..Default::default()
+            },
+        );
+        state.set_error(&crate::error::AppError::PolicyUpdate {
+            policy: crate::error::Policy::Lockdown,
+            outcome: "application completed but saving failed",
+            source: Box::new(crate::error::AppError::Config("read-only directory".into())),
+        });
+        let rendered = rendered_policy_state(&state).join("\n");
+        assert!(
+            rendered.contains("Lockdown Mode (root): UNKNOWN"),
+            "{rendered}"
+        );
     }
 
     #[test]
