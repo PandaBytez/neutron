@@ -217,6 +217,12 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             rebuild_lockdown_if_enabled(client, &path)
         }
         Some(Commands::StartupRandom) => {
+            let app_cfg = config::load(&path)?;
+            if !app_cfg.general.autoconnect_at_login {
+                let _ = service::set_autoconnect_at_login(client, &path, false);
+                println!("Startup random skipped: auto-connect at login is disabled in config");
+                return Ok(());
+            }
             let res = service::run_startup_random(client);
             let _ = rebuild_lockdown_if_enabled(client, &path);
             service::indicator::ensure_indicator_daemon_running();

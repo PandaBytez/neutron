@@ -166,6 +166,26 @@ pub fn set_autoconnect_at_login<C: NmClient>(
     set_autoconnect_at_login_in(client, path, &autostart::dir()?, enable)
 }
 
+pub fn reconcile_autoconnect_at_login(config_path: &Path) -> AppResult<()> {
+    if let Ok(autostart_dir) = autostart::dir() {
+        reconcile_autoconnect_at_login_in(config_path, &autostart_dir)?;
+    }
+    Ok(())
+}
+
+pub fn reconcile_autoconnect_at_login_in(
+    config_path: &Path,
+    autostart_dir: &Path,
+) -> AppResult<()> {
+    let cfg = config::load(config_path)?;
+    if cfg.general.autoconnect_at_login {
+        autostart::install_in(autostart_dir)?;
+    } else {
+        autostart::uninstall_in(autostart_dir)?;
+    }
+    Ok(())
+}
+
 fn set_autoconnect_at_login_in<C: NmClient>(
     client: &C,
     path: &Path,
@@ -182,9 +202,15 @@ fn set_autoconnect_at_login_in<C: NmClient>(
         autostart::uninstall_in(autostart_dir)?;
     }
 
-    // Persist last: the caller reverts its switch when this errors, so saving
-    // before the work could leave the stored state disagreeing with the UI.
-    config::update(path, |cfg| cfg.general.autoconnect_at_login = enable).map(|_| ())
+    if let Err(err) = config::update(path, |cfg| cfg.general.autoconnect_at_login = enable) {
+        if enable {
+            let _ = autostart::uninstall_in(autostart_dir);
+        } else {
+            let _ = autostart::install_in(autostart_dir);
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -621,6 +647,48 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&autostart_dir);
         cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn reconcile_autoconnect_keeps_desktop_file_and_config_synchronized() {
+        let config_path = unique_test_config_path();
+        let autostart_dir = autostart_test_dir();
+        let mut cfg = AppConfig::default();
+        cfg.general.autoconnect_at_login = true;
+        write_config(&config_path, cfg);
+
+        // Before reconcile: desktop file missing
+        assert!(!autostart::is_installed_in(&autostart_dir));
+        reconcile_autoconnect_at_login_in(&config_path, &autostart_dir).unwrap();
+        // After reconcile: installed
+        assert!(autostart::is_installed_in(&autostart_dir));
+
+        // When config changes to false:
+        let mut cfg2 = AppConfig::default();
+        cfg2.general.autoconnect_at_login = false;
+        write_config(&config_path, cfg2);
+        reconcile_autoconnect_at_login_in(&config_path, &autostart_dir).unwrap();
+        // After reconcile: uninstalled
+        assert!(!autostart::is_installed_in(&autostart_dir));
+
+        let _ = std::fs::remove_dir_all(&autostart_dir);
+        cleanup_test_artifacts(&config_path);
+    }
+
+    #[test]
+    fn failed_persistence_rolls_back_desktop_entry() {
+        let client = MockNmClient::new(vec![]);
+        let bad_config_path = PathBuf::from("/nonexistent/directory/config.toml");
+        let autostart_dir = autostart_test_dir();
+
+        let res = set_autoconnect_at_login_in(&client, &bad_config_path, &autostart_dir, true);
+        assert!(res.is_err(), "config update to bad path should fail");
+        assert!(
+            !autostart::is_installed_in(&autostart_dir),
+            "entry must be uninstalled on persistence failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&autostart_dir);
     }
 
     /// A throwaway autostart directory, so these tests never write into the

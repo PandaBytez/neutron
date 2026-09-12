@@ -87,6 +87,7 @@ where
             let _ = crate::app::rebuild_lockdown_if_enabled(&client, &state.config_path);
         }
     }
+    let _ = crate::service::reconcile_autoconnect_at_login(&state.config_path);
     let mut initial_refresh_needed = false;
     if let Err(err) = events::reload_profiles(&mut state, &client) {
         state.set_error(&err);
