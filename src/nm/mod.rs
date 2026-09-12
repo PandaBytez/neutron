@@ -1233,7 +1233,7 @@ mod tests {
                         ["ipv4.routes", "10.0.0.0/8"],
                     ] {
                         assert!(
-                            settings.as_chunks::<2>().0.iter().any(|p| *p == pair),
+                            settings.as_chunks::<2>().0.contains(&pair),
                             "missing {pair:?}"
                         );
                     }
