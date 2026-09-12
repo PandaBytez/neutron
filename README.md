@@ -184,13 +184,15 @@ cargo xtask container-shell
   or privileged helper are involved.
 - Lockdown is an optional always-on firewall that closes the kill switch's one gap: the kill switch only protects
   traffic *while a tunnel is active*, whereas lockdown blocks all non-tunnel traffic even while disconnected and across
-  reboots. It installs permanent `firewalld` direct rules on the OUTPUT chain (both IPv4 and IPv6) that allow only
-  loopback, established connections, DNS, the WireGuard tunnel interfaces, and the peer endpoints (so the *encrypted*
-  handshake can still leave); everything else is rejected by a `neutron-lockdown`-tagged rule. Because it touches the
+  reboots. It installs permanent `firewalld` direct rules in mangle OUTPUT (both IPv4 and IPv6), before filter-table
+  established-connection accepts. Loopback, LAN destinations, tunnel interfaces and peer endpoints are allowed;
+  broad DNS is allowed when the supplied tunnel list is empty. Everything else is dropped by a
+  `neutron-lockdown`-tagged rule. Teardown removes tagged rules from both mangle and the legacy filter table.
+  Because it touches the
   system firewall, `firewall-cmd` runs through `pkexec` (polkit caches the prompt, so enabling/disabling asks for a
   password at most once), and the disable path always tears the ruleset down so the user can never be permanently locked
-  out. The pure rule-builders are unit-tested; the privileged `firewall-cmd`/`pkexec` calls need a real firewalld and
-  root, so they are verified by running the binary, not in `cargo test`.
+  out. Rule builders are unit-tested, and isolated sandbox tests exercise real firewall operations and established
+  IPv4/IPv6 packet egress on both firewalld backends.
 - Profile import runs `nmcli connection import type wireguard file <path>`, so NetworkManager stays the single source of
   truth — no local copy of the `.conf` is kept.
 - The application binary is named **Neutron** (`neutron`) with zero runtime shared library dependencies when compiled

@@ -10,14 +10,8 @@
 //! ruleset installed here is confined to the container. This was verified before
 //! being relied upon -- see the note in `testing/Containerfile`.
 //!
-//! Two groups of test live here:
-//!
-//! * ordinary ones, which assert behaviour that is correct today and must stay
-//!   that way; and
-//! * `leak_*` ones, which **document open leaks from `BUGS.md` and are expected
-//!   to fail**. They are skipped by the default runner and run on demand with
-//!   `./testing/run-container-tests.sh --leaks`, so an open leak is
-//!   demonstrable without turning CI permanently red.
+//! The `leak_*` tests are regression guards included in the system tier.
+//! BUG-018 exercises actual packet egress; other checks inspect stored rules.
 //!
 //! Run with: `./testing/run-container-tests.sh --firewall`
 
@@ -85,8 +79,10 @@ fn firewalld_accepts_the_lockdown_ruleset() {
         all_rules()
     );
     assert!(
-        rules.iter().any(|rule| rule.contains("REJECT")),
-        "the terminal REJECT is what makes lockdown a deny-by-default policy"
+        rules
+            .iter()
+            .any(|rule| rule.contains("mangle OUTPUT") && rule.contains("DROP")),
+        "the mangle DROP must enforce lockdown before filter-table accepts"
     );
     assert!(
         rules.iter().any(|rule| rule.contains("wg-test")),
@@ -171,15 +167,45 @@ fn teardown_leaves_foreign_rules_untouched() {
         .status()
         .expect("firewall-cmd should run");
 
+    // Upgrade from the old filter-table rules must remove our legacy entries
+    // while preserving foreign rules in both tables.
+    let mut legacy = foreign;
+    legacy[10] = MARKER;
+    assert!(
+        std::process::Command::new("firewall-cmd")
+            .args(legacy)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut foreign_mangle = foreign;
+    foreign_mangle[4] = "mangle";
+    assert!(
+        std::process::Command::new("firewall-cmd")
+            .args(foreign_mangle)
+            .status()
+            .unwrap()
+            .success()
+    );
+
     CliNmClient
         .enable_lockdown(&[tunnel("wg-test", "192.0.2.1", 51820)])
         .expect("lockdown should enable");
+    assert!(
+        marked_rules()
+            .iter()
+            .all(|rule| rule.contains("mangle OUTPUT"))
+    );
     CliNmClient
         .disable_lockdown()
         .expect("lockdown should disable");
 
     assert!(
-        all_rules().contains("someone-elses-rule"),
+        all_rules()
+            .lines()
+            .filter(|line| line.contains("someone-elses-rule"))
+            .count()
+            == 2,
         "teardown destroyed a rule Neutron did not create:\n{}",
         all_rules()
     );
@@ -187,6 +213,10 @@ fn teardown_leaves_foreign_rules_untouched() {
     // Clean up the foreign rule so the next test starts from an empty chain.
     let mut remove = vec!["--permanent", "--direct", "--remove-rule"];
     remove.extend_from_slice(&foreign[3..]);
+    let _ = std::process::Command::new("firewall-cmd")
+        .args(&remove)
+        .status();
+    remove[4] = "mangle";
     let _ = std::process::Command::new("firewall-cmd")
         .args(&remove)
         .status();
@@ -257,36 +287,32 @@ fn an_endpoint_hostname_with_shell_metacharacters_cannot_escape_the_script() {
 }
 
 // ---------------------------------------------------------------------------
-// Open leaks. These assert the *correct* behaviour and are expected to FAIL
-// until the corresponding bug is fixed. Skipped by the default runner; run with
-// `./testing/run-container-tests.sh --leaks`.
+// Leak regression guards, also selectable with --leaks.
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
 fn leak_bug018_established_flows_cannot_escape_a_dead_tunnel() {
-    // BUG-018. `-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT` is
-    // installed at priority 0 with no interface scope. conntrack tracks flows,
-    // not interfaces, so a flow established through the tunnel keeps being
-    // accepted after the tunnel dies -- now leaving over the physical interface
-    // in the clear, which is the exact scenario lockdown exists to prevent.
     require_sandbox();
+    let mut child = std::process::Command::new("python3")
+        .args(["-u", "-c", include_str!("firewall_egress.py")])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("start isolated packet fixture");
+    use std::io::{BufRead, Write};
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "ready", "fixture failed before lockdown");
     let _guard = Lockdown;
-
     CliNmClient
         .enable_lockdown(&[tunnel("wg-test", "192.0.2.1", 51820)])
-        .expect("lockdown should enable");
-
-    let unscoped: Vec<String> = marked_rules()
-        .into_iter()
-        .filter(|rule| rule.contains("ESTABLISHED"))
-        .filter(|rule| !rule.contains("-o wg") && !rule.contains("--out-interface wg"))
-        .collect();
-
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"go\n").unwrap();
     assert!(
-        unscoped.is_empty(),
-        "BUG-018: an unscoped ESTABLISHED accept lets flows leak over the \
-         physical interface once the tunnel drops:\n{unscoped:#?}"
+        child.wait().unwrap().success(),
+        "established egress escaped lockdown"
     );
 }
 

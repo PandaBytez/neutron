@@ -18,6 +18,15 @@ fail() {
 [[ "${NEUTRON_TEST_SANDBOX:-}" == "1" ]] ||
     fail "NEUTRON_TEST_SANDBOX is not set; refusing to start (is this the sandbox image?)"
 
+# Allow the same packet regressions to exercise both supported firewalld backends.
+if [[ -n "${NEUTRON_TEST_FIREWALL_BACKEND:-}" ]]; then
+    case "$NEUTRON_TEST_FIREWALL_BACKEND" in
+        iptables|nftables)
+            sed -i "s/^FirewallBackend=.*/FirewallBackend=$NEUTRON_TEST_FIREWALL_BACKEND/" /etc/firewalld/firewalld.conf ;;
+        *) fail "unsupported firewall backend: $NEUTRON_TEST_FIREWALL_BACKEND" ;;
+    esac
+fi
+
 # Wait for a daemon to become ready, failing with its log if it dies first.
 # $1 = human name, $2 = pid, $3 = log path, $4... = readiness probe
 wait_ready() {
