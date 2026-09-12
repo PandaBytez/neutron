@@ -72,7 +72,19 @@ pub fn gateway_for_address(address: &str) -> Option<Ipv4Addr> {
 /// needs together. Note this performs a blocking UDP round trip of up to
 /// [`READ_TIMEOUT`], so callers on a UI thread should only invoke it when the
 /// tunnel actually changed or the lease is due.
+/// A mapped port and its granted lifetime from the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    pub port: u16,
+    pub lifetime_secs: u32,
+}
+
 pub fn port_for_tunnel_address(address: &str) -> Option<u16> {
+    mapping_for_tunnel_address(address).map(|m| m.port)
+}
+
+/// Request a port mapping and granted lifetime for the given tunnel address.
+pub fn mapping_for_tunnel_address(address: &str) -> Option<PortMapping> {
     let gateway = gateway_for_address(address)?;
     let local_ip = parse_local_address(address);
     request_mapping_from(local_ip, gateway).ok()
@@ -103,7 +115,11 @@ fn build_map_request(
 /// Rejects replies that are truncated, that answer a different opcode than the
 /// one asked for, or that carry a non-zero result code, so a misbehaving
 /// responder cannot be mistaken for a successful mapping.
-fn parse_map_response(bytes: &[u8], request_opcode: u8, internal_port: u16) -> AppResult<u16> {
+fn parse_map_response(
+    bytes: &[u8],
+    request_opcode: u8,
+    internal_port: u16,
+) -> AppResult<PortMapping> {
     if bytes.len() != RESPONSE_LEN {
         return Err(AppError::PortForward(format!(
             "invalid NAT-PMP reply length ({} bytes, expected {RESPONSE_LEN})",
@@ -149,7 +165,16 @@ fn parse_map_response(bytes: &[u8], request_opcode: u8, internal_port: u16) -> A
             "gateway mapped port 0, so no port is forwarded".to_string(),
         ));
     }
-    Ok(external_port)
+    let lifetime_secs = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    if lifetime_secs == 0 {
+        return Err(AppError::PortForward(
+            "gateway granted lifetime 0, so mapping is expired/refused".to_string(),
+        ));
+    }
+    Ok(PortMapping {
+        port: external_port,
+        lifetime_secs,
+    })
 }
 
 /// Human-readable form of the RFC 6886 §3.5 result codes.
@@ -169,11 +194,14 @@ fn describe_result_code(code: u16) -> String {
 /// Both UDP and TCP are mapped because providers hand out one port for the
 /// pair, and a caller asking for "the forwarded port" expects both protocols to
 /// work. The UDP mapping decides the port; the TCP request reuses it.
-pub fn request_mapping_from(local_ip: Option<Ipv4Addr>, gateway: Ipv4Addr) -> AppResult<u16> {
-    let port = map_protocol(local_ip, gateway, OP_MAP_UDP, 0)?;
+pub fn request_mapping_from(
+    local_ip: Option<Ipv4Addr>,
+    gateway: Ipv4Addr,
+) -> AppResult<PortMapping> {
+    let mapping = map_protocol(local_ip, gateway, OP_MAP_UDP, 0)?;
     // Best effort: a provider that only forwards UDP still gives a usable port.
-    let _ = map_protocol(local_ip, gateway, OP_MAP_TCP, port);
-    Ok(port)
+    let _ = map_protocol(local_ip, gateway, OP_MAP_TCP, mapping.port);
+    Ok(mapping)
 }
 
 fn map_protocol(
@@ -181,7 +209,7 @@ fn map_protocol(
     gateway: Ipv4Addr,
     opcode: u8,
     requested_port: u16,
-) -> AppResult<u16> {
+) -> AppResult<PortMapping> {
     map_protocol_at(
         local_ip,
         SocketAddrV4::new(gateway, NATPMP_PORT),
@@ -195,7 +223,7 @@ fn map_protocol_at(
     gateway: SocketAddrV4,
     opcode: u8,
     requested_port: u16,
-) -> AppResult<u16> {
+) -> AppResult<PortMapping> {
     let local = local_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
     let socket = UdpSocket::bind((local, 0)).map_err(|error| {
         AppError::PortForward(format!("could not bind NAT-PMP socket to {local}: {error}"))
@@ -246,7 +274,10 @@ mod tests {
     fn response_validates_version_size_and_internal_port() {
         let mut reply = response(OP_MAP_TCP, 0, 51234);
         reply[8..10].copy_from_slice(&1234u16.to_be_bytes());
-        assert_eq!(parse_map_response(&reply, OP_MAP_TCP, 1234).unwrap(), 51234);
+        assert_eq!(
+            parse_map_response(&reply, OP_MAP_TCP, 1234).unwrap().port,
+            51234
+        );
         assert!(parse_map_response(&reply, OP_MAP_TCP, 4321).is_err());
         assert!(parse_map_response(&reply, OP_MAP_TCP, 0).is_err());
         reply[8..10].copy_from_slice(&51234u16.to_be_bytes());
@@ -278,7 +309,9 @@ mod tests {
                 .unwrap();
         });
         assert_eq!(
-            map_protocol_at(Some(Ipv4Addr::LOCALHOST), address, OP_MAP_UDP, 0).unwrap(),
+            map_protocol_at(Some(Ipv4Addr::LOCALHOST), address, OP_MAP_UDP, 0)
+                .unwrap()
+                .port,
             51234
         );
         worker.join().unwrap();
@@ -286,10 +319,20 @@ mod tests {
 
     /// Build a well-formed reply so tests describe intent rather than offsets.
     fn response(opcode: u8, result_code: u16, external_port: u16) -> [u8; RESPONSE_LEN] {
+        response_with_lifetime(opcode, result_code, external_port, LIFETIME)
+    }
+
+    fn response_with_lifetime(
+        opcode: u8,
+        result_code: u16,
+        external_port: u16,
+        lifetime: u32,
+    ) -> [u8; RESPONSE_LEN] {
         let mut bytes = [0u8; RESPONSE_LEN];
         bytes[1] = opcode + RESPONSE_OPCODE_OFFSET;
         bytes[2..4].copy_from_slice(&result_code.to_be_bytes());
         bytes[10..12].copy_from_slice(&external_port.to_be_bytes());
+        bytes[12..16].copy_from_slice(&lifetime.to_be_bytes());
         bytes
     }
 
@@ -315,7 +358,10 @@ mod tests {
     fn parses_the_mapped_port_from_a_success_reply() {
         let reply = response(OP_MAP_UDP, 0, 51234);
 
-        assert_eq!(parse_map_response(&reply, OP_MAP_UDP, 0).unwrap(), 51234);
+        assert_eq!(
+            parse_map_response(&reply, OP_MAP_UDP, 0).unwrap().port,
+            51234
+        );
     }
 
     #[test]
@@ -444,9 +490,26 @@ mod tests {
         let mut reply = [0u8; RESPONSE_LEN];
         let (len, _) = client_socket.recv_from(&mut reply).unwrap();
         let mapped = parse_map_response(&reply[..len], OP_MAP_UDP, 0).unwrap();
-        assert_eq!(mapped, 48888);
+        assert_eq!(mapped.port, 48888);
 
         done.store(true, Ordering::Relaxed);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn parse_map_response_rejects_zero_lifetime() {
+        let reply = response_with_lifetime(OP_MAP_UDP, 0, 51234, 0);
+        let result = parse_map_response(&reply, OP_MAP_UDP, 0);
+        assert!(
+            matches!(result, Err(AppError::PortForward(message)) if message.contains("lifetime 0"))
+        );
+    }
+
+    #[test]
+    fn parse_map_response_parses_lifetime() {
+        let reply = response_with_lifetime(OP_MAP_UDP, 0, 51234, 120);
+        let mapping = parse_map_response(&reply, OP_MAP_UDP, 0).unwrap();
+        assert_eq!(mapping.port, 51234);
+        assert_eq!(mapping.lifetime_secs, 120);
     }
 }
