@@ -191,6 +191,8 @@ cargo xtask container-shell
   established-connection accepts. Loopback, LAN destinations, tunnel interfaces and peer endpoints are allowed;
   broad DNS is allowed when the supplied tunnel list is empty. Everything else is dropped by a
   `neutron-lockdown`-tagged rule. Teardown removes tagged rules from both mangle and the legacy filter table.
+  Rebuilds install permanent fail-closed guards before replacing rules. An interrupted rebuild may block all outbound
+  traffic after a reload/reboot; retry enabling lockdown or disable it to remove the guards and recover.
   Because it touches the
   system firewall, `firewall-cmd` runs through `pkexec` (polkit caches the prompt, so enabling/disabling asks for a
   password at most once), and the disable path always tears the ruleset down so the user can never be permanently locked

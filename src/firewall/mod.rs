@@ -105,11 +105,8 @@ impl FirewallClient for crate::nm::CliNmClient {
         // the user is prompted for a password at most once. Reads are
         // unprivileged and never prompt.
         //
-        // The batch first clears any leftover Neutron rules (so re-enabling is
-        // idempotent and cannot fail with ALREADY_ENABLED), then installs the
-        // new ruleset and reloads.
-        let mut batches = marked_removal_batches()?;
-        batches.extend(lockdown_enable_batches(tunnels));
+        // Permanent fail-closed guards protect every intermediate rebuild state.
+        let batches = lockdown_rebuild_batches(marked_removal_batches()?, tunnels);
         run_privileged_batches(&batches)
     }
 
@@ -261,6 +258,41 @@ fn lockdown_enable_batches(tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
     for family in FAMILIES {
         batches.extend(lockdown_family_batches(family, tunnels));
     }
+    batches.push(reload_batch());
+    batches
+}
+
+/// Keep permanent protection complete at every rebuild boundary, including
+/// SIGKILL/power loss where a shell trap cannot roll back. A interrupted rebuild
+/// leaves a tagged fail-closed guard which disable or a successful retry removes.
+fn lockdown_rebuild_batches(
+    removals: Vec<Vec<String>>,
+    tunnels: &[WireguardTunnel],
+) -> Vec<Vec<String>> {
+    let guards: Vec<_> = FAMILIES
+        .iter()
+        .map(|family| add_rule(family, -1, &["-j", "DROP"]))
+        .collect();
+    let guard_removals: Vec<_> = guards
+        .iter()
+        .map(|guard| {
+            let mut remove = guard.clone();
+            remove[2] = "--remove-rule".into();
+            remove
+        })
+        .collect();
+    let mut batches = guards;
+    // A previous interrupted rebuild may already have guards. Do not remove
+    // those until both replacement families have been fully installed.
+    batches.extend(
+        removals
+            .into_iter()
+            .filter(|batch| !guard_removals.contains(batch)),
+    );
+    let mut replacement = lockdown_enable_batches(tunnels);
+    replacement.pop(); // Reload only after both guards are removed.
+    batches.extend(replacement);
+    batches.extend(guard_removals);
     batches.push(reload_batch());
     batches
 }
@@ -469,7 +501,7 @@ fn endpoint_rules(family: &str, endpoint: &Endpoint) -> Vec<Vec<String>> {
 /// requires matches to precede the jump) so every rule we install is
 /// identifiable and can be removed surgically at teardown without disturbing
 /// foreign direct rules. Each `rule` therefore must end with `-j <target>`.
-fn add_rule(family: &str, priority: u8, rule: &[&str]) -> Vec<String> {
+fn add_rule(family: &str, priority: i32, rule: &[&str]) -> Vec<String> {
     let mut batch = direct_args("--add-rule", family, "mangle");
     batch.push(priority.to_string());
     let jump_at = rule.len().saturating_sub(2);
@@ -486,6 +518,94 @@ fn reload_batch() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_rebuild_prefix_retains_complete_policy_or_guard() {
+        let old = lockdown_enable_batches(&[tunnel("wg-old", &[])]);
+        let old_rules: Vec<_> = old.into_iter().filter(|b| b != &reload_batch()).collect();
+        let removals = old_rules.iter().map(|b| expected_removal(b)).collect();
+        let new_rules: Vec<_> = lockdown_enable_batches(&[tunnel("wg-new", &[])])
+            .into_iter()
+            .filter(|b| b != &reload_batch())
+            .collect();
+        let mut installed = old_rules.clone();
+        for batch in lockdown_rebuild_batches(removals, &[tunnel("wg-new", &[])]) {
+            if batch == reload_batch() {
+                continue;
+            }
+            let mut add = batch.clone();
+            add[2] = "--add-rule".into();
+            if batch[2] == "--add-rule" {
+                installed.push(add);
+            } else {
+                installed.retain(|b| b != &add);
+            }
+            for family in FAMILIES {
+                let complete = |rules: &[Vec<String>]| {
+                    rules
+                        .iter()
+                        .filter(|b| b[3] == family)
+                        .all(|b| installed.contains(b))
+                };
+                assert!(
+                    installed.contains(&add_rule(family, -1, &["-j", "DROP"]))
+                        || complete(&old_rules)
+                        || complete(&new_rules),
+                    "unprotected boundary: {batch:?}"
+                );
+            }
+        }
+        assert_eq!(installed, new_rules);
+    }
+
+    #[test]
+    #[ignore = "system test: requires the disposable sandbox"]
+    fn interrupted_rebuild_stays_closed_after_reload_and_recovers() {
+        crate::testing::require_sandbox();
+        let client = crate::nm::CliNmClient;
+        let tunnels = [tunnel("wg-old", &[])];
+        client.enable_lockdown(&tunnels).unwrap();
+        let batches =
+            lockdown_rebuild_batches(marked_removal_batches().unwrap(), &[tunnel("wg-new", &[])]);
+        // Inject interruption after removal, midway through replacement, and
+        // before guard removal. Reload makes the interrupted permanent state live.
+        let first_add = batches
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find(|(_, b)| b[2] == "--add-rule")
+            .unwrap()
+            .0;
+        for stop in [first_add, first_add + 3, batches.len() - 3] {
+            client.enable_lockdown(&tunnels).unwrap();
+            run_privileged_batches(&batches[..stop]).unwrap();
+            run_privileged_batches(&[reload_batch()]).unwrap();
+            for tool in ["iptables", "ip6tables"] {
+                let output = std::process::Command::new(tool)
+                    .args(["-t", "mangle", "-S"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                let rules = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    rules
+                        .lines()
+                        .any(|line| line.contains("neutron-lockdown") && line.ends_with("-j DROP")),
+                    "{rules}"
+                );
+            }
+            client.enable_lockdown(&tunnels).unwrap();
+            for family in FAMILIES {
+                assert!(
+                    !read_marked_rules(family, "mangle")
+                        .unwrap()
+                        .lines()
+                        .any(|line| line.starts_with("-1 "))
+                );
+            }
+        }
+        client.disable_lockdown().unwrap();
+    }
 
     fn tunnel(interface: &str, endpoints: &[(&str, u16)]) -> WireguardTunnel {
         WireguardTunnel {
