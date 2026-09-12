@@ -240,3 +240,38 @@ fn transient_list_failure_retains_refresh_and_eventually_reloads() {
 
     testing::remove_temp_config(&path);
 }
+
+#[test]
+fn split_worker_failure_reconciles_modal_and_pending_state() {
+    let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)]);
+    let path = testing::temp_config_path("tui-split-reconcile");
+    let initial_cfg = AppConfig::default();
+    config::save(&path, &initial_cfg).unwrap();
+    let mut state = TuiState::new(path.clone(), initial_cfg);
+
+    let (st_tx, st_rx) = std::sync::mpsc::channel();
+    state.split_tunnel_tx = Some(st_tx);
+
+    // Open modal with default config
+    state.modal = neutron::tui::state::ActiveModal::SplitTunnel(
+        neutron::tui::state::SplitTunnelModalState::from_config(&state.config.global_split_tunnel),
+    );
+
+    // Apply a new config that will fail in the worker
+    let mut rejected_cfg = state.config.global_split_tunnel.clone();
+    rejected_cfg.mode = neutron::config::SplitTunnelMode::Include;
+    rejected_cfg.cidrs.push("192.168.1.0/24".to_string());
+
+    state.apply_split_tunnel(&client, rejected_cfg).unwrap();
+    let pending = st_rx.recv().unwrap();
+    assert_eq!(pending.cidrs, vec!["192.168.1.0/24".to_string()]);
+
+    // Background reload happens while modal is open - must preserve modal edit state
+    neutron::tui::events::reload_profiles(&mut state, &client).unwrap();
+    assert_eq!(
+        state.config.global_split_tunnel.cidrs,
+        vec!["192.168.1.0/24".to_string()]
+    );
+
+    testing::remove_temp_config(&path);
+}

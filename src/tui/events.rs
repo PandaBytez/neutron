@@ -673,7 +673,12 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
         &app_cfg.favorite_profile_ids,
         &app_cfg.profile_custom_info,
     );
+    let preserve_split = matches!(state.modal, ActiveModal::SplitTunnel(_));
+    let pending_split = state.config.global_split_tunnel.clone();
     state.config = app_cfg;
+    if preserve_split {
+        state.config.global_split_tunnel = pending_split;
+    }
 
     // Both facts about the active row are taken in one pass so the borrow of
     // `state.rows` ends here: everything below mutates `state` as a whole.

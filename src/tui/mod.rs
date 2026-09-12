@@ -230,8 +230,9 @@ where
                 )
             } else {
                 let current = crate::config::load(&config_path_for_st);
-                let mode_changed =
-                    current.map(|c| c.global_split_tunnel.mode != cfg.mode).unwrap_or(false);
+                let mode_changed = current
+                    .map(|c| c.global_split_tunnel.mode != cfg.mode)
+                    .unwrap_or(false);
                 if mode_changed {
                     crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
                         &client_for_st,
@@ -387,10 +388,11 @@ where
             }
         }
 
-        // Drain any incoming background split tunneling application results
-        while let Ok((_cfg, res)) = st_res_rx.try_recv() {
+        // Drain any incoming background split tunneling application results (BUG-063)
+        while let Ok((applied_cfg, res)) = st_res_rx.try_recv() {
             match res {
                 Ok(()) => {
+                    state.config.global_split_tunnel = applied_cfg.clone();
                     state.set_status("Split tunneling saved; reconnect to apply routing changes.");
                     state
                         .uncertain_policies
@@ -399,7 +401,13 @@ where
                 Err(err) => {
                     state.set_error(&err);
                     if let Ok(persisted) = crate::config::load(&state.config_path) {
-                        state.config.global_split_tunnel = persisted.global_split_tunnel;
+                        state.config.global_split_tunnel = persisted.global_split_tunnel.clone();
+                        if let crate::tui::state::ActiveModal::SplitTunnel(ref mut st) = state.modal
+                        {
+                            *st = crate::tui::state::SplitTunnelModalState::from_config(
+                                &persisted.global_split_tunnel,
+                            );
+                        }
                     }
                 }
             }
