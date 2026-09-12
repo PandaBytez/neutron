@@ -4,6 +4,11 @@ pub fn should_refresh_from_nm_monitor_line(line: &str) -> bool {
         return false;
     }
 
+    // Ignore passive profile metadata updates like timestamp refreshes (BUG-037)
+    if normalized.contains("connection profile changed") {
+        return false;
+    }
+
     normalized.contains("connection")
         || normalized.contains("device")
         || normalized.contains("wireguard")
@@ -25,6 +30,16 @@ mod tests {
     fn refreshes_for_device_event_line() {
         assert!(should_refresh_from_nm_monitor_line(
             "device wlan0 state changed"
+        ));
+    }
+
+    #[test]
+    fn ignores_connection_profile_changed_events_bug037() {
+        assert!(!should_refresh_from_nm_monitor_line(
+            "wg-SK-10: connection profile changed"
+        ));
+        assert!(!should_refresh_from_nm_monitor_line(
+            "connection profile changed"
         ));
     }
 

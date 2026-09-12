@@ -341,24 +341,27 @@ impl Theme {
 }
 
 fn parse_color(hex: &str) -> Option<Color> {
-    let s = hex.trim().trim_start_matches('#');
-    if s.len() == 6 && s.is_ascii() {
-        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    let s = hex.trim();
+    match s.to_lowercase().as_str() {
+        "red" => return Some(Color::Red),
+        "green" => return Some(Color::Green),
+        "yellow" => return Some(Color::Yellow),
+        "blue" => return Some(Color::Blue),
+        "magenta" | "purple" => return Some(Color::Magenta),
+        "cyan" => return Some(Color::Cyan),
+        "white" => return Some(Color::White),
+        "black" => return Some(Color::Black),
+        _ => {}
+    }
+
+    let h = s.trim_start_matches('#');
+    if h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&h[4..6], 16).ok()?;
         Some(Color::Rgb(r, g, b))
     } else {
-        match s.to_lowercase().as_str() {
-            "red" => Some(Color::Red),
-            "green" => Some(Color::Green),
-            "yellow" => Some(Color::Yellow),
-            "blue" => Some(Color::Blue),
-            "magenta" | "purple" => Some(Color::Magenta),
-            "cyan" => Some(Color::Cyan),
-            "white" => Some(Color::White),
-            "black" => Some(Color::Black),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -371,6 +374,10 @@ mod tests {
         assert_eq!(parse_color("#ff0000"), Some(Color::Rgb(255, 0, 0)));
         assert_eq!(parse_color("00ff00"), Some(Color::Rgb(0, 255, 0)));
         assert_eq!(parse_color("blue"), Some(Color::Blue));
+        assert_eq!(parse_color("yellow"), Some(Color::Yellow));
+        assert_eq!(parse_color("purple"), Some(Color::Magenta));
+        assert_eq!(parse_color("Yellow"), Some(Color::Yellow));
+        assert_eq!(parse_color("Purple"), Some(Color::Magenta));
         assert_eq!(parse_color("invalid"), None);
         assert_eq!(parse_color("日本"), None);
         assert_eq!(parse_color("#日本"), None);

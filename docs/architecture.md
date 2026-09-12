@@ -44,9 +44,9 @@ Neutron is designed with a strictly decoupled architecture where all networking,
 
 ### 2. `firewall/` — Always-On Lockdown Netfilter Engine
 - Trait `FirewallClient` manages permanent direct `OUTPUT` chain rules in `firewalld`.
-- Protects traffic while disconnected by rejecting all non-tunnel traffic except loopback, established connections, DNS, tunnel interfaces, and peer handshake endpoints.
+- Uses mangle OUTPUT allow-list rules and a final DROP before filter-table established accepts; see [Security & Kill Switch](security.md).
 - All rules are tagged with a unique comment (`neutron-lockdown`) ensuring surgical removal without modifying user-defined firewall rules.
-- Privilege escalation is consolidated into a single `pkexec /bin/sh` transaction.
+- Privilege escalation is consolidated into one `pkexec` shell batch, with permanent fail-closed guards during rebuilds.
 
 ### 3. `portforward/` — NAT-PMP Dynamic Port Leasing & App Integrations
 - Implements RFC 6886 NAT-PMP client directly over `std::net::UdpSocket`.
@@ -57,7 +57,7 @@ Neutron is designed with a strictly decoupled architecture where all networking,
 ### 4. `config/` — Configuration & State Persistence
 - Manages `AppConfig` serialized as TOML in `~/.config/neutron/config.toml`.
 - Implements atomic file writes (`fs::rename` with fallback across filesystem boundaries) with strict `0o600` permissions.
-- Stores global split-tunnel rules, startup eligibility exclusions, kill-switch intent, and window geometry.
+- Stores policy intent, startup eligibility, favorites, theme settings, and integration settings. Narrow updates are serialized by a sidecar file lock.
 
 ### 5. `service/` — Boot-Time Automation
 - Implements the one-shot random profile selector for login / boot.

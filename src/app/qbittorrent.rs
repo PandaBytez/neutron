@@ -23,7 +23,7 @@ use crate::portforward::qbittorrent::{QBittorrentClient, QBittorrentSyncReport};
 /// profile diagnostics, because the latter substitutes the uuid when no
 /// interface name is configured. Binding to that substitute would point
 /// qBittorrent at a device that does not exist and silently drop every incoming
-/// connection; `None` instead leaves it listening on any interface.
+/// connection. A missing interface is an error when binding is requested.
 ///
 /// Whether the interface is applied at all is the user's call, via
 /// [`QBittorrentConfig::bind_interface`].
@@ -89,19 +89,24 @@ mod tests {
     }
 
     #[test]
-    fn a_tunnel_without_an_interface_binds_to_none() {
+    fn a_tunnel_without_an_interface_refuses_requested_binding() {
         // `get_profile_diagnostics` substitutes the uuid when NetworkManager
         // reports no interface name, because the details pane needs something to
         // print. Binding qBittorrent to that label would point its socket at a
         // device that does not exist and drop every incoming connection, so the
-        // push must carry no interface at all instead.
+        // push must fail without changing any preferences instead.
         if !curl_available() {
             return;
         }
         let server = MockQBittorrentWebUi::start();
         let client = MockNmClient::default().without_tunnel_interface();
 
-        sync_port(&client, &config(server.url()), "uuid-eu", 51820).expect("push should succeed");
+        assert!(sync_port(&client, &config(server.url()), "uuid-eu", 51820).is_err());
+        assert!(server.last_set_preferences().is_empty());
+
+        let mut optional = config(server.url());
+        optional.bind_interface = false;
+        sync_port(&client, &optional, "uuid-eu", 51820).expect("port-only sync should succeed");
 
         let pushed = server.last_set_preferences();
         assert!(

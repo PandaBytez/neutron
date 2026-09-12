@@ -9,13 +9,11 @@
 #   ./testing/run-container-tests.sh             # NetworkManager + firewall tiers
 #   ./testing/run-container-tests.sh --nm        # NetworkManager tier only
 #   ./testing/run-container-tests.sh --firewall  # firewall tier only
-#   ./testing/run-container-tests.sh --leaks     # the open leaks from BUGS.md
+#   ./testing/run-container-tests.sh --leaks     # leak regression checks
 #   ./testing/run-container-tests.sh --rebuild   # force a fresh image
 #   ./testing/run-container-tests.sh --shell     # interactive shell in the sandbox
 #
-# `--leaks` runs the `leak_*` tests, which assert the behaviour the open bugs in
-# BUGS.md violate. They are EXPECTED TO FAIL until those bugs are fixed, and are
-# excluded from the default run so an open leak does not turn CI permanently red.
+# `--leaks` selects the `leak_*` regression tests, also included in the firewall tier.
 set -euo pipefail
 
 readonly IMAGE=neutron-sandbox

@@ -292,10 +292,7 @@ mod tests {
 
     #[test]
     fn interface_receive_bytes_distinguishes_absent_from_silent() {
-        // A tunnel that has received nothing and a tunnel that does not exist
-        // are different facts: the health check treats the first as a dead peer
-        // and the second as "not ours to verify", so they must not collapse
-        // into the same `0`.
+        // Preserve interface existence separately from a zero receive counter.
         let sample = "Inter-|   Receive                                                |  Transmit\n\
                       face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
                       wg0: 0             0    0    0    0     0          0         0        0        0    0    0    0     0       0          0\n\

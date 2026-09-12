@@ -14,7 +14,7 @@ use crate::app::sync;
 use crate::config;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
-use crate::nm::{self, NmClient};
+use crate::nm::{self, NmClient, ProfileDiagnostics};
 use crate::tui::state::{
     ActiveModal, CachedProfileInfo, CommandPaletteState, SplitTunnelFocus, ThemePickerState,
     TuiState, wrap_next, wrap_prev,
@@ -114,6 +114,7 @@ pub fn execute_action<C: ActionClient>(
     client: &C,
     id: &str,
 ) -> AppResult<()> {
+    let action_tx = state.action_tx.clone();
     match id {
         "palette" => state.modal = ActiveModal::CommandPalette(CommandPaletteState::default()),
         "theme" => state.modal = ActiveModal::ThemePicker(ThemePickerState::default()),
@@ -146,6 +147,7 @@ pub fn execute_action<C: ActionClient>(
                         client.switch_to(&uuid)?;
                         state.set_status(format!("Connected '{name}'."));
                     }
+                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                     reload_profiles(state, client)?;
                 }
             }
@@ -169,6 +171,7 @@ pub fn execute_action<C: ActionClient>(
                 } else {
                     client.switch_to(&uuid)?;
                     state.set_status(format!("Switched to '{name}'."));
+                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                     reload_profiles(state, client)?;
                 }
             }
@@ -192,6 +195,7 @@ pub fn execute_action<C: ActionClient>(
             } else {
                 client.disconnect_active()?;
                 state.set_status("Disconnected active profile.");
+                let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                 reload_profiles(state, client)?;
             }
         }
@@ -200,13 +204,15 @@ pub fn execute_action<C: ActionClient>(
                 return Ok(());
             };
             let (uuid, name, new_eligible) = (row.uuid.clone(), row.name.clone(), !row.eligible);
-            let mut app_cfg = config::load(&state.config_path)?;
-            if eligibility::set_profile_eligible(
-                &mut app_cfg.excluded_profile_ids,
-                &uuid,
-                new_eligible,
-            ) {
-                config::save(&state.config_path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&state.config_path, |cfg| {
+                changed = eligibility::set_profile_eligible(
+                    &mut cfg.excluded_profile_ids,
+                    &uuid,
+                    new_eligible,
+                );
+            })?;
+            if changed {
                 let verb = if new_eligible { "Eligible" } else { "Excluded" };
                 state.set_status(format!("{verb} '{name}' for startup pool."));
                 reload_profiles(state, client)?;
@@ -217,13 +223,13 @@ pub fn execute_action<C: ActionClient>(
                 return Ok(());
             };
             let (uuid, name, was_fav) = (row.uuid.clone(), row.name.clone(), row.is_favorite);
-            let mut app_cfg = config::load(&state.config_path)?;
-            if was_fav {
-                app_cfg.favorite_profile_ids.remove(&uuid);
-            } else {
-                app_cfg.favorite_profile_ids.insert(uuid.clone());
-            }
-            config::save(&state.config_path, &app_cfg)?;
+            let app_cfg = config::update(&state.config_path, |app_cfg| {
+                if was_fav {
+                    app_cfg.favorite_profile_ids.remove(&uuid);
+                } else {
+                    app_cfg.favorite_profile_ids.insert(uuid.clone());
+                }
+            })?;
             state.config = app_cfg;
             reload_profiles(state, client)?;
             let msg = if was_fav {
@@ -235,32 +241,62 @@ pub fn execute_action<C: ActionClient>(
         }
         "kill_switch" => {
             let enable = !state.config.kill_switch_enabled;
-            crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
-            state.config.kill_switch_enabled = enable;
-            state.set_status(format!(
-                "{} Kill Switch (all profiles).",
-                enabled_verb(enable)
-            ));
+            if let Some(ref tx) = action_tx {
+                state.set_status(format!(
+                    "{} Kill Switch policy...",
+                    if enable { "Enabling" } else { "Disabling" }
+                ));
+                let _ = tx.send(crate::tui::state::AsyncAction::KillSwitch(enable));
+            } else {
+                crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
+                state
+                    .uncertain_policies
+                    .remove(&crate::error::Policy::KillSwitch);
+                state.config.kill_switch_enabled = enable;
+                state.set_status(format!(
+                    "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
+                    enabled_verb(enable)
+                ));
+            }
         }
         "lockdown" => {
             let enable = !state.config.lockdown_enabled;
-            crate::app::set_global_lockdown(client, &state.config_path, enable)?;
-            state.config.lockdown_enabled = enable;
-            state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
+            if let Some(ref tx) = action_tx {
+                state.set_status(format!(
+                    "{} Lockdown Mode...",
+                    if enable { "Enabling" } else { "Disabling" }
+                ));
+                let _ = tx.send(crate::tui::state::AsyncAction::Lockdown(enable));
+            } else {
+                crate::app::set_global_lockdown(client, &state.config_path, enable)?;
+                state
+                    .uncertain_policies
+                    .remove(&crate::error::Policy::Lockdown);
+                state.config.lockdown_enabled = enable;
+                state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
+            }
         }
         "autoconnect" => {
             let enable = !state.config.general.autoconnect_at_login;
-            crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
-            state.config.general.autoconnect_at_login = enable;
-            state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+            if let Some(ref tx) = action_tx {
+                state.set_status(format!(
+                    "{} Auto Connect at Login...",
+                    if enable { "Enabling" } else { "Disabling" }
+                ));
+                let _ = tx.send(crate::tui::state::AsyncAction::Autoconnect(enable));
+            } else {
+                crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
+                state.config.general.autoconnect_at_login = enable;
+                state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+            }
         }
         "port_forwarding" => {
             let enable = !state.config.port_forwarding.enabled;
             // Persisted before the reload below, which re-reads the config from
             // disk into `state.config` and would otherwise revert the toggle.
-            let mut app_cfg = config::load(&state.config_path)?;
-            app_cfg.port_forwarding.enabled = enable;
-            config::save(&state.config_path, &app_cfg)?;
+            config::update(&state.config_path, |cfg| {
+                cfg.port_forwarding.enabled = enable
+            })?;
             state.config.port_forwarding.enabled = enable;
 
             // Nothing local to drop: the daemon owns the lease and picks the
@@ -271,19 +307,26 @@ pub fn execute_action<C: ActionClient>(
             state.set_status(format!("{} NAT-PMP Port Forwarding.", enabled_verb(enable)));
         }
         "sync" => {
-            let report = sync::sync_profiles_dir(client, &state.config)?;
-            // The profile set may have changed, so the lockdown allow-list is
-            // stale: a freshly imported profile has no rule and would be
-            // blocked by the terminal REJECT.
-            crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
-            reload_profiles(state, client)?;
-            if report.imported.is_empty() {
-                state.set_status("Refreshed profiles.");
+            if let Some(ref tx) = action_tx {
+                state.set_status("Syncing profiles in background...");
+                let _ = tx.send(crate::tui::state::AsyncAction::Sync);
             } else {
-                state.set_status(format!(
-                    "Synced drop directory: imported {} profiles.",
-                    report.imported.len()
-                ));
+                let report = sync::sync_profiles_dir(client, &state.config)?;
+                // The profile set may have changed, so the lockdown allow-list is
+                // stale: a freshly imported profile has no rule and would be
+                // blocked by the terminal DROP.
+                crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
+                reload_profiles(state, client)?;
+                if !report.errors.is_empty() {
+                    state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+                } else if report.imported.is_empty() {
+                    state.set_status("Refreshed profiles.");
+                } else {
+                    state.set_status(format!(
+                        "Imported {} new profile(s).",
+                        report.imported.len()
+                    ));
+                }
             }
         }
         #[cfg(feature = "qbittorrent")]
@@ -333,9 +376,7 @@ pub fn execute_action<C: ActionClient>(
         #[cfg(feature = "qbittorrent")]
         "qbit_toggle" => {
             let enable = !state.config.qbittorrent.enabled;
-            let mut app_cfg = config::load(&state.config_path)?;
-            app_cfg.qbittorrent.enabled = enable;
-            config::save(&state.config_path, &app_cfg)?;
+            config::update(&state.config_path, |cfg| cfg.qbittorrent.enabled = enable)?;
             state.config.qbittorrent.enabled = enable;
             state.set_status(format!(
                 "{} qBittorrent Port Forward Auto-Sync.",
@@ -364,7 +405,7 @@ pub fn execute_action<C: ActionClient>(
     Ok(())
 }
 
-fn enabled_verb(enabled: bool) -> &'static str {
+pub fn enabled_verb(enabled: bool) -> &'static str {
     if enabled { "Enabled" } else { "Disabled" }
 }
 
@@ -429,10 +470,16 @@ fn handle_theme_picker_key(state: &mut TuiState, key: KeyEvent) {
             let selected = tp.themes.get(tp.selected_index).copied();
             state.modal = ActiveModal::None;
             if let Some((preset, label)) = selected {
-                state.config.theme.preset = preset.to_string();
-                let _ = config::save(&state.config_path, &state.config);
-                state.theme = crate::tui::theme::Theme::from_config(&state.config.theme);
-                state.set_status(format!("Applied theme: {label}"));
+                match config::update(&state.config_path, |cfg| {
+                    cfg.theme.preset = preset.to_string()
+                }) {
+                    Ok(saved) => {
+                        state.config = saved;
+                        state.theme = crate::tui::theme::Theme::from_config(&state.config.theme);
+                        state.set_status(format!("Applied theme: {label}"));
+                    }
+                    Err(error) => state.set_error(&error),
+                }
             }
         }
         _ => {}
@@ -447,12 +494,18 @@ fn handle_delete_key<C: ActionClient>(
 ) -> AppResult<()> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-            client.delete_profile(uuid)?;
+            let action_tx = state.action_tx.clone();
             state.modal = ActiveModal::None;
-            state.set_status("Profile deleted.");
-            // The deleted profile's interface and endpoint rules are now stale.
-            crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
-            reload_profiles(state, client)?;
+            if let Some(ref tx) = action_tx {
+                state.set_status("Deleting profile in background...");
+                let _ = tx.send(crate::tui::state::AsyncAction::Delete(uuid.to_string()));
+            } else {
+                client.delete_profile(uuid)?;
+                state.set_status("Profile deleted.");
+                // The deleted profile's interface and endpoint rules are now stale.
+                crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
+                reload_profiles(state, client)?;
+            }
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             state.modal = ActiveModal::None;
@@ -496,24 +549,23 @@ fn handle_split_tunnel_key<C: NmClient>(
             }
             KeyCode::Enter => match st.focus {
                 SplitTunnelFocus::DomainInput => {
-                    if let Some(domain) = nm::split_tunnel::normalize_domain(&st.domain_input) {
-                        if !st.domains.contains(&domain) {
-                            st.domains.push(domain);
-                            st.selected_domain = st.domains.len().saturating_sub(1);
-                            should_apply_cfg = Some(st.to_config());
-                        }
+                    if let Some(domain) = nm::split_tunnel::normalize_domain(&st.domain_input)
+                        && !st.domains.contains(&domain)
+                    {
+                        st.domains.push(domain);
+                        st.selected_domain = st.domains.len().saturating_sub(1);
+                        should_apply_cfg = Some(st.to_config());
                         st.domain_input.clear();
                     }
                 }
                 SplitTunnelFocus::CidrInput => {
                     if let Ok((normalized, _)) =
                         nm::split_tunnel::parse_and_normalize_cidr(&st.cidr_input)
+                        && !st.cidrs.contains(&normalized)
                     {
-                        if !st.cidrs.contains(&normalized) {
-                            st.cidrs.push(normalized);
-                            st.selected_cidr = st.cidrs.len().saturating_sub(1);
-                            should_apply_cfg = Some(st.to_config());
-                        }
+                        st.cidrs.push(normalized);
+                        st.selected_cidr = st.cidrs.len().saturating_sub(1);
+                        should_apply_cfg = Some(st.to_config());
                         st.cidr_input.clear();
                     }
                 }
@@ -612,16 +664,36 @@ pub fn fetch_profile_info<C: NmClient>(
 }
 
 pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResult<()> {
+    if state.diag_tx.is_some() {
+        state.profile_refresh_requested = true;
+        return Ok(());
+    }
     let profiles = client.list_wireguard_profiles()?;
     let app_cfg = config::load(&state.config_path)?;
 
+    apply_profile_snapshot(state, profiles, app_cfg);
+    update_diagnostics(state, client);
+    Ok(())
+}
+
+pub(crate) fn apply_profile_snapshot(
+    state: &mut TuiState,
+    profiles: Vec<crate::nm::WireguardProfile>,
+    app_cfg: config::AppConfig,
+) {
     state.rows = crate::app::profile_list::build_rows(
         &profiles,
         &app_cfg.excluded_profile_ids,
         &app_cfg.favorite_profile_ids,
         &app_cfg.profile_custom_info,
     );
+    let preserve_split =
+        state.pending_split.is_some() || matches!(state.modal, ActiveModal::SplitTunnel(_));
+    let pending_split = state.config.global_split_tunnel.clone();
     state.config = app_cfg;
+    if preserve_split {
+        state.config.global_split_tunnel = pending_split;
+    }
 
     // Both facts about the active row are taken in one pass so the borrow of
     // `state.rows` ends here: everything below mutates `state` as a whole.
@@ -632,6 +704,7 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
         .map(|row| (row.uuid.clone(), row.name.clone()))
         .unzip();
     state.active_profile_name = active_name;
+    state.active_profile_uuid = active_uuid.clone();
 
     if state.selected_index >= state.rows.len() {
         state.selected_index = state.rows.len().saturating_sub(1);
@@ -642,9 +715,6 @@ pub fn reload_profiles<C: NmClient>(state: &mut TuiState, client: &C) -> AppResu
     if let Some(uuid) = active_uuid {
         state.profile_cache.remove(&uuid);
     }
-
-    update_diagnostics(state, client);
-    Ok(())
 }
 
 pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
@@ -656,9 +726,19 @@ pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
     let info = match state.profile_cache.get(&uuid) {
         Some(cached) => cached.clone(),
         None => {
-            let fetched = fetch_profile_info(client, &uuid, is_active);
-            state.profile_cache.insert(uuid, fetched.clone());
-            fetched
+            if let Some(ref tx) = state.diag_tx {
+                let _ = tx.send((uuid.clone(), is_active));
+                CachedProfileInfo {
+                    diagnostics: ProfileDiagnostics::default(),
+                    tunnel_address: None,
+                    tunnel_dns: None,
+                    gateway: None,
+                }
+            } else {
+                let fetched = fetch_profile_info(client, &uuid, is_active);
+                state.profile_cache.insert(uuid, fetched.clone());
+                fetched
+            }
         }
     };
 
@@ -670,6 +750,20 @@ mod tests {
     use super::*;
     use crate::config::SplitTunnelMode;
     use crate::tui::state::CommandPaletteState;
+
+    #[test]
+    fn routing_changes_show_reconnect_toasts() {
+        let path = crate::testing::temp_config_path("reconnect-toast");
+        let client = crate::testing::MockNmClient::default();
+        let mut state = TuiState::new(path.clone(), config::AppConfig::default());
+        execute_action(&mut state, &client, "kill_switch").unwrap();
+        assert!(state.active_toast().unwrap().message.contains("reconnect"));
+        state
+            .apply_split_tunnel(&client, config::SplitTunnelConfig::default())
+            .unwrap();
+        assert!(state.active_toast().unwrap().message.contains("reconnect"));
+        crate::testing::remove_temp_config(&path);
+    }
 
     #[test]
     fn every_action_the_key_map_produces_is_offered_by_the_palette() {
@@ -946,6 +1040,23 @@ mod tests {
         assert_eq!(state.modal, ActiveModal::None);
         assert_eq!(state.config.theme.preset, "osaka-jade");
 
+        // Another process changes security intent while this TUI holds an old
+        // snapshot and unsubmitted split edits. A theme edit must save neither.
+        state.config.global_split_tunnel.mode = crate::config::SplitTunnelMode::Include;
+        config::update(&path, |cfg| cfg.lockdown_enabled = true).unwrap();
+        state.modal = ActiveModal::ThemePicker(ThemePickerState::default());
+        handle_theme_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let saved = config::load(&path).unwrap();
+        assert!(saved.lockdown_enabled);
+        assert!(state.config.lockdown_enabled);
+        assert_eq!(
+            saved.global_split_tunnel.mode,
+            crate::config::SplitTunnelMode::Disabled
+        );
+
         crate::testing::remove_temp_config(&path);
     }
 
@@ -1111,7 +1222,36 @@ mod tests {
             vec!["10.0.0.0/8".to_string()]
         );
 
-        // Esc closes modal
+        // Type duplicate CIDR "10.0.0.0/8" and press Enter -> input retained
+        for c in "10.0.0.0/8".chars() {
+            handle_key_event(
+                &mut state,
+                &client,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        if let ActiveModal::SplitTunnel(ref st) = state.modal {
+            assert_eq!(st.cidrs, vec!["10.0.0.0/8".to_string()]);
+            assert_eq!(st.cidr_input, "10.0.0.0/8");
+        }
+
+        // First Esc clears cidr_input, second Esc closes modal
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        if let ActiveModal::SplitTunnel(ref st) = state.modal {
+            assert_eq!(st.cidr_input, "");
+        }
         handle_key_event(
             &mut state,
             &client,

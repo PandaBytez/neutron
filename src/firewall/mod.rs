@@ -8,7 +8,7 @@
 //! Lockdown closes that gap. It installs an always-on `firewalld` ruleset that
 //! blocks **all** traffic except:
 //!
-//! * loopback and already-established connections,
+//! * loopback,
 //! * private/link-local networks (so LAN devices — router, printer, NAS, other
 //!   local hosts — stay reachable; these are not internet-routable, so allowing
 //!   them does not weaken the "no VPN, no internet" guarantee),
@@ -17,7 +17,7 @@
 //! * the WireGuard peer endpoints (the encrypted handshake, so the VPN can
 //!   still connect from a locked-down system).
 //!
-//! Everything else is rejected, even before any VPN is connected and across
+//! Everything else is dropped, even before any VPN is connected and across
 //! reboots (the rules are made `--permanent`). Changing the system firewall
 //! requires privileges, so the rule changes run through `pkexec`; the `disable`
 //! path always works to lift the block, so the user can never be permanently
@@ -29,6 +29,10 @@
 //! own `firewalld` direct rules are never disturbed. Teardown never falls back
 //! to a chain-wide clear: if it cannot remove one of its own rules it reports an
 //! error rather than wipe rules it did not create.
+//!
+//! Enforcement lives in mangle OUTPUT, before firewalld's filter-table
+//! ESTABLISHED accept on either backend. Disallowed packets are dropped there;
+//! allow rules only finish this table and do not bypass other firewall policy.
 //!
 //! Privileges note: *reading* the ruleset (`--get-rules`) does not require root,
 //! so those queries run unprivileged and never prompt. All rule *changes* for a
@@ -57,6 +61,8 @@ const MARKER_ARGS: [&str; 4] = ["-m", "comment", "--comment", LOCKDOWN_MARKER];
 
 /// Address families lockdown manages, each with its own OUTPUT chain.
 const FAMILIES: [&str; 2] = ["ipv4", "ipv6"];
+// Include the old filter table when removing rules installed by older versions.
+const MANAGED_TABLES: [&str; 2] = ["mangle", "filter"];
 
 /// IPv4 destination ranges kept reachable under lockdown so the local network
 /// keeps working: RFC 1918 private space, link-local, multicast (mDNS/SSDP) and
@@ -99,19 +105,16 @@ impl FirewallClient for crate::nm::CliNmClient {
         // the user is prompted for a password at most once. Reads are
         // unprivileged and never prompt.
         //
-        // The batch first clears any leftover Neutron rules (so re-enabling is
-        // idempotent and cannot fail with ALREADY_ENABLED), then installs the
-        // new ruleset and reloads.
-        let mut batches = marked_removal_batches()?;
-        batches.extend(lockdown_enable_batches(tunnels));
+        // Permanent fail-closed guards protect every intermediate rebuild state.
+        let mut batches = lockdown_rebuild_batches(marked_removal_batches()?, tunnels);
+        batches.extend(runtime_rebuild_batches(tunnels)?);
         run_privileged_batches(&batches)
     }
 
     fn disable_lockdown(&self) -> AppResult<()> {
-        // Collect surgical removals from an unprivileged read of each family,
-        // then remove them and reload in a single privileged batch (one prompt).
+        // Remove only Neutron rules from permanent and runtime configuration.
         let mut batches = marked_removal_batches()?;
-        batches.push(reload_batch());
+        batches.extend(runtime_removal_batches()?);
         run_privileged_batches(&batches)?;
 
         // Strictly scoped teardown: only our own tagged rules are ever removed,
@@ -139,9 +142,9 @@ impl FirewallClient for crate::nm::CliNmClient {
 /// go through `pkexec`: it never triggers a password prompt. That is what lets
 /// enable/disable read the current rules freely and confine privilege to the
 /// single batched write below (see [`crate::process::host_command`]).
-fn read_marked_rules(family: &str) -> AppResult<String> {
+fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
     let output = crate::process::host_command(FIREWALL_CMD)
-        .args(get_rules_batch(family))
+        .args(direct_args("--get-rules", family, table))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -160,6 +163,66 @@ fn read_marked_rules(family: &str) -> AppResult<String> {
     }))
 }
 
+/// Read direct rules across all tables and chains.
+fn read_direct_all_rules(permanent: bool) -> AppResult<String> {
+    let mut args = vec!["--direct", "--get-all-rules"];
+    if permanent {
+        args.insert(0, "--permanent");
+    }
+    let output = crate::process::host_command(FIREWALL_CMD)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| AppError::Firewall(error.to_string()))?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+
+    Err(AppError::Firewall(
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
+fn runtime_removal_batches() -> AppResult<Vec<Vec<String>>> {
+    Ok(read_direct_all_rules(false)?
+        .lines()
+        .filter(|line| line_is_marked(line))
+        .filter_map(|line| {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            if parts.len() < 5
+                || !FAMILIES.contains(&parts[0])
+                || !MANAGED_TABLES.contains(&parts[1])
+                || parts[2] != "OUTPUT"
+            {
+                return None;
+            }
+            let mut batch = vec!["--direct".into(), "--remove-rule".into()];
+            batch.extend(parts.into_iter().map(str::to_string));
+            Some(batch)
+        })
+        .collect())
+}
+
+fn runtime_rebuild_batches(tunnels: &[WireguardTunnel]) -> AppResult<Vec<Vec<String>>> {
+    let removals = runtime_removal_batches()?
+        .into_iter()
+        .map(|mut batch| {
+            batch.insert(0, "--permanent".into());
+            batch
+        })
+        .collect();
+    Ok(lockdown_rebuild_batches(removals, tunnels)
+        .into_iter()
+        .map(|mut batch| {
+            batch.remove(0);
+            batch
+        })
+        .collect())
+}
+
 /// Execute every `firewall-cmd` batch in a *single* `pkexec` invocation, so the
 /// user authenticates at most once regardless of how many rules change.
 ///
@@ -174,10 +237,8 @@ fn read_marked_rules(family: &str) -> AppResult<String> {
 /// `/bin/sh` is always present and listed, so this makes the escalation work
 /// regardless of the user's login shell.
 ///
-/// No timeout is imposed: `pkexec` is interactive (it may wait on a password
-/// prompt), so a deadline would race the user. The GUI runs this off the main
-/// thread, and the CLI is a foreground command, so a stuck call cannot freeze
-/// the UI.
+/// No timeout is imposed because `pkexec` may wait for a password prompt.
+/// This call blocks; interactive callers must account for authorization latency.
 fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
     if batches.is_empty() {
         return Ok(());
@@ -208,8 +269,8 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
 }
 
 /// Render `firewall-cmd` argument batches into a single `/bin/sh` script that
-/// runs each in order and aborts on the first failure (`set -e`), so a partial
-/// failure cannot silently leave a half-applied ruleset.
+/// runs each in order and aborts on the first failure (`set -e`). Rebuild guards
+/// keep partially applied permanent rules fail-closed.
 ///
 /// Every argument is shell-quoted (see [`shell_quote`]); values taken from
 /// WireGuard profiles (interface names, endpoint hosts) therefore cannot break
@@ -247,15 +308,45 @@ fn shell_quote(arg: &str) -> String {
     quoted
 }
 
-/// All `firewall-cmd` batches that install the lockdown ruleset: the IPv4 and
-/// IPv6 allow/reject rules followed by a `--reload` that makes the permanent
-/// rules live.
+/// Permanent IPv4/IPv6 rules; runtime rules are updated separately without reload.
 fn lockdown_enable_batches(tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
     let mut batches = Vec::new();
     for family in FAMILIES {
         batches.extend(lockdown_family_batches(family, tunnels));
     }
-    batches.push(reload_batch());
+    batches
+}
+
+/// Keep permanent protection complete at every rebuild boundary, including
+/// SIGKILL/power loss where a shell trap cannot roll back. A interrupted rebuild
+/// leaves a tagged fail-closed guard which disable or a successful retry removes.
+fn lockdown_rebuild_batches(
+    removals: Vec<Vec<String>>,
+    tunnels: &[WireguardTunnel],
+) -> Vec<Vec<String>> {
+    let guards: Vec<_> = FAMILIES
+        .iter()
+        .map(|family| add_rule(family, -1, &["-j", "DROP"]))
+        .collect();
+    let guard_removals: Vec<_> = guards
+        .iter()
+        .map(|guard| {
+            let mut remove = guard.clone();
+            remove[2] = "--remove-rule".into();
+            remove
+        })
+        .collect();
+    let mut batches = guards;
+    // A previous interrupted rebuild may already have guards. Do not remove
+    // those until both replacement families have been fully installed.
+    batches.extend(
+        removals
+            .into_iter()
+            .filter(|batch| !guard_removals.contains(batch)),
+    );
+    let replacement = lockdown_enable_batches(tunnels);
+    batches.extend(replacement);
+    batches.extend(guard_removals);
     batches
 }
 
@@ -263,8 +354,15 @@ fn lockdown_enable_batches(tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
 /// teardown safety check so we never leave the user locked out. The read is
 /// unprivileged, so this check costs no password prompt.
 fn family_has_marked_rule(family: &str) -> AppResult<bool> {
-    let listing = read_marked_rules(family)?;
-    Ok(listing.lines().any(line_is_marked))
+    for table in MANAGED_TABLES {
+        if read_marked_rules(family, table)?
+            .lines()
+            .any(line_is_marked)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a `--get-rules` output line is one of ours (carries the marker).
@@ -274,8 +372,8 @@ fn line_is_marked(line: &str) -> bool {
 }
 
 /// Direct rule argument prefix for permanent OUTPUT chain operations.
-fn direct_args(verb: &str, family: &str) -> Vec<String> {
-    ["--permanent", "--direct", verb, family, "filter", "OUTPUT"]
+fn direct_args(verb: &str, family: &str, table: &str) -> Vec<String> {
+    ["--permanent", "--direct", verb, family, table, "OUTPUT"]
         .iter()
         .map(|a| a.to_string())
         .collect()
@@ -285,7 +383,13 @@ fn direct_args(verb: &str, family: &str) -> Vec<String> {
 fn marked_removal_batches() -> AppResult<Vec<Vec<String>>> {
     let mut batches = Vec::new();
     for family in FAMILIES {
-        batches.extend(parse_marked_removals(family, &read_marked_rules(family)?));
+        for table in MANAGED_TABLES {
+            batches.extend(parse_marked_removals(
+                family,
+                table,
+                &read_marked_rules(family, table)?,
+            ));
+        }
     }
     Ok(batches)
 }
@@ -293,7 +397,7 @@ fn marked_removal_batches() -> AppResult<Vec<Vec<String>>> {
 /// Parse `--get-rules` output (a newline-separated list of `<priority> <args>`)
 /// into a `--remove-rule` batch for each Neutron-tagged rule. Untagged (foreign)
 /// rules are skipped so user-defined direct rules are preserved.
-fn parse_marked_removals(family: &str, listing: &str) -> Vec<Vec<String>> {
+fn parse_marked_removals(family: &str, table: &str, listing: &str) -> Vec<Vec<String>> {
     listing
         .lines()
         .filter(|line| line_is_marked(line))
@@ -302,7 +406,7 @@ fn parse_marked_removals(family: &str, listing: &str) -> Vec<Vec<String>> {
             // The first field is the rule priority; the rest are the iptables
             // args, fed back verbatim so `--remove-rule` matches exactly.
             let priority = tokens.next()?;
-            let mut batch = direct_args("--remove-rule", family);
+            let mut batch = direct_args("--remove-rule", family, table);
             batch.push(priority.to_string());
             batch.extend(tokens.map(|token| token.to_string()));
             Some(batch)
@@ -310,16 +414,25 @@ fn parse_marked_removals(family: &str, listing: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The allow + reject rules for a single address family (`ipv4`/`ipv6`).
+/// The allow + drop rules for a single address family (`ipv4`/`ipv6`).
 fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
     // Priorities order the rules within the chain: accepts (0/1) before the
-    // catch-all reject (10).
+    // catch-all drop (10).
     let mut batches = vec![add_rule(family, 0, &["-o", "lo", "-j", "ACCEPT"])];
+
+    let any_active = tunnels.iter().any(|t| t.is_active);
+    // Permit first traffic on configured tunnel interfaces before activation
+    // completes. The DNS exception below still depends on connection state.
+    for tunnel in tunnels {
+        if let Some(interface) = &tunnel.interface {
+            batches.push(add_rule(family, 0, &["-o", interface, "-j", "ACCEPT"]));
+        }
+    }
 
     // When disconnected (no tunnels active), allow broad DNS so peer endpoints
     // can resolve before connecting. When a tunnel is active, DNS travels through
     // the tunnel interface (-o <iface> -j ACCEPT) without leaking outside.
-    if tunnels.is_empty() {
+    if !any_active {
         batches.push(add_rule(
             family,
             1,
@@ -330,23 +443,32 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
             1,
             &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
         ));
+    } else {
+        // Block external/LAN-bound DNS while connected so queries cannot leak to LAN resolvers.
+        batches.push(add_rule(
+            family,
+            1,
+            &["-p", "udp", "--dport", "53", "-j", "DROP"],
+        ));
+        batches.push(add_rule(
+            family,
+            1,
+            &["-p", "tcp", "--dport", "53", "-j", "DROP"],
+        ));
     }
 
     // Keep the local network reachable (LAN devices, DHCP, mDNS).
     batches.extend(local_network_batches(family));
 
     for tunnel in tunnels {
-        if let Some(interface) = &tunnel.interface {
-            batches.push(add_rule(family, 1, &["-o", interface, "-j", "ACCEPT"]));
-        }
         for endpoint in &tunnel.endpoints {
             batches.extend(endpoint_rules(family, endpoint));
         }
     }
 
-    // Catch-all reject. The marker (added to every rule by `add_rule`) is what
+    // DROP is valid in mangle (REJECT is not). The marker added by `add_rule`
     // makes this and the allow rules above identifiable for surgical teardown.
-    batches.push(add_rule(family, 10, &["-j", "REJECT"]));
+    batches.push(add_rule(family, 10, &["-j", "DROP"]));
     batches
 }
 
@@ -443,15 +565,15 @@ fn endpoint_rules(family: &str, endpoint: &Endpoint) -> Vec<Vec<String>> {
     rules
 }
 
-/// Build a permanent `--direct --add-rule <family> filter OUTPUT <priority>
+/// Build a permanent `--direct --add-rule <family> mangle OUTPUT <priority>
 /// <rule...>` argument batch, tagging the rule with [`LOCKDOWN_MARKER`].
 ///
 /// The marker is inserted right before the trailing `-j <target>` (iptables
 /// requires matches to precede the jump) so every rule we install is
 /// identifiable and can be removed surgically at teardown without disturbing
 /// foreign direct rules. Each `rule` therefore must end with `-j <target>`.
-fn add_rule(family: &str, priority: u8, rule: &[&str]) -> Vec<String> {
-    let mut batch = direct_args("--add-rule", family);
+fn add_rule(family: &str, priority: i32, rule: &[&str]) -> Vec<String> {
+    let mut batch = direct_args("--add-rule", family, "mangle");
     batch.push(priority.to_string());
     let jump_at = rule.len().saturating_sub(2);
     batch.extend(rule[..jump_at].iter().map(|arg| arg.to_string()));
@@ -460,14 +582,7 @@ fn add_rule(family: &str, priority: u8, rule: &[&str]) -> Vec<String> {
     batch
 }
 
-/// The permanent `--direct --get-rules <family> filter OUTPUT` query batch,
-/// whose output drives [`parse_marked_removals`]. This is the only chain-wide
-/// `--direct` action lockdown issues: it reads the chain so teardown can target
-/// our own rules individually; it never clears the chain wholesale.
-fn get_rules_batch(family: &str) -> Vec<String> {
-    direct_args("--get-rules", family)
-}
-
+#[cfg(test)]
 fn reload_batch() -> Vec<String> {
     vec!["--reload".to_string()]
 }
@@ -476,16 +591,105 @@ fn reload_batch() -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn every_rebuild_prefix_retains_complete_policy_or_guard() {
+        let old = lockdown_enable_batches(&[tunnel("wg-old", &[])]);
+        let old_rules: Vec<_> = old.into_iter().filter(|b| b != &reload_batch()).collect();
+        let removals = old_rules.iter().map(|b| expected_removal(b)).collect();
+        let new_rules: Vec<_> = lockdown_enable_batches(&[tunnel("wg-new", &[])])
+            .into_iter()
+            .filter(|b| b != &reload_batch())
+            .collect();
+        let mut installed = old_rules.clone();
+        for batch in lockdown_rebuild_batches(removals, &[tunnel("wg-new", &[])]) {
+            if batch == reload_batch() {
+                continue;
+            }
+            let mut add = batch.clone();
+            add[2] = "--add-rule".into();
+            if batch[2] == "--add-rule" {
+                installed.push(add);
+            } else {
+                installed.retain(|b| b != &add);
+            }
+            for family in FAMILIES {
+                let complete = |rules: &[Vec<String>]| {
+                    rules
+                        .iter()
+                        .filter(|b| b[3] == family)
+                        .all(|b| installed.contains(b))
+                };
+                assert!(
+                    installed.contains(&add_rule(family, -1, &["-j", "DROP"]))
+                        || complete(&old_rules)
+                        || complete(&new_rules),
+                    "unprotected boundary: {batch:?}"
+                );
+            }
+        }
+        assert_eq!(installed, new_rules);
+    }
+
+    #[test]
+    #[ignore = "system test: requires the disposable sandbox"]
+    fn interrupted_rebuild_stays_closed_after_reload_and_recovers() {
+        crate::testing::require_sandbox();
+        let client = crate::nm::CliNmClient;
+        let tunnels = [tunnel("wg-old", &[])];
+        client.enable_lockdown(&tunnels).unwrap();
+        let batches =
+            lockdown_rebuild_batches(marked_removal_batches().unwrap(), &[tunnel("wg-new", &[])]);
+        // Inject interruption after removal, midway through replacement, and
+        // before guard removal. Reload makes the interrupted permanent state live.
+        let first_add = batches
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find(|(_, b)| b[2] == "--add-rule")
+            .unwrap()
+            .0;
+        for stop in [first_add, first_add + 3, batches.len() - 2] {
+            client.enable_lockdown(&tunnels).unwrap();
+            run_privileged_batches(&batches[..stop]).unwrap();
+            run_privileged_batches(&[reload_batch()]).unwrap();
+            for tool in ["iptables", "ip6tables"] {
+                let output = std::process::Command::new(tool)
+                    .args(["-t", "mangle", "-S"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                let rules = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    rules
+                        .lines()
+                        .any(|line| line.contains("neutron-lockdown") && line.ends_with("-j DROP")),
+                    "{rules}"
+                );
+            }
+            client.enable_lockdown(&tunnels).unwrap();
+            for family in FAMILIES {
+                assert!(
+                    !read_marked_rules(family, "mangle")
+                        .unwrap()
+                        .lines()
+                        .any(|line| line.starts_with("-1 "))
+                );
+            }
+        }
+        client.disable_lockdown().unwrap();
+    }
+
     fn tunnel(interface: &str, endpoints: &[(&str, u16)]) -> WireguardTunnel {
         WireguardTunnel {
             interface: Some(interface.to_string()),
             endpoints: endpoints
                 .iter()
                 .map(|(host, port)| Endpoint {
-                    host: host.to_string(),
+                    host: (*host).to_string(),
                     port: *port,
                 })
                 .collect(),
+            is_active: true,
         }
     }
 
@@ -506,7 +710,7 @@ mod tests {
     /// OUTPUT` (6 tokens). Lets tests feed what we *installed* straight back
     /// into the teardown parser to prove the round-trip.
     fn as_get_rules_line(add_batch: &[String]) -> String {
-        let prefix_len = direct_args("--add-rule", "ipv4").len();
+        let prefix_len = direct_args("--add-rule", "ipv4", "mangle").len();
         add_batch[prefix_len..].join(" ")
     }
 
@@ -526,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn enable_batches_cover_both_families_and_reload_last() {
+    fn enable_batches_cover_both_families_without_global_reload() {
         let batches = lockdown_enable_batches(&[]);
 
         assert!(
@@ -539,22 +743,34 @@ mod tests {
                 .iter()
                 .any(|batch| batch.contains(&"ipv6".to_string()))
         );
-        assert_eq!(batches.last().expect("non-empty"), &reload_batch());
+        assert!(!batches.iter().any(|b| b == &reload_batch()));
     }
 
     #[test]
-    fn enable_batches_allow_loopback_dns_and_reject_marker() {
+    fn enable_batches_allow_loopback_dns_and_drop_before_filter() {
         let batches = lockdown_enable_batches(&[]);
 
         assert!(has_rule(&batches, &["-o", "lo", "-j", "ACCEPT"]));
         assert!(has_rule(&batches, &["--dport", "53"]));
-        // The catch-all reject carries the recognizable marker.
+        // The catch-all drop carries the recognizable marker.
         assert!(has_rule(&batches, &["--comment", LOCKDOWN_MARKER]));
         assert!(
             batches
                 .iter()
-                .any(|batch| batch.contains(&"REJECT".to_string()))
+                .any(|batch| batch.contains(&"DROP".to_string()) && batch[4] == "mangle")
         );
+    }
+
+    #[test]
+    fn disconnected_bootstrap_dns_and_connected_lan_dns_drop() {
+        let mut inactive = tunnel("wg0", &[("vpn.example.com", 51820)]);
+        inactive.is_active = false;
+        let disconnected = lockdown_enable_batches(&[inactive]);
+        assert!(has_rule(&disconnected, &["--dport", "53", "-j", "ACCEPT"]));
+
+        let active = lockdown_enable_batches(&[tunnel("wg0", &[("vpn.example.com", 51820)])]);
+        assert!(!has_rule(&active, &["--dport", "53", "-j", "ACCEPT"]));
+        assert!(has_rule(&active, &["--dport", "53", "-j", "DROP"]));
     }
 
     #[test]
@@ -663,7 +879,7 @@ mod tests {
 0 -o lo -m comment --comment neutron-lockdown -j ACCEPT
 10 -m comment --comment neutron-lockdown -j REJECT
 ";
-        let removals = parse_marked_removals("ipv4", listing);
+        let removals = parse_marked_removals("ipv4", "filter", listing);
 
         // Only the two tagged rules are removed; the foreign `eth0` rule is left.
         assert_eq!(removals.len(), 2);
@@ -685,7 +901,7 @@ mod tests {
         // followed by the exact iptables args, so `--remove-rule` matches.
         let listing = "10 -m comment --comment neutron-lockdown -j REJECT\n";
 
-        let removals = parse_marked_removals("ipv6", listing);
+        let removals = parse_marked_removals("ipv6", "filter", listing);
 
         assert_eq!(
             removals,
@@ -709,19 +925,19 @@ mod tests {
 
     #[test]
     fn parse_marked_removals_ignores_blank_lines() {
-        assert!(parse_marked_removals("ipv4", "\n   \n").is_empty());
+        assert!(parse_marked_removals("ipv4", "mangle", "\n   \n").is_empty());
     }
 
     #[test]
     fn get_rules_batch_is_permanent_and_scoped_to_output() {
         assert_eq!(
-            get_rules_batch("ipv4"),
+            direct_args("--get-rules", "ipv4", "mangle"),
             vec![
                 "--permanent".to_string(),
                 "--direct".to_string(),
                 "--get-rules".to_string(),
                 "ipv4".to_string(),
-                "filter".to_string(),
+                "mangle".to_string(),
                 "OUTPUT".to_string(),
             ]
         );
@@ -765,7 +981,7 @@ mod tests {
 0 -o lo -m comment --comment other-app -j ACCEPT
 10 -m comment --comment neutron-lockdown -j REJECT
 ";
-        let removals = parse_marked_removals("ipv4", listing);
+        let removals = parse_marked_removals("ipv4", "filter", listing);
 
         assert_eq!(removals.len(), 1);
         assert!(
@@ -785,7 +1001,7 @@ mod tests {
 0 -o lo -m comment --comment neutron-lockdown -j ACCEPT
 10 -m comment --comment neutron-lockdown -j REJECT
 ";
-        let removals = parse_marked_removals("ipv4", listing);
+        let removals = parse_marked_removals("ipv4", "filter", listing);
 
         assert!(!removals.is_empty());
         for batch in &removals {
@@ -811,7 +1027,7 @@ mod tests {
                 continue;
             }
             let family = &add[3];
-            let removals = parse_marked_removals(family, &as_get_rules_line(&add));
+            let removals = parse_marked_removals(family, &add[4], &as_get_rules_line(&add));
             assert_eq!(
                 removals,
                 vec![expected_removal(&add)],
@@ -849,7 +1065,7 @@ mod tests {
         ];
         let script = build_firewall_script(&batches);
 
-        // `set -e` so a failed command stops the rest (no half-applied ruleset).
+        // `set -e` stops subsequent commands after a failure.
         assert!(script.starts_with("set -e\n"));
         // One `firewall-cmd` line per batch, each argument single-quoted.
         assert!(script.contains("\nfirewall-cmd '--reload'\n"));

@@ -84,15 +84,10 @@ pub struct GeneralConfig {
     /// what the UI renders. An earlier top-level `autoconnect_at_boot` field
     /// duplicated it and drifted, so it is deliberately not reintroduced; the
     /// alias keeps configs written by those versions loading correctly.
-    #[serde(default = "default_true", alias = "autoconnect_at_boot")]
+    #[serde(default, alias = "autoconnect_at_boot")]
     pub autoconnect_at_login: bool,
-    /// Whether a freshly activated tunnel is checked for actually carrying
-    /// traffic, and taken back down if it is not.
-    ///
-    /// On by default: `nmcli` reporting success only means the interface was
-    /// created, so without this a dead peer looks like a working connection
-    /// while swallowing every packet. Can be turned off for networks where the
-    /// probe is unreliable.
+    /// Verify fresh tunnels with an endpoint and persistent keepalive; disconnect
+    /// if no authenticated traffic arrives. Idle on-demand tunnels are exempt.
     #[serde(default = "default_true")]
     pub verify_tunnel_on_connect: bool,
 }
@@ -106,7 +101,7 @@ impl Default for GeneralConfig {
         Self {
             profiles_dir: default_profiles_dir(),
             auto_sync_profiles: default_true(),
-            autoconnect_at_login: default_true(),
+            autoconnect_at_login: false,
             verify_tunnel_on_connect: default_true(),
         }
     }
@@ -213,8 +208,9 @@ pub struct AppConfig {
     /// qBittorrent dynamic port forwarding synchronization
     #[serde(default)]
     pub qbittorrent: QBittorrentConfig,
-    /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
-    #[serde(default)]
+    /// Imported notes keyed by UUID. Loaded from profile-info.json; the legacy
+    /// inline field is accepted for migration but never serialized into settings.
+    #[serde(default, skip_serializing)]
     pub profile_custom_info: BTreeMap<String, String>,
 }
 
@@ -223,26 +219,132 @@ fn default_true() -> bool {
 }
 
 pub fn load(path: &Path) -> AppResult<AppConfig> {
-    if !path.exists() {
-        return Ok(AppConfig::default());
-    }
-
-    let data = fs::read_to_string(path)?;
-    if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        let parsed = serde_json::from_str::<AppConfig>(&data)?;
-        Ok(parsed)
+    let mut config = if path.exists() {
+        let data = fs::read_to_string(path)?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            serde_json::from_str::<AppConfig>(&data)?
+        } else {
+            toml::from_str::<AppConfig>(&data)?
+        }
     } else {
-        let parsed = toml::from_str::<AppConfig>(&data)?;
-        Ok(parsed)
+        AppConfig::default()
+    };
+    if let Some(info) = read_profile_info(path)? {
+        // The sidecar is authoritative, even when empty: a failed settings
+        // save must not resurrect deleted notes from the old inline field.
+        config.profile_custom_info = info;
+    }
+    Ok(config)
+}
+
+fn profile_info_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("profile-info.json")
+}
+
+fn read_profile_info(config_path: &Path) -> AppResult<Option<BTreeMap<String, String>>> {
+    let path = profile_info_path(config_path);
+    match fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).map(Some).map_err(|error| {
+            AppError::Config(format!("could not parse {}: {error}", path.display()))
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::Config(format!(
+            "could not read {}: {error}",
+            path.display()
+        ))),
     }
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
+    let _lock = lock_config(path)?;
+    save_unlocked(path, config)
+}
+
+static IN_PROCESS_POLICY_LOCKS: std::sync::Mutex<
+    Option<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::Mutex::new(None);
+
+fn path_policy_mutex(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let mut lock = IN_PROCESS_POLICY_LOCKS.lock().unwrap();
+    let map = lock.get_or_insert_with(std::collections::HashMap::new);
+    map.entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Coordinate global policy sweeps and activation so concurrent workers cannot
+/// interleave profile changes and overwrite settings with stale configurations.
+pub fn coordinate_policy<R>(path: &Path, f: impl FnOnce() -> AppResult<R>) -> AppResult<R> {
+    let mutex = path_policy_mutex(path);
+    let _mem_lock = mutex
+        .lock()
+        .map_err(|_| AppError::Config("policy coordination mutex poisoned".to_string()))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".policy.lock");
+    let lock = options.open(PathBuf::from(lock_path))?;
+    lock.lock()?;
+    f()
+}
+
+/// Serialize narrow read-modify-write edits across threads and Neutron processes.
+/// Lock a stable sidecar, since atomic replacement changes the config's inode.
+pub fn update(path: &Path, edit: impl FnOnce(&mut AppConfig)) -> AppResult<AppConfig> {
+    let _lock = lock_config(path)?;
+    let mut config = load(path)?;
+    edit(&mut config);
+    save_unlocked(path, &config)?;
+    Ok(config)
+}
+
+fn lock_config(path: &Path) -> AppResult<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = options.open(PathBuf::from(lock_path))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn save_unlocked(path: &Path, config: &AppConfig) -> AppResult<()> {
     let body = if path.extension().and_then(|e| e.to_str()) == Some("json") {
         serde_json::to_string_pretty(config)?
     } else {
         toml::to_string_pretty(config)?
     };
+    let stored_info = read_profile_info(path)?;
+    if stored_info.as_ref() != Some(&config.profile_custom_info)
+        && (stored_info.is_some() || !config.profile_custom_info.is_empty())
+    {
+        // Preserve notes before removing their legacy copy from settings. Both
+        // writes share the config lock; each individual file is replaced atomically.
+        let info_path = profile_info_path(path);
+        write_atomically(
+            &info_path,
+            &serde_json::to_string_pretty(&config.profile_custom_info)?,
+        )
+        .map_err(|error| {
+            AppError::Config(format!("could not save {}: {error}", info_path.display()))
+        })?;
+    }
     write_atomically(path, &body)?;
     Ok(())
 }
@@ -353,6 +455,104 @@ pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_notes_migrate_from_toml_and_json_and_follow_profile_deletion() {
+        for (label, legacy) in [
+            (
+                "notes",
+                "[profile_custom_info]\nuuid = \"Provider notes\\nSecond line\"\n",
+            ),
+            (
+                "notes.json",
+                r#"{"profile_custom_info":{"uuid":"Provider notes\nSecond line"}}"#,
+            ),
+        ] {
+            let path = unique_path(label);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, legacy).unwrap();
+            assert_eq!(
+                load(&path).unwrap().profile_custom_info["uuid"],
+                "Provider notes\nSecond line"
+            );
+            assert!(
+                !profile_info_path(&path).exists(),
+                "reading must not migrate files"
+            );
+            update(&path, |cfg| cfg.theme.preset = "gruvbox".into()).unwrap();
+            assert!(
+                !fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("profile_custom_info")
+            );
+            assert_eq!(
+                load(&path).unwrap().profile_custom_info["uuid"],
+                "Provider notes\nSecond line"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(profile_info_path(&path))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            update(&path, |cfg| {
+                forget_profile(cfg, "uuid");
+            })
+            .unwrap();
+            assert!(load(&path).unwrap().profile_custom_info.is_empty());
+            // A stale inline copy after an interrupted save must not resurrect notes.
+            fs::write(&path, legacy).unwrap();
+            assert!(load(&path).unwrap().profile_custom_info.is_empty());
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn failed_metadata_migration_preserves_inline_notes_and_reports_the_file() {
+        let path = unique_path("notes-failed-migration");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = "[profile_custom_info]\nuuid = \"keep me\"\n";
+        fs::write(&path, legacy).unwrap();
+        fs::create_dir(profile_info_path(&path)).unwrap();
+        let error = update(&path, |_| {}).unwrap_err();
+        assert!(error.to_string().contains("profile-info.json"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
+        fs::remove_dir(profile_info_path(&path)).unwrap();
+        fs::write(profile_info_path(&path), "invalid JSON").unwrap();
+        assert!(load(&path).is_err());
+        assert!(save(&path, &AppConfig::default()).is_err());
+        assert_eq!(
+            fs::read_to_string(profile_info_path(&path)).unwrap(),
+            "invalid JSON"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn concurrent_narrow_updates_preserve_every_writer() {
+        let path = unique_path("concurrent-updates");
+        save(&path, &AppConfig::default()).unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let path = &path;
+                scope.spawn(move || {
+                    update(path, |cfg| {
+                        cfg.favorite_profile_ids.insert(format!("uuid-{i}"));
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(load(&path).unwrap().favorite_profile_ids.len(), 16);
+        cleanup(&path);
+    }
 
     #[test]
     fn roundtrips_toml_config() {

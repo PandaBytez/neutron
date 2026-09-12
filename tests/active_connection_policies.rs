@@ -276,7 +276,65 @@ fn switching_profiles_pins_routing_on_the_new_target() {
 }
 
 #[test]
+fn switching_fails_when_active_profile_teardown_fails() {
+    let client = MockNmClient::new(vec![
+        profile("wg-eu", "uuid-eu", ProfileState::Active),
+        profile("wg-us", "uuid-us", ProfileState::Inactive),
+    ])
+    .fail_disconnect()
+    .strict_disconnect();
+
+    let res = client.switch_to("uuid-us");
+    assert!(
+        res.is_err(),
+        "switch_to must fail if previous active tunnel teardown fails"
+    );
+}
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "neutron-sync-lockdown-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = sandbox.join("neutron");
+    let profiles_dir = config_dir.join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    let conf = profiles_dir.join("test-sync.conf");
+    std::fs::write(&conf, "[Interface]\nPrivateKey = a\n").unwrap();
+
+    let config_path = config_dir.join("config.toml");
+    let config = AppConfig {
+        general: config::GeneralConfig {
+            profiles_dir: profiles_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        },
+        lockdown_enabled: true,
+        ..Default::default()
+    };
+    config::save(&config_path, &config).expect("config should save");
+
+    let client = MockNmClient::new(vec![]);
+    let report = neutron::app::sync::sync_profiles_dir(&client, &config).unwrap();
+    assert_eq!(report.imported, vec!["test-sync".to_string()]);
+    neutron::app::rebuild_lockdown_if_enabled(&client, &config_path).unwrap();
+
+    assert!(
+        !client.lockdown_calls().is_empty(),
+        "importing must rebuild lockdown allowances"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
 fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
     let sandbox = std::env::temp_dir().join(format!(
         "neutron-import-test-{}",
         std::time::SystemTime::now()
@@ -334,6 +392,7 @@ fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
 
 #[test]
 fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
     let sandbox = std::env::temp_dir().join(format!(
         "neutron-activate-test-{}",
         std::time::SystemTime::now()
@@ -374,4 +433,65 @@ fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel(
 
     unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn policy_sweep_and_activation_are_coordinated_without_conflicting_settings() {
+    let path = testing::temp_config_path("coord-test");
+    let initial_cfg = AppConfig {
+        global_split_tunnel: SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            cidrs: vec!["10.0.0.0/8".to_string()],
+            domains: Vec::new(),
+        },
+        ..Default::default()
+    };
+    config::save(&path, &initial_cfg).unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let client = MockNmClient::new(vec![
+        profile("wg-a", "uuid-a", ProfileState::Inactive),
+        profile("wg-b", "uuid-b", ProfileState::Inactive),
+    ])
+    .with_config_path(path.clone())
+    .with_sweep_barrier(barrier.clone());
+
+    let client_for_sweep = client.clone();
+    let path_for_sweep = path.clone();
+    let sweep_handle = std::thread::spawn(move || {
+        let new_st = SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            cidrs: vec!["192.168.0.0/16".to_string()],
+            domains: Vec::new(),
+        };
+        neutron::app::split_tunnel::apply_and_persist_global_split_tunnel(
+            &client_for_sweep,
+            &path_for_sweep,
+            &new_st,
+        )
+    });
+
+    // Wait until policy sweep has entered apply and hit the barrier
+    barrier.wait();
+
+    let client_for_conn = client.clone();
+    let conn_handle = std::thread::spawn(move || client_for_conn.connect("uuid-a"));
+
+    let sweep_res = sweep_handle.join().unwrap();
+    let conn_res = conn_handle.join().unwrap();
+    assert!(sweep_res.is_ok());
+    assert!(conn_res.is_ok());
+
+    // uuid-a must end up with Exclude policy, not the stale Include policy
+    let saved = config::load(&path).unwrap();
+    assert_eq!(saved.global_split_tunnel.mode, SplitTunnelMode::Exclude);
+
+    // Verify settings on uuid-a reflect Exclude mode
+    let routes = client.setting("uuid-a", "ipv4.routes").unwrap();
+    assert!(
+        !routes.contains("10.0.0.0/8"),
+        "must not retain old Include route"
+    );
+
+    testing::remove_temp_config(&path);
 }

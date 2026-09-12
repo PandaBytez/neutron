@@ -29,8 +29,10 @@ const DISCONNECTED_24_ARGB32: &[u8] =
 #[derive(Debug, Clone, Default)]
 pub struct IndicatorSharedState {
     pub active_profile: Option<String>,
+    pub active_uuid: Option<String>,
     pub forwarded_port: Option<u16>,
     pub favorite_profiles: Vec<(String, String)>,
+    pub favorite_id_map: HashMap<i32, String>,
     pub menu_revision: u32,
 }
 
@@ -259,15 +261,21 @@ where
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> MenuLayoutResult<'_> {
-        let (prof, port_opt, favorites, rev) = if let Ok(st) = self.state.lock() {
-            (
-                st.active_profile.clone(),
-                st.forwarded_port,
-                st.favorite_profiles.clone(),
-                st.menu_revision,
-            )
+        let (prof, active_uuid, port_opt, favorites, rev) = if let Ok(mut st) = self.state.lock() {
+            let active_prof = st.active_profile.clone();
+            let active_id = st.active_uuid.clone();
+            let port = st.forwarded_port;
+            let favs = st.favorite_profiles.clone();
+            let rev = st.menu_revision;
+            for (uuid, _) in &favs {
+                if !st.favorite_id_map.values().any(|known| known == uuid) {
+                    let id = st.favorite_id_map.keys().max().copied().unwrap_or(99) + 1;
+                    st.favorite_id_map.insert(id, uuid.clone());
+                }
+            }
+            (active_prof, active_id, port, favs, rev)
         } else {
-            (None, None, Vec::new(), 1)
+            (None, None, None, Vec::new(), 1)
         };
 
         let mut children = Vec::new();
@@ -291,8 +299,8 @@ where
             fav_sep.insert("visible".to_string(), Value::from(true));
             children.push(Value::from((10i32, fav_sep, Vec::<Value<'_>>::new())));
 
-            for (idx, (_uuid, name)) in favorites.iter().enumerate() {
-                let is_active = prof.as_deref() == Some(name.as_str());
+            for (uuid, name) in &favorites {
+                let is_active = active_uuid.as_deref() == Some(uuid.as_str());
                 let label = if is_active {
                     format!("{name} (Active)")
                 } else {
@@ -302,7 +310,17 @@ where
                 fav_props.insert("label".to_string(), Value::from(label));
                 fav_props.insert("enabled".to_string(), Value::from(true));
                 fav_props.insert("visible".to_string(), Value::from(true));
-                let item_id = 100 + idx as i32;
+                let item_id = self
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|st| {
+                        st.favorite_id_map
+                            .iter()
+                            .find(|(_, known)| *known == uuid)
+                            .map(|(id, _)| *id)
+                    })
+                    .unwrap_or(-1);
                 children.push(Value::from((item_id, fav_props, Vec::<Value<'_>>::new())));
             }
         }
@@ -373,11 +391,20 @@ where
                 std::process::exit(0);
             }
             item_id if item_id >= 100 => {
-                let idx = (item_id - 100) as usize;
-                if let Ok(st) = self.state.lock()
-                    && let Some((uuid, _)) = st.favorite_profiles.get(idx)
+                let target_uuid = self.state.lock().ok().and_then(|st| {
+                    st.favorite_id_map
+                        .get(&item_id)
+                        .filter(|uuid| {
+                            st.favorite_profiles
+                                .iter()
+                                .any(|(current, _)| current == *uuid)
+                        })
+                        .cloned()
+                });
+                if let Some(uuid) = target_uuid
+                    && let Err(err) = self.client.switch_to(&uuid)
                 {
-                    let _ = self.client.switch_to(uuid);
+                    warn!("Failed to switch to favorite profile '{uuid}': {err}");
                 }
             }
             _ => {}
@@ -397,16 +424,28 @@ where
 }
 
 fn copy_to_clipboard(text: &str) {
-    if std::process::Command::new("wl-copy")
-        .arg(text)
-        .status()
-        .is_ok()
+    if let Ok(status) = std::process::Command::new("wl-copy").arg(text).status()
+        && status.success()
     {
         return;
     }
     use std::io::Write;
     if let Ok(mut child) = std::process::Command::new("xclip")
         .args(["-selection", "clipboard"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if let Ok(status) = child.wait()
+            && status.success()
+        {
+            return;
+        }
+    }
+    if let Ok(mut child) = std::process::Command::new("xsel")
+        .args(["--clipboard", "--input"])
         .stdin(std::process::Stdio::piped())
         .spawn()
     {
@@ -561,7 +600,7 @@ where
                 }
             });
 
-            // Keep D-Bus connection processing all incoming requests with 0ms latency
+            // Keep the D-Bus connection alive while its executor handles requests.
             std::future::pending::<()>().await
         });
     })
@@ -617,12 +656,18 @@ struct LeaseTracker {
     tunnel_uuid: Option<String>,
     /// The port the gateway mapped.
     port: Option<u16>,
-    /// When the mapping last succeeded. Advanced only on success, so a transient
-    /// failure retries on the next poll rather than waiting out another
-    /// [`crate::portforward::RENEW_INTERVAL`] and letting the lease lapse.
-    leased_at: Option<std::time::Instant>,
+    /// Last mapping attempt, including failures. Independent of lease validity
+    /// so unsupported gateways are not retried on every poll (BUG-033).
+    attempted_at: Option<std::time::Instant>,
+    /// When the current mapping lease expires. None when no lease is held (BUG-014).
+    expires_at: Option<std::time::Instant>,
+    /// Granted lease duration, or zero if unmapped.
+    lifetime: std::time::Duration,
     /// What became of the last push to qBittorrent.
     qbit_sync: QbitSyncStatus,
+    /// Last qBittorrent configuration associated with the sync verdict (BUG-055).
+    last_qbit_config: Option<crate::config::QBittorrentConfig>,
+    qbit_attempted_at: Option<std::time::Instant>,
 }
 
 impl LeaseTracker {
@@ -637,41 +682,100 @@ impl LeaseTracker {
         if self.tunnel_uuid != *active_uuid {
             self.tunnel_uuid = active_uuid.clone();
             self.release();
+            self.attempted_at = None;
         }
     }
 
     /// Give up the lease and everything said about it.
     fn release(&mut self) {
         self.port = None;
-        self.leased_at = None;
+        self.expires_at = None;
+        self.lifetime = std::time::Duration::ZERO;
         self.qbit_sync = QbitSyncStatus::Pending;
+        self.last_qbit_config = None;
+        self.qbit_attempted_at = None;
+    }
+
+    /// Expire the lease if its granted lifetime has passed.
+    fn check_expiry(&mut self) -> bool {
+        self.check_expiry_at(std::time::Instant::now())
+    }
+
+    fn check_expiry_at(&mut self, now: std::time::Instant) -> bool {
+        if let Some(exp) = self.expires_at
+            && now >= exp
+        {
+            self.release();
+            return true;
+        }
+        false
     }
 
     /// Whether the mapping should be renewed on this poll.
     fn is_due(&self) -> bool {
-        self.leased_at
-            .is_none_or(|at| at.elapsed() >= crate::portforward::RENEW_INTERVAL)
+        self.is_due_at(std::time::Instant::now())
     }
 
-    /// Record the outcome of a renewal, reporting whether qBittorrent should now
-    /// be told about the port.
-    ///
-    /// A renewal normally returns the same port, so a push gated only on the port
-    /// *changing* would never retry: qBittorrent started after a failed first
-    /// attempt would stay unsynced for the life of the tunnel, showing a failure
-    /// the user has no way to clear. A previous failure is therefore retried on
-    /// every renewal.
-    fn record(&mut self, mapped: Option<u16>) -> bool {
-        self.leased_at = Some(std::time::Instant::now());
+    fn is_due_at(&self, now: std::time::Instant) -> bool {
+        self.attempted_at.is_none_or(|at| {
+            let renew_after = if self.lifetime.is_zero() {
+                crate::portforward::RENEW_INTERVAL
+            } else {
+                (self.lifetime / 2).min(crate::portforward::RENEW_INTERVAL)
+            };
+            now.saturating_duration_since(at) >= renew_after
+        })
+    }
+
+    /// Record the outcome of a renewal, reporting whether the mapped port changed.
+    fn record(&mut self, mapped: Option<crate::portforward::PortMapping>) -> bool {
+        self.record_at(mapped, std::time::Instant::now())
+    }
+
+    fn record_at(
+        &mut self,
+        mapped: Option<crate::portforward::PortMapping>,
+        now: std::time::Instant,
+    ) -> bool {
+        self.attempted_at = Some(now);
 
         let Some(mapped) = mapped else {
             self.release();
             return false;
         };
 
-        let changed = self.port != Some(mapped);
-        self.port = Some(mapped);
+        let duration = std::time::Duration::from_secs(mapped.lifetime_secs as u64);
+        self.lifetime = duration;
+        self.expires_at = Some(now + duration);
+
+        let changed = self.port != Some(mapped.port);
+        self.port = Some(mapped.port);
+        if changed {
+            self.qbit_sync = QbitSyncStatus::Pending;
+        }
         changed || self.qbit_sync == QbitSyncStatus::Failed
+    }
+
+    /// Whether qBittorrent synchronization is required (BUG-055).
+    fn sync_needed(&self, current_cfg: &crate::config::QBittorrentConfig) -> bool {
+        self.sync_needed_at(current_cfg, std::time::Instant::now())
+    }
+
+    fn sync_needed_at(
+        &self,
+        current_cfg: &crate::config::QBittorrentConfig,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.port.is_none() || !current_cfg.enabled {
+            return false;
+        }
+        if self.last_qbit_config.as_ref() != Some(current_cfg) {
+            return true;
+        }
+        (self.qbit_sync == QbitSyncStatus::Failed || self.qbit_sync == QbitSyncStatus::Pending)
+            && self.qbit_attempted_at.is_none_or(|at| {
+                now.saturating_duration_since(at) >= crate::portforward::RENEW_INTERVAL
+            })
     }
 
     /// The lease as published for the TUI.
@@ -701,12 +805,43 @@ fn active_profile<C: NmClient>(client: &C) -> Option<crate::nm::WireguardProfile
 /// connection change within a second or two.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+pub fn acquire_indicator_lock_in(dir: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
+    let lock_path = dir.join("indicator.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path).ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => None,
+    }
+}
+
+pub fn acquire_indicator_lock() -> Option<std::fs::File> {
+    let path = crate::config::default_config_path().ok()?;
+    let parent = path.parent()?;
+    acquire_indicator_lock_in(parent)
+}
+
 /// Run standalone persistent indicator daemon in the foreground.
 pub fn run_standalone_indicator<C>(client: C) -> AppResult<()>
 where
-    C: NmClient + Clone + Send + Sync + 'static,
+    C: NmClient + crate::firewall::FirewallClient + Clone + Send + Sync + 'static,
 {
     install_status_icons();
+
+    let _indicator_lock = match acquire_indicator_lock() {
+        Some(file) => file,
+        None => {
+            debug!("Another indicator daemon holds the lock, exiting.");
+            return Ok(());
+        }
+    };
 
     if is_indicator_running() {
         debug!("Indicator daemon already active, exiting.");
@@ -731,12 +866,23 @@ where
     let _handle = spawn_indicator_service(client.clone(), state.clone());
 
     let mut lease = LeaseTracker::default();
+    let mut prev_active_uuid: Option<Option<String>> = None;
+    let mut last_domain_refresh = std::time::Instant::now();
 
     loop {
         let profiles = client.list_wireguard_profiles().unwrap_or_default();
         let active = profiles.iter().find(|p| p.is_active());
         let active_name = active.map(|profile| profile.name.clone());
         let active_uuid = active.map(|profile| profile.uuid.clone());
+
+        if prev_active_uuid.as_ref() != Some(&active_uuid)
+            && let Ok(path) = crate::config::default_config_path()
+        {
+            match crate::app::rebuild_lockdown_if_enabled(&client, &path) {
+                Ok(()) => prev_active_uuid = Some(active_uuid.clone()),
+                Err(error) => warn!("lockdown reconciliation failed; will retry: {error}"),
+            }
+        }
 
         let app_cfg = crate::config::default_config_path()
             .ok()
@@ -750,30 +896,55 @@ where
             .collect();
 
         lease.follow_tunnel(&active_uuid);
+        let renewal_due = lease.is_due();
+        lease.check_expiry();
 
         if !app_cfg.port_forwarding.enabled {
             lease.release();
-        } else if let Some(profile) = active
-            && lease.is_due()
-            && let Some(address) = client.tunnel_address(&profile.uuid)
-        {
-            let mapped = crate::portforward::port_for_tunnel_address(&address);
-            if lease.record(mapped) {
+        } else if let Some(profile) = active {
+            if renewal_due {
+                if let Some(address) = client.tunnel_address(&profile.uuid) {
+                    let mapped = crate::portforward::mapping_for_tunnel_address(&address);
+                    lease.record(mapped);
+                } else {
+                    lease.attempted_at = Some(std::time::Instant::now());
+                }
+            }
+
+            if lease.sync_needed(&app_cfg.qbittorrent) {
+                lease.last_qbit_config = Some(app_cfg.qbittorrent.clone());
+                lease.qbit_attempted_at = Some(std::time::Instant::now());
                 lease.qbit_sync =
                     sync_qbittorrent_port(&client, &profile.uuid, lease.port.unwrap_or_default());
             }
         }
 
+        if active.is_some() && last_domain_refresh.elapsed() >= Duration::from_secs(30) {
+            last_domain_refresh = std::time::Instant::now();
+            if let Ok(path) = crate::config::default_config_path()
+                && let Err(error) =
+                    crate::app::split_tunnel::refresh_active_domain_routes(&client, &path)
+            {
+                warn!("active domain-route refresh failed: {error}");
+            }
+        }
+        lease.check_expiry();
+
         // Republished every poll even when nothing changed: the timestamp is how
         // a reader tells a held lease from one left behind by a dead daemon.
-        crate::service::lease::publish(&lease.publication(active_uuid.clone()));
+        if !crate::service::lease::publish(&lease.publication(active_uuid.clone())) {
+            warn!("Lease publication rejected by active owner, exiting duplicate indicator.");
+            return Ok(());
+        }
 
         if let Ok(mut st) = state.lock()
             && (st.active_profile != active_name
+                || st.active_uuid != active_uuid
                 || st.forwarded_port != lease.port
                 || st.favorite_profiles != favorites)
         {
             st.active_profile = active_name;
+            st.active_uuid = active_uuid.clone();
             st.forwarded_port = lease.port;
             st.favorite_profiles = favorites;
             st.menu_revision += 1;
@@ -795,6 +966,7 @@ mod tests {
             forwarded_port: port,
             favorite_profiles: Vec::new(),
             menu_revision: 1,
+            ..Default::default()
         }));
         StatusNotifierItem { state }
     }
@@ -805,9 +977,122 @@ mod tests {
             forwarded_port: port,
             favorite_profiles: Vec::new(),
             menu_revision: 1,
+            ..Default::default()
         }));
         let client = MockNmClient::default();
         DBusMenu { client, state }
+    }
+
+    fn test_mapping(port: u16) -> crate::portforward::PortMapping {
+        crate::portforward::PortMapping {
+            port,
+            lifetime_secs: crate::portforward::LIFETIME,
+        }
+    }
+
+    #[test]
+    fn indicator_lock_excludes_concurrent_instance() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "neutron-indicator-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let lock1 = acquire_indicator_lock_in(&temp_dir);
+        assert!(lock1.is_some(), "first instance should acquire the lock");
+
+        let lock2 = acquire_indicator_lock_in(&temp_dir);
+        assert!(
+            lock2.is_none(),
+            "second concurrent instance must be denied the lock"
+        );
+
+        drop(lock1);
+        let lock3 = acquire_indicator_lock_in(&temp_dir);
+        assert!(
+            lock3.is_some(),
+            "after first instance drops, successor can acquire"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn favorite_switch_does_not_hold_shared_state_lock() {
+        use crate::testing::profile;
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: None,
+            forwarded_port: None,
+            favorite_profiles: vec![("uuid-fav".to_string(), "Favorite 1".to_string())],
+            menu_revision: 1,
+            ..Default::default()
+        }));
+        let client = MockNmClient::new(vec![profile(
+            "Favorite 1",
+            "uuid-fav",
+            ProfileState::Inactive,
+        )]);
+        let menu = DBusMenu {
+            client,
+            state: state.clone(),
+        };
+
+        menu.event(100, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert!(
+            state.try_lock().is_ok(),
+            "shared state lock must remain available during/after favorite switch"
+        );
+    }
+
+    #[test]
+    fn favorite_menu_ids_map_to_stable_uuids_and_check_active_by_uuid() {
+        use crate::testing::profile;
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: Some("WireGuard".to_string()),
+            active_uuid: Some("uuid-1".to_string()),
+            forwarded_port: None,
+            favorite_profiles: vec![
+                ("uuid-1".to_string(), "WireGuard".to_string()),
+                ("uuid-2".to_string(), "WireGuard".to_string()),
+            ],
+            ..Default::default()
+        }));
+        let client = MockNmClient::new(vec![
+            profile("WireGuard", "uuid-1", ProfileState::Active),
+            profile("WireGuard", "uuid-2", ProfileState::Inactive),
+        ]);
+        let menu = DBusMenu {
+            client: client.clone(),
+            state: state.clone(),
+        };
+
+        // Render layout: populates favorite_id_map and checks active state by UUID
+        let (_, layout) = menu.get_layout(0, -1, vec![]);
+        let (id, _, children) = layout;
+        assert_eq!(id, 0);
+        // Children: toggle(2), sep(10), fav 100, fav 101, sep(12), quit(4)
+        assert_eq!(children.len(), 6);
+
+        // Click item 101 -> maps to uuid-2
+        menu.event(101, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(client.calls(), vec!["switch:uuid-2"]);
+
+        // Non-existent item 199 is a no-op
+        menu.event(199, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(client.calls(), vec!["switch:uuid-2"]);
+        state.lock().unwrap().favorite_profiles.remove(0);
+        let _ = menu.get_layout(0, -1, vec![]);
+        menu.event(100, "clicked", Value::from(0u32), 0);
+        assert_eq!(
+            client.calls(),
+            vec!["switch:uuid-2"],
+            "removed IDs must not select their replacement"
+        );
+        menu.event(101, "clicked", Value::from(0u32), 0);
+        assert_eq!(client.calls(), vec!["switch:uuid-2", "switch:uuid-2"]);
     }
 
     #[test]
@@ -816,7 +1101,7 @@ mod tests {
         let eu = Some("uuid-eu".to_string());
 
         lease.follow_tunnel(&eu);
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
         lease.follow_tunnel(&eu);
 
         assert_eq!(lease.port, Some(51820));
@@ -827,7 +1112,7 @@ mod tests {
         let mut lease = LeaseTracker::default();
 
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
         lease.follow_tunnel(&Some("uuid-us".to_string()));
 
         assert_eq!(lease.port, None, "the new tunnel has no lease yet");
@@ -843,7 +1128,7 @@ mod tests {
         let mut lease = LeaseTracker::default();
 
         lease.follow_tunnel(&Some("uuid-first".to_string()));
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
         lease.follow_tunnel(&Some("uuid-second".to_string()));
 
         assert_eq!(lease.port, None);
@@ -855,11 +1140,11 @@ mod tests {
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
 
         assert!(
-            lease.record(Some(51820)),
+            lease.record(Some(test_mapping(51820))),
             "the first mapping must be pushed"
         );
         assert!(
-            !lease.record(Some(51820)),
+            !lease.record(Some(test_mapping(51820))),
             "an unchanged port needs no second push"
         );
     }
@@ -868,9 +1153,9 @@ mod tests {
     fn a_renewal_returning_a_different_port_is_pushed() {
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
 
-        assert!(lease.record(Some(40000)));
+        assert!(lease.record(Some(test_mapping(40000))));
     }
 
     #[test]
@@ -880,30 +1165,75 @@ mod tests {
         // the port is stable, so "push only when it changes" means never again.
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
         lease.qbit_sync = QbitSyncStatus::Failed;
 
         assert!(
-            lease.record(Some(51820)),
+            lease.record(Some(test_mapping(51820))),
             "a failure must be retried even though the port is unchanged"
         );
+    }
+
+    #[test]
+    fn qbit_config_change_invalidates_sync_and_triggers_push() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(test_mapping(51820)));
+
+        let cfg_disabled = crate::config::QBittorrentConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(
+            !lease.sync_needed(&cfg_disabled),
+            "no sync needed when integration is disabled"
+        );
+
+        // Transition: disabled -> enabled with stable port
+        let mut cfg_enabled = crate::config::QBittorrentConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            lease.sync_needed(&cfg_enabled),
+            "enabling integration requires sync even if port is unchanged"
+        );
+        lease.last_qbit_config = Some(cfg_enabled.clone());
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+        assert!(
+            !lease.sync_needed(&cfg_enabled),
+            "already synchronized with same config requires no push"
+        );
+
+        // Transition: configuration URL / binding changes with stable port
+        cfg_enabled.url = "http://10.0.0.1:8080".to_string();
+        assert!(
+            lease.sync_needed(&cfg_enabled),
+            "config modification invalidates sync and triggers push"
+        );
+        let now = std::time::Instant::now();
+        lease.last_qbit_config = Some(cfg_enabled.clone());
+        lease.qbit_sync = QbitSyncStatus::Failed;
+        lease.qbit_attempted_at = Some(now);
+        assert!(!lease.sync_needed_at(&cfg_enabled, now + POLL_INTERVAL));
+        assert!(lease.sync_needed_at(&cfg_enabled, now + crate::portforward::RENEW_INTERVAL));
     }
 
     #[test]
     fn a_successful_push_is_not_retried_forever() {
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
         lease.qbit_sync = QbitSyncStatus::Synchronized;
 
-        assert!(!lease.record(Some(51820)));
+        assert!(!lease.record(Some(test_mapping(51820))));
     }
 
     #[test]
     fn a_renewal_that_maps_nothing_gives_up_the_lease() {
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
 
         assert!(!lease.record(None), "there is no port to push");
         assert_eq!(lease.port, None);
@@ -911,15 +1241,75 @@ mod tests {
     }
 
     #[test]
+    fn failed_mapping_keeps_backoff_until_interval_or_tunnel_change() {
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".into()));
+        for mapped in [Some(test_mapping(51820)), None, None] {
+            lease.record(mapped);
+            let attempted = lease.attempted_at.unwrap();
+            lease.release();
+            assert_eq!(lease.port, None);
+            assert!(!lease.is_due_at(attempted + POLL_INTERVAL));
+            assert!(!lease.is_due_at(
+                attempted + crate::portforward::RENEW_INTERVAL - Duration::from_nanos(1)
+            ));
+            assert!(lease.is_due_at(attempted + crate::portforward::RENEW_INTERVAL));
+        }
+        lease.follow_tunnel(&Some("uuid-new".into()));
+        assert!(
+            lease.is_due(),
+            "a new tunnel should get its first attempt immediately"
+        );
+    }
+
+    #[test]
     fn a_fresh_lease_is_not_due_for_renewal_but_an_unheld_one_is() {
         let mut lease = LeaseTracker::default();
         assert!(lease.is_due(), "with no lease there is nothing to wait for");
 
-        lease.record(Some(51820));
+        lease.record(Some(test_mapping(51820)));
         assert!(
             !lease.is_due(),
             "a just-renewed lease must not be re-requested"
         );
+    }
+
+    #[test]
+    fn lease_expires_and_clears_port_on_expiry() {
+        let mut lease = LeaseTracker::default();
+        let now = std::time::Instant::now();
+        let mapping = crate::portforward::PortMapping {
+            port: 51820,
+            lifetime_secs: 10,
+        };
+        lease.record_at(Some(mapping), now);
+        assert_eq!(lease.port, Some(51820));
+
+        // Before expiry: lease remains valid
+        assert!(!lease.check_expiry_at(now + Duration::from_secs(5)));
+        assert_eq!(lease.port, Some(51820));
+
+        // At or after expiry: lease expires and clears port
+        assert!(lease.check_expiry_at(now + Duration::from_secs(10)));
+        assert_eq!(lease.port, None);
+        assert_eq!(lease.publication(Some("uuid-1".into())).port, None);
+    }
+
+    #[test]
+    fn short_lifetime_mapping_sets_renewal_due_proportionately() {
+        let mut lease = LeaseTracker::default();
+        let now = std::time::Instant::now();
+        let mapping = crate::portforward::PortMapping {
+            port: 51820,
+            lifetime_secs: 20,
+        };
+        lease.record_at(Some(mapping), now);
+
+        assert!(!lease.is_due_at(now + Duration::from_secs(9)));
+        assert!(lease.is_due_at(now + Duration::from_secs(10)));
+        assert!(!lease.check_expiry_at(now + Duration::from_secs(10)));
+        lease.record_at(Some(mapping), now + Duration::from_secs(10));
+        assert!(!lease.check_expiry_at(now + Duration::from_secs(20)));
     }
 
     #[test]
@@ -932,6 +1322,7 @@ mod tests {
                 ("uuid-backup".to_string(), "wg-backup".to_string()),
             ],
             menu_revision: 1,
+            ..Default::default()
         }));
         let client = MockNmClient::default();
         let menu = DBusMenu { client, state };

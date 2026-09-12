@@ -9,7 +9,6 @@ pub mod sync;
 use clap::{Parser, Subcommand};
 
 use crate::config;
-#[cfg(feature = "qbittorrent")]
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
@@ -161,13 +160,13 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
     cli: Cli,
 ) -> AppResult<()> {
+    let path = config::default_config_path()?;
     match cli.command {
         None | Some(Commands::Tui) => crate::tui::run(client.clone()),
         Some(Commands::Indicator) => {
             crate::service::indicator::run_standalone_indicator(client.clone())
         }
         Some(Commands::Sync) => {
-            let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let report = sync::sync_profiles_dir(client, &app_cfg)?;
             // Imported profiles have no lockdown allow-rule yet, so the ruleset
@@ -192,7 +191,6 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             Ok(())
         }
         Some(Commands::List) => {
-            let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let profiles = client.list_wireguard_profiles()?;
             let rows = profile_list::build_rows(
@@ -206,11 +204,27 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             }
             Ok(())
         }
-        Some(Commands::Connect { profile }) => client.connect(&profile),
-        Some(Commands::Disconnect) => client.disconnect_active(),
-        Some(Commands::Switch { profile }) => client.switch_to(&profile),
+        Some(Commands::Connect { profile }) => {
+            client.connect(&profile)?;
+            rebuild_lockdown_if_enabled(client, &path)
+        }
+        Some(Commands::Disconnect) => {
+            client.disconnect_active()?;
+            rebuild_lockdown_if_enabled(client, &path)
+        }
+        Some(Commands::Switch { profile }) => {
+            client.switch_to(&profile)?;
+            rebuild_lockdown_if_enabled(client, &path)
+        }
         Some(Commands::StartupRandom) => {
+            let app_cfg = config::load(&path)?;
+            if !app_cfg.general.autoconnect_at_login {
+                let _ = service::set_autoconnect_at_login(client, &path, false);
+                println!("Startup random skipped: auto-connect at login is disabled in config");
+                return Ok(());
+            }
             let res = service::run_startup_random(client);
+            let _ = rebuild_lockdown_if_enabled(client, &path);
             service::indicator::ensure_indicator_daemon_running();
             match res? {
                 service::StartupRandomResult::Connected(selected) => {
@@ -239,7 +253,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
 
 fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -> AppResult<()> {
     let path = config::default_config_path()?;
-    let mut app_cfg = config::load(&path)?;
+    let app_cfg = config::load(&path)?;
     let profiles = client.list_wireguard_profiles()?;
 
     match command {
@@ -262,12 +276,15 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
         EligibleCommands::Add { profile } => {
             // "Add to eligible" clears any exclusion for the profile.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if eligibility::set_profile_eligible(
-                &mut app_cfg.excluded_profile_ids,
-                &profile_id,
-                true,
-            ) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = eligibility::set_profile_eligible(
+                    &mut cfg.excluded_profile_ids,
+                    &profile_id,
+                    true,
+                )
+            })?;
+            if changed {
                 println!("Profile is now eligible for startup-random: {profile} ({profile_id})");
             } else {
                 println!("Profile already eligible: {profile} ({profile_id})");
@@ -276,12 +293,15 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
         EligibleCommands::Remove { profile } => {
             // "Remove from eligible" excludes the profile from startup-random.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if eligibility::set_profile_eligible(
-                &mut app_cfg.excluded_profile_ids,
-                &profile_id,
-                false,
-            ) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = eligibility::set_profile_eligible(
+                    &mut cfg.excluded_profile_ids,
+                    &profile_id,
+                    false,
+                )
+            })?;
+            if changed {
                 println!("Profile excluded from startup-random: {profile} ({profile_id})");
             } else {
                 println!("Profile already excluded: {profile} ({profile_id})");
@@ -294,7 +314,7 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
 
 fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -> AppResult<()> {
     let path = config::default_config_path()?;
-    let mut app_cfg = config::load(&path)?;
+    let app_cfg = config::load(&path)?;
     let profiles = client.list_wireguard_profiles()?;
 
     match command {
@@ -307,8 +327,11 @@ fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -
         }
         FavoriteCommands::Add { profile } => {
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if app_cfg.favorite_profile_ids.insert(profile_id.clone()) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = cfg.favorite_profile_ids.insert(profile_id.clone())
+            })?;
+            if changed {
                 println!("Starred profile as favorite: {profile} ({profile_id})");
             } else {
                 println!("Profile already in favorites: {profile} ({profile_id})");
@@ -316,8 +339,11 @@ fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -
         }
         FavoriteCommands::Remove { profile } => {
             let profile_id = resolve_profile_id(&profiles, &profile)?;
-            if app_cfg.favorite_profile_ids.remove(&profile_id) {
-                config::save(&path, &app_cfg)?;
+            let mut changed = false;
+            config::update(&path, |cfg| {
+                changed = cfg.favorite_profile_ids.remove(&profile_id)
+            })?;
+            if changed {
                 println!("Removed profile from favorites: {profile} ({profile_id})");
             } else {
                 println!("Profile not in favorites: {profile} ({profile_id})");
@@ -369,20 +395,42 @@ fn handle_kill_switch_command_with_path<C: NmClient>(
 /// Apply the global kill-switch routing policy to every WireGuard profile and
 /// persist the new intent.
 ///
-/// NetworkManager is updated *before* the config is saved, so a failed `nmcli`
-/// call (the `?` returns early) leaves the persisted `kill_switch_enabled` flag
-/// untouched. This apply-then-persist ordering is a correctness invariant — see
-/// the `kill_switch_*_when_nm_fails` tests — and is shared by both the CLI
-/// handler and the GUI toggle so it lives in exactly one place.
+/// Backend changes precede persistence; failures report possible partial state.
 pub fn set_global_kill_switch<C: NmClient>(
     client: &C,
     path: &std::path::Path,
     enable: bool,
 ) -> AppResult<()> {
-    client.set_kill_switch_all(enable)?;
-    let mut app_cfg = config::load(path)?;
-    app_cfg.kill_switch_enabled = enable;
-    config::save(path, &app_cfg)
+    apply_and_save_policy(
+        path,
+        crate::error::Policy::KillSwitch,
+        || client.set_kill_switch_all(enable),
+        |cfg| cfg.kill_switch_enabled = enable,
+    )
+}
+
+/// Preserve emergency disable even when configuration is unreadable/unwritable,
+/// but distinguish backend failure from successful application with failed saving.
+pub(crate) fn apply_and_save_policy(
+    path: &std::path::Path,
+    policy: crate::error::Policy,
+    apply: impl FnOnce() -> AppResult<()>,
+    edit: impl FnOnce(&mut config::AppConfig),
+) -> AppResult<()> {
+    config::coordinate_policy(path, || {
+        apply().map_err(|source| AppError::PolicyUpdate {
+            policy,
+            outcome: "application failed and may be partial; effective state is unknown",
+            source: Box::new(source),
+        })?;
+        config::update(path, edit)
+            .map(|_| ())
+            .map_err(|source| AppError::PolicyUpdate {
+                policy,
+                outcome: "application completed but saving failed",
+                source: Box::new(source),
+            })
+    })
 }
 
 fn handle_lockdown_command<C: NmClient + FirewallClient>(
@@ -406,7 +454,7 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
             } else {
                 "off"
             };
-            println!("Lockdown (always-on firewall): {label}");
+            println!("Lockdown saved intent: {label} (effective firewall state is not verified)");
         }
         LockdownCommands::Enable => {
             set_global_lockdown(client, path, true)?;
@@ -436,15 +484,45 @@ pub fn set_global_lockdown<C: NmClient + FirewallClient>(
     path: &std::path::Path,
     enable: bool,
 ) -> AppResult<()> {
-    if enable {
-        let tunnels = client.wireguard_tunnels()?;
-        client.enable_lockdown(&tunnels)?;
-    } else {
-        client.disable_lockdown()?;
+    if !enable {
+        let disable = || -> AppResult<()> {
+            client
+                .disable_lockdown()
+                .map_err(|source| AppError::PolicyUpdate {
+                    policy: crate::error::Policy::Lockdown,
+                    outcome: "disable failed; effective state is unknown",
+                    source: Box::new(source),
+                })?;
+            config::update(path, |cfg| cfg.lockdown_enabled = false)
+                .map(|_| ())
+                .map_err(|source| AppError::PolicyUpdate {
+                    policy: crate::error::Policy::Lockdown,
+                    outcome: "application completed but saving failed",
+                    source: Box::new(source),
+                })
+        };
+        let mut entered = false;
+        let result = config::coordinate_policy(path, || {
+            entered = true;
+            disable()
+        });
+        // If coordination storage is unavailable, still permit emergency removal.
+        return if entered { result } else { disable() };
     }
-    let mut app_cfg = config::load(path)?;
-    app_cfg.lockdown_enabled = enable;
-    config::save(path, &app_cfg)
+    apply_and_save_policy(
+        path,
+        crate::error::Policy::Lockdown,
+        || {
+            if enable {
+                let tunnels = client.wireguard_tunnels()?;
+                client.enable_lockdown(&tunnels)?;
+            } else {
+                client.disable_lockdown()?;
+            }
+            Ok(())
+        },
+        |cfg| cfg.lockdown_enabled = enable,
+    )
 }
 
 fn handle_split_tunnel_command<C: NmClient>(
@@ -665,15 +743,11 @@ fn handle_qbit_command_with_path<C: NmClient>(
             }
         }
         QbitCommands::Enable => {
-            let mut app_cfg = config::load(path)?;
-            app_cfg.qbittorrent.enabled = true;
-            config::save(path, &app_cfg)?;
+            config::update(path, |cfg| cfg.qbittorrent.enabled = true)?;
             println!("qBittorrent automatic port forwarding sync enabled.");
         }
         QbitCommands::Disable => {
-            let mut app_cfg = config::load(path)?;
-            app_cfg.qbittorrent.enabled = false;
-            config::save(path, &app_cfg)?;
+            config::update(path, |cfg| cfg.qbittorrent.enabled = false)?;
             println!("qBittorrent automatic port forwarding sync disabled.");
         }
         QbitCommands::Config {
@@ -682,24 +756,24 @@ fn handle_qbit_command_with_path<C: NmClient>(
             password,
             bind,
         } => {
-            let mut app_cfg = config::load(path)?;
-            if let Some(u) = url {
-                app_cfg.qbittorrent.url = u;
-            }
-            if let Some(user) = username {
-                app_cfg.qbittorrent.username = if user.trim().is_empty() {
-                    None
-                } else {
-                    Some(user)
-                };
-            }
-            if let Some(pass) = password {
-                app_cfg.qbittorrent.password = if pass.is_empty() { None } else { Some(pass) };
-            }
-            if let Some(b) = bind {
-                app_cfg.qbittorrent.bind_interface = b;
-            }
-            config::save(path, &app_cfg)?;
+            let app_cfg = config::update(path, |app_cfg| {
+                if let Some(u) = url {
+                    app_cfg.qbittorrent.url = u;
+                }
+                if let Some(user) = username {
+                    app_cfg.qbittorrent.username = if user.trim().is_empty() {
+                        None
+                    } else {
+                        Some(user)
+                    };
+                }
+                if let Some(pass) = password {
+                    app_cfg.qbittorrent.password = if pass.is_empty() { None } else { Some(pass) };
+                }
+                if let Some(b) = bind {
+                    app_cfg.qbittorrent.bind_interface = b;
+                }
+            })?;
             println!("qBittorrent configuration updated.");
             println!("URL:            {}", app_cfg.qbittorrent.url);
             println!(
@@ -725,7 +799,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
 /// The allow-list pins each profile's interface and peer endpoint, so it is only
 /// correct for the profiles that existed when it was built. A profile added
 /// afterwards gets an interface with no matching rule and is blocked by the
-/// terminal REJECT -- it simply fails to connect, and because new profiles are
+/// terminal DROP -- it simply fails to connect, and because new profiles are
 /// eligible by default the startup selector can pick it and silently fall
 /// through to another. Removing a profile leaves a stale rule behind.
 ///
@@ -735,11 +809,13 @@ pub fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
     client: &C,
     path: &std::path::Path,
 ) -> AppResult<()> {
-    if !config::load(path)?.lockdown_enabled {
-        return Ok(());
-    }
-    let tunnels = client.wireguard_tunnels()?;
-    client.enable_lockdown(&tunnels)
+    config::coordinate_policy(path, || {
+        if !config::load(path)?.lockdown_enabled {
+            return Ok(());
+        }
+        let tunnels = client.wireguard_tunnels()?;
+        client.enable_lockdown(&tunnels)
+    })
 }
 
 /// Terminate all running neutron processes on the system except the current process.
@@ -762,10 +838,6 @@ pub fn kill_other_neutron_processes() {
                 let Ok(pid) = pid_str.parse::<u32>() else {
                     continue;
                 };
-                if pid == current_pid || pid <= 1 {
-                    continue;
-                }
-
                 let exe_path = entry.path().join("exe");
                 let is_same_binary = match (&my_exe, std::fs::read_link(&exe_path)) {
                     (Some(my), Ok(target)) => target == *my,
@@ -776,7 +848,7 @@ pub fn kill_other_neutron_processes() {
                     .map(|comm| comm.trim() == "neutron")
                     .unwrap_or(false);
 
-                if is_same_binary || is_neutron_comm {
+                if should_terminate_process(pid, current_pid, is_same_binary, is_neutron_comm) {
                     unsafe {
                         let _ = kill(pid as i32, 15); // SIGTERM
                     }
@@ -784,6 +856,15 @@ pub fn kill_other_neutron_processes() {
             }
         }
     }
+}
+
+fn should_terminate_process(
+    pid: u32,
+    current_pid: u32,
+    is_same_binary: bool,
+    is_neutron_comm: bool,
+) -> bool {
+    pid > 1 && pid != current_pid && (is_same_binary || is_neutron_comm)
 }
 
 fn resolve_profile_id(
@@ -797,6 +878,90 @@ fn resolve_profile_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_rebuild_rechecks_disabled_intent_after_coordination() {
+        let path = crate::testing::temp_config_path("rebuild-coordination");
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let client = crate::testing::MockNmClient::default();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = config::coordinate_policy(&path, || {
+                let worker = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    done_tx
+                        .send(rebuild_lockdown_if_enabled(&client, &path))
+                        .unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_millis(30))
+                        .is_err()
+                );
+                config::update(&path, |cfg| cfg.lockdown_enabled = false)?;
+                Ok(worker)
+            })
+            .unwrap();
+            worker.join().unwrap();
+        });
+        done_rx.recv().unwrap().unwrap();
+        assert!(client.lockdown_calls().is_empty());
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn policy_success_then_save_failure_reports_uncertain_state() {
+        use crate::error::Policy;
+        let path = crate::testing::temp_config_path("policy-save-failure");
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A directory at the stable lock path deterministically prevents saving,
+        // including when tests run as root. Reading the config still succeeds.
+        std::fs::create_dir(format!("{}.blocked", path.display())).unwrap();
+        let lock = format!("{}.lock", path.display());
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::rename(format!("{}.blocked", path.display()), &lock).unwrap();
+        std::fs::create_dir(format!("{}.policy.lock", path.display())).unwrap();
+        let client = crate::testing::MockNmClient::default();
+        let error = set_global_lockdown(&client, &path, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("application completed but saving failed")
+        );
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:off"]);
+        let saved = config::load(&path).unwrap();
+        assert!(saved.lockdown_enabled);
+        let mut state = crate::tui::state::TuiState::new(path.clone(), saved);
+        state.set_error(&error);
+        state.set_status("unrelated action");
+        assert!(state.uncertain_policies.contains(&Policy::Lockdown));
+        std::fs::remove_dir(format!("{}.policy.lock", path.display())).unwrap();
+        let backend_error = apply_and_save_policy(
+            &path,
+            Policy::KillSwitch,
+            || Err(AppError::CommandFailed("second profile rejected".into())),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(backend_error.to_string().contains("may be partial"));
+        crate::testing::remove_temp_config(&path);
+    }
     use crate::error::AppError;
 
     fn profile(name: &str, uuid: &str) -> WireguardProfile {
@@ -857,9 +1022,20 @@ mod tests {
     }
 
     #[test]
-    fn kill_other_neutron_processes_does_not_panic() {
-        // Safe to call when no other processes exist or in test environments
-        kill_other_neutron_processes();
+    fn termination_selection_excludes_self_system_and_unrelated_processes() {
+        for (pid, same_binary, neutron_comm, expected) in [
+            (0, true, true, false),
+            (1, true, true, false),
+            (42, true, true, false),
+            (43, false, false, false),
+            (43, true, false, true),
+            (43, false, true, true),
+        ] {
+            assert_eq!(
+                should_terminate_process(pid, 42, same_binary, neutron_comm),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -944,7 +1120,13 @@ mod tests {
         let result =
             handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path);
 
-        assert!(matches!(result, Err(AppError::CommandFailed(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::KillSwitch,
+                ..
+            })
+        ));
         // The change was attempted, but because NetworkManager rejected it the
         // enabled intent must not be persisted.
         assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:on"]);
@@ -970,7 +1152,13 @@ mod tests {
         let result =
             handle_kill_switch_command_with_path(&client, KillSwitchCommands::Disable, &path);
 
-        assert!(matches!(result, Err(AppError::CommandFailed(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::KillSwitch,
+                ..
+            })
+        ));
         // A failed disable must leave the previously-enabled state intact.
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.kill_switch_enabled);
@@ -1022,7 +1210,7 @@ mod tests {
     #[test]
     fn rebuild_lockdown_reapplies_rules_when_lockdown_is_on() {
         // A profile imported after lockdown was enabled has no allow-rule and
-        // is blocked by the terminal REJECT, so the ruleset has to be rebuilt
+        // is blocked by the terminal DROP, so the ruleset has to be rebuilt
         // whenever the profile set changes.
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
         let path = unique_test_config_path();
@@ -1122,7 +1310,13 @@ mod tests {
 
         let result = handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path);
 
-        assert!(matches!(result, Err(AppError::Firewall(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::Lockdown,
+                ..
+            })
+        ));
         // The change was attempted, but because the firewall rejected it the
         // enabled intent must not be persisted.
         assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
@@ -1147,7 +1341,13 @@ mod tests {
 
         let result = handle_lockdown_command_with_path(&client, LockdownCommands::Disable, &path);
 
-        assert!(matches!(result, Err(AppError::Firewall(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyUpdate {
+                policy: crate::error::Policy::Lockdown,
+                ..
+            })
+        ));
         // A failed disable must leave the previously-enabled state intact.
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.lockdown_enabled);

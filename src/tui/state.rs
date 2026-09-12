@@ -416,12 +416,16 @@ pub struct CachedProfileInfo {
 pub struct TuiState {
     pub config_path: PathBuf,
     pub config: AppConfig,
+    /// Failed operations can leave applied policy different from saved intent.
+    /// Reloading config or dismissing a toast must not clear this uncertainty.
+    pub uncertain_policies: std::collections::BTreeSet<crate::error::Policy>,
     pub theme: Theme,
     pub rows: Vec<ProfileListRow>,
     pub profile_cache: std::collections::HashMap<String, CachedProfileInfo>,
     pub selected_index: usize,
     pub selected_info: Option<CachedProfileInfo>,
     pub active_profile_name: Option<String>,
+    pub active_profile_uuid: Option<String>,
     /// The forwarded-port lease as last published by the tray daemon, or `None`
     /// when it is not publishing one.
     ///
@@ -444,8 +448,38 @@ pub struct TuiState {
     pub connecting: Option<ConnectingState>,
     pub connect_tx: Option<std::sync::mpsc::Sender<(String, String, bool)>>,
     pub split_tunnel_tx: Option<std::sync::mpsc::Sender<SplitTunnelConfig>>,
+    pub pending_split: Option<SplitTunnelConfig>,
+    pub profile_refresh_requested: bool,
+    pub action_tx: Option<std::sync::mpsc::Sender<AsyncAction>>,
+    pub diag_tx: Option<std::sync::mpsc::Sender<(String, bool)>>,
     pub modal: ActiveModal,
     pub should_quit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AsyncAction {
+    KillSwitch(bool),
+    Lockdown(bool),
+    Autoconnect(bool),
+    Sync,
+    Delete(String),
+}
+
+pub enum AsyncActionResult {
+    KillSwitch {
+        enable: bool,
+        result: crate::error::AppResult<()>,
+    },
+    Lockdown {
+        enable: bool,
+        result: crate::error::AppResult<()>,
+    },
+    Autoconnect {
+        enable: bool,
+        result: crate::error::AppResult<()>,
+    },
+    Sync(crate::error::AppResult<crate::app::sync::SyncReport>),
+    Delete(crate::error::AppResult<String>),
 }
 
 impl TuiState {
@@ -454,12 +488,14 @@ impl TuiState {
         Self {
             config_path,
             config,
+            uncertain_policies: Default::default(),
             theme,
             rows: Vec::new(),
             profile_cache: std::collections::HashMap::new(),
             selected_index: 0,
             selected_info: None,
             active_profile_name: None,
+            active_profile_uuid: None,
             lease: None,
             public_ip_info: None,
             download_rate: 0,
@@ -472,6 +508,10 @@ impl TuiState {
             connecting: None,
             connect_tx: None,
             split_tunnel_tx: None,
+            pending_split: None,
+            profile_refresh_requested: false,
+            action_tx: None,
+            diag_tx: None,
             modal: ActiveModal::None,
             should_quit: false,
         }
@@ -484,14 +524,57 @@ impl TuiState {
     ) -> crate::error::AppResult<()> {
         self.config.global_split_tunnel = new_cfg.clone();
         if let Some(ref tx) = self.split_tunnel_tx {
-            let _ = tx.send(new_cfg);
+            tx.send(new_cfg.clone()).map_err(|_| {
+                crate::error::AppError::Config("split policy worker stopped".into())
+            })?;
+            self.pending_split = Some(new_cfg);
             Ok(())
         } else {
             crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
                 client,
                 &self.config_path,
                 &new_cfg,
-            )
+            )?;
+            self.uncertain_policies
+                .remove(&crate::error::Policy::SplitTunnel);
+            self.set_status("Split tunneling saved; reconnect to apply routing changes.");
+            Ok(())
+        }
+    }
+
+    pub fn finish_split(
+        &mut self,
+        applied: SplitTunnelConfig,
+        result: crate::error::AppResult<()>,
+    ) {
+        if self
+            .pending_split
+            .as_ref()
+            .is_some_and(|pending| pending != &applied)
+        {
+            // An older reply must not replace a newer edit still queued.
+            if let Err(error) = result {
+                self.set_error(&error);
+            }
+            return;
+        }
+        self.pending_split = None;
+        match result {
+            Ok(()) => {
+                self.config.global_split_tunnel = applied;
+                self.uncertain_policies
+                    .remove(&crate::error::Policy::SplitTunnel);
+                self.set_status("Split tunneling saved; reconnect to apply routing changes.");
+            }
+            Err(error) => {
+                self.set_error(&error);
+                if let Ok(saved) = crate::config::load(&self.config_path) {
+                    self.config.global_split_tunnel = saved.global_split_tunnel;
+                }
+            }
+        }
+        if let ActiveModal::SplitTunnel(ref mut modal) = self.modal {
+            *modal = SplitTunnelModalState::from_config(&self.config.global_split_tunnel);
         }
     }
 
@@ -526,6 +609,9 @@ impl TuiState {
     /// Report a failed action in a toast notification. Kept distinct from
     /// [`Self::set_status`] so an error cannot be mistaken for a success.
     pub fn set_error(&mut self, error: &crate::error::AppError) {
+        if let crate::error::AppError::PolicyUpdate { policy, .. } = error {
+            self.uncertain_policies.insert(*policy);
+        }
         let msg = error.to_string();
         self.status_message = msg.clone();
         self.status_is_error = true;

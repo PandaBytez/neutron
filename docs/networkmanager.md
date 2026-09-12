@@ -26,12 +26,12 @@ nmcli -t -f NAME,UUID,TYPE connection show --active
 The output is parsed into `WireguardProfile` structs with active/inactive states.
 
 ### 2. Timeouts & Concurrency
-All `nmcli` invocations run through `run_command_with_timeout` with a strict **30-second deadline** (`NMCLI_TIMEOUT`).
+NetworkManager command helpers use `process::run_with_timeout` with a **30-second deadline** (`NMCLI_TIMEOUT`). The long-lived `nmcli monitor` process is managed separately.
 * Standard output and standard error pipes are drained concurrently on separate worker threads to prevent pipe buffer deadlocks.
-* If a command exceeds the deadline, the child process is terminated and an explicit `AppError::NmCommandFailed` error is returned.
+* If a command exceeds the deadline, the child process is terminated and an explicit `AppError::CommandFailed` error is returned. Failed commands surface their exit status.
 
 ### 3. Error Aggregation (`apply_to_every_profile`)
-When modifying global settings across all profiles (such as setting `connection.autoconnect` or applying split-tunneling routes), the sweep does not abort on the first failure. It processes every profile, collects all failures, and surfaces an aggregated report (e.g. `1 of 5 profiles rejected the change: ...`).
+Autoconnect normalization processes every profile and aggregates failures. Other policy sweeps can stop on a failure and leave mixed profile settings; callers report that possible partial state. See [Implementation Notes](implementation.md#saved-intent-and-effective-policy).
 
 ### 4. WireGuard Comment Ingestion
-When importing `.conf` files via `nmcli connection import type wireguard file <path>`, comments inside the `[Interface]` section (often containing provider metadata, server features, or notes) are extracted and saved in `AppConfig.profile_custom_info` keyed by profile UUID.
+When importing `.conf` files via `nmcli connection import type wireguard file <path>`, comments inside the `[Interface]` section (often containing provider metadata, server features, or notes) are extracted and saved in `profile-info.json` beside the application settings, keyed by profile UUID. `AppConfig.profile_custom_info` remains the in-memory view used by the CLI and TUI.

@@ -5,8 +5,6 @@
 //! `connection up`. NetworkManager is never asked to choose -- `autoconnect` is
 //! held off on every profile (see [`crate::nm::autoconnect`]) precisely so the
 //! selector is the only thing that activates a tunnel.
-//!
-//! The entry is written by the app itself so the feature stays zero-config.
 
 use std::path::{Path, PathBuf};
 
@@ -73,9 +71,6 @@ pub fn uninstall_in(dir: &Path) -> AppResult<()> {
 }
 
 /// Render the `.desktop` body for `exec_cmd`.
-///
-/// Split out from [`install`] so the contents can be asserted without touching
-/// the real home directory.
 fn entry_contents(exec_cmd: &str) -> String {
     // `X-GNOME-Autostart-enabled` keeps GNOME from treating the entry as
     // disabled, and the AppImage `Exec` is quoted because its path may contain
