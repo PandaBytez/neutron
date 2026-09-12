@@ -282,7 +282,7 @@ pub fn execute_action<C: ActionClient>(
             let report = sync::sync_profiles_dir(client, &state.config)?;
             // The profile set may have changed, so the lockdown allow-list is
             // stale: a freshly imported profile has no rule and would be
-            // blocked by the terminal REJECT.
+            // blocked by the terminal DROP.
             crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
             reload_profiles(state, client)?;
             if report.imported.is_empty() {

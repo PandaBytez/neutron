@@ -86,13 +86,8 @@ pub struct GeneralConfig {
     /// alias keeps configs written by those versions loading correctly.
     #[serde(default = "default_true", alias = "autoconnect_at_boot")]
     pub autoconnect_at_login: bool,
-    /// Whether a freshly activated tunnel is checked for actually carrying
-    /// traffic, and taken back down if it is not.
-    ///
-    /// On by default: `nmcli` reporting success only means the interface was
-    /// created, so without this a dead peer looks like a working connection
-    /// while swallowing every packet. Can be turned off for networks where the
-    /// probe is unreliable.
+    /// Verify fresh tunnels with an endpoint and persistent keepalive; disconnect
+    /// if no authenticated traffic arrives. Idle on-demand tunnels are exempt.
     #[serde(default = "default_true")]
     pub verify_tunnel_on_connect: bool,
 }

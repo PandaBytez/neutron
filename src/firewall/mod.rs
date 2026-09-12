@@ -177,10 +177,8 @@ fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
 /// `/bin/sh` is always present and listed, so this makes the escalation work
 /// regardless of the user's login shell.
 ///
-/// No timeout is imposed: `pkexec` is interactive (it may wait on a password
-/// prompt), so a deadline would race the user. The GUI runs this off the main
-/// thread, and the CLI is a foreground command, so a stuck call cannot freeze
-/// the UI.
+/// No timeout is imposed because `pkexec` may wait for a password prompt.
+/// This call blocks; interactive callers must account for authorization latency.
 fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
     if batches.is_empty() {
         return Ok(());
@@ -211,8 +209,8 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
 }
 
 /// Render `firewall-cmd` argument batches into a single `/bin/sh` script that
-/// runs each in order and aborts on the first failure (`set -e`), so a partial
-/// failure cannot silently leave a half-applied ruleset.
+/// runs each in order and aborts on the first failure (`set -e`). Rebuild guards
+/// keep partially applied permanent rules fail-closed.
 ///
 /// Every argument is shell-quoted (see [`shell_quote`]); values taken from
 /// WireGuard profiles (interface names, endpoint hosts) therefore cannot break
@@ -980,7 +978,7 @@ mod tests {
         ];
         let script = build_firewall_script(&batches);
 
-        // `set -e` so a failed command stops the rest (no half-applied ruleset).
+        // `set -e` stops subsequent commands after a failure.
         assert!(script.starts_with("set -e\n"));
         // One `firewall-cmd` line per batch, each argument single-quoted.
         assert!(script.contains("\nfirewall-cmd '--reload'\n"));

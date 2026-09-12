@@ -573,7 +573,7 @@ where
                 }
             });
 
-            // Keep D-Bus connection processing all incoming requests with 0ms latency
+            // Keep the D-Bus connection alive while its executor handles requests.
             std::future::pending::<()>().await
         });
     })

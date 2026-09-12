@@ -1,12 +1,12 @@
 //! System tests: the real [`FirewallClient`] against a real firewalld.
 //!
-//! The 24 unit tests in `src/firewall` assert the *arguments* passed to
+//! Unit tests in `src/firewall` assert the *arguments* passed to
 //! `firewall-cmd`. They cannot show that firewalld accepts those arguments, that
 //! the resulting rules say what was intended, or that teardown removes exactly
 //! the rules Neutron installed. BUG-018 and BUG-019 live in precisely that gap:
 //! rules that are present, correctly spelled, and too permissive.
 //!
-//! Safety: netfilter tables are per network namespace, so the REJECT-all
+//! Safety: netfilter tables are per network namespace, so the deny-by-default
 //! ruleset installed here is confined to the container. This was verified before
 //! being relied upon -- see the note in `testing/Containerfile`.
 //!
@@ -40,7 +40,7 @@ fn marked_rules() -> Vec<String> {
 }
 
 /// Ensures lockdown is torn down even if an assertion panics, so one failure
-/// cannot leave a REJECT-all ruleset behind for the next test.
+/// cannot leave a blocking ruleset behind for the next test.
 struct Lockdown;
 
 impl Drop for Lockdown {

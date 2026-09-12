@@ -380,11 +380,7 @@ fn handle_kill_switch_command_with_path<C: NmClient>(
 /// Apply the global kill-switch routing policy to every WireGuard profile and
 /// persist the new intent.
 ///
-/// NetworkManager is updated *before* the config is saved, so a failed `nmcli`
-/// call (the `?` returns early) leaves the persisted `kill_switch_enabled` flag
-/// untouched. This apply-then-persist ordering is a correctness invariant — see
-/// the `kill_switch_*_when_nm_fails` tests — and is shared by both the CLI
-/// handler and the GUI toggle so it lives in exactly one place.
+/// Backend changes precede persistence; failures report possible partial state.
 pub fn set_global_kill_switch<C: NmClient>(
     client: &C,
     path: &std::path::Path,
@@ -761,7 +757,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
 /// The allow-list pins each profile's interface and peer endpoint, so it is only
 /// correct for the profiles that existed when it was built. A profile added
 /// afterwards gets an interface with no matching rule and is blocked by the
-/// terminal REJECT -- it simply fails to connect, and because new profiles are
+/// terminal DROP -- it simply fails to connect, and because new profiles are
 /// eligible by default the startup selector can pick it and silently fall
 /// through to another. Removing a profile leaves a stale rule behind.
 ///
@@ -1129,7 +1125,7 @@ mod tests {
     #[test]
     fn rebuild_lockdown_reapplies_rules_when_lockdown_is_on() {
         // A profile imported after lockdown was enabled has no allow-rule and
-        // is blocked by the terminal REJECT, so the ruleset has to be rebuilt
+        // is blocked by the terminal DROP, so the ruleset has to be rebuilt
         // whenever the profile set changes.
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
         let path = unique_test_config_path();

@@ -156,10 +156,7 @@ pub fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile 
 
 /// A configurable in-memory [`NmClient`] for tests.
 ///
-/// Recorded-call state lives behind `Arc<Mutex<_>>`, so clones share the same
-/// history. This keeps the mock `Clone + Send + 'static` (as required by the GUI
-/// code paths) while still letting a clone handed to background work report its
-/// calls back to the original handle.
+/// Clones share recorded calls and simulated state through `Arc<Mutex<_>>`.
 #[derive(Clone, Default)]
 pub struct MockNmClient {
     profiles: Vec<WireguardProfile>,

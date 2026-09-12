@@ -35,11 +35,6 @@ pub fn run_startup_random_with_path<C: NmClient>(
 /// profile is its own interface they never compete for a device -- left alone,
 /// NM activates *every* profile at boot.
 ///
-/// Selecting a profile by arming one with `autoconnect` was tried and removed:
-/// it made NM a second activation authority that could not see what the app had
-/// already connected, so an armed profile would come up *alongside* the active
-/// one. Activation is now always an explicit `connection up` issued here.
-///
 /// Best-effort: failures are logged, since callers must still work on a system
 /// where the flag could not be cleared.
 fn normalize_autoconnect<C: NmClient>(client: &C) {
@@ -159,8 +154,7 @@ where
 
 /// Turn "connect a random profile at login" on or off, and persist the choice.
 ///
-/// Enabling installs the autostart entry that relaunches the app hidden at
-/// login; that launch is what performs the connection. Disabling removes it.
+/// Enabling installs a `startup-random` desktop entry; disabling removes it.
 /// Neither direction disturbs a tunnel that is already up -- an active profile
 /// is a deliberate connection, and toggling a preference is not a request to
 /// drop traffic.
@@ -423,8 +417,7 @@ mod tests {
 
     #[test]
     fn still_connects_when_arming_fails() {
-        // Arming sets up the *next* boot; it is incidental to connecting now,
-        // so a rejection from NetworkManager must not fail the connection.
+        // Autoconnect normalization is best-effort; explicit selection still runs.
         let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Inactive)])
             .fail_autoconnect();
         let config_path = unique_test_config_path();

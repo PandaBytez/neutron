@@ -31,14 +31,12 @@ pub fn run<C>(client: C) -> AppResult<()>
 where
     C: NmClient + FirewallClient + Clone + Send + Sync + 'static,
 {
-    // Setup terminal
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, Hide)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    // Set panic hook so terminal is restored cleanly if a panic occurs
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -55,7 +53,6 @@ where
     let ip_lookup_in_flight = Arc::new(AtomicBool::new(false));
     spawn_public_ip_lookup(ip_tx.clone(), ip_lookup_in_flight.clone());
 
-    // Channel for async latency updates
     let (lat_tx, lat_rx) = std::sync::mpsc::channel();
     let lat_tx_clone = lat_tx.clone();
     thread::spawn(move || {
@@ -67,7 +64,6 @@ where
         }
     });
 
-    // Initial drop directory sync & profile loading
     if state.config.general.auto_sync_profiles {
         let _ = crate::app::sync::sync_profiles_dir(&client, &state.config);
     }
@@ -76,7 +72,6 @@ where
     // reporting it missing until the first periodic tick.
     events::refresh_lease(&mut state);
 
-    // Initial focus on active profile (or index 0) once at TUI startup
     if let Some(active_idx) = state.rows.iter().position(|r| r.is_active) {
         state.selected_index = active_idx;
     } else {
@@ -84,7 +79,6 @@ where
     }
     events::update_diagnostics(&mut state, &client);
 
-    // Channel for background profile cache warming
     let (cache_tx, cache_rx) = std::sync::mpsc::channel();
     let client_for_cache = client.clone();
     let rows_to_cache: Vec<(String, bool)> = state
@@ -99,7 +93,6 @@ where
         }
     });
 
-    // Channel for non-blocking asynchronous connection requests & worker replies
     let (connect_tx, connect_rx) = std::sync::mpsc::channel::<(String, String, bool)>();
     let (conn_res_tx, conn_res_rx) = std::sync::mpsc::channel::<(String, AppResult<()>, bool)>();
     state.connect_tx = Some(connect_tx);
@@ -116,7 +109,6 @@ where
         }
     });
 
-    // Channel for non-blocking asynchronous split tunneling application
     let (split_tunnel_tx, split_tunnel_rx) =
         std::sync::mpsc::channel::<crate::config::SplitTunnelConfig>();
     let (st_res_tx, st_res_rx) =
@@ -140,10 +132,8 @@ where
         }
     });
 
-    // Ensure background indicator daemon is running (spawn once if not already active)
     crate::service::indicator::ensure_indicator_daemon_running();
 
-    // NetworkManager monitor event counter
     let monitor_events = Arc::new(AtomicU64::new(0));
     let monitor_events_clone = monitor_events.clone();
     let monitor_child: MonitorChild = Arc::new(Mutex::new(None));
@@ -152,10 +142,7 @@ where
         start_nm_monitor_loop(monitor_events_clone, monitor_child_for_thread);
     });
 
-    // The loop body is wrapped so the terminal is restored on *every* exit
-    // path. A `?` inside it (a failed draw or a lost stdin) previously skipped
-    // the restore below and left the shell in raw mode with no cursor -- the
-    // user's terminal was unusable until they blindly typed `reset`.
+    // Keep event-loop errors from skipping terminal and child-process cleanup.
     let outcome = run_event_loop(
         &mut terminal,
         &mut state,
@@ -179,11 +166,6 @@ where
 type MonitorChild = Arc<Mutex<Option<std::process::Child>>>;
 
 /// Kill the `nmcli monitor` child and reap it.
-///
-/// The monitor is a separate process, not just a thread, so letting the reader
-/// thread end does not stop it: it keeps running with a closed pipe. Every TUI
-/// session used to leave one behind, so a few launches accumulated a handful of
-/// orphaned `nmcli monitor` processes that outlived the app indefinitely.
 fn stop_nm_monitor(child: &MonitorChild) {
     if let Ok(mut slot) = child.lock()
         && let Some(mut child) = slot.take()

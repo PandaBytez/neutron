@@ -21,7 +21,7 @@ pub struct SyncReport {
     pub errors: Vec<String>,
 }
 
-/// Ensure the profiles directory exists with secure user-only permissions (0700 on Unix).
+/// Create the profiles directory, attempting owner-only permissions on Unix.
 pub fn ensure_profiles_dir(dir: &Path) -> std::io::Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir)?;
@@ -34,8 +34,7 @@ pub fn ensure_profiles_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ensure the application directories (~/.config/neutron and profiles inbox) exist
-/// with secure user-only permissions (0700 on Unix).
+/// Create the config and inbox directories using [`ensure_profiles_dir`].
 pub fn ensure_app_dirs(config: &AppConfig) -> std::io::Result<()> {
     if let Ok(config_path) = config::default_config_path()
         && let Some(parent) = config_path.parent()
@@ -49,8 +48,7 @@ pub fn ensure_app_dirs(config: &AppConfig) -> std::io::Result<()> {
 
 /// Scan the configured `profiles_dir` inbox and import any new `.conf` files into NetworkManager.
 ///
-/// Successfully imported or already-existing profiles are removed from the inbox directory so that
-/// NetworkManager remains the sole source of truth and profile deletions are never overridden.
+/// Source removal is best-effort after import or a matching profile name.
 pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResult<SyncReport> {
     let dir = config::resolve_profiles_dir(config);
     let _ = ensure_profiles_dir(&dir);
@@ -85,8 +83,7 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
                 .to_string();
 
             if existing_names.contains(&stem) {
-                // Already managed by NetworkManager; consume from the inbox
-                // so it doesn't linger and resurrect if deleted later.
+                // Matching uses the filename stem, not a content comparison.
                 let _ = fs::remove_file(&path);
                 report.skipped += 1;
                 continue;
@@ -95,7 +92,6 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
             match client.import_wireguard_profile(&path) {
                 Ok(_) => {
                     report.imported.push(stem);
-                    // Consumed on successful import: NetworkManager is now the source of truth.
                     let _ = fs::remove_file(&path);
                 }
                 Err(err) => {

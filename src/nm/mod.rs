@@ -12,10 +12,6 @@ pub mod split_tunnel;
 pub mod tunnel_routing;
 
 /// Maximum time to wait for an `nmcli` invocation before giving up.
-///
-/// NetworkManager operations are normally fast, but a stuck daemon or hung
-/// network operation must not block the caller (and, in the GUI, the main
-/// thread) indefinitely.
 const NMCLI_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -441,7 +437,7 @@ struct PeerSettings {
 }
 
 /// Parse the `connection.interface-name` and `wireguard.peers` lines out of
-/// `nmcli -s connection show` output.
+/// `nmcli connection show` output.
 ///
 /// Split out of `get_profile_diagnostics` so the parsing can be tested without
 /// invoking `nmcli`.
