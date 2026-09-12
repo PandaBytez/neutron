@@ -106,7 +106,8 @@ impl FirewallClient for crate::nm::CliNmClient {
         // unprivileged and never prompt.
         //
         // Permanent fail-closed guards protect every intermediate rebuild state.
-        let batches = lockdown_rebuild_batches(marked_removal_batches()?, tunnels);
+        let mut batches = lockdown_rebuild_batches(marked_removal_batches()?, tunnels);
+        batches.extend(read_foreign_runtime_rules().unwrap_or_default());
         run_privileged_batches(&batches)
     }
 
@@ -115,6 +116,7 @@ impl FirewallClient for crate::nm::CliNmClient {
         // then remove them and reload in a single privileged batch (one prompt).
         let mut batches = marked_removal_batches()?;
         batches.push(reload_batch());
+        batches.extend(read_foreign_runtime_rules().unwrap_or_default());
         run_privileged_batches(&batches)?;
 
         // Strictly scoped teardown: only our own tagged rules are ever removed,
@@ -161,6 +163,75 @@ fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
     } else {
         stderr
     }))
+}
+
+/// Read direct rules across all tables and chains.
+fn read_direct_all_rules(permanent: bool) -> AppResult<String> {
+    let mut args = vec!["--direct", "--get-all-rules"];
+    if permanent {
+        args.insert(0, "--permanent");
+    }
+    let output = crate::process::host_command(FIREWALL_CMD)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| AppError::Firewall(error.to_string()))?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+
+    Ok(String::new())
+}
+
+/// Query foreign runtime-only direct rules so they can be re-applied after
+/// `firewall-cmd --reload` flushes them (BUG-042).
+fn read_foreign_runtime_rules() -> AppResult<Vec<Vec<String>>> {
+    let runtime_str = read_direct_all_rules(false)?;
+    let permanent_str = read_direct_all_rules(true)?;
+    Ok(parse_foreign_runtime_preservations(
+        &runtime_str,
+        &permanent_str,
+    ))
+}
+
+/// Parse foreign runtime direct rules not present in permanent rules into
+/// `--direct --add-rule` batches. Neutron-marked rules are skipped.
+pub(crate) fn parse_foreign_runtime_preservations(
+    runtime_listing: &str,
+    permanent_listing: &str,
+) -> Vec<Vec<String>> {
+    let permanent_set: std::collections::HashSet<&str> = permanent_listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut batches = Vec::new();
+    for line in runtime_listing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || line_is_marked(trimmed) || permanent_set.contains(trimmed) {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        // Line format from --get-all-rules: <family> <table> <chain> <priority> <args...>
+        if parts.len() < 4 {
+            continue;
+        }
+        let mut batch = vec![
+            "--direct".to_string(),
+            "--add-rule".to_string(),
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+            parts[3].to_string(),
+        ];
+        batch.extend(parts[4..].iter().map(|p| p.to_string()));
+        batches.push(batch);
+    }
+    batches
 }
 
 /// Execute every `firewall-cmd` batch in a *single* `pkexec` invocation, so the
@@ -1033,5 +1104,41 @@ mod tests {
     #[test]
     fn build_firewall_script_of_no_batches_is_just_the_guard() {
         assert_eq!(build_firewall_script(&[]), "set -e\n");
+    }
+
+    #[test]
+    fn parse_foreign_runtime_preservations_captures_unmarked_runtime_only_rules() {
+        let runtime = "ipv4 filter OUTPUT 0 -p tcp --dport 8080 -j DROP\n\
+                       ipv4 mangle OUTPUT -1 -m comment --comment neutron-lockdown -j DROP\n\
+                       ipv6 filter OUTPUT 10 -j ACCEPT\n";
+        let permanent = "ipv6 filter OUTPUT 10 -j ACCEPT\n";
+
+        let batches = parse_foreign_runtime_preservations(runtime, permanent);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0],
+            vec![
+                "--direct",
+                "--add-rule",
+                "ipv4",
+                "filter",
+                "OUTPUT",
+                "0",
+                "-p",
+                "tcp",
+                "--dport",
+                "8080",
+                "-j",
+                "DROP",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_foreign_runtime_preservations_ignores_empty_or_all_permanent() {
+        let runtime = "ipv4 filter OUTPUT 0 -j DROP\n";
+        let permanent = "ipv4 filter OUTPUT 0 -j DROP\n";
+        assert!(parse_foreign_runtime_preservations(runtime, permanent).is_empty());
+        assert!(parse_foreign_runtime_preservations("", "").is_empty());
     }
 }

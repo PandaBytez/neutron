@@ -224,6 +224,76 @@ fn teardown_leaves_foreign_rules_untouched() {
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
+fn teardown_and_rebuild_preserve_runtime_only_foreign_rules() {
+    require_sandbox();
+    let _guard = Lockdown;
+
+    let foreign_runtime = [
+        "--direct",
+        "--add-rule",
+        "ipv4",
+        "filter",
+        "OUTPUT",
+        "77",
+        "-p",
+        "tcp",
+        "--dport",
+        "8888",
+        "-m",
+        "comment",
+        "--comment",
+        "foreign-runtime-rule",
+        "-j",
+        "DROP",
+    ];
+    let status = std::process::Command::new("firewall-cmd")
+        .args(foreign_runtime)
+        .status()
+        .expect("install foreign runtime rule");
+    assert!(status.success());
+
+    // Enable lockdown (which rebuilds)
+    CliNmClient
+        .enable_lockdown(&[tunnel("wg-test", "192.0.2.1", 51820)])
+        .expect("lockdown should enable");
+
+    // Assert foreign runtime rule survived enable/rebuild
+    let runtime_rules = std::process::Command::new("firewall-cmd")
+        .args(["--direct", "--get-all-rules"])
+        .output()
+        .expect("get runtime rules");
+    let runtime_str = String::from_utf8_lossy(&runtime_rules.stdout);
+    assert!(
+        runtime_str.contains("foreign-runtime-rule"),
+        "foreign runtime rule was lost after lockdown enable:\n{runtime_str}"
+    );
+
+    // Disable lockdown
+    CliNmClient
+        .disable_lockdown()
+        .expect("lockdown should disable");
+
+    // Assert foreign runtime rule survived disable
+    let runtime_rules_after = std::process::Command::new("firewall-cmd")
+        .args(["--direct", "--get-all-rules"])
+        .output()
+        .expect("get runtime rules");
+    let runtime_str_after = String::from_utf8_lossy(&runtime_rules_after.stdout);
+    assert!(
+        runtime_str_after.contains("foreign-runtime-rule"),
+        "foreign runtime rule was lost after lockdown disable:\n{runtime_str_after}"
+    );
+
+    // Clean up
+    let mut remove = vec!["--direct", "--remove-rule"];
+    remove.extend_from_slice(&foreign_runtime[2..]);
+    let _ = std::process::Command::new("firewall-cmd")
+        .args(&remove)
+        .status();
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
 fn enabling_lockdown_twice_is_idempotent() {
     // Re-enabling happens whenever the profile set changes
     // (`rebuild_lockdown_if_enabled`). Duplicated rules would accumulate on
