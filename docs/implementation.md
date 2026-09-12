@@ -70,6 +70,10 @@ For permanent rebuild guards and recovery, see
 
 ## Binary and Verification
 
+NAT-PMP sockets accept replies only from the requested gateway address and port.
+Replies must match the protocol version, length, opcode and internal port (with
+the provider's zero-port allocation convention supported).
+
 The executable is named `neutron`. The musl target produces a statically linked
 binary; system tools and services such as NetworkManager are still required.
 Build instructions are in [Packaging & Distribution](packaging-distribution.md).

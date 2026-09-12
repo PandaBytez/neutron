@@ -103,12 +103,18 @@ fn build_map_request(
 /// Rejects replies that are truncated, that answer a different opcode than the
 /// one asked for, or that carry a non-zero result code, so a misbehaving
 /// responder cannot be mistaken for a successful mapping.
-fn parse_map_response(bytes: &[u8], request_opcode: u8) -> AppResult<u16> {
-    if bytes.len() < RESPONSE_LEN {
+fn parse_map_response(bytes: &[u8], request_opcode: u8, internal_port: u16) -> AppResult<u16> {
+    if bytes.len() != RESPONSE_LEN {
         return Err(AppError::PortForward(format!(
-            "short NAT-PMP reply ({} bytes, expected {RESPONSE_LEN})",
+            "invalid NAT-PMP reply length ({} bytes, expected {RESPONSE_LEN})",
             bytes.len()
         )));
+    }
+
+    if bytes[0] != 0 {
+        return Err(AppError::PortForward(
+            "unsupported NAT-PMP reply version".into(),
+        ));
     }
 
     let expected_opcode = request_opcode + RESPONSE_OPCODE_OFFSET;
@@ -128,6 +134,16 @@ fn parse_map_response(bytes: &[u8], request_opcode: u8) -> AppResult<u16> {
     }
 
     let external_port = u16::from_be_bytes([bytes[10], bytes[11]]);
+    let returned_internal = u16::from_be_bytes([bytes[8], bytes[9]]);
+    // Providers may replace an allocation request's internal port zero with
+    // the assigned port. Fixed-port requests must echo the requested port.
+    if returned_internal != internal_port
+        && !(internal_port == 0 && returned_internal == external_port)
+    {
+        return Err(AppError::PortForward(
+            "NAT-PMP reply does not match the requested internal port".into(),
+        ));
+    }
     if external_port == 0 {
         return Err(AppError::PortForward(
             "gateway mapped port 0, so no port is forwarded".to_string(),
@@ -166,6 +182,20 @@ fn map_protocol(
     opcode: u8,
     requested_port: u16,
 ) -> AppResult<u16> {
+    map_protocol_at(
+        local_ip,
+        SocketAddrV4::new(gateway, NATPMP_PORT),
+        opcode,
+        requested_port,
+    )
+}
+
+fn map_protocol_at(
+    local_ip: Option<Ipv4Addr>,
+    gateway: SocketAddrV4,
+    opcode: u8,
+    requested_port: u16,
+) -> AppResult<u16> {
     let socket = if let Some(local) = local_ip {
         UdpSocket::bind((local, 0)).or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))
     } else {
@@ -177,25 +207,70 @@ fn map_protocol(
         .map_err(|error| AppError::PortForward(format!("could not set a timeout: {error}")))?;
 
     let request = build_map_request(opcode, requested_port, requested_port, LIFETIME);
-    socket
-        .send_to(&request, SocketAddrV4::new(gateway, NATPMP_PORT))
-        .map_err(|error| {
-            AppError::PortForward(format!("could not reach the gateway {gateway}: {error}"))
-        })?;
+    socket.connect(gateway).map_err(|error| {
+        AppError::PortForward(format!("could not connect to gateway {gateway}: {error}"))
+    })?;
+    socket.send(&request).map_err(|error| {
+        AppError::PortForward(format!("could not reach the gateway {gateway}: {error}"))
+    })?;
 
-    let mut reply = [0u8; RESPONSE_LEN];
-    let (len, _) = socket.recv_from(&mut reply).map_err(|error| {
+    // One spare byte lets us reject oversized datagrams rather than accepting
+    // a truncated valid-looking prefix. Connected UDP filters the sender.
+    let mut reply = [0u8; RESPONSE_LEN + 1];
+    let len = socket.recv(&mut reply).map_err(|error| {
         AppError::PortForward(format!(
             "no reply from {gateway}; the server may not offer port forwarding ({error})"
         ))
     })?;
 
-    parse_map_response(&reply[..len], opcode)
+    parse_map_response(&reply[..len], opcode, requested_port)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_validates_version_size_and_internal_port() {
+        let mut reply = response(OP_MAP_TCP, 0, 51234);
+        reply[8..10].copy_from_slice(&1234u16.to_be_bytes());
+        assert_eq!(parse_map_response(&reply, OP_MAP_TCP, 1234).unwrap(), 51234);
+        assert!(parse_map_response(&reply, OP_MAP_TCP, 4321).is_err());
+        assert!(parse_map_response(&reply, OP_MAP_TCP, 0).is_err());
+        reply[8..10].copy_from_slice(&51234u16.to_be_bytes());
+        assert!(parse_map_response(&reply, OP_MAP_TCP, 0).is_ok());
+        let mut oversized = reply.to_vec();
+        oversized.push(0);
+        assert!(parse_map_response(&oversized, OP_MAP_TCP, 0).is_err());
+        reply[0] = 1;
+        assert!(parse_map_response(&reply, OP_MAP_TCP, 0).is_err());
+    }
+
+    #[test]
+    fn mapping_ignores_packets_from_another_responder() {
+        let gateway = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        gateway
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, gateway.local_addr().unwrap().port());
+        let worker = std::thread::spawn(move || {
+            let mut request = [0; 12];
+            let (_, client) = gateway.recv_from(&mut request).unwrap();
+            let stranger = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            stranger
+                .send_to(&response(OP_MAP_UDP, 0, 11111), client)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            gateway
+                .send_to(&response(OP_MAP_UDP, 0, 51234), client)
+                .unwrap();
+        });
+        assert_eq!(
+            map_protocol_at(Some(Ipv4Addr::LOCALHOST), address, OP_MAP_UDP, 0).unwrap(),
+            51234
+        );
+        worker.join().unwrap();
+    }
 
     /// Build a well-formed reply so tests describe intent rather than offsets.
     fn response(opcode: u8, result_code: u16, external_port: u16) -> [u8; RESPONSE_LEN] {
@@ -228,16 +303,18 @@ mod tests {
     fn parses_the_mapped_port_from_a_success_reply() {
         let reply = response(OP_MAP_UDP, 0, 51234);
 
-        assert_eq!(parse_map_response(&reply, OP_MAP_UDP).unwrap(), 51234);
+        assert_eq!(parse_map_response(&reply, OP_MAP_UDP, 0).unwrap(), 51234);
     }
 
     #[test]
     fn rejects_a_truncated_reply() {
         let reply = response(OP_MAP_UDP, 0, 51234);
 
-        let result = parse_map_response(&reply[..8], OP_MAP_UDP);
+        let result = parse_map_response(&reply[..8], OP_MAP_UDP, 0);
 
-        assert!(matches!(result, Err(AppError::PortForward(message)) if message.contains("short")));
+        assert!(
+            matches!(result, Err(AppError::PortForward(message)) if message.contains("length"))
+        );
     }
 
     #[test]
@@ -246,7 +323,7 @@ mod tests {
         // datagram could be read as this request's mapping.
         let reply = response(OP_MAP_TCP, 0, 51234);
 
-        let result = parse_map_response(&reply, OP_MAP_UDP);
+        let result = parse_map_response(&reply, OP_MAP_UDP, 0);
 
         assert!(
             matches!(result, Err(AppError::PortForward(message)) if message.contains("opcode"))
@@ -258,7 +335,7 @@ mod tests {
         // Result code 2 is what a server without port forwarding answers.
         let reply = response(OP_MAP_UDP, 2, 0);
 
-        let result = parse_map_response(&reply, OP_MAP_UDP);
+        let result = parse_map_response(&reply, OP_MAP_UDP, 0);
 
         assert!(
             matches!(result, Err(AppError::PortForward(message)) if message.contains("not authorized"))
@@ -269,7 +346,7 @@ mod tests {
     fn rejects_a_success_reply_that_mapped_no_port() {
         let reply = response(OP_MAP_UDP, 0, 0);
 
-        let result = parse_map_response(&reply, OP_MAP_UDP);
+        let result = parse_map_response(&reply, OP_MAP_UDP, 0);
 
         assert!(
             matches!(result, Err(AppError::PortForward(message)) if message.contains("port 0"))
@@ -354,7 +431,7 @@ mod tests {
 
         let mut reply = [0u8; RESPONSE_LEN];
         let (len, _) = client_socket.recv_from(&mut reply).unwrap();
-        let mapped = parse_map_response(&reply[..len], OP_MAP_UDP).unwrap();
+        let mapped = parse_map_response(&reply[..len], OP_MAP_UDP, 0).unwrap();
         assert_eq!(mapped, 48888);
 
         done.store(true, Ordering::Relaxed);
