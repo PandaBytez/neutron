@@ -444,13 +444,20 @@ pub fn set_args(
 }
 
 /// Whether one address family should be barred from taking the tunnel's default
-/// route: only when split tunneling is on *and* that family has routes of its
-/// own to use instead.
+/// route: in Exclude mode, always (an empty route list means the entire family
+/// was excluded and must exit via physical routing - BUG-009); in Include mode,
+/// only when routes are installed to carry that family instead of the default route.
 fn never_default_for(mode: SplitTunnelMode, routes: &[String]) -> &'static str {
-    if mode.is_enabled() && !routes.is_empty() {
-        "yes"
-    } else {
-        "no"
+    match mode {
+        SplitTunnelMode::Disabled => "no",
+        SplitTunnelMode::Include => {
+            if routes.is_empty() {
+                "no"
+            } else {
+                "yes"
+            }
+        }
+        SplitTunnelMode::Exclude => "yes",
     }
 }
 
@@ -602,13 +609,11 @@ mod tests {
 
     #[test]
     fn no_family_is_ever_barred_from_routing_with_an_empty_route_list() {
-        // The invariant behind the bug, checked across every mode: a family may
-        // only be barred from the default route if it has somewhere else to go.
-        for mode in [
-            SplitTunnelMode::Disabled,
-            SplitTunnelMode::Include,
-            SplitTunnelMode::Exclude,
-        ] {
+        // The invariant behind BUG-012, checked for Disabled and Include modes:
+        // an un-split family may only be barred from the default route if it has
+        // routes of its own. In Exclude mode, an empty route list means the whole
+        // family was intentionally excluded and must use physical routing (BUG-009).
+        for mode in [SplitTunnelMode::Disabled, SplitTunnelMode::Include] {
             for (v4, v6) in [
                 (vec![], vec![]),
                 (vec!["10.0.0.0/8".to_string()], vec![]),
@@ -632,6 +637,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exclude_mode_whole_family_exclusion_sets_never_default_yes() {
+        // BUG-009: When 0.0.0.0/0 is excluded, routes_for produces an empty v4 list.
+        // set_args must still set ipv4.never-default = yes so NetworkManager does
+        // not re-install the tunnel default route and send excluded traffic into the VPN.
+        let (v4, v6) = routes_for(
+            SplitTunnelMode::Exclude,
+            &["0.0.0.0/0".to_string(), "::/0".to_string()],
+            &[],
+        );
+        assert!(v4.is_empty());
+        assert!(v6.is_empty());
+
+        let args = set_args("test-uuid", SplitTunnelMode::Exclude, &v4, &v6);
+        assert_eq!(
+            args[4], "yes",
+            "ipv4.never-default must be yes when all ipv4 is excluded"
+        );
+        assert_eq!(
+            args[6], "yes",
+            "ipv6.never-default must be yes when all ipv6 is excluded"
+        );
+        assert_eq!(args[8], "", "ipv4.routes must be empty");
+        assert_eq!(args[10], "", "ipv6.routes must be empty");
     }
 
     #[test]
