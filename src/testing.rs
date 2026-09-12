@@ -565,6 +565,11 @@ impl NmClient for MockNmClient {
 
     fn switch_to(&self, profile_identifier: &str) -> AppResult<()> {
         record(&self.calls, format!("switch:{profile_identifier}"));
+        if self.strict_disconnect && self.fail_disconnect {
+            return Err(AppError::CommandFailed(
+                "teardown failed and old profile is still active".to_string(),
+            ));
+        }
         self.apply_args(&crate::nm::tunnel_routing::set_args(
             profile_identifier,
             true,

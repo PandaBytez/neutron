@@ -276,6 +276,22 @@ fn switching_profiles_pins_routing_on_the_new_target() {
 }
 
 #[test]
+fn switching_fails_when_active_profile_teardown_fails() {
+    let client = MockNmClient::new(vec![
+        profile("wg-eu", "uuid-eu", ProfileState::Active),
+        profile("wg-us", "uuid-us", ProfileState::Inactive),
+    ])
+    .fail_disconnect()
+    .strict_disconnect();
+
+    let res = client.switch_to("uuid-us");
+    assert!(
+        res.is_err(),
+        "switch_to must fail if previous active tunnel teardown fails"
+    );
+}
+
+#[test]
 fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
     let sandbox = std::env::temp_dir().join(format!(
         "neutron-import-test-{}",
