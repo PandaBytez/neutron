@@ -513,8 +513,8 @@ fn handle_split_tunnel_key<C: NmClient>(
                             st.domains.push(domain);
                             st.selected_domain = st.domains.len().saturating_sub(1);
                             should_apply_cfg = Some(st.to_config());
+                            st.domain_input.clear();
                         }
-                        st.domain_input.clear();
                     }
                 }
                 SplitTunnelFocus::CidrInput => {
@@ -525,8 +525,8 @@ fn handle_split_tunnel_key<C: NmClient>(
                             st.cidrs.push(normalized);
                             st.selected_cidr = st.cidrs.len().saturating_sub(1);
                             should_apply_cfg = Some(st.to_config());
+                            st.cidr_input.clear();
                         }
-                        st.cidr_input.clear();
                     }
                 }
                 _ => {}
@@ -1154,7 +1154,36 @@ mod tests {
             vec!["10.0.0.0/8".to_string()]
         );
 
-        // Esc closes modal
+        // Type duplicate CIDR "10.0.0.0/8" and press Enter -> input retained
+        for c in "10.0.0.0/8".chars() {
+            handle_key_event(
+                &mut state,
+                &client,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        if let ActiveModal::SplitTunnel(ref st) = state.modal {
+            assert_eq!(st.cidrs, vec!["10.0.0.0/8".to_string()]);
+            assert_eq!(st.cidr_input, "10.0.0.0/8");
+        }
+
+        // First Esc clears cidr_input, second Esc closes modal
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        if let ActiveModal::SplitTunnel(ref st) = state.modal {
+            assert_eq!(st.cidr_input, "");
+        }
         handle_key_event(
             &mut state,
             &client,
