@@ -11,17 +11,6 @@ NC='\033[0m' # No Color
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAP_DIR="$(cd "$ROOT_DIR/../homebrew-tap" 2>/dev/null && pwd || true)"
 
-# Enable in-memory credential caching for this session so credentials
-# are entered at most once and shared across neutron and homebrew-tap pushes.
-export GIT_CONFIG_COUNT=1
-export GIT_CONFIG_KEY_0="credential.helper"
-export GIT_CONFIG_VALUE_0="cache --timeout=900"
-
-# Pre-seed credentials if GITHUB_TOKEN is available in the environment
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    printf "protocol=https\nhost=github.com\nusername=PandaBytez\npassword=%s\n\n" "$GITHUB_TOKEN" | git credential approve 2>/dev/null || true
-fi
-
 if [ $# -lt 1 ]; then
     echo -e "${RED}Error:${NC} Version/tag argument required."
     echo "Usage: ./release.sh <tag> (e.g. ./release.sh v0.1.0 or ./release --v0.1.0)"
@@ -64,11 +53,15 @@ fi
 
 # 3. Tag release locally
 echo -e "${BLUE}==>${NC} Tagging ${TAG}..."
-git tag -fa "$TAG" -m "Release $TAG"
+if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+    echo "Reusing existing tag $TAG."
+else
+    git tag -a "$TAG" -m "Release $TAG"
+fi
 
 # 4. Push main branch AND tag together in a single network operation
 echo -e "${BLUE}==>${NC} Pushing main branch and ${TAG} to origin..."
-git push origin main "$TAG" --force
+git push --atomic origin main "$TAG"
 
 # 5. Calculate SHA256 of the release archive
 TARBALL_URL="https://github.com/PandaBytez/neutron/archive/refs/tags/${TAG}.tar.gz"
@@ -95,12 +88,8 @@ for i in {1..12}; do
 done
 
 if [ -z "$SHA256" ]; then
-    echo -e "${YELLOW}Notice:${NC} Could not download public GitHub tarball directly (repo may be private or generating)."
-    echo "Generating archive checksum from local git tree..."
-    TMP_LOCAL="/tmp/neutron-local-${TAG}.tar.gz"
-    git archive --format=tar.gz --prefix="neutron-${VERSION}/" "$TAG" -o "$TMP_LOCAL"
-    SHA256=$(sha256sum "$TMP_LOCAL" | awk '{print $1}')
-    rm -f "$TMP_LOCAL"
+    echo -e "${RED}Error:${NC} Could not download the GitHub archive; refusing to publish an unverified Homebrew checksum."
+    exit 1
 fi
 
 echo -e "${GREEN}==>${NC} SHA256: ${YELLOW}${SHA256}${NC}"
