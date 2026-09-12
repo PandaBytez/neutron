@@ -160,13 +160,13 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
     cli: Cli,
 ) -> AppResult<()> {
+    let path = config::default_config_path()?;
     match cli.command {
         None | Some(Commands::Tui) => crate::tui::run(client.clone()),
         Some(Commands::Indicator) => {
             crate::service::indicator::run_standalone_indicator(client.clone())
         }
         Some(Commands::Sync) => {
-            let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let report = sync::sync_profiles_dir(client, &app_cfg)?;
             // Imported profiles have no lockdown allow-rule yet, so the ruleset
@@ -191,7 +191,6 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             Ok(())
         }
         Some(Commands::List) => {
-            let path = config::default_config_path()?;
             let app_cfg = config::load(&path)?;
             let profiles = client.list_wireguard_profiles()?;
             let rows = profile_list::build_rows(
@@ -205,11 +204,21 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             }
             Ok(())
         }
-        Some(Commands::Connect { profile }) => client.connect(&profile),
-        Some(Commands::Disconnect) => client.disconnect_active(),
-        Some(Commands::Switch { profile }) => client.switch_to(&profile),
+        Some(Commands::Connect { profile }) => {
+            client.connect(&profile)?;
+            rebuild_lockdown_if_enabled(client, &path)
+        }
+        Some(Commands::Disconnect) => {
+            client.disconnect_active()?;
+            rebuild_lockdown_if_enabled(client, &path)
+        }
+        Some(Commands::Switch { profile }) => {
+            client.switch_to(&profile)?;
+            rebuild_lockdown_if_enabled(client, &path)
+        }
         Some(Commands::StartupRandom) => {
             let res = service::run_startup_random(client);
+            let _ = rebuild_lockdown_if_enabled(client, &path);
             service::indicator::ensure_indicator_daemon_running();
             match res? {
                 service::StartupRandomResult::Connected(selected) => {

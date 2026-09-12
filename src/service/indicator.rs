@@ -758,7 +758,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Run standalone persistent indicator daemon in the foreground.
 pub fn run_standalone_indicator<C>(client: C) -> AppResult<()>
 where
-    C: NmClient + Clone + Send + Sync + 'static,
+    C: NmClient + crate::firewall::FirewallClient + Clone + Send + Sync + 'static,
 {
     install_status_icons();
 
@@ -785,12 +785,20 @@ where
     let _handle = spawn_indicator_service(client.clone(), state.clone());
 
     let mut lease = LeaseTracker::default();
+    let mut prev_active_uuid: Option<Option<String>> = None;
 
     loop {
         let profiles = client.list_wireguard_profiles().unwrap_or_default();
         let active = profiles.iter().find(|p| p.is_active());
         let active_name = active.map(|profile| profile.name.clone());
         let active_uuid = active.map(|profile| profile.uuid.clone());
+
+        if prev_active_uuid.as_ref() != Some(&active_uuid) {
+            prev_active_uuid = Some(active_uuid.clone());
+            if let Ok(path) = crate::config::default_config_path() {
+                let _ = crate::app::rebuild_lockdown_if_enabled(&client, &path);
+            }
+        }
 
         let app_cfg = crate::config::default_config_path()
             .ok()

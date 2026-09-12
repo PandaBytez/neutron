@@ -249,6 +249,7 @@ where
                     } else {
                         state.set_status(format!("Disconnected '{name}'."));
                     }
+                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                     let _ = events::reload_profiles(state, client);
                     events::update_diagnostics(state, client);
                 }

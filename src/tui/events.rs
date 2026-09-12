@@ -146,6 +146,7 @@ pub fn execute_action<C: ActionClient>(
                         client.switch_to(&uuid)?;
                         state.set_status(format!("Connected '{name}'."));
                     }
+                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                     reload_profiles(state, client)?;
                 }
             }
@@ -169,6 +170,7 @@ pub fn execute_action<C: ActionClient>(
                 } else {
                     client.switch_to(&uuid)?;
                     state.set_status(format!("Switched to '{name}'."));
+                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                     reload_profiles(state, client)?;
                 }
             }
@@ -192,6 +194,7 @@ pub fn execute_action<C: ActionClient>(
             } else {
                 client.disconnect_active()?;
                 state.set_status("Disconnected active profile.");
+                let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                 reload_profiles(state, client)?;
             }
         }
@@ -508,25 +511,24 @@ fn handle_split_tunnel_key<C: NmClient>(
             }
             KeyCode::Enter => match st.focus {
                 SplitTunnelFocus::DomainInput => {
-                    if let Some(domain) = nm::split_tunnel::normalize_domain(&st.domain_input) {
-                        if !st.domains.contains(&domain) {
-                            st.domains.push(domain);
-                            st.selected_domain = st.domains.len().saturating_sub(1);
-                            should_apply_cfg = Some(st.to_config());
-                            st.domain_input.clear();
-                        }
+                    if let Some(domain) = nm::split_tunnel::normalize_domain(&st.domain_input)
+                        && !st.domains.contains(&domain)
+                    {
+                        st.domains.push(domain);
+                        st.selected_domain = st.domains.len().saturating_sub(1);
+                        should_apply_cfg = Some(st.to_config());
+                        st.domain_input.clear();
                     }
                 }
                 SplitTunnelFocus::CidrInput => {
                     if let Ok((normalized, _)) =
                         nm::split_tunnel::parse_and_normalize_cidr(&st.cidr_input)
+                        && !st.cidrs.contains(&normalized)
                     {
-                        if !st.cidrs.contains(&normalized) {
-                            st.cidrs.push(normalized);
-                            st.selected_cidr = st.cidrs.len().saturating_sub(1);
-                            should_apply_cfg = Some(st.to_config());
-                            st.cidr_input.clear();
-                        }
+                        st.cidrs.push(normalized);
+                        st.selected_cidr = st.cidrs.len().saturating_sub(1);
+                        should_apply_cfg = Some(st.to_config());
+                        st.cidr_input.clear();
                     }
                 }
                 _ => {}

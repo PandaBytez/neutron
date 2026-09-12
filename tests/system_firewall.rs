@@ -56,6 +56,7 @@ fn tunnel(interface: &str, host: &str, port: u16) -> WireguardTunnel {
             host: host.to_string(),
             port,
         }],
+        is_active: true,
     }
 }
 
@@ -400,7 +401,7 @@ fn leak_bug019_dns_is_not_permitted_to_arbitrary_resolvers() {
 
     let unscoped: Vec<String> = marked_rules()
         .into_iter()
-        .filter(|rule| rule.contains("--dport 53"))
+        .filter(|rule| rule.contains("--dport 53") && rule.contains("ACCEPT"))
         .filter(|rule| !rule.contains("-d "))
         .collect();
 

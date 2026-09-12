@@ -436,10 +436,12 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
     // catch-all drop (10).
     let mut batches = vec![add_rule(family, 0, &["-o", "lo", "-j", "ACCEPT"])];
 
+    let any_active = tunnels.iter().any(|t| t.is_active);
+
     // When disconnected (no tunnels active), allow broad DNS so peer endpoints
     // can resolve before connecting. When a tunnel is active, DNS travels through
     // the tunnel interface (-o <iface> -j ACCEPT) without leaking outside.
-    if tunnels.is_empty() {
+    if !any_active {
         batches.push(add_rule(
             family,
             1,
@@ -450,15 +452,29 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
             1,
             &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
         ));
+    } else {
+        for tunnel in tunnels.iter().filter(|t| t.is_active) {
+            if let Some(interface) = &tunnel.interface {
+                batches.push(add_rule(family, 0, &["-o", interface, "-j", "ACCEPT"]));
+            }
+        }
+        // Block external/LAN-bound DNS while connected so queries cannot leak to LAN resolvers.
+        batches.push(add_rule(
+            family,
+            1,
+            &["-p", "udp", "--dport", "53", "-j", "DROP"],
+        ));
+        batches.push(add_rule(
+            family,
+            1,
+            &["-p", "tcp", "--dport", "53", "-j", "DROP"],
+        ));
     }
 
     // Keep the local network reachable (LAN devices, DHCP, mDNS).
     batches.extend(local_network_batches(family));
 
     for tunnel in tunnels {
-        if let Some(interface) = &tunnel.interface {
-            batches.push(add_rule(family, 1, &["-o", interface, "-j", "ACCEPT"]));
-        }
         for endpoint in &tunnel.endpoints {
             batches.extend(endpoint_rules(family, endpoint));
         }
@@ -682,10 +698,11 @@ mod tests {
             endpoints: endpoints
                 .iter()
                 .map(|(host, port)| Endpoint {
-                    host: host.to_string(),
+                    host: (*host).to_string(),
                     port: *port,
                 })
                 .collect(),
+            is_active: true,
         }
     }
 
@@ -755,6 +772,18 @@ mod tests {
                 .iter()
                 .any(|batch| batch.contains(&"DROP".to_string()) && batch[4] == "mangle")
         );
+    }
+
+    #[test]
+    fn disconnected_bootstrap_dns_and_connected_lan_dns_drop() {
+        let mut inactive = tunnel("wg0", &[("vpn.example.com", 51820)]);
+        inactive.is_active = false;
+        let disconnected = lockdown_enable_batches(&[inactive]);
+        assert!(has_rule(&disconnected, &["--dport", "53", "-j", "ACCEPT"]));
+
+        let active = lockdown_enable_batches(&[tunnel("wg0", &[("vpn.example.com", 51820)])]);
+        assert!(!has_rule(&active, &["--dport", "53", "-j", "ACCEPT"]));
+        assert!(has_rule(&active, &["--dport", "53", "-j", "DROP"]));
     }
 
     #[test]

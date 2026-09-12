@@ -50,6 +50,7 @@ pub struct Endpoint {
 pub struct WireguardTunnel {
     pub interface: Option<String>,
     pub endpoints: Vec<Endpoint>,
+    pub is_active: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,6 +300,7 @@ impl NmClient for CliNmClient {
             tunnels.push(WireguardTunnel {
                 interface,
                 endpoints,
+                is_active: profile.is_active(),
             });
         }
         Ok(tunnels)
