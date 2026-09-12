@@ -2,6 +2,12 @@
 
 Neutron uses a human-readable, self-documenting **TOML** configuration file located at `~/.config/neutron/config.toml`.
 
+Imported profile comments are stored separately in `profile-info.json` beside the
+settings file, keyed by NetworkManager profile UUID. They still appear in profile
+details, but no longer clutter `config.toml`. Existing inline `profile_custom_info`
+entries migrate on the next successful settings save. The notes file uses atomic
+writes and owner-only permissions; deleting a profile removes its notes.
+
 ---
 
 ## Configuration File Schema

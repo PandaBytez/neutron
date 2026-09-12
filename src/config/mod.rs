@@ -208,8 +208,9 @@ pub struct AppConfig {
     /// qBittorrent dynamic port forwarding synchronization
     #[serde(default)]
     pub qbittorrent: QBittorrentConfig,
-    /// Custom comments/info from the imported `.conf` file, indexed by profile UUID.
-    #[serde(default)]
+    /// Imported notes keyed by UUID. Loaded from profile-info.json; the legacy
+    /// inline field is accepted for migration but never serialized into settings.
+    #[serde(default, skip_serializing)]
     pub profile_custom_info: BTreeMap<String, String>,
 }
 
@@ -218,17 +219,39 @@ fn default_true() -> bool {
 }
 
 pub fn load(path: &Path) -> AppResult<AppConfig> {
-    if !path.exists() {
-        return Ok(AppConfig::default());
-    }
-
-    let data = fs::read_to_string(path)?;
-    if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        let parsed = serde_json::from_str::<AppConfig>(&data)?;
-        Ok(parsed)
+    let mut config = if path.exists() {
+        let data = fs::read_to_string(path)?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            serde_json::from_str::<AppConfig>(&data)?
+        } else {
+            toml::from_str::<AppConfig>(&data)?
+        }
     } else {
-        let parsed = toml::from_str::<AppConfig>(&data)?;
-        Ok(parsed)
+        AppConfig::default()
+    };
+    if let Some(info) = read_profile_info(path)? {
+        // The sidecar is authoritative, even when empty: a failed settings
+        // save must not resurrect deleted notes from the old inline field.
+        config.profile_custom_info = info;
+    }
+    Ok(config)
+}
+
+fn profile_info_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("profile-info.json")
+}
+
+fn read_profile_info(config_path: &Path) -> AppResult<Option<BTreeMap<String, String>>> {
+    let path = profile_info_path(config_path);
+    match fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).map(Some).map_err(|error| {
+            AppError::Config(format!("could not parse {}: {error}", path.display()))
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::Config(format!(
+            "could not read {}: {error}",
+            path.display()
+        ))),
     }
 }
 
@@ -271,6 +294,21 @@ fn save_unlocked(path: &Path, config: &AppConfig) -> AppResult<()> {
     } else {
         toml::to_string_pretty(config)?
     };
+    let stored_info = read_profile_info(path)?;
+    if stored_info.as_ref() != Some(&config.profile_custom_info)
+        && (stored_info.is_some() || !config.profile_custom_info.is_empty())
+    {
+        // Preserve notes before removing their legacy copy from settings. Both
+        // writes share the config lock; each individual file is replaced atomically.
+        let info_path = profile_info_path(path);
+        write_atomically(
+            &info_path,
+            &serde_json::to_string_pretty(&config.profile_custom_info)?,
+        )
+        .map_err(|error| {
+            AppError::Config(format!("could not save {}: {error}", info_path.display()))
+        })?;
+    }
     write_atomically(path, &body)?;
     Ok(())
 }
@@ -381,6 +419,84 @@ pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_notes_migrate_from_toml_and_json_and_follow_profile_deletion() {
+        for (label, legacy) in [
+            (
+                "notes",
+                "[profile_custom_info]\nuuid = \"Provider notes\\nSecond line\"\n",
+            ),
+            (
+                "notes.json",
+                r#"{"profile_custom_info":{"uuid":"Provider notes\nSecond line"}}"#,
+            ),
+        ] {
+            let path = unique_path(label);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, legacy).unwrap();
+            assert_eq!(
+                load(&path).unwrap().profile_custom_info["uuid"],
+                "Provider notes\nSecond line"
+            );
+            assert!(
+                !profile_info_path(&path).exists(),
+                "reading must not migrate files"
+            );
+            update(&path, |cfg| cfg.theme.preset = "gruvbox".into()).unwrap();
+            assert!(
+                !fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("profile_custom_info")
+            );
+            assert_eq!(
+                load(&path).unwrap().profile_custom_info["uuid"],
+                "Provider notes\nSecond line"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(profile_info_path(&path))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            update(&path, |cfg| {
+                forget_profile(cfg, "uuid");
+            })
+            .unwrap();
+            assert!(load(&path).unwrap().profile_custom_info.is_empty());
+            // A stale inline copy after an interrupted save must not resurrect notes.
+            fs::write(&path, legacy).unwrap();
+            assert!(load(&path).unwrap().profile_custom_info.is_empty());
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn failed_metadata_migration_preserves_inline_notes_and_reports_the_file() {
+        let path = unique_path("notes-failed-migration");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = "[profile_custom_info]\nuuid = \"keep me\"\n";
+        fs::write(&path, legacy).unwrap();
+        fs::create_dir(profile_info_path(&path)).unwrap();
+        let error = update(&path, |_| {}).unwrap_err();
+        assert!(error.to_string().contains("profile-info.json"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
+        fs::remove_dir(profile_info_path(&path)).unwrap();
+        fs::write(profile_info_path(&path), "invalid JSON").unwrap();
+        assert!(load(&path).is_err());
+        assert!(save(&path, &AppConfig::default()).is_err());
+        assert_eq!(
+            fs::read_to_string(profile_info_path(&path)).unwrap(),
+            "invalid JSON"
+        );
+        cleanup(&path);
+    }
 
     #[test]
     fn concurrent_narrow_updates_preserve_every_writer() {

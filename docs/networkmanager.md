@@ -34,4 +34,4 @@ All `nmcli` invocations run through `run_command_with_timeout` with a strict **3
 When modifying global settings across all profiles (such as setting `connection.autoconnect` or applying split-tunneling routes), the sweep does not abort on the first failure. It processes every profile, collects all failures, and surfaces an aggregated report (e.g. `1 of 5 profiles rejected the change: ...`).
 
 ### 4. WireGuard Comment Ingestion
-When importing `.conf` files via `nmcli connection import type wireguard file <path>`, comments inside the `[Interface]` section (often containing provider metadata, server features, or notes) are extracted and saved in `AppConfig.profile_custom_info` keyed by profile UUID.
+When importing `.conf` files via `nmcli connection import type wireguard file <path>`, comments inside the `[Interface]` section (often containing provider metadata, server features, or notes) are extracted and saved in `profile-info.json` beside the application settings, keyed by profile UUID. `AppConfig.profile_custom_info` remains the in-memory view used by the CLI and TUI.
