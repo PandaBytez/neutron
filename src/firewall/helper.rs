@@ -11,32 +11,111 @@ use crate::nm::NmClient;
 pub const NAME: &str = "neutron-lockdown-helper";
 const PATH: &str = "/usr/local/libexec/neutron-lockdown-helper";
 pub(super) const LOCK_PATH: &str = "/run/neutron-lockdown.lock";
-const POLICY_PATH: &str = "/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules";
-const POLICY: &str = r#"polkit.addRule(function(action, subject) {
-    if (action.id == "org.freedesktop.policykit.exec" &&
-        action.lookup("program") == "/usr/local/libexec/neutron-lockdown-helper") {
-        return subject.local && subject.active ? polkit.Result.YES : polkit.Result.NO;
-    }
-});
-"#;
+const ACTION_ID: &str = "io.github.pandabytez.neutron.lockdown-refresh";
+const LEGACY_POLICY_PATH: &str = "/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules";
 
 pub(super) fn install_script() -> AppResult<String> {
     let executable = std::env::current_exe()?;
     let executable = executable
         .to_str()
         .ok_or_else(|| AppError::Firewall("Neutron executable path is not valid UTF-8".into()))?;
+    let version = crate::process::run_with_timeout(
+        "pkaction",
+        &["--version"],
+        std::time::Duration::from_secs(5),
+    )?;
+    let action_dir = action_directory(&version)?;
+    let action_path = format!("{action_dir}/{ACTION_ID}.policy");
+    let policy_start = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="{ACTION_ID}">
+    <description>Refresh existing Neutron lockdown rules</description>
+    <message>Refresh existing Neutron lockdown rules</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">"#
+    );
+    let policy_end = "</annotate>\n  </action>\n</policyconfig>\n";
+    // A newly created local actions directory may not invalidate polkit's
+    // cache. Reload the authority by its D-Bus owner's PID, not by process name.
+    let reload = if action_dir == "/usr/local/share/polkit-1/actions" {
+        "polkit_reply=$(dbus-send --system --print-reply --dest=org.freedesktop.DBus \
+         /org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID \
+         string:org.freedesktop.PolicyKit1)\n\
+         polkit_pid=${polkit_reply##*uint32 }\n\
+         case \"$polkit_pid\" in ''|*[!0-9]*) echo 'Invalid polkit daemon PID' >&2; exit 1;; esac\n\
+         kill -HUP \"$polkit_pid\"\n"
+    } else {
+        ""
+    };
     // Replace atomically: another process may still be executing the old copy.
+    // pkexec resolves symlinks before matching exec.path (e.g. /usr/local on
+    // Fedora Atomic), so record the installed helper's canonical path.
     Ok(format!(
         "install -d -m 755 /usr/local/libexec\n\
          install -m 755 -- {} {PATH}.new\n\
          mv -f -- {PATH}.new {PATH}\n\
-         install -d -m 755 /etc/polkit-1/rules.d\n\
-         printf %s {} > {POLICY_PATH}\n\
-         chmod 644 {POLICY_PATH}\n\
+         helper_path=$(readlink -f -- {PATH})\n\
+         helper_path_xml=$(printf %s \"$helper_path\" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g')\n\
+         install -d -m 755 {action_dir}\n\
+         printf %s {} \"$helper_path_xml\" {} > {action_path}.new\n\
+         chmod 644 {action_path}.new\n\
+         mv -f -- {action_path}.new {action_path}\n\
+         rm -f -- {LEGACY_POLICY_PATH}\n\
+         {reload}\
+         attempt=0\n\
+         until pkaction --action-id {ACTION_ID} >/dev/null 2>&1; do\n\
+           attempt=$((attempt + 1))\n\
+           if [ \"$attempt\" -ge 5 ]; then pkaction --action-id {ACTION_ID} >&2; exit 1; fi\n\
+           sleep 1\n\
+         done\n\
          if [ -d /run/systemd/system ]; then systemctl enable firewalld.service; fi\n",
         shell_quote(executable),
-        shell_quote(POLICY),
+        shell_quote(&policy_start),
+        shell_quote(policy_end),
     ))
+}
+
+fn action_directory(version: &str) -> AppResult<&'static str> {
+    let release = version
+        .split_whitespace()
+        .last()
+        .and_then(|value| {
+            value
+                .strip_prefix("0.")
+                .unwrap_or(value)
+                .parse::<u32>()
+                .ok()
+        })
+        .ok_or_else(|| AppError::Firewall(format!("Unrecognized polkit version: {version}")))?;
+    // Local action directories were added in polkit 126. Older releases only
+    // read /usr/share; newer ones can also install on immutable /usr systems.
+    Ok(if release >= 126 {
+        "/usr/local/share/polkit-1/actions"
+    } else {
+        "/usr/share/polkit-1/actions"
+    })
+}
+
+fn authorization_command() -> std::process::Command {
+    let mut command = crate::process::host_command("pkcheck");
+    // Unprivileged callers cannot supply --detail, even for their own process.
+    // The dedicated action binds pkexec to the helper without caller details.
+    command
+        .args([
+            "--action-id",
+            ACTION_ID,
+            "--process",
+            &std::process::id().to_string(),
+        ])
+        .stdin(Stdio::null());
+    command
 }
 
 /// Invoke only the narrowly authorized helper; never fall back to a password prompt.
@@ -55,27 +134,23 @@ pub(super) fn refresh(activating: Option<&str>) -> AppResult<()> {
         ));
     }
     // pkexec's flag only disables its *terminal* agent. Check authorization
-    // without AllowUserInteraction first, so a missing rule cannot open a GUI prompt.
-    let authorization = crate::process::host_command("pkcheck")
-        .args([
-            "--action-id",
-            "org.freedesktop.policykit.exec",
-            "--process",
-            &std::process::id().to_string(),
-            "--detail",
-            "program",
-            PATH,
-        ])
-        .output()?;
+    // without AllowUserInteraction first, so a missing action cannot open a GUI prompt.
+    let authorization = authorization_command().output()?;
     if !authorization.status.success() {
-        return Err(AppError::Firewall(
-            "Password-free lockdown refresh is unavailable. Run `neutron lockdown enable` \
-             once from an active local session to install or repair authorization."
-                .into(),
-        ));
+        let detail = crate::process::format_command_error(
+            "pkcheck denied authorization",
+            authorization.status,
+            &String::from_utf8_lossy(&authorization.stderr),
+        );
+        return Err(AppError::Firewall(format!(
+            "Password-free lockdown refresh is unavailable: {detail}. \
+             Run `neutron lockdown enable` once from an active local session to install \
+             or repair authorization; existing protection remains in place."
+        )));
     }
     let mut child = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")])
-        .args(["--disable-internal-agent", PATH])
+        .arg("--disable-internal-agent")
+        .arg(std::fs::canonicalize(PATH)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -194,6 +269,40 @@ fn rules_match(removals: &[Vec<String>], desired: &[Vec<String>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_check_is_unprivileged_and_noninteractive() {
+        let command = authorization_command();
+        assert_eq!(command.get_program(), "pkcheck");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "--action-id",
+                ACTION_ID,
+                "--process",
+                &std::process::id().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn action_directory_supports_old_polkit_and_immutable_usr() {
+        for version in ["pkaction version 0.105", "pkaction version 125"] {
+            assert_eq!(
+                action_directory(version).unwrap(),
+                "/usr/share/polkit-1/actions"
+            );
+        }
+        for version in ["pkaction version 126", "pkaction version 127\n"] {
+            assert_eq!(
+                action_directory(version).unwrap(),
+                "/usr/local/share/polkit-1/actions"
+            );
+        }
+        assert!(action_directory("unexpected output").is_err());
+        assert!(action_directory("").is_err());
+    }
 
     #[test]
     fn restored_rules_are_a_noop_but_dns_changes_and_missing_rules_are_not() {

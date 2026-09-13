@@ -57,6 +57,9 @@ mkdir -p /run/dbus /run/firewalld /var/log /etc/NetworkManager/system-connection
 
 dbus-daemon --system --fork
 
+/usr/lib/polkit-1/polkitd --no-debug >/var/log/neutron-polkit.log 2>&1 &
+wait_ready polkit $! /var/log/neutron-polkit.log pkaction
+
 # `--no-daemon`/`--nofork` keep both in the foreground so their lifetime is tied
 # to this container; backgrounded here so the test command can run.
 NetworkManager --no-daemon >/var/log/neutron-nm.log 2>&1 &

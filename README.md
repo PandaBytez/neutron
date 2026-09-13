@@ -104,11 +104,16 @@ For headless servers without an XDG desktop environment, an optional user servic
 
 Lockdown is stored in firewalld's permanent configuration and takes effect when
 firewalld starts, before login. Enabling/disabling it requires administrator
-authentication. Enabling also installs a root-owned refresh helper and a narrowly
-scoped polkit rule so an active local session can refresh tunnel/DNS allowances
+authentication. Enabling also installs a root-owned refresh helper and a dedicated
+polkit action so an active local session can refresh tunnel/DNS allowances
 without another password prompt. The helper cannot turn lockdown on or off.
 
-After upgrading from an older version, run `neutron lockdown enable` once to
-install/update the helper. Enabling lockdown also enables firewalld at boot on systemd systems.
+After upgrading (including from 0.1.2), run `neutron lockdown enable` once from an
+active local session to install/update the helper and its authorization. This
+replaces the old authorization check that polkit rejected for non-root users.
+Existing protection stays in place if an automatic refresh cannot be authorized.
+Enabling lockdown also enables firewalld at boot on systemd systems. Polkit 126+
+uses `/usr/local/share/polkit-1/actions`, supporting immutable `/usr`; older
+versions require a writable `/usr/share/polkit-1/actions`.
 
 ---

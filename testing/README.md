@@ -46,7 +46,14 @@ cargo lint
 ```
 
 Requires `podman` (or `docker`). The first run builds the `neutron-sandbox` Fedora image with NetworkManager,
-firewalld, WireGuard tools, and the Rust toolchain.
+firewalld, polkit, WireGuard tools, and the Rust toolchain. Rebuild an older image
+with `./testing/run-container-tests.sh --rebuild --firewall` to include real polkit.
+
+The firewall tier checks refresh authorization with real `pkcheck`, `pkexec`,
+and polkit as an unprivileged user, including denial and missing-policy errors.
+Since the container has no desktop login session, a temporary test-only rule
+grants only the refresh action for the success case. Active/inactive desktop
+session classification still requires a real login session.
 
 ## Safety model
 

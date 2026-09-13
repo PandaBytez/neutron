@@ -111,6 +111,175 @@ fn permanent_lockdown_refreshes_after_reload_without_reenabling_after_disable() 
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
+fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
+    require_sandbox();
+    const ACTION: &str = "io.github.pandabytez.neutron.lockdown-refresh";
+    const TEST_RULE: &str = "/etc/polkit-1/rules.d/00-neutron-test-refresh.rules";
+    const CHILD_ENV: &str = "NEUTRON_TEST_REFRESH_CHILD";
+
+    if let Ok(mode) = std::env::var(CHILD_ENV) {
+        let result = CliNmClient.refresh_lockdown(None);
+        match mode.as_str() {
+            "allowed" => result.expect("authorized unprivileged refresh should succeed"),
+            "denied" | "missing" => {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("Password-free lockdown refresh is unavailable"),
+                    "{error}"
+                );
+                assert!(error.contains("neutron lockdown enable"), "{error}");
+                assert!(
+                    error.contains(if mode == "denied" {
+                        "exit 1)"
+                    } else {
+                        "exit 127)"
+                    }),
+                    "{error}"
+                );
+                assert!(!error.contains("Only trusted callers"), "{error}");
+            }
+            _ => panic!("unexpected refresh test mode: {mode}"),
+        }
+        return;
+    }
+
+    struct TestRule;
+    impl Drop for TestRule {
+        fn drop(&mut self) {
+            std::fs::remove_file(TEST_RULE).expect("remove test authorization rule");
+        }
+    }
+
+    let run_child = |mode| {
+        let output = std::process::Command::new("runuser")
+            .args(["-u", "nobody", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "password_free_refresh_uses_real_polkit_as_an_unprivileged_user",
+                "--nocapture",
+            ])
+            // Bypass the root-only firewall-test pkexec shim.
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/sh")
+            .env(CHILD_ENV, mode)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    let wait_for_authorization = |expected| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output = std::process::Command::new("runuser")
+                .args([
+                    "-u",
+                    "nobody",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "exec /usr/bin/pkcheck --action-id \"$1\" --process \"$$\"",
+                    "sh",
+                    ACTION,
+                ])
+                .output()
+                .unwrap();
+            if output.status.code() == Some(expected) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{output:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    let _lockdown = Lockdown;
+    let legacy_rule = "/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules";
+    std::fs::write(
+        legacy_rule,
+        r#"polkit.addRule(function(action, subject) {
+            if (action.id == "org.freedesktop.policykit.exec" &&
+                action.lookup("program") == "/usr/local/libexec/neutron-lockdown-helper") {
+                return subject.local && subject.active ? polkit.Result.YES : polkit.Result.NO;
+            }
+        });
+"#,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
+            .args(["lockdown", "enable"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!std::path::Path::new(legacy_rule).exists());
+    let action_path = format!("/usr/local/share/polkit-1/actions/{ACTION}.policy");
+    let policy = std::fs::read_to_string(&action_path).unwrap();
+    let helper_path = std::fs::canonicalize("/usr/local/libexec/neutron-lockdown-helper").unwrap();
+    assert!(policy.contains(&format!(
+        "<annotate key=\"org.freedesktop.policykit.exec.path\">{}</annotate>",
+        helper_path.display()
+    )));
+    assert!(policy.contains("<allow_any>no</allow_any>"));
+    assert!(policy.contains("<allow_inactive>no</allow_inactive>"));
+    assert!(policy.contains("<allow_active>yes</allow_active>"));
+    let saved = marked_rules();
+    wait_for_authorization(1);
+    run_child("denied");
+    assert_eq!(marked_rules(), saved);
+
+    // There is no active logind session in this container. Grant only this
+    // action to the test user so both pkcheck and pkexec exercise real polkit.
+    std::fs::write(
+        TEST_RULE,
+        format!(
+            "polkit.addRule(function(action, subject) {{\n\
+             if (action.id == \"{ACTION}\" && subject.user == \"nobody\") \
+             return polkit.Result.YES;\n\
+             }});\n"
+        ),
+    )
+    .unwrap();
+    let _rule = TestRule;
+    wait_for_authorization(0);
+    // Removing an allowance is fail-closed and forces the helper to do real
+    // privileged work instead of merely accepting already-matching rules.
+    let loopback = saved.iter().find(|rule| rule.contains("-o lo ")).unwrap();
+    assert!(
+        std::process::Command::new("firewall-cmd")
+            .args(["--direct", "--remove-rule"])
+            .args(loopback.split_whitespace())
+            .status()
+            .unwrap()
+            .success()
+    );
+    run_child("allowed");
+    assert_eq!(marked_rules(), saved);
+    let runtime = std::process::Command::new("firewall-cmd")
+        .args(["--direct", "--get-all-rules"])
+        .output()
+        .unwrap();
+    assert!(runtime.status.success(), "{runtime:?}");
+    assert!(
+        String::from_utf8_lossy(&runtime.stdout)
+            .lines()
+            .any(|line| line == loopback)
+    );
+
+    CliNmClient.disable_lockdown().unwrap();
+    run_child("allowed");
+    assert!(
+        marked_rules().is_empty(),
+        "refresh must not re-enable lockdown"
+    );
+
+    std::fs::remove_file(action_path).unwrap();
+    wait_for_authorization(127);
+    run_child("missing");
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
 fn firewalld_accepts_the_lockdown_ruleset() {
     // The whole ruleset is built and applied through the real `pkexec sh -c`
     // path, so this also exercises `build_firewall_script` and `shell_quote`

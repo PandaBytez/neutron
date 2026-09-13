@@ -35,6 +35,8 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         procps-ng \
         curl \
         dbus-daemon \
+        polkit \
+        util-linux \
         wireguard-tools \
         iproute \
         cargo \
@@ -53,11 +55,11 @@ RUN mkdir -p /run/dbus /run/firewalld /etc/NetworkManager/system-connections /va
     fi
 
 # Neutron escalates privilege for firewall changes by invoking `pkexec`. There is
-# no polkit authority or user session in a container, and the tests already run
-# as root, so this shim stands in for it.
+# no login session in a container, and the normal firewall tests already run as
+# root, so this shim stands in for it. Authorization regressions use the real
+# /usr/bin/pkexec as an unprivileged user; pkcheck must never be shimmed.
 RUN printf '#!/bin/sh\n[ "$1" != "--disable-internal-agent" ] || shift\nexec "$@"\n' > /usr/local/bin/pkexec \
-    && printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/pkcheck \
-    && chmod +x /usr/local/bin/pkexec /usr/local/bin/pkcheck
+    && chmod +x /usr/local/bin/pkexec
 
 # Keep cargo's output away from the mounted source tree so a container run can
 # never clobber the host's `target/` (different glibc, different flags).
