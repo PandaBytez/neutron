@@ -55,8 +55,9 @@ RUN mkdir -p /run/dbus /run/firewalld /etc/NetworkManager/system-connections /va
 # Neutron escalates privilege for firewall changes by invoking `pkexec`. There is
 # no polkit authority or user session in a container, and the tests already run
 # as root, so this shim stands in for it.
-RUN printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/pkexec \
-    && chmod +x /usr/local/bin/pkexec
+RUN printf '#!/bin/sh\n[ "$1" != "--disable-internal-agent" ] || shift\nexec "$@"\n' > /usr/local/bin/pkexec \
+    && printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/pkcheck \
+    && chmod +x /usr/local/bin/pkexec /usr/local/bin/pkcheck
 
 # Keep cargo's output away from the mounted source tree so a container run can
 # never clobber the host's `target/` (different glibc, different flags).

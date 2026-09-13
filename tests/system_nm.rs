@@ -211,7 +211,14 @@ fn activation_prepares_connected_lockdown_before_first_traffic() {
         .replace("0.0.0.0/0, ::/0", "198.19.0.0/16")
         .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0");
     let fixture = Fixture::import_config("locked", &config);
-    neutron::app::set_global_lockdown(&CliNmClient, &path, true).unwrap();
+    // Install the actual application as the refresh helper, not this test binary.
+    assert!(
+        std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
+            .args(["lockdown", "enable"])
+            .status()
+            .unwrap()
+            .success()
+    );
     CliNmClient.connect(&fixture.uuid).unwrap();
     let output = std::process::Command::new("firewall-cmd")
         .args(["--direct", "--get-all-rules"])

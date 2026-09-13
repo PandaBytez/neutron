@@ -813,8 +813,7 @@ pub fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
         if !config::load(path)?.lockdown_enabled {
             return Ok(());
         }
-        let tunnels = client.wireguard_tunnels()?;
-        client.enable_lockdown(&tunnels)
+        client.refresh_lockdown(None)
     })
 }
 
@@ -1225,7 +1224,7 @@ mod tests {
 
         rebuild_lockdown_if_enabled(&client, &path).expect("rebuild should succeed");
 
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:refresh"]);
         cleanup_test_config(&path);
     }
 

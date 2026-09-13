@@ -952,15 +952,7 @@ fn activate(uuid: &str) -> AppResult<()> {
         prepare_profile(uuid, &config, &mut run_nmcli)?;
         let settings = parse_peer_settings(&run_nmcli(&["connection", "show", uuid])?);
         if config.lockdown_enabled {
-            let mut tunnels = CliNmClient.wireguard_tunnels()?;
-            // Install the target interface and connected DNS policy before up.
-            let interface = tunnel_interface_name(uuid);
-            for tunnel in &mut tunnels {
-                if tunnel.interface == interface {
-                    tunnel.is_active = true;
-                }
-            }
-            CliNmClient.enable_lockdown(&tunnels)?;
+            CliNmClient.refresh_lockdown(Some(uuid))?;
         }
         let result = activate_prepared(
             uuid,
@@ -969,9 +961,7 @@ fn activate(uuid: &str) -> AppResult<()> {
             &mut run_nmcli,
         );
         if config.lockdown_enabled {
-            let reconciliation = CliNmClient
-                .wireguard_tunnels()
-                .and_then(|tunnels| CliNmClient.enable_lockdown(&tunnels));
+            let reconciliation = CliNmClient.refresh_lockdown(None);
             if result.is_ok() {
                 reconciliation?;
             }

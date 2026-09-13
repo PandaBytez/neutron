@@ -19,7 +19,8 @@
 //!
 //! Everything else is dropped, even before any VPN is connected and across
 //! reboots (the rules are made `--permanent`). Changing the system firewall
-//! requires privileges, so the rule changes run through `pkexec`; the `disable`
+//! requires privileges: explicit toggles authenticate through `pkexec`, while
+//! automatic refreshes use a root-owned, refresh-only helper; the `disable`
 //! path always works to lift the block, so the user can never be permanently
 //! locked out.
 //!
@@ -44,6 +45,8 @@
 
 use std::net::IpAddr;
 use std::process::Stdio;
+
+pub mod helper;
 
 use crate::error::{AppError, AppResult};
 use crate::nm::{Endpoint, WireguardTunnel};
@@ -94,6 +97,9 @@ pub trait FirewallClient {
     /// Install the lockdown ruleset, allowing the supplied tunnels' interfaces
     /// and endpoints through. Replaces any previous lockdown rules.
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()>;
+    /// Refresh an already enabled policy without interactive authorization.
+    /// `activating` identifies the NM profile whose first traffic must be protected.
+    fn refresh_lockdown(&self, activating: Option<&str>) -> AppResult<()>;
     /// Remove the lockdown ruleset, restoring normal connectivity. Idempotent:
     /// safe to call when lockdown is not currently active.
     fn disable_lockdown(&self) -> AppResult<()>;
@@ -106,16 +112,32 @@ impl FirewallClient for crate::nm::CliNmClient {
         // unprivileged and never prompt.
         //
         // Permanent fail-closed guards protect every intermediate rebuild state.
-        let mut batches = lockdown_rebuild_batches(marked_removal_batches()?, tunnels);
-        batches.extend(runtime_rebuild_batches(tunnels)?);
-        run_privileged_batches(&batches)
+        let mut script = locked_script();
+        script.push_str(&helper::install_script()?);
+        for permanent in [true, false] {
+            let mut batches = lockdown_rebuild_batches(Vec::new(), tunnels);
+            if !permanent {
+                for batch in &mut batches {
+                    batch.remove(0);
+                }
+            }
+            script.push_str(&build_firewall_script(&batches[..2]));
+            script.push_str(&live_removal_script(permanent, true));
+            script.push_str(&build_firewall_script(&batches[2..]));
+        }
+        run_script(&script, true)
+    }
+
+    fn refresh_lockdown(&self, activating: Option<&str>) -> AppResult<()> {
+        helper::refresh(activating)
     }
 
     fn disable_lockdown(&self) -> AppResult<()> {
         // Remove only Neutron rules from permanent and runtime configuration.
-        let mut batches = marked_removal_batches()?;
-        batches.extend(runtime_removal_batches()?);
-        run_privileged_batches(&batches)?;
+        let mut script = locked_script();
+        script.push_str(&live_removal_script(true, false));
+        script.push_str(&live_removal_script(false, false));
+        run_script(&script, true)?;
 
         // Strictly scoped teardown: only our own tagged rules are ever removed,
         // never the user's (or other software's) direct rules. If one of ours
@@ -206,29 +228,41 @@ fn runtime_removal_batches() -> AppResult<Vec<Vec<String>>> {
         .collect())
 }
 
-fn runtime_rebuild_batches(tunnels: &[WireguardTunnel]) -> AppResult<Vec<Vec<String>>> {
-    let removals = runtime_removal_batches()?
-        .into_iter()
-        .map(|mut batch| {
-            batch.insert(0, "--permanent".into());
-            batch
-        })
-        .collect();
-    Ok(lockdown_rebuild_batches(removals, tunnels)
-        .into_iter()
-        .map(|mut batch| {
-            batch.remove(0);
-            batch
-        })
-        .collect())
+/// Enumerate under the root lock, not before a potentially long password prompt.
+/// Otherwise a concurrent refresh can leave newly added rules behind on disable.
+fn live_removal_script(permanent: bool, keep_guards: bool) -> String {
+    let scope = if permanent { "--permanent" } else { "" };
+    let guard = if keep_guards {
+        "[ \"$4\" != -1 ] || continue"
+    } else {
+        ":"
+    };
+    format!(
+        "rules=$(firewall-cmd {scope} --direct --get-all-rules)\n\
+         set -f\n\
+         printf '%s\\n' \"$rules\" | while IFS= read -r rule; do\n\
+           set -- $rule\n\
+           [ \"$#\" -ge 5 ] || continue\n\
+           case \"$1:$2:$3\" in\n\
+             ipv4:mangle:OUTPUT|ipv6:mangle:OUTPUT|ipv4:filter:OUTPUT|ipv6:filter:OUTPUT) ;;\n\
+             *) continue ;;\n\
+           esac\n\
+           {guard}\n\
+           marked=false\n\
+           for arg do [ \"$arg\" != '{LOCKDOWN_MARKER}' ] || marked=true; done\n\
+           if [ \"$marked\" = true ]; then\n\
+             firewall-cmd {scope} --direct --remove-rule \"$@\"\n\
+           fi\n\
+         done\n"
+    )
 }
 
 /// Execute every `firewall-cmd` batch in a *single* `pkexec` invocation, so the
 /// user authenticates at most once regardless of how many rules change.
 ///
 /// The batches are rendered into one `/bin/sh` script (see
-/// [`build_firewall_script`]) which `pkexec` runs. This is the only privileged
-/// call in the module. A no-op when there is nothing to do.
+/// [`build_firewall_script`]) which `pkexec` runs. Used for sandbox fault injection.
+/// A no-op when there is nothing to do.
 ///
 /// `SHELL` is forced to `/bin/sh` because `pkexec` refuses to run (exit 127,
 /// "The value for the SHELL variable was not found in the /etc/shells file")
@@ -239,16 +273,32 @@ fn runtime_rebuild_batches(tunnels: &[WireguardTunnel]) -> AppResult<Vec<Vec<Str
 ///
 /// No timeout is imposed because `pkexec` may wait for a password prompt.
 /// This call blocks; interactive callers must account for authorization latency.
+#[cfg(test)]
 fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
     if batches.is_empty() {
         return Ok(());
     }
 
-    let script = build_firewall_script(batches);
-    let output = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")])
-        .arg("sh")
+    let mut script = locked_script();
+    script.push_str(&build_firewall_script(batches));
+    run_script(&script, true)
+}
+
+fn locked_script() -> String {
+    format!("set -e\nexec 9>{}\nflock -x 9\n", helper::LOCK_PATH)
+}
+
+fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
+    let mut command = if authenticate {
+        let mut command = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")]);
+        command.arg("sh");
+        command
+    } else {
+        crate::process::host_command("/bin/sh")
+    };
+    let output = command
         .arg("-c")
-        .arg(&script)
+        .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -260,7 +310,7 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let prefix = format!("pkexec {FIREWALL_CMD} batch failed");
+    let prefix = format!("{FIREWALL_CMD} batch failed");
     Err(AppError::Firewall(crate::process::format_command_error(
         &prefix,
         output.status,

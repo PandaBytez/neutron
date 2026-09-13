@@ -808,6 +808,14 @@ impl NmClient for MockNmClient {
 }
 
 impl FirewallClient for MockNmClient {
+    fn refresh_lockdown(&self, _activating: Option<&str>) -> AppResult<()> {
+        record(&self.lockdown_calls, "lockdown:refresh".to_string());
+        if self.fail_lockdown {
+            return Err(AppError::Firewall("simulated lockdown failure".to_string()));
+        }
+        Ok(())
+    }
+
     fn enable_lockdown(&self, _tunnels: &[WireguardTunnel]) -> AppResult<()> {
         record(&self.lockdown_calls, "lockdown:on".to_string());
 

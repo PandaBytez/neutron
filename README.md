@@ -100,4 +100,15 @@ which connects an eligible WireGuard profile at login.
 
 For headless servers without an XDG desktop environment, an optional user service is provided in [`systemd/`](systemd/).
 
+### Lockdown across reboots
+
+Lockdown is stored in firewalld's permanent configuration and takes effect when
+firewalld starts, before login. Enabling/disabling it requires administrator
+authentication. Enabling also installs a root-owned refresh helper and a narrowly
+scoped polkit rule so an active local session can refresh tunnel/DNS allowances
+without another password prompt. The helper cannot turn lockdown on or off.
+
+After upgrading from an older version, run `neutron lockdown enable` once to
+install/update the helper. Enabling lockdown also enables firewalld at boot on systemd systems.
+
 ---

@@ -62,6 +62,55 @@ fn tunnel(interface: &str, host: &str, port: u16) -> WireguardTunnel {
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
+fn permanent_lockdown_refreshes_after_reload_without_reenabling_after_disable() {
+    require_sandbox();
+    let _guard = Lockdown;
+    assert!(
+        std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
+            .args(["lockdown", "enable"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let saved = marked_rules();
+    // firewalld reconstructs runtime from permanent configuration at boot.
+    assert!(
+        std::process::Command::new("firewall-cmd")
+            .arg("--reload")
+            .status()
+            .unwrap()
+            .success()
+    );
+    CliNmClient.refresh_lockdown(None).unwrap();
+    assert_eq!(marked_rules(), saved);
+    let runtime = std::process::Command::new("firewall-cmd")
+        .args(["--direct", "--get-all-rules"])
+        .output()
+        .unwrap();
+    let runtime = String::from_utf8_lossy(&runtime.stdout);
+    for rule in &saved {
+        assert!(runtime.lines().any(|line| line == rule), "{runtime}");
+    }
+    CliNmClient.disable_lockdown().unwrap();
+    CliNmClient.refresh_lockdown(None).unwrap();
+    assert!(
+        marked_rules().is_empty(),
+        "refresh must never enable lockdown"
+    );
+    // Even CLI toggle arguments cannot make the installed helper disable rules.
+    assert!(
+        std::process::Command::new("/usr/local/libexec/neutron-lockdown-helper")
+            .args(["lockdown", "enable"])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(marked_rules().is_empty());
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
 fn firewalld_accepts_the_lockdown_ruleset() {
     // The whole ruleset is built and applied through the real `pkexec sh -c`
     // path, so this also exercises `build_firewall_script` and `shell_quote`
