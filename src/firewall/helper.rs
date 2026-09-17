@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
 use super::*;
-use crate::nm::NmClient;
+use crate::nm::{NmIntrospect, NmLifecycle};
 
 pub const NAME: &str = "neutron-lockdown-helper";
 const PATH: &str = "/usr/local/libexec/neutron-lockdown-helper";

@@ -13,7 +13,7 @@
 //! tests assert on the configuration a profile actually ends up with.
 
 use neutron::config::{self, AppConfig, SplitTunnelConfig, SplitTunnelMode};
-use neutron::nm::{NmClient, ProfileState};
+use neutron::nm::{NmLifecycle, NmPolicy, ProfileState};
 use neutron::testing::{self, MockNmClient, profile};
 
 /// The properties that decide whether a tunnel carries traffic at all.
