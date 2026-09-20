@@ -12,7 +12,7 @@ use crate::config;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
-use crate::nm::{self, NmClient, WireguardProfile};
+use crate::nm::{self, NmClient, NmIntrospect, NmPolicy, WireguardProfile};
 use crate::service;
 
 #[derive(Debug, Parser)]
@@ -396,7 +396,7 @@ fn handle_kill_switch_command_with_path<C: NmClient>(
 /// persist the new intent.
 ///
 /// Backend changes precede persistence; failures report possible partial state.
-pub fn set_global_kill_switch<C: NmClient>(
+pub fn set_global_kill_switch<C: NmPolicy>(
     client: &C,
     path: &std::path::Path,
     enable: bool,
@@ -409,8 +409,11 @@ pub fn set_global_kill_switch<C: NmClient>(
     )
 }
 
-/// Preserve emergency disable even when configuration is unreadable/unwritable,
-/// but distinguish backend failure from successful application with failed saving.
+/// Single seam for apply-before-persist policy changes.
+///
+/// Backend changes precede persistence; failures report possible partial state.
+/// The lockdown emergency-disable in [`set_global_lockdown`] is the only
+/// sanctioned bypass, and it reuses the mappers below.
 pub(crate) fn apply_and_save_policy(
     path: &std::path::Path,
     policy: crate::error::Policy,
@@ -418,19 +421,37 @@ pub(crate) fn apply_and_save_policy(
     edit: impl FnOnce(&mut config::AppConfig),
 ) -> AppResult<()> {
     config::coordinate_policy(path, || {
-        apply().map_err(|source| AppError::PolicyUpdate {
-            policy,
-            outcome: "application failed and may be partial; effective state is unknown",
-            source: Box::new(source),
+        apply().map_err(|source| {
+            policy_apply_error(
+                policy,
+                source,
+                "application failed and may be partial; effective state is unknown",
+            )
         })?;
         config::update(path, edit)
             .map(|_| ())
-            .map_err(|source| AppError::PolicyUpdate {
-                policy,
-                outcome: "application completed but saving failed",
-                source: Box::new(source),
-            })
+            .map_err(|source| policy_save_error(policy, source))
     })
+}
+
+fn policy_apply_error(
+    policy: crate::error::Policy,
+    source: AppError,
+    outcome: &'static str,
+) -> AppError {
+    AppError::PolicyUpdate {
+        policy,
+        outcome,
+        source: Box::new(source),
+    }
+}
+
+fn policy_save_error(policy: crate::error::Policy, source: AppError) -> AppError {
+    AppError::PolicyUpdate {
+        policy,
+        outcome: "application completed but saving failed",
+        source: Box::new(source),
+    }
 }
 
 fn handle_lockdown_command<C: NmClient + FirewallClient>(
@@ -479,27 +500,23 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
 /// tunnels so their interfaces and endpoints are allowed through; disabling
 /// needs no tunnel data and always tears the ruleset down (the safeguard that
 /// the user can never be permanently locked out).
-pub fn set_global_lockdown<C: NmClient + FirewallClient>(
+pub fn set_global_lockdown<C: NmIntrospect + FirewallClient>(
     client: &C,
     path: &std::path::Path,
     enable: bool,
 ) -> AppResult<()> {
     if !enable {
         let disable = || -> AppResult<()> {
-            client
-                .disable_lockdown()
-                .map_err(|source| AppError::PolicyUpdate {
-                    policy: crate::error::Policy::Lockdown,
-                    outcome: "disable failed; effective state is unknown",
-                    source: Box::new(source),
-                })?;
+            client.disable_lockdown().map_err(|source| {
+                policy_apply_error(
+                    crate::error::Policy::Lockdown,
+                    source,
+                    "disable failed; effective state is unknown",
+                )
+            })?;
             config::update(path, |cfg| cfg.lockdown_enabled = false)
                 .map(|_| ())
-                .map_err(|source| AppError::PolicyUpdate {
-                    policy: crate::error::Policy::Lockdown,
-                    outcome: "application completed but saving failed",
-                    source: Box::new(source),
-                })
+                .map_err(|source| policy_save_error(crate::error::Policy::Lockdown, source))
         };
         let mut entered = false;
         let result = config::coordinate_policy(path, || {
@@ -805,7 +822,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
 ///
 /// Does nothing when lockdown is off, so callers can invoke it unconditionally
 /// after the profile set changes.
-pub fn rebuild_lockdown_if_enabled<C: NmClient + FirewallClient>(
+pub fn rebuild_lockdown_if_enabled<C: FirewallClient>(
     client: &C,
     path: &std::path::Path,
 ) -> AppResult<()> {

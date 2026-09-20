@@ -235,30 +235,11 @@ where
             while let Ok(newer_cfg) = split_tunnel_rx.try_recv() {
                 cfg = newer_cfg;
             }
-            let res = if cfg.mode.is_enabled() {
-                crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
-                    &client_for_st,
-                    &config_path_for_st,
-                    &cfg,
-                )
-            } else {
-                let current = crate::config::load(&config_path_for_st);
-                let mode_changed = current
-                    .map(|c| c.global_split_tunnel.mode != cfg.mode)
-                    .unwrap_or(false);
-                if mode_changed {
-                    crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
-                        &client_for_st,
-                        &config_path_for_st,
-                        &cfg,
-                    )
-                } else {
-                    crate::config::update(&config_path_for_st, |c| {
-                        c.global_split_tunnel = cfg.clone()
-                    })
-                    .map(|_| ())
-                }
-            };
+            let res = crate::app::split_tunnel::apply_split_config(
+                &client_for_st,
+                &config_path_for_st,
+                &cfg,
+            );
             let _ = st_res_tx.send((cfg, res));
         }
     });
