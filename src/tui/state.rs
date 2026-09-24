@@ -777,6 +777,31 @@ mod tests {
     }
 
     #[test]
+    fn split_tunnel_modal_navigation_handles_empty_lists() {
+        let mut st = SplitTunnelModalState::from_config(&SplitTunnelConfig::default());
+
+        // Down from an empty input stays put: there is no list to enter.
+        st.move_down();
+        assert_eq!(st.focus, SplitTunnelFocus::DomainInput);
+        st.focus = SplitTunnelFocus::CidrInput;
+        st.move_down();
+        assert_eq!(st.focus, SplitTunnelFocus::CidrInput);
+
+        // Down clamps at the last item rather than running past the list.
+        st.domains.push("a.example".to_string());
+        st.domains.push("b.example".to_string());
+        st.focus = SplitTunnelFocus::DomainList;
+        st.selected_domain = 1;
+        st.move_down();
+        assert_eq!(st.selected_domain, 1);
+
+        // Up from the first item returns to the input.
+        st.selected_domain = 0;
+        st.move_up();
+        assert_eq!(st.focus, SplitTunnelFocus::DomainInput);
+    }
+
+    #[test]
     fn only_the_two_input_fields_capture_typing() {
         assert!(SplitTunnelFocus::CidrInput.is_text_input());
         assert!(SplitTunnelFocus::DomainInput.is_text_input());
@@ -815,6 +840,68 @@ mod tests {
 
         modal.move_left();
         assert_eq!(modal.highlighted_mode, 2);
+    }
+
+    #[test]
+    fn finish_split_ignores_stale_replies_but_reports_their_errors() {
+        let path = crate::testing::temp_config_path("tui-finish-split");
+        crate::config::save(&path, &AppConfig::default()).expect("config should save");
+        let mut state = TuiState::new(path.clone(), AppConfig::default());
+
+        let pending = SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            cidrs: vec!["10.0.0.0/8".to_string()],
+            domains: Vec::new(),
+        };
+        let stale = SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            ..Default::default()
+        };
+        state.pending_split = Some(pending.clone());
+
+        // Stale failure: the error surfaces, but the newer pending edit stays.
+        state.finish_split(
+            stale,
+            Err(crate::error::AppError::Config("stale boom".into())),
+        );
+        assert!(state.status_is_error);
+        assert_eq!(state.pending_split, Some(pending.clone()));
+
+        // Stale success: silently dropped, pending edit and status untouched.
+        state.finish_split(SplitTunnelConfig::default(), Ok(()));
+        assert_eq!(state.pending_split, Some(pending.clone()));
+        assert!(state.status_is_error);
+        assert!(state.status_message.contains("stale boom"));
+
+        // Fresh success: pending cleared, config applied, open modal rebuilt.
+        state.modal = ActiveModal::SplitTunnel(SplitTunnelModalState::from_config(
+            &SplitTunnelConfig::default(),
+        ));
+        state.finish_split(pending.clone(), Ok(()));
+        assert!(state.pending_split.is_none());
+        assert_eq!(state.config.global_split_tunnel, pending);
+        assert_eq!(
+            state.status_message,
+            "Split tunneling saved; reconnect to apply routing changes."
+        );
+        if let ActiveModal::SplitTunnel(ref modal) = state.modal {
+            assert_eq!(modal.mode, SplitTunnelMode::Include);
+        } else {
+            panic!("an open split modal must be rebuilt from the applied config");
+        }
+
+        // Fresh failure: error surfaces and config reverts to what is on disk.
+        state.finish_split(
+            pending,
+            Err(crate::error::AppError::Config("fresh boom".into())),
+        );
+        assert!(state.status_is_error);
+        assert_eq!(
+            state.config.global_split_tunnel,
+            SplitTunnelConfig::default()
+        );
+
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
