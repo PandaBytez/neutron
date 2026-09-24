@@ -1,6 +1,5 @@
 pub(crate) mod eligibility;
 pub mod profile_list;
-#[cfg(feature = "qbittorrent")]
 pub mod qbittorrent;
 pub mod refresh_sync;
 pub mod split_tunnel;
@@ -65,7 +64,6 @@ enum Commands {
         command: SplitTunnelCommands,
     },
     /// Configure or synchronize dynamic port forwarding with qBittorrent WebUI
-    #[cfg(feature = "qbittorrent")]
     #[command(alias = "qbittorrent")]
     Qbit {
         #[command(subcommand)]
@@ -118,7 +116,6 @@ enum SplitTunnelCommands {
 }
 
 #[derive(Debug, Subcommand)]
-#[cfg(feature = "qbittorrent")]
 enum QbitCommands {
     /// Show qBittorrent integration status, WebUI connectivity, and current ports
     Status,
@@ -126,9 +123,9 @@ enum QbitCommands {
     Test,
     /// Sync active forwarded port to qBittorrent immediately
     Sync,
-    /// Enable automatic port forwarding sync with qBittorrent
+    /// Enable port forwarding with automatic sync to qBittorrent
     Enable,
-    /// Disable automatic port forwarding sync with qBittorrent
+    /// Disable automatic sync to qBittorrent, keeping port forwarding on
     Disable,
     /// Update qBittorrent WebUI connection settings
     Config {
@@ -246,7 +243,6 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::KillSwitch { command }) => handle_kill_switch_command(client, command),
         Some(Commands::Lockdown { command }) => handle_lockdown_command(client, command),
         Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
-        #[cfg(feature = "qbittorrent")]
         Some(Commands::Qbit { command }) => handle_qbit_command(client, command),
     }
 }
@@ -605,13 +601,11 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
     Ok(())
 }
 
-#[cfg(feature = "qbittorrent")]
 fn handle_qbit_command<C: NmClient>(client: &C, command: QbitCommands) -> AppResult<()> {
     let path = config::default_config_path()?;
     handle_qbit_command_with_path(client, command, &path)
 }
 
-#[cfg(feature = "qbittorrent")]
 fn handle_qbit_command_with_path<C: NmClient>(
     client: &C,
     command: QbitCommands,
@@ -622,9 +616,14 @@ fn handle_qbit_command_with_path<C: NmClient>(
             let app_cfg = config::load(path)?;
             let qcfg = &app_cfg.qbittorrent;
             println!("=== qBittorrent Port Forwarding Integration ===");
+            println!("Port Forward Mode: {}", app_cfg.port_forwarding.mode);
             println!(
                 "Auto-Sync:         {}",
-                if qcfg.enabled { "Enabled" } else { "Disabled" }
+                if app_cfg.port_forwarding.mode.syncs_to_qbittorrent() {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
             );
             println!("WebUI URL:         {}", qcfg.url);
             println!(
@@ -743,12 +742,18 @@ fn handle_qbit_command_with_path<C: NmClient>(
             }
         }
         QbitCommands::Enable => {
-            config::update(path, |cfg| cfg.qbittorrent.enabled = true)?;
+            config::update(path, |cfg| {
+                cfg.port_forwarding.mode = crate::config::PortForwardMode::ForwardAndSync
+            })?;
             println!("qBittorrent automatic port forwarding sync enabled.");
         }
         QbitCommands::Disable => {
-            config::update(path, |cfg| cfg.qbittorrent.enabled = false)?;
-            println!("qBittorrent automatic port forwarding sync disabled.");
+            config::update(path, |cfg| {
+                cfg.port_forwarding.mode = crate::config::PortForwardMode::Forward
+            })?;
+            println!(
+                "qBittorrent automatic port forwarding sync disabled (port forwarding stays on)."
+            );
         }
         QbitCommands::Config {
             url,
@@ -1435,26 +1440,26 @@ mod tests {
         cleanup_test_config(&path);
     }
 
-    #[cfg(feature = "qbittorrent")]
     #[test]
     fn qbit_enable_and_disable_persists() {
+        use crate::config::PortForwardMode;
+
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
         let path = unique_test_config_path();
 
         handle_qbit_command_with_path(&client, QbitCommands::Enable, &path)
             .expect("enable should succeed");
         let loaded = config::load(&path).expect("config should load");
-        assert!(loaded.qbittorrent.enabled);
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::ForwardAndSync);
 
         handle_qbit_command_with_path(&client, QbitCommands::Disable, &path)
             .expect("disable should succeed");
         let loaded = config::load(&path).expect("config should load");
-        assert!(!loaded.qbittorrent.enabled);
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::Forward);
 
         cleanup_test_config(&path);
     }
 
-    #[cfg(feature = "qbittorrent")]
     #[test]
     fn qbit_config_updates_settings() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);

@@ -19,7 +19,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
 
-#[cfg(feature = "qbittorrent")]
 pub mod qbittorrent;
 
 use crate::error::{AppError, AppResult};

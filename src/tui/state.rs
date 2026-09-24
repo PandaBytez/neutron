@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use crate::app::profile_list::ProfileListRow;
-use crate::config::{AppConfig, SplitTunnelConfig, SplitTunnelMode};
+use crate::config::{
+    AppConfig, PortForwardConfig, PortForwardMode, SplitTunnelConfig, SplitTunnelMode,
+};
 use crate::nm::ProfileDiagnostics;
 use crate::nm::network_info::PublicIpInfo;
 use crate::service::lease::{LeaseState, QbitSyncStatus};
@@ -41,6 +43,7 @@ pub enum ActiveModal {
     CommandPalette(CommandPaletteState),
     ThemePicker(ThemePickerState),
     SplitTunnel(SplitTunnelModalState),
+    PortForward(PortForwardModalState),
     ConfirmDelete { name: String, uuid: String },
 }
 
@@ -137,8 +140,8 @@ impl CommandPaletteState {
             },
             CommandPaletteItem {
                 id: "port_forwarding",
-                title: "Port Forward: Toggle NAT-PMP",
-                description: "Lease an incoming port from the tunnel gateway and keep renewing it",
+                title: "Port Forwarding: Configure Mode",
+                description: "Off, lease a NAT-PMP port, or lease and auto-sync it to qBittorrent",
                 shortcut: Some("o"),
             },
             CommandPaletteItem {
@@ -153,18 +156,10 @@ impl CommandPaletteState {
                 description: "Permanently remove the profile from NetworkManager",
                 shortcut: Some("d"),
             },
-            #[cfg(feature = "qbittorrent")]
             CommandPaletteItem {
                 id: "qbit_sync",
                 title: "qBittorrent: Sync Forwarded Port Now",
                 description: "Push active NAT-PMP port to local qBittorrent WebUI",
-                shortcut: None,
-            },
-            #[cfg(feature = "qbittorrent")]
-            CommandPaletteItem {
-                id: "qbit_toggle",
-                title: "qBittorrent: Toggle Auto-Sync",
-                description: "Automatically sync dynamic NAT-PMP ports with qBittorrent",
                 shortcut: None,
             },
             CommandPaletteItem {
@@ -397,6 +392,45 @@ impl SplitTunnelModalState {
                 }
             }
         }
+    }
+}
+
+/// Mode selector for the port-forwarding policy, opened with `[o]`.
+///
+/// A single-purpose modal rather than a full editor: the policy is just the
+/// [`PortForwardMode`], so it needs the same navigate-and-confirm selector as
+/// [`SplitTunnelModalState`]'s top row and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardModalState {
+    pub mode: PortForwardMode,
+    pub highlighted_mode: usize,
+}
+
+impl PortForwardModalState {
+    pub const MODES: [PortForwardMode; 3] = [
+        PortForwardMode::Disabled,
+        PortForwardMode::Forward,
+        PortForwardMode::ForwardAndSync,
+    ];
+
+    pub fn from_config(pf: &PortForwardConfig) -> Self {
+        let highlighted_mode = Self::MODES.iter().position(|&m| m == pf.mode).unwrap_or(0);
+        Self {
+            mode: pf.mode,
+            highlighted_mode,
+        }
+    }
+
+    pub fn selected_highlighted_mode(&self) -> PortForwardMode {
+        Self::MODES[self.highlighted_mode.min(Self::MODES.len() - 1)]
+    }
+
+    pub fn move_left(&mut self) {
+        self.highlighted_mode = wrap_prev(self.highlighted_mode, Self::MODES.len());
+    }
+
+    pub fn move_right(&mut self) {
+        self.highlighted_mode = wrap_next(self.highlighted_mode, Self::MODES.len());
     }
 }
 
@@ -749,6 +783,38 @@ mod tests {
         assert!(!SplitTunnelFocus::Mode.is_text_input());
         assert!(!SplitTunnelFocus::CidrList.is_text_input());
         assert!(!SplitTunnelFocus::DomainList.is_text_input());
+    }
+
+    #[test]
+    fn port_forward_modal_highlights_the_saved_mode() {
+        let pf = PortForwardConfig {
+            mode: PortForwardMode::ForwardAndSync,
+            ..Default::default()
+        };
+        let modal = PortForwardModalState::from_config(&pf);
+        assert_eq!(modal.mode, PortForwardMode::ForwardAndSync);
+        assert_eq!(modal.highlighted_mode, 2);
+        assert_eq!(
+            modal.selected_highlighted_mode(),
+            PortForwardMode::ForwardAndSync
+        );
+    }
+
+    #[test]
+    fn port_forward_modal_arrow_navigation_wraps() {
+        let mut modal = PortForwardModalState::from_config(&PortForwardConfig::default());
+        assert_eq!(modal.highlighted_mode, 0);
+
+        modal.move_right();
+        assert_eq!(modal.highlighted_mode, 1);
+        assert_eq!(modal.selected_highlighted_mode(), PortForwardMode::Forward);
+
+        modal.move_right();
+        modal.move_right();
+        assert_eq!(modal.highlighted_mode, 0);
+
+        modal.move_left();
+        assert_eq!(modal.highlighted_mode, 2);
     }
 
     #[test]

@@ -845,7 +845,6 @@ impl FirewallClient for MockNmClient {
 ///
 /// Lives here rather than beside any one test module because all three layers
 /// that push a port -- the TUI, the tray daemon and the CLI -- need it.
-#[cfg(feature = "qbittorrent")]
 pub struct MockQBittorrentWebUi {
     port: u16,
     set_preferences: Arc<Mutex<String>>,
@@ -853,7 +852,6 @@ pub struct MockQBittorrentWebUi {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(feature = "qbittorrent")]
 impl MockQBittorrentWebUi {
     /// The session cookie the stub hands out on a successful login.
     pub const SESSION_COOKIE: &'static str = "mock_session";
@@ -928,7 +926,6 @@ impl MockQBittorrentWebUi {
     }
 }
 
-#[cfg(feature = "qbittorrent")]
 impl Drop for MockQBittorrentWebUi {
     fn drop(&mut self) {
         self.done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -941,7 +938,6 @@ impl Drop for MockQBittorrentWebUi {
 /// A WebUI address with nothing listening on it, so a push fails immediately
 /// with a connection refusal instead of waiting out a timeout. Port 1 is
 /// reserved and never bindable by an unprivileged service.
-#[cfg(feature = "qbittorrent")]
 pub fn unreachable_qbittorrent_url() -> String {
     "http://127.0.0.1:1".to_string()
 }
@@ -950,7 +946,6 @@ pub fn unreachable_qbittorrent_url() -> String {
 ///
 /// Tests that reach the WebUI skip themselves when it is absent rather than
 /// reporting a failure that says nothing about the code under test.
-#[cfg(feature = "qbittorrent")]
 pub fn curl_available() -> bool {
     std::process::Command::new("curl")
         .arg("--version")

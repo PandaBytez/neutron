@@ -39,6 +39,7 @@ pub fn handle_key_event<C: ActionClient>(
             handle_delete_key(state, client, key, &uuid)?;
         }
         ActiveModal::SplitTunnel(_) => handle_split_tunnel_key(state, client, key)?,
+        ActiveModal::PortForward(_) => handle_port_forward_key(state, client, key)?,
         ActiveModal::None => handle_normal_key(state, client, key)?,
     }
     Ok(())
@@ -291,20 +292,12 @@ pub fn execute_action<C: ActionClient>(
             }
         }
         "port_forwarding" => {
-            let enable = !state.config.port_forwarding.enabled;
-            // Persisted before the reload below, which re-reads the config from
-            // disk into `state.config` and would otherwise revert the toggle.
-            config::update(&state.config_path, |cfg| {
-                cfg.port_forwarding.enabled = enable
-            })?;
-            state.config.port_forwarding.enabled = enable;
-
-            // Nothing local to drop: the daemon owns the lease and picks the
-            // new setting up on its next poll, which the periodic lease refresh
-            // then shows. Reloaded anyway so the rest of the view stays current.
-            reload_profiles(state, client)?;
-
-            state.set_status(format!("{} NAT-PMP Port Forwarding.", enabled_verb(enable)));
+            // A mode, not a switch: Disabled, Forward, or ForwardAndSync.
+            // Committed inside the modal, which also reloads and reports.
+            state.modal =
+                ActiveModal::PortForward(crate::tui::state::PortForwardModalState::from_config(
+                    &state.config.port_forwarding,
+                ));
         }
         "sync" => {
             if let Some(ref tx) = action_tx {
@@ -329,7 +322,6 @@ pub fn execute_action<C: ActionClient>(
                 }
             }
         }
-        #[cfg(feature = "qbittorrent")]
         "qbit_sync" => {
             // Both halves come from the daemon's lease: the port is only
             // meaningful together with the tunnel it was obtained for, which is
@@ -362,7 +354,7 @@ pub fn execute_action<C: ActionClient>(
                 // Distinguished, because the three causes have three different
                 // fixes and one message for all of them sends the user looking
                 // in the wrong place.
-                None if !state.config.port_forwarding.enabled => {
+                None if !state.config.port_forwarding.mode.is_enabled() => {
                     state.set_status("No forwarded port: NAT-PMP port forwarding is off.")
                 }
                 None if state.lease.is_none() => {
@@ -372,18 +364,6 @@ pub fn execute_action<C: ActionClient>(
                     "No forwarded port yet (connect to a profile that offers NAT-PMP).",
                 ),
             }
-        }
-        #[cfg(feature = "qbittorrent")]
-        "qbit_toggle" => {
-            let enable = !state.config.qbittorrent.enabled;
-            config::update(&state.config_path, |cfg| cfg.qbittorrent.enabled = enable)?;
-            state.config.qbittorrent.enabled = enable;
-            state.set_status(format!(
-                "{} qBittorrent Port Forward Auto-Sync.",
-                enabled_verb(enable)
-            ));
-            // No local verdict to reset: the daemon reads this setting on its
-            // next poll and republishes what it decides.
         }
         "delete" => {
             if let Some(row) = state.selected_row() {
@@ -617,6 +597,62 @@ fn handle_split_tunnel_key<C: NmClient>(
     Ok(())
 }
 
+/// Commit the highlighted port-forward mode, mirroring the split tunnel's
+/// mode selector: `Left`/`Right` move, `Space`/`Enter` applies and closes,
+/// `Esc`/`q` cancels without touching the saved policy.
+fn handle_port_forward_key<C: ActionClient>(
+    state: &mut TuiState,
+    client: &C,
+    key: KeyEvent,
+) -> AppResult<()> {
+    use crate::config::PortForwardMode;
+
+    let mut commit = None;
+    let mut close_modal = false;
+
+    if let ActiveModal::PortForward(ref mut modal) = state.modal {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => close_modal = true,
+            KeyCode::Left => modal.move_left(),
+            KeyCode::Right => modal.move_right(),
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                modal.mode = modal.selected_highlighted_mode();
+                commit = Some(modal.mode);
+                close_modal = true;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(mode) = commit {
+        // Persisted before the reload below, which re-reads the config from
+        // disk into `state.config` and would otherwise revert the choice.
+        config::update(&state.config_path, |cfg| {
+            cfg.port_forwarding.mode = mode;
+        })?;
+        state.config.port_forwarding.mode = mode;
+        let summary = match mode {
+            PortForwardMode::Disabled => "Disabled NAT-PMP Port Forwarding.",
+            PortForwardMode::Forward => "Enabled NAT-PMP Port Forwarding.",
+            PortForwardMode::ForwardAndSync => {
+                "Enabled NAT-PMP Port Forwarding with qBittorrent Auto-Sync."
+            }
+        };
+        state.set_status(summary);
+
+        // Nothing local to drop: the daemon owns the lease and picks the
+        // new setting up on its next poll, which the periodic lease refresh
+        // then shows. Reloaded anyway so the rest of the view stays current.
+        reload_profiles(state, client)?;
+    }
+
+    if close_modal {
+        state.modal = ActiveModal::None;
+    }
+
+    Ok(())
+}
+
 /// Drop `list[*selected]`, keeping `*selected` inside the shortened list.
 fn remove_selected(list: &mut Vec<String>, selected: &mut usize) {
     if *selected >= list.len() {
@@ -814,14 +850,17 @@ mod tests {
         // NAT-PMP leases are renewed on a timer against the provider's gateway,
         // so they are opt-in: a user who never asked for a forwarded port must
         // never have one requested on their behalf.
-        assert!(
-            !crate::config::AppConfig::default().port_forwarding.enabled,
+        assert_eq!(
+            crate::config::AppConfig::default().port_forwarding.mode,
+            crate::config::PortForwardMode::Disabled,
             "port forwarding must default to off"
         );
     }
 
     #[test]
-    fn toggling_port_forwarding_persists() {
+    fn committing_a_port_forward_mode_persists() {
+        use crate::config::PortForwardMode;
+
         let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
             "wg-eu",
             "uuid-eu",
@@ -832,24 +871,47 @@ mod tests {
             .expect("config should save");
         let mut state = TuiState::new(path.clone(), crate::config::AppConfig::default());
 
-        execute_action(&mut state, &client, "port_forwarding").expect("toggle should succeed");
-        assert!(state.config.port_forwarding.enabled);
-        assert!(
+        let press = |state: &mut TuiState, code: KeyCode| {
+            handle_key_event(state, &client, KeyEvent::new(code, KeyModifiers::NONE))
+                .expect("key should be handled");
+        };
+
+        // The action opens the mode selector rather than flipping a switch.
+        execute_action(&mut state, &client, "port_forwarding").expect("modal should open");
+        assert!(matches!(state.modal, ActiveModal::PortForward(_)));
+
+        // Right, Right, Enter selects ForwardAndSync and commits it.
+        press(&mut state, KeyCode::Right);
+        press(&mut state, KeyCode::Right);
+        press(&mut state, KeyCode::Enter);
+
+        assert_eq!(state.modal, ActiveModal::None);
+        assert_eq!(
+            state.config.port_forwarding.mode,
+            PortForwardMode::ForwardAndSync
+        );
+        assert_eq!(
             crate::config::load(&path)
                 .expect("config should load")
                 .port_forwarding
-                .enabled,
-            "the toggle must survive a restart, not just live in memory"
+                .mode,
+            PortForwardMode::ForwardAndSync,
+            "the mode must survive a restart, not just live in memory"
+        );
+        assert!(
+            state.status_message.contains("Auto-Sync"),
+            "the confirmation must name the mode that was applied: {}",
+            state.status_message
         );
 
-        execute_action(&mut state, &client, "port_forwarding").expect("toggle should succeed");
-
-        assert!(!state.config.port_forwarding.enabled);
-        assert!(
-            !crate::config::load(&path)
-                .expect("config should load")
-                .port_forwarding
-                .enabled
+        // Left moves the highlight, but Esc closes without applying.
+        execute_action(&mut state, &client, "port_forwarding").expect("modal should open");
+        press(&mut state, KeyCode::Left);
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.modal, ActiveModal::None);
+        assert_eq!(
+            state.config.port_forwarding.mode,
+            PortForwardMode::ForwardAndSync
         );
 
         let _ = std::fs::remove_file(&path);
@@ -1264,7 +1326,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "qbittorrent"))]
+#[cfg(test)]
 mod qbittorrent_tests {
     use super::*;
     use crate::config::AppConfig;
@@ -1277,7 +1339,7 @@ mod qbittorrent_tests {
     /// A TUI holding the daemon's lease, with qBittorrent pointed at `url`.
     fn state_holding_lease(url: String) -> (TuiState, MockNmClient) {
         let mut config = AppConfig::default();
-        config.qbittorrent.enabled = true;
+        config.port_forwarding.mode = crate::config::PortForwardMode::ForwardAndSync;
         config.qbittorrent.url = url;
 
         let path = temp_config_path("tui-qbit");

@@ -46,11 +46,11 @@ mod tests {
 
     fn config(url: String) -> QBittorrentConfig {
         QBittorrentConfig {
-            enabled: true,
             url,
             username: None,
             password: None,
             bind_interface: true,
+            ..Default::default()
         }
     }
 

@@ -493,11 +493,11 @@ mod tests {
     #[test]
     fn client_url_formatting() {
         let cfg = QBittorrentConfig {
-            enabled: true,
             url: "http://127.0.0.1:8080/".to_string(),
             username: None,
             password: None,
             bind_interface: false,
+            ..Default::default()
         };
         let client = QBittorrentClient::new(&cfg);
         assert_eq!(
@@ -547,11 +547,11 @@ mod tests {
 
         let server = MockQBittorrentWebUi::start();
         let base = |bind_interface: bool, authenticated: bool| QBittorrentConfig {
-            enabled: true,
             url: server.url(),
             username: authenticated.then(|| "admin".to_string()),
             password: authenticated.then(|| "adminadmin".to_string()),
             bind_interface,
+            ..Default::default()
         };
 
         let mut client = QBittorrentClient::new(&base(true, true));

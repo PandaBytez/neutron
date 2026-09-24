@@ -609,17 +609,16 @@ where
 /// Push a newly leased forwarded port to qBittorrent, reporting what came of it
 /// so the daemon can publish the verdict for the TUI to render.
 ///
-/// Gated behind the `qbittorrent` feature: the daemon calls this on every lease
-/// renewal, so a broken integration would reach a third-party Web API
-/// unattended. Compiled out unless the feature is enabled.
-#[cfg(feature = "qbittorrent")]
+/// Runs only when the port-forward mode is `ForwardAndSync`: the daemon calls
+/// this on every lease renewal, so a broken integration would reach a
+/// third-party Web API unattended.
 fn sync_qbittorrent_port<C: NmClient>(client: &C, uuid: &str, port: u16) -> QbitSyncStatus {
     let Ok(config) =
         crate::config::default_config_path().and_then(|path| crate::config::load(&path))
     else {
         return QbitSyncStatus::Pending;
     };
-    if !config.qbittorrent.enabled {
+    if !config.port_forwarding.mode.syncs_to_qbittorrent() {
         return QbitSyncStatus::Pending;
     }
 
@@ -636,12 +635,6 @@ fn sync_qbittorrent_port<C: NmClient>(client: &C, uuid: &str, port: u16) -> Qbit
             QbitSyncStatus::Failed
         }
     }
-}
-
-/// No-op when the `qbittorrent` feature is disabled.
-#[cfg(not(feature = "qbittorrent"))]
-fn sync_qbittorrent_port<C: NmClient>(_: &C, _: &str, _: u16) -> QbitSyncStatus {
-    QbitSyncStatus::Pending
 }
 
 /// The daemon's running record of the forwarded-port lease.
@@ -757,16 +750,21 @@ impl LeaseTracker {
     }
 
     /// Whether qBittorrent synchronization is required (BUG-055).
-    fn sync_needed(&self, current_cfg: &crate::config::QBittorrentConfig) -> bool {
-        self.sync_needed_at(current_cfg, std::time::Instant::now())
+    fn sync_needed(
+        &self,
+        mode: &crate::config::PortForwardMode,
+        current_cfg: &crate::config::QBittorrentConfig,
+    ) -> bool {
+        self.sync_needed_at(mode, current_cfg, std::time::Instant::now())
     }
 
     fn sync_needed_at(
         &self,
+        mode: &crate::config::PortForwardMode,
         current_cfg: &crate::config::QBittorrentConfig,
         now: std::time::Instant,
     ) -> bool {
-        if self.port.is_none() || !current_cfg.enabled {
+        if self.port.is_none() || !mode.syncs_to_qbittorrent() {
             return false;
         }
         if self.last_qbit_config.as_ref() != Some(current_cfg) {
@@ -899,7 +897,7 @@ where
         let renewal_due = lease.is_due();
         lease.check_expiry();
 
-        if !app_cfg.port_forwarding.enabled {
+        if !app_cfg.port_forwarding.mode.is_enabled() {
             lease.release();
         } else if let Some(profile) = active {
             if renewal_due {
@@ -911,7 +909,7 @@ where
                 }
             }
 
-            if lease.sync_needed(&app_cfg.qbittorrent) {
+            if lease.sync_needed(&app_cfg.port_forwarding.mode, &app_cfg.qbittorrent) {
                 lease.last_qbit_config = Some(app_cfg.qbittorrent.clone());
                 lease.qbit_attempted_at = Some(std::time::Instant::now());
                 lease.qbit_sync =
@@ -1176,47 +1174,79 @@ mod tests {
 
     #[test]
     fn qbit_config_change_invalidates_sync_and_triggers_push() {
+        use crate::config::PortForwardMode;
+
+        let mode_sync = PortForwardMode::ForwardAndSync;
+        let mode_forward = PortForwardMode::Forward;
+
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
         lease.record(Some(test_mapping(51820)));
 
-        let cfg_disabled = crate::config::QBittorrentConfig {
-            enabled: false,
-            ..Default::default()
-        };
+        let cfg = crate::config::QBittorrentConfig::default();
         assert!(
-            !lease.sync_needed(&cfg_disabled),
-            "no sync needed when integration is disabled"
+            !lease.sync_needed(&mode_forward, &cfg),
+            "no sync needed when the mode does not include qBittorrent"
         );
 
-        // Transition: disabled -> enabled with stable port
-        let mut cfg_enabled = crate::config::QBittorrentConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        // Transition: forward -> forward-and-sync with stable port
         assert!(
-            lease.sync_needed(&cfg_enabled),
-            "enabling integration requires sync even if port is unchanged"
+            lease.sync_needed(&mode_sync, &cfg),
+            "enabling sync requires a push even if port is unchanged"
         );
-        lease.last_qbit_config = Some(cfg_enabled.clone());
+        lease.last_qbit_config = Some(cfg.clone());
         lease.qbit_sync = QbitSyncStatus::Synchronized;
         assert!(
-            !lease.sync_needed(&cfg_enabled),
+            !lease.sync_needed(&mode_sync, &cfg),
             "already synchronized with same config requires no push"
         );
 
         // Transition: configuration URL / binding changes with stable port
-        cfg_enabled.url = "http://10.0.0.1:8080".to_string();
+        let mut cfg_changed = cfg.clone();
+        cfg_changed.url = "http://10.0.0.1:8080".to_string();
         assert!(
-            lease.sync_needed(&cfg_enabled),
+            lease.sync_needed(&mode_sync, &cfg_changed),
             "config modification invalidates sync and triggers push"
         );
         let now = std::time::Instant::now();
-        lease.last_qbit_config = Some(cfg_enabled.clone());
+        lease.last_qbit_config = Some(cfg_changed.clone());
         lease.qbit_sync = QbitSyncStatus::Failed;
         lease.qbit_attempted_at = Some(now);
-        assert!(!lease.sync_needed_at(&cfg_enabled, now + POLL_INTERVAL));
-        assert!(lease.sync_needed_at(&cfg_enabled, now + crate::portforward::RENEW_INTERVAL));
+        assert!(!lease.sync_needed_at(&mode_sync, &cfg_changed, now + POLL_INTERVAL));
+        assert!(lease.sync_needed_at(
+            &mode_sync,
+            &cfg_changed,
+            now + crate::portforward::RENEW_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn leaving_sync_mode_does_not_repush_the_same_port() {
+        use crate::config::PortForwardMode;
+
+        let mode_sync = PortForwardMode::ForwardAndSync;
+        let mode_forward = PortForwardMode::Forward;
+
+        // Synchronized, then sync switched off and back on with a stable
+        // port and config: qBittorrent already holds the port, so no push.
+        let mut lease = LeaseTracker::default();
+        lease.follow_tunnel(&Some("uuid-eu".to_string()));
+        lease.record(Some(test_mapping(51820)));
+
+        let cfg = crate::config::QBittorrentConfig::default();
+        assert!(lease.sync_needed(&mode_sync, &cfg));
+        lease.last_qbit_config = Some(cfg.clone());
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+
+        assert!(!lease.sync_needed(&mode_forward, &cfg));
+        assert!(
+            !lease.sync_needed(&mode_sync, &cfg),
+            "returning to sync mode with the already-pushed port requires no push"
+        );
+
+        // But a port leased while sync was off is pushed on return.
+        lease.record(Some(test_mapping(51821)));
+        assert!(lease.sync_needed(&mode_sync, &cfg));
     }
 
     #[test]
