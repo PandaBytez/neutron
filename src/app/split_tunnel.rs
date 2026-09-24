@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::config::{self, AppConfig, SplitTunnelConfig, SplitTunnelMode};
 use crate::error::{AppError, AppResult};
-use crate::nm::{self, NmClient};
+use crate::nm::{self, NmPolicy};
 
 /// Get the global split tunnel configuration from app config.
 pub fn get_global_split_tunnel(config: &AppConfig) -> SplitTunnelConfig {
@@ -15,7 +15,7 @@ pub fn get_global_split_tunnel(config: &AppConfig) -> SplitTunnelConfig {
 ///
 /// Follows the apply-before-persist invariant: NetworkManager is modified first;
 /// if `apply_split_tunnel_all` fails, the config is not updated.
-pub fn apply_and_persist_global_split_tunnel<C: NmClient>(
+pub fn apply_and_persist_global_split_tunnel<C: NmPolicy>(
     client: &C,
     path: &Path,
     st_cfg: &SplitTunnelConfig,
@@ -33,7 +33,7 @@ pub fn apply_and_persist_global_split_tunnel<C: NmClient>(
 
 /// Re-resolve split-tunnel domains and reapply routing rules to NetworkManager if
 /// resolved IP endpoints changed during an active session (record rotation).
-pub fn refresh_active_domain_routes<C: NmClient>(client: &C, path: &Path) -> AppResult<bool> {
+pub fn refresh_active_domain_routes<C: NmPolicy>(client: &C, path: &Path) -> AppResult<bool> {
     config::coordinate_policy(path, || {
         let app_cfg = config::load(path)?;
         let split = &app_cfg.global_split_tunnel;
@@ -48,6 +48,31 @@ pub fn refresh_active_domain_routes<C: NmClient>(client: &C, path: &Path) -> App
     })
 }
 
+/// Single seam for persisting a split-tunnel config.
+///
+/// Sweeps NetworkManager when routing is affected (enabled, or transitioning
+/// out of an enabled mode); persist list edits directly while disabled
+/// without touching profiles (BUG-062).
+pub fn apply_split_config<C: NmPolicy>(
+    client: &C,
+    path: &Path,
+    st_cfg: &SplitTunnelConfig,
+) -> AppResult<()> {
+    if st_cfg.mode.is_enabled() {
+        return apply_and_persist_global_split_tunnel(client, path, st_cfg);
+    }
+    // ponytail: load-then-decide can race a concurrent writer; the sweep
+    // itself runs under coordinate_policy, so worst case is one redundant sweep.
+    let mode_changed = config::load(path)
+        .map(|c| c.global_split_tunnel.mode != st_cfg.mode)
+        .unwrap_or(true);
+    if mode_changed {
+        apply_and_persist_global_split_tunnel(client, path, st_cfg)
+    } else {
+        config::update(path, |c| c.global_split_tunnel = st_cfg.clone()).map(|_| ())
+    }
+}
+
 /// Load the global split-tunnel config, apply `edit` to it, and persist the
 /// result if `edit` reports a change.
 ///
@@ -56,37 +81,31 @@ pub fn refresh_active_domain_routes<C: NmClient>(client: &C, path: &Path) -> App
 /// apply-before-persist ordering.
 fn mutate_global<C, F>(client: &C, path: &Path, edit: F) -> AppResult<(SplitTunnelConfig, bool)>
 where
-    C: NmClient,
+    C: NmPolicy,
     F: FnOnce(&mut SplitTunnelConfig) -> AppResult<bool>,
 {
     let mut st_cfg = config::load(path)?.global_split_tunnel;
     let changed = edit(&mut st_cfg)?;
     if changed {
-        if st_cfg.mode.is_enabled() {
-            apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
-        } else {
-            // When split tunneling is disabled, editing the list does not affect routing;
-            // persist the list directly without modifying NetworkManager profiles (BUG-062).
-            config::update(path, |cfg| cfg.global_split_tunnel = st_cfg.clone())?;
-        }
+        apply_split_config(client, path, &st_cfg)?;
     }
     Ok((st_cfg, changed))
 }
 
 /// Set global split tunnel mode.
-pub fn set_global_mode<C: NmClient>(
+pub fn set_global_mode<C: NmPolicy>(
     client: &C,
     path: &Path,
     mode: SplitTunnelMode,
 ) -> AppResult<SplitTunnelConfig> {
     let mut st_cfg = config::load(path)?.global_split_tunnel;
     st_cfg.mode = mode;
-    apply_and_persist_global_split_tunnel(client, path, &st_cfg)?;
+    apply_split_config(client, path, &st_cfg)?;
     Ok(st_cfg)
 }
 
 /// Add a CIDR or IP to the global split tunnel config.
-pub fn add_global_cidr<C: NmClient>(
+pub fn add_global_cidr<C: NmPolicy>(
     client: &C,
     path: &Path,
     cidr: &str,
@@ -104,7 +123,7 @@ pub fn add_global_cidr<C: NmClient>(
 }
 
 /// Remove a CIDR or IP from the global split tunnel config.
-pub fn remove_global_cidr<C: NmClient>(
+pub fn remove_global_cidr<C: NmPolicy>(
     client: &C,
     path: &Path,
     cidr: &str,
@@ -125,7 +144,7 @@ pub fn remove_global_cidr<C: NmClient>(
 }
 
 /// Add a domain to the global split tunnel config.
-pub fn add_global_domain<C: NmClient>(
+pub fn add_global_domain<C: NmPolicy>(
     client: &C,
     path: &Path,
     domain: &str,
@@ -143,7 +162,7 @@ pub fn add_global_domain<C: NmClient>(
 }
 
 /// Remove a domain from the global split tunnel config.
-pub fn remove_global_domain<C: NmClient>(
+pub fn remove_global_domain<C: NmPolicy>(
     client: &C,
     path: &Path,
     domain: &str,
@@ -160,8 +179,8 @@ pub fn remove_global_domain<C: NmClient>(
 }
 
 /// Clear all global split tunneling rules and restore default full-tunneling.
-pub fn clear_global<C: NmClient>(client: &C, path: &Path) -> AppResult<()> {
-    apply_and_persist_global_split_tunnel(client, path, &SplitTunnelConfig::default())
+pub fn clear_global<C: NmPolicy>(client: &C, path: &Path) -> AppResult<()> {
+    apply_split_config(client, path, &SplitTunnelConfig::default())
 }
 
 /// Format the global split tunnel status for display in the CLI.

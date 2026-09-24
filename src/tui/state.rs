@@ -551,7 +551,7 @@ impl TuiState {
         }
     }
 
-    pub fn apply_split_tunnel<C: crate::nm::NmClient>(
+    pub fn apply_split_tunnel<C: crate::nm::NmPolicy>(
         &mut self,
         client: &C,
         new_cfg: SplitTunnelConfig,
@@ -564,11 +564,7 @@ impl TuiState {
             self.pending_split = Some(new_cfg);
             Ok(())
         } else {
-            crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
-                client,
-                &self.config_path,
-                &new_cfg,
-            )?;
+            crate::app::split_tunnel::apply_split_config(client, &self.config_path, &new_cfg)?;
             self.uncertain_policies
                 .remove(&crate::error::Policy::SplitTunnel);
             self.set_status("Split tunneling saved; reconnect to apply routing changes.");

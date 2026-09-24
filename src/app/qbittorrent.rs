@@ -13,13 +13,13 @@
 
 use crate::config::QBittorrentConfig;
 use crate::error::AppResult;
-use crate::nm::NmClient;
+use crate::nm::NmIntrospect;
 use crate::portforward::qbittorrent::{QBittorrentClient, QBittorrentSyncReport};
 
 /// Push `port` into the qBittorrent instance described by `config`, binding it
 /// to the interface of the tunnel `uuid` that leased the port.
 ///
-/// The interface comes from [`NmClient::tunnel_interface`] rather than from the
+/// The interface comes from [`NmIntrospect::tunnel_interface`] rather than from the
 /// profile diagnostics, because the latter substitutes the uuid when no
 /// interface name is configured. Binding to that substitute would point
 /// qBittorrent at a device that does not exist and silently drop every incoming
@@ -27,7 +27,7 @@ use crate::portforward::qbittorrent::{QBittorrentClient, QBittorrentSyncReport};
 ///
 /// Whether the interface is applied at all is the user's call, via
 /// [`QBittorrentConfig::bind_interface`].
-pub fn sync_port<C: NmClient>(
+pub fn sync_port<C: NmIntrospect>(
     client: &C,
     config: &QBittorrentConfig,
     uuid: &str,

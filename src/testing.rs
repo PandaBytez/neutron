@@ -14,7 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, AppResult};
 use crate::firewall::FirewallClient;
-use crate::nm::{NmClient, ProfileState, WireguardProfile, WireguardTunnel};
+use crate::nm::{
+    NmIntrospect, NmLifecycle, NmPolicy, ProfileState, WireguardProfile, WireguardTunnel,
+};
 
 fn record(log: &Mutex<Vec<String>>, entry: String) {
     log.lock().expect("mock mutex poisoned").push(entry);
@@ -467,11 +469,75 @@ impl MockNmClient {
     }
 }
 
-impl NmClient for MockNmClient {
+impl NmPolicy for MockNmClient {
     fn reapply_active_routes(&self) -> AppResult<()> {
         record(&self.calls, "reapply-active-routes".into());
         Ok(())
     }
+
+    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
+        record(
+            &self.kill_switch_calls,
+            format!("kill-switch-all:{}", if enable { "on" } else { "off" }),
+        );
+
+        if self.fail_kill_switch {
+            return Err(AppError::CommandFailed(
+                "simulated kill-switch failure".to_string(),
+            ));
+        }
+
+        self.apply_to_all(|uuid| crate::nm::kill_switch::set_args(uuid, enable, true));
+        Ok(())
+    }
+
+    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
+        record(
+            &self.autoconnect_calls,
+            format!("autoconnect-all:{}", if enable { "on" } else { "off" }),
+        );
+
+        if self.fail_autoconnect {
+            return Err(AppError::CommandFailed(
+                "simulated autoconnect failure".to_string(),
+            ));
+        }
+
+        self.apply_to_all(|uuid| crate::nm::autoconnect::set_args(uuid, enable));
+        Ok(())
+    }
+
+    fn apply_split_tunnel_all(
+        &self,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()> {
+        record(
+            &self.split_tunnel_calls,
+            format!(
+                "split-tunnel-all:{}:{}:{}",
+                mode,
+                v4_routes.len(),
+                v6_routes.len()
+            ),
+        );
+
+        if self.fail_split_tunnel {
+            return Err(AppError::CommandFailed(
+                "simulated split-tunnel failure".to_string(),
+            ));
+        }
+
+        self.apply_to_all(|uuid| {
+            crate::nm::split_tunnel::set_args(uuid, mode, v4_routes, v6_routes)
+        });
+        Ok(())
+    }
+}
+
+/// Lifecycle seam.
+impl NmLifecycle for MockNmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
         if self.fail_list
             || self
@@ -626,45 +692,6 @@ impl NmClient for MockNmClient {
         Ok(())
     }
 
-    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
-        record(
-            &self.kill_switch_calls,
-            format!("kill-switch-all:{}", if enable { "on" } else { "off" }),
-        );
-
-        if self.fail_kill_switch {
-            return Err(AppError::CommandFailed(
-                "simulated kill-switch failure".to_string(),
-            ));
-        }
-
-        self.apply_to_all(|uuid| crate::nm::kill_switch::set_args(uuid, enable, true));
-        Ok(())
-    }
-
-    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
-        record(
-            &self.autoconnect_calls,
-            format!("autoconnect-all:{}", if enable { "on" } else { "off" }),
-        );
-
-        if self.fail_autoconnect {
-            return Err(AppError::CommandFailed(
-                "simulated autoconnect failure".to_string(),
-            ));
-        }
-
-        self.apply_to_all(|uuid| crate::nm::autoconnect::set_args(uuid, enable));
-        Ok(())
-    }
-
-    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
-        if self.fail_list {
-            return Err(AppError::CommandFailed("simulated".to_string()));
-        }
-        Ok(self.tunnels.clone())
-    }
-
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
         record(&self.imported, path.display().to_string());
         if self.fail_import {
@@ -720,6 +747,37 @@ impl NmClient for MockNmClient {
         Ok(format!("Imported {}", path.display()))
     }
 
+    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
+        record(&self.calls, format!("delete:{}", uuid));
+        self.deleted
+            .lock()
+            .expect("mock mutex poisoned")
+            .insert(uuid.to_string());
+        self.active
+            .lock()
+            .expect("mock mutex poisoned")
+            .retain(|u| u != uuid);
+        self.settings
+            .lock()
+            .expect("mock mutex poisoned")
+            .remove(uuid);
+        self.extra_profiles
+            .lock()
+            .expect("mock mutex poisoned")
+            .retain(|p| p.uuid != uuid);
+        Ok(())
+    }
+}
+
+/// Introspection seam.
+impl NmIntrospect for MockNmClient {
+    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
+        if self.fail_list {
+            return Err(AppError::CommandFailed("simulated".to_string()));
+        }
+        Ok(self.tunnels.clone())
+    }
+
     fn get_profile_diagnostics(
         &self,
         _uuid: &str,
@@ -755,55 +813,6 @@ impl NmClient for MockNmClient {
 
     fn tunnel_dns(&self, _uuid: &str) -> Option<String> {
         Some("10.2.0.1".to_string())
-    }
-
-    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
-        record(&self.calls, format!("delete:{}", uuid));
-        self.deleted
-            .lock()
-            .expect("mock mutex poisoned")
-            .insert(uuid.to_string());
-        self.active
-            .lock()
-            .expect("mock mutex poisoned")
-            .retain(|u| u != uuid);
-        self.settings
-            .lock()
-            .expect("mock mutex poisoned")
-            .remove(uuid);
-        self.extra_profiles
-            .lock()
-            .expect("mock mutex poisoned")
-            .retain(|p| p.uuid != uuid);
-        Ok(())
-    }
-
-    fn apply_split_tunnel_all(
-        &self,
-        mode: crate::config::SplitTunnelMode,
-        v4_routes: &[String],
-        v6_routes: &[String],
-    ) -> AppResult<()> {
-        record(
-            &self.split_tunnel_calls,
-            format!(
-                "split-tunnel-all:{}:{}:{}",
-                mode,
-                v4_routes.len(),
-                v6_routes.len()
-            ),
-        );
-
-        if self.fail_split_tunnel {
-            return Err(AppError::CommandFailed(
-                "simulated split-tunnel failure".to_string(),
-            ));
-        }
-
-        self.apply_to_all(|uuid| {
-            crate::nm::split_tunnel::set_args(uuid, mode, v4_routes, v6_routes)
-        });
-        Ok(())
     }
 }
 

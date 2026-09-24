@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use neutron::config::SplitTunnelMode;
-use neutron::nm::{CliNmClient, NmClient};
+use neutron::nm::{CliNmClient, NmIntrospect, NmLifecycle};
 use neutron::testing::{require_sandbox, sample_wireguard_config, sandbox_profile_name};
 
 /// A WireGuard profile that exists in NetworkManager for the duration of a test

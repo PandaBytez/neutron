@@ -10,7 +10,9 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::error::AppResult;
-use crate::nm::NmClient;
+#[cfg(test)]
+use crate::nm::NmLifecycle;
+use crate::nm::{NmClient, NmIntrospect};
 use crate::service::lease::QbitSyncStatus;
 
 pub const INDICATOR_BUS_NAME: &str = "io.github.pandabytez.neutron.indicator";
@@ -612,7 +614,7 @@ where
 /// Runs only when the port-forward mode is `ForwardAndSync`: the daemon calls
 /// this on every lease renewal, so a broken integration would reach a
 /// third-party Web API unattended.
-fn sync_qbittorrent_port<C: NmClient>(client: &C, uuid: &str, port: u16) -> QbitSyncStatus {
+fn sync_qbittorrent_port<C: NmIntrospect>(client: &C, uuid: &str, port: u16) -> QbitSyncStatus {
     let Ok(config) =
         crate::config::default_config_path().and_then(|path| crate::config::load(&path))
     else {
@@ -677,6 +679,20 @@ impl LeaseTracker {
             self.release();
             self.attempted_at = None;
         }
+    }
+
+    /// One poll's lease preamble: track the active tunnel, drop the lease when
+    /// port forwarding is off, and report whether a renewal is due.
+    ///
+    /// Extracted from the poll loop so the ordering is unit-testable; expiry
+    /// is checked once per poll just before publication, not here.
+    fn begin_poll(&mut self, active_uuid: &Option<String>, forwarding_enabled: bool) -> bool {
+        self.follow_tunnel(active_uuid);
+        if !forwarding_enabled {
+            self.release();
+            return false;
+        }
+        self.is_due()
     }
 
     /// Give up the lease and everything said about it.
@@ -749,6 +765,12 @@ impl LeaseTracker {
         changed || self.qbit_sync == QbitSyncStatus::Failed
     }
 
+    /// Record a renewal attempt that never reached the gateway (no tunnel
+    /// address). Backs off the next attempt without dropping a held lease.
+    fn note_mapping_miss(&mut self) {
+        self.attempted_at = Some(std::time::Instant::now());
+    }
+
     /// Whether qBittorrent synchronization is required (BUG-055).
     fn sync_needed(
         &self,
@@ -776,6 +798,21 @@ impl LeaseTracker {
             })
     }
 
+    /// Claim a qBittorrent push: stamp the config/attempt the loop is about to
+    /// act on and hand back the port, or `None` when no push is needed.
+    fn claim_qbit_push(
+        &mut self,
+        mode: &crate::config::PortForwardMode,
+        current_cfg: &crate::config::QBittorrentConfig,
+    ) -> Option<u16> {
+        if !self.sync_needed(mode, current_cfg) {
+            return None;
+        }
+        self.last_qbit_config = Some(current_cfg.clone());
+        self.qbit_attempted_at = Some(std::time::Instant::now());
+        self.port
+    }
+
     /// The lease as published for the TUI.
     fn publication(&self, profile_uuid: Option<String>) -> crate::service::lease::LeaseState {
         crate::service::lease::LeaseState {
@@ -790,7 +827,7 @@ impl LeaseTracker {
 
 /// The currently active WireGuard profile, if any.
 #[cfg(test)]
-fn active_profile<C: NmClient>(client: &C) -> Option<crate::nm::WireguardProfile> {
+fn active_profile<C: NmLifecycle>(client: &C) -> Option<crate::nm::WireguardProfile> {
     client
         .list_wireguard_profiles()
         .ok()?
@@ -893,27 +930,21 @@ where
             .map(|p| (p.uuid.clone(), p.name.clone()))
             .collect();
 
-        lease.follow_tunnel(&active_uuid);
-        let renewal_due = lease.is_due();
-        lease.check_expiry();
-
-        if !app_cfg.port_forwarding.mode.is_enabled() {
-            lease.release();
-        } else if let Some(profile) = active {
+        let renewal_due = lease.begin_poll(&active_uuid, app_cfg.port_forwarding.mode.is_enabled());
+        if let Some(profile) = active {
             if renewal_due {
                 if let Some(address) = client.tunnel_address(&profile.uuid) {
                     let mapped = crate::portforward::mapping_for_tunnel_address(&address);
                     lease.record(mapped);
                 } else {
-                    lease.attempted_at = Some(std::time::Instant::now());
+                    lease.note_mapping_miss();
                 }
             }
 
-            if lease.sync_needed(&app_cfg.port_forwarding.mode, &app_cfg.qbittorrent) {
-                lease.last_qbit_config = Some(app_cfg.qbittorrent.clone());
-                lease.qbit_attempted_at = Some(std::time::Instant::now());
-                lease.qbit_sync =
-                    sync_qbittorrent_port(&client, &profile.uuid, lease.port.unwrap_or_default());
+            if let Some(port) =
+                lease.claim_qbit_push(&app_cfg.port_forwarding.mode, &app_cfg.qbittorrent)
+            {
+                lease.qbit_sync = sync_qbittorrent_port(&client, &profile.uuid, port);
             }
         }
 
@@ -1340,6 +1371,61 @@ mod tests {
         assert!(!lease.check_expiry_at(now + Duration::from_secs(10)));
         lease.record_at(Some(mapping), now + Duration::from_secs(10));
         assert!(!lease.check_expiry_at(now + Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn begin_poll_releases_the_lease_and_reports_nothing_due_when_disabled() {
+        let mut lease = LeaseTracker::default();
+        let eu = Some("uuid-eu".to_string());
+        lease.follow_tunnel(&eu);
+        lease.record(Some(test_mapping(51820)));
+
+        assert!(
+            !lease.begin_poll(&eu, false),
+            "a disabled integration must not renew"
+        );
+        assert_eq!(lease.port, None);
+        assert!(
+            !lease.begin_poll(&eu, false),
+            "a released lease reports nothing due while disabled"
+        );
+    }
+
+    #[test]
+    fn a_mapping_miss_keeps_the_lease_but_backs_off_retry() {
+        let mut lease = LeaseTracker::default();
+        let eu = Some("uuid-eu".to_string());
+        assert!(lease.begin_poll(&eu, true), "first poll renews");
+        lease.note_mapping_miss();
+        assert!(
+            !lease.begin_poll(&eu, true),
+            "a miss must back off instead of retrying every poll"
+        );
+    }
+
+    #[test]
+    fn a_claimed_push_is_not_claimed_twice_without_progress() {
+        let mut lease = LeaseTracker::default();
+        let eu = Some("uuid-eu".to_string());
+        lease.follow_tunnel(&eu);
+        lease.record(Some(test_mapping(51820)));
+        let cfg = crate::config::QBittorrentConfig::default();
+
+        let mode = crate::config::PortForwardMode::ForwardAndSync;
+        assert_eq!(lease.claim_qbit_push(&mode, &cfg), Some(51820));
+        assert_eq!(
+            lease.claim_qbit_push(&mode, &cfg),
+            None,
+            "the loop owns the claimed attempt until it resolves"
+        );
+        lease.qbit_sync = QbitSyncStatus::Failed;
+        lease.qbit_attempted_at =
+            Some(std::time::Instant::now() - crate::portforward::RENEW_INTERVAL);
+        assert_eq!(
+            lease.claim_qbit_push(&mode, &cfg),
+            Some(51820),
+            "a failed push is claimable again after backoff"
+        );
     }
 
     #[test]
