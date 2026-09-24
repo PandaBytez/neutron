@@ -792,6 +792,7 @@ impl NmIntrospect for MockNmClient {
             transfer_rx: "100.00 KiB".to_string(),
             transfer_tx: "50.00 KiB".to_string(),
             keepalive: "25".to_string(),
+            listen_port: None,
         })
     }
 

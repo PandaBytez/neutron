@@ -63,6 +63,9 @@ pub struct ProfileDiagnostics {
     pub transfer_rx: String,
     pub transfer_tx: String,
     pub keepalive: String,
+    /// Live `wg show` listen port. Independent of NAT-PMP forwarding.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
 }
 
 /// Connection lifecycle: listing, bringing tunnels up/down, importing, deleting.
@@ -603,6 +606,7 @@ fn settings_to_diagnostics(
         transfer_rx: "0 B".to_string(),
         transfer_tx: "0 B".to_string(),
         keepalive: or_na(&settings.keepalive),
+        listen_port: None,
     }
 }
 
@@ -618,6 +622,14 @@ fn overlay_wg_dump(diagnostics: &mut ProfileDiagnostics, dump: &str) {
         let columns: Vec<&str> = interface_line.split('\t').collect();
         if let Some(public_key) = columns.get(1).filter(|value| !value.is_empty()) {
             diagnostics.public_key = (*public_key).to_string();
+        }
+        // `off` is WireGuard's random-port placeholder, not a bound port.
+        if let Some(port) = columns
+            .get(2)
+            .filter(|value| !value.is_empty() && **value != "off")
+            .and_then(|value| value.parse().ok())
+        {
+            diagnostics.listen_port = Some(port);
         }
     }
 
@@ -1671,6 +1683,7 @@ mod tests {
         overlay_wg_dump(&mut diagnostics, &dump);
 
         assert_eq!(diagnostics.public_key, "ifacekey");
+        assert_eq!(diagnostics.listen_port, Some(51820));
         assert_eq!(diagnostics.endpoint, "9.9.9.9:51820");
         assert_eq!(diagnostics.allowed_ips, "10.0.0.0/8");
         assert_eq!(diagnostics.transfer_rx, "2.00 KiB");
@@ -1706,9 +1719,10 @@ mod tests {
         let mut diagnostics =
             settings_to_diagnostics(&PeerSettings::default(), "wg0".to_string(), true);
 
-        overlay_wg_dump(&mut diagnostics, "privkey\tifacekey\t51820\toff\n");
+        overlay_wg_dump(&mut diagnostics, "privkey\tifacekey\toff\toff\n");
 
         assert_eq!(diagnostics.public_key, "ifacekey");
+        assert_eq!(diagnostics.listen_port, None, "`off` is not a bound port");
         assert_eq!(diagnostics.transfer_rx, "0 B", "no peer line, no counters");
     }
 
