@@ -156,10 +156,12 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     // publishing one there is nothing renewing a port, so that is reported as
     // its own state rather than as a bare "N/A" -- otherwise a stopped daemon
     // looks like a provider that does not offer port forwarding.
+    // The tunnel that is up, not the highlighted row. Selecting another
+    // profile must not hide the live listen port.
     let listen_port = state
-        .selected_info
+        .active_profile_uuid
         .as_ref()
-        .filter(|_| state.active_profile_name.is_some())
+        .and_then(|uuid| state.profile_cache.get(uuid))
         .and_then(|info| info.diagnostics.listen_port);
     let (port_val, port_val_style) = if let Some(port) = state.forwarded_port() {
         (format!("{port}"), theme.accent)
@@ -1912,16 +1914,28 @@ mod render_tests {
 
         state.lease = None;
         state.config.port_forwarding.mode = crate::config::PortForwardMode::Disabled;
+        state.active_profile_uuid = Some("uuid-us".to_string());
+        state.profile_cache.insert(
+            "uuid-us".to_string(),
+            crate::tui::state::CachedProfileInfo {
+                diagnostics: crate::nm::ProfileDiagnostics {
+                    listen_port: Some(51234),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Highlighting a different profile must not replace the live port.
         state.selected_info = Some(crate::tui::state::CachedProfileInfo {
             diagnostics: crate::nm::ProfileDiagnostics {
-                listen_port: Some(51234),
+                listen_port: Some(1),
                 ..Default::default()
             },
             ..Default::default()
         });
         let listen = rendered_status(&state);
         assert!(
-            listen.contains("51234"),
+            listen.contains("51234") && !listen.contains("Port: 1"),
             "the live listen port must show with forwarding off: {listen}"
         );
         assert!(

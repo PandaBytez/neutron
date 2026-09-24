@@ -630,8 +630,10 @@ fn handle_port_forward_key<C: ActionClient>(
             KeyCode::Right if !typing => modal.move_right(),
             KeyCode::Char(' ') | KeyCode::Enter if !typing => {
                 let mode = modal.selected_highlighted_mode();
+                // Only a failed probe refuses. Unknown is still checking, and
+                // saying the WebUI is down would be a lie.
                 if mode == PortForwardMode::ForwardAndSync
-                    && state.qbit_webui_reachable != Some(true)
+                    && state.qbit_webui_reachable == Some(false)
                 {
                     blocked = true;
                 } else {
@@ -767,22 +769,26 @@ const QBIT_WEBUI_REFRESH: std::time::Duration = std::time::Duration::from_secs(5
 
 /// Probe the WebUI while the port-forward panel is open, then again every 5s.
 ///
-/// A probe already in flight (`checked_at` set, verdict still `None`) is not
-/// restarted. Closing the panel clears both so the next open checks again.
+/// A probe still inside that window is left alone. One that never answered
+/// is sent again, so a dropped send cannot leave Auto-Sync looking unchecked
+/// for the rest of the session. Closing the panel clears both.
 pub fn refresh_qbit_webui_probe(state: &mut TuiState) {
     if !matches!(state.modal, ActiveModal::PortForward(_)) {
         state.qbit_webui_reachable = None;
         state.qbit_webui_checked_at = None;
         return;
     }
+    let in_flight = state.qbit_webui_reachable.is_none() && state.qbit_webui_checked_at.is_some();
     let due = state
         .qbit_webui_checked_at
         .is_none_or(|at| at.elapsed() >= QBIT_WEBUI_REFRESH);
-    if !due || state.qbit_webui_reachable.is_none() && state.qbit_webui_checked_at.is_some() {
+    if !due {
         return;
     }
-    state.qbit_webui_reachable = None;
-    state.qbit_webui_checked_at = Some(std::time::Instant::now());
+    if !in_flight {
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = Some(std::time::Instant::now());
+    }
     if let Some(ref tx) = state.action_tx {
         let _ = tx.send(crate::tui::state::AsyncAction::ProbeQbitWebUi);
     }
