@@ -174,6 +174,7 @@ pub struct MockNmClient {
     strict_disconnect: bool,
     no_tunnel_address: bool,
     no_tunnel_interface: bool,
+    tunnel_address_override: Option<String>,
     unhealthy: bool,
     calls: Arc<Mutex<Vec<String>>>,
     attempted: Arc<Mutex<Vec<String>>>,
@@ -404,6 +405,14 @@ impl MockNmClient {
     /// configured.
     pub fn without_tunnel_address(mut self) -> Self {
         self.no_tunnel_address = true;
+        self
+    }
+
+    /// Consume this mock and return one whose `tunnel_address` is `address`
+    /// instead of the default `10.2.0.2/32`. Tests that need the derived
+    /// NAT-PMP gateway to be reachable point it at loopback.
+    pub fn with_tunnel_address(mut self, address: &str) -> Self {
+        self.tunnel_address_override = Some(address.to_string());
         self
     }
 
@@ -740,6 +749,8 @@ impl NmClient for MockNmClient {
     fn tunnel_address(&self, _uuid: &str) -> Option<String> {
         if self.no_tunnel_address {
             None
+        } else if let Some(address) = &self.tunnel_address_override {
+            Some(address.clone())
         } else {
             Some("10.2.0.2/32".to_string())
         }
@@ -940,6 +951,16 @@ impl Drop for MockQBittorrentWebUi {
 /// reserved and never bindable by an unprivileged service.
 pub fn unreachable_qbittorrent_url() -> String {
     "http://127.0.0.1:1".to_string()
+}
+
+/// Whether tests run as root. Directory-permission tricks do not fail for
+/// root, so tests that rely on them must skip instead of asserting.
+pub fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+        .unwrap_or(false)
 }
 
 /// Whether `curl` is available, which the qBittorrent client shells out to.

@@ -537,6 +537,107 @@ mod tests {
     }
 
     #[test]
+    fn app_version_retries_once_after_auth_expiry() {
+        use crate::testing::curl_available;
+        use std::sync::atomic::Ordering;
+
+        if !curl_available() {
+            eprintln!("Skipping auth-expiry test: 'curl' is not installed in the environment.");
+            return;
+        }
+        // First version call looks like an expired session; the client must
+        // re-authenticate and retry exactly once rather than fail outright.
+        let (url, hits, done, handle) = scripted_webui(vec![
+            "HTTP/1.1 403 Forbidden\r\n\r\nFails.",
+            "HTTP/1.1 200 OK\r\n\r\nv5.0.3",
+        ]);
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            url,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            client.app_version().expect("retry should succeed"),
+            "v5.0.3"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "an expired session must be retried exactly once"
+        );
+
+        done.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn app_version_reports_persistent_failures() {
+        use crate::testing::curl_available;
+
+        if !curl_available() {
+            eprintln!("Skipping failure test: 'curl' is not installed in the environment.");
+            return;
+        }
+        let (url, _, done, handle) =
+            scripted_webui(vec!["HTTP/1.1 500 Internal Server Error\r\n\r\nboom"]);
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            url,
+            ..Default::default()
+        });
+
+        let error = client.app_version().unwrap_err();
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "a broken WebUI must be reported with its status: {error}"
+        );
+
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = handle.join();
+    }
+
+    /// A WebUI stub answering each request with the next scripted response
+    /// (repeating the last), counting requests so tests can assert retries.
+    fn scripted_webui(
+        responses: Vec<&'static str>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = hits.clone();
+        let stop = done.clone();
+        let handle = std::thread::spawn(move || {
+            let mut index = 0;
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0u8; 2048];
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    if read == 0 {
+                        continue;
+                    }
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    let body = responses[index.min(responses.len() - 1)];
+                    let _ = stream.write_all(body.as_bytes());
+                    index += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        (format!("http://127.0.0.1:{port}"), hits, done, handle)
+    }
+
+    #[test]
     fn mock_webui_server_login_and_sync_port() {
         use crate::testing::{MockQBittorrentWebUi, curl_available};
 

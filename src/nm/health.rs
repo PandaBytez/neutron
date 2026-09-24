@@ -143,6 +143,12 @@ mod tests {
     }
 
     #[test]
+    fn only_a_handshake_counts_as_healthy() {
+        assert!(TunnelHealth::Handshaken.is_healthy());
+        assert!(!TunnelHealth::NoHandshake.is_healthy());
+    }
+
+    #[test]
     fn the_probe_never_depends_on_a_third_party_host() {
         // Regression: the probe used to accept `ping 1.1.1.1` as a liveness
         // signal, so filtered ICMP or an unreachable third party disconnected a

@@ -450,6 +450,17 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_address_entries_reject_garbage_without_touching_the_network() {
+        // Unparseable addresses fail in gateway derivation, before any
+        // socket exists -- so these complete without network access.
+        assert_eq!(port_for_tunnel_address("not-an-address"), None);
+        assert_eq!(mapping_for_tunnel_address("not-an-address"), None);
+        assert_eq!(port_for_tunnel_address(""), None);
+        assert_eq!(mapping_for_tunnel_address("999.999.0.1"), None);
+        assert_eq!(mapping_for_tunnel_address("2001:db8::1"), None);
+    }
+
+    #[test]
     fn mock_natpmp_responder_mapping_flow() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
