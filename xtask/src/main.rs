@@ -317,7 +317,7 @@ fn run_in_container_interactive(root: &Path, command_args: &[String]) -> i32 {
 
 fn run_host_tests(root: &Path) -> i32 {
     let status = Command::new("cargo")
-        .args(["test", "--all-targets", "--features", "qbittorrent"])
+        .args(["test", "--all-targets"])
         .current_dir(root)
         .status();
     run_status(status)
@@ -337,15 +337,7 @@ fn run_linter(root: &Path) -> i32 {
 
     println!("==> Running Clippy lints (strict mode)...");
     let clippy_status = Command::new("cargo")
-        .args([
-            "clippy",
-            "--all-targets",
-            "--features",
-            "qbittorrent",
-            "--",
-            "-D",
-            "warnings",
-        ])
+        .args(["clippy", "--all-targets", "--", "-D", "warnings"])
         .current_dir(root)
         .status();
 
