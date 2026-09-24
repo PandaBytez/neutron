@@ -254,6 +254,35 @@ fn default_qbittorrent_url() -> String {
     "http://127.0.0.1:8080".to_string()
 }
 
+/// Host and port of a WebUI URL. Scheme and path stay put so editing the
+/// address does not drop `http://` or a non-root path.
+pub fn split_webui_url(url: &str) -> (String, String) {
+    let rest = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return (host.to_string(), port.to_string());
+    }
+    (
+        authority.to_string(),
+        default_qbittorrent_url()
+            .rsplit_once(':')
+            .map(|(_, port)| port.to_string())
+            .unwrap_or_else(|| "8080".to_string()),
+    )
+}
+
+pub fn join_webui_url(url: &str, host: &str, port: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let path = rest.find(['/', '?', '#']).map(|i| &rest[i..]).unwrap_or("");
+    format!("{scheme}://{host}:{port}{path}")
+}
+
 impl Default for QBittorrentConfig {
     fn default() -> Self {
         Self {
@@ -898,6 +927,12 @@ mod tests {
         assert_eq!(loaded.qbittorrent.username.as_deref(), Some("admin"));
         assert_eq!(loaded.qbittorrent.password.as_deref(), Some("secret123"));
         assert!(loaded.qbittorrent.bind_interface);
+        let (host, port) = split_webui_url(&loaded.qbittorrent.url);
+        assert_eq!((host.as_str(), port.as_str()), ("192.168.1.50", "8080"));
+        assert_eq!(
+            join_webui_url("http://127.0.0.1:8080/qbittorrent", "10.0.0.2", "9090"),
+            "http://10.0.0.2:9090/qbittorrent"
+        );
         cleanup(&path);
     }
 

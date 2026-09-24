@@ -395,15 +395,23 @@ impl SplitTunnelModalState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortForwardFocus {
+    Mode,
+    Host,
+    Port,
+}
+
 /// Mode selector for the port-forwarding policy, opened with `[o]`.
 ///
-/// A single-purpose modal rather than a full editor: the policy is just the
-/// [`PortForwardMode`], so it needs the same navigate-and-confirm selector as
-/// [`SplitTunnelModalState`]'s top row and nothing else.
+/// Host and port edit the saved WebUI URL. The scheme and path stay as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForwardModalState {
     pub mode: PortForwardMode,
     pub highlighted_mode: usize,
+    pub focus: PortForwardFocus,
+    pub host: String,
+    pub port: String,
 }
 
 impl PortForwardModalState {
@@ -413,12 +421,20 @@ impl PortForwardModalState {
         PortForwardMode::ForwardAndSync,
     ];
 
-    pub fn from_config(pf: &PortForwardConfig) -> Self {
+    pub fn from_config(pf: &PortForwardConfig, webui_url: &str) -> Self {
         let highlighted_mode = Self::MODES.iter().position(|&m| m == pf.mode).unwrap_or(0);
+        let (host, port) = crate::config::split_webui_url(webui_url);
         Self {
             mode: pf.mode,
             highlighted_mode,
+            focus: PortForwardFocus::Mode,
+            host,
+            port,
         }
+    }
+
+    pub fn webui_url(&self, current: &str) -> String {
+        crate::config::join_webui_url(current, self.host.trim(), self.port.trim())
     }
 
     pub fn selected_highlighted_mode(&self) -> PortForwardMode {
@@ -469,6 +485,11 @@ pub struct TuiState {
     /// render thread on a UDP round trip -- and still go stale, since the TUI
     /// only learns of a tunnel change while it happens to be open.
     pub lease: Option<LeaseState>,
+    /// Last WebUI probe while the port-forward modal is open.
+    /// `None` means still checking; `Some(false)` blocks Auto-Sync.
+    pub qbit_webui_reachable: Option<bool>,
+    /// When the current verdict was taken, so the open panel can recheck.
+    pub qbit_webui_checked_at: Option<std::time::Instant>,
     pub public_ip_info: Option<PublicIpInfo>,
     pub download_rate: u64,
     pub upload_rate: u64,
@@ -497,6 +518,7 @@ pub enum AsyncAction {
     Autoconnect(bool),
     Sync,
     Delete(String),
+    ProbeQbitWebUi,
 }
 
 pub enum AsyncActionResult {
@@ -514,6 +536,7 @@ pub enum AsyncActionResult {
     },
     Sync(crate::error::AppResult<crate::app::sync::SyncReport>),
     Delete(crate::error::AppResult<String>),
+    ProbeQbitWebUi(bool),
 }
 
 impl TuiState {
@@ -531,6 +554,8 @@ impl TuiState {
             active_profile_name: None,
             active_profile_uuid: None,
             lease: None,
+            qbit_webui_reachable: None,
+            qbit_webui_checked_at: None,
             public_ip_info: None,
             download_rate: 0,
             upload_rate: 0,
@@ -787,7 +812,7 @@ mod tests {
             mode: PortForwardMode::ForwardAndSync,
             ..Default::default()
         };
-        let modal = PortForwardModalState::from_config(&pf);
+        let modal = PortForwardModalState::from_config(&pf, "http://127.0.0.1:8080");
         assert_eq!(modal.mode, PortForwardMode::ForwardAndSync);
         assert_eq!(modal.highlighted_mode, 2);
         assert_eq!(
@@ -798,7 +823,8 @@ mod tests {
 
     #[test]
     fn port_forward_modal_arrow_navigation_wraps() {
-        let mut modal = PortForwardModalState::from_config(&PortForwardConfig::default());
+        let mut modal =
+            PortForwardModalState::from_config(&PortForwardConfig::default(), "http://127.0.0.1:8080");
         assert_eq!(modal.highlighted_mode, 0);
 
         modal.move_right();

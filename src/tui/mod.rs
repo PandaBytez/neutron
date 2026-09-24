@@ -191,6 +191,18 @@ where
                     })();
                     crate::tui::state::AsyncActionResult::Delete(r)
                 }
+                crate::tui::state::AsyncAction::ProbeQbitWebUi => {
+                    let reachable = crate::config::load(&config_path_for_action)
+                        .map(|cfg| {
+                            crate::portforward::qbittorrent::QBittorrentClient::new(
+                                &cfg.qbittorrent,
+                            )
+                            .with_timeout(std::time::Duration::from_secs(1))
+                            .reachable()
+                        })
+                        .unwrap_or(false);
+                    crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable)
+                }
             };
             let _ = action_res_tx.send(res);
         }
@@ -474,6 +486,11 @@ where
                     }
                     Err(err) => state.set_error(&err),
                 },
+                crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable) => {
+                    if matches!(state.modal, crate::tui::state::ActiveModal::PortForward(_)) {
+                        state.qbit_webui_reachable = Some(reachable);
+                    }
+                }
             }
         }
 
@@ -485,6 +502,7 @@ where
             // anything NetworkManager reports, so it has to be re-read on a tick
             // rather than only when the profile list changes.
             events::refresh_lease(state);
+            events::refresh_qbit_webui_probe(state);
 
             if let Some((uuid, _, true)) = state.selected_identity() {
                 if let Some(ref tx) = state.diag_tx {

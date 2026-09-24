@@ -12,7 +12,7 @@ use crate::config::{PortForwardMode, SplitTunnelMode};
 use crate::nm::network_info::format_speed;
 use crate::service::lease::QbitSyncStatus;
 use crate::tui::state::{
-    ActiveModal, CommandPaletteState, PortForwardModalState, SplitTunnelFocus,
+    ActiveModal, CommandPaletteState, PortForwardFocus, PortForwardModalState, SplitTunnelFocus,
     SplitTunnelModalState, ThemePickerState, TuiState,
 };
 pub const MIN_WIDTH: u16 = 120;
@@ -156,10 +156,17 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     // publishing one there is nothing renewing a port, so that is reported as
     // its own state rather than as a bare "N/A" -- otherwise a stopped daemon
     // looks like a provider that does not offer port forwarding.
+    let listen_port = state
+        .selected_info
+        .as_ref()
+        .filter(|_| state.active_profile_name.is_some())
+        .and_then(|info| info.diagnostics.listen_port);
     let (port_val, port_val_style) = if let Some(port) = state.forwarded_port() {
         (format!("{port}"), theme.accent)
+    } else if let Some(port) = listen_port {
+        (format!("{port}"), theme.text_primary)
     } else if !state.config.port_forwarding.mode.is_enabled() {
-        ("Disabled".to_string(), theme.label_dim)
+        ("--".to_string(), theme.label_dim)
     } else if state.lease.is_none() {
         ("No daemon".to_string(), theme.warning)
     } else if state.active_profile_name.is_some() {
@@ -1163,16 +1170,23 @@ fn render_port_forward_modal(
     state: &TuiState,
 ) {
     let theme = &state.theme;
-    let popup_area = centered_rect(75, 30, area);
+    let show_webui_warning = state.qbit_webui_reachable == Some(false);
+    let popup_area = centered_rect(75, if show_webui_warning { 50 } else { 40 }, area);
 
     frame.render_widget(Clear, popup_area);
 
+    let mut constraints = vec![
+        Constraint::Length(3), // Mode Selector
+        Constraint::Length(3), // WebUI host and port
+    ];
+    if show_webui_warning {
+        constraints.push(Constraint::Length(2));
+    }
+    constraints.push(Constraint::Length(2)); // Explanation footer
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Mode Selector
-            Constraint::Length(2), // Explanation footer
-        ])
+        .constraints(constraints)
         .margin(1)
         .split(popup_area);
 
@@ -1199,24 +1213,87 @@ fn render_port_forward_modal(
         mode_spans.push(Span::raw("  "));
     }
 
+    let mode_style = if pf.focus == PortForwardFocus::Mode {
+        theme.active_border
+    } else {
+        theme.border
+    };
     let mode_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.active_border)
+        .border_style(mode_style)
         .title(Span::styled(
-            " Port Forwarding Mode (←/→ Navigate, Space/Enter Select, Esc Cancel) ",
+            " Port Forwarding Mode (←/→ Navigate, Space/Enter Select) ",
             theme.title,
         ));
 
     let mode_widget = Paragraph::new(Line::from(mode_spans)).block(mode_block);
     frame.render_widget(mode_widget, chunks[0]);
 
+    let host_style = if pf.focus == PortForwardFocus::Host {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let port_style = if pf.focus == PortForwardFocus::Port {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let endpoint = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(chunks[1]);
+    frame.render_widget(
+        Paragraph::new(pf.host.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(host_style)
+                .title(" WebUI host "),
+        ),
+        endpoint[0],
+    );
+    frame.render_widget(
+        Paragraph::new(pf.port.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(port_style)
+                .title(" port "),
+        ),
+        endpoint[1],
+    );
+
+    let footer_chunk = if show_webui_warning {
+        let warn = Paragraph::new(Line::from(vec![
+            Span::styled(" ⚠ qBittorrent WebUI unavailable: ", theme.warning),
+            Span::styled(
+                "enable Web UI (Tools → Options → Web UI). Auto-Sync cannot be selected until it answers.",
+                theme.text_secondary,
+            ),
+        ]));
+        frame.render_widget(warn, chunks[2]);
+        chunks[3]
+    } else {
+        chunks[2]
+    };
+
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" Forward ", theme.text_secondary),
         Span::styled("leases a NAT-PMP port. ", theme.label_dim),
         Span::styled("Forward + qBittorrent Sync ", theme.text_secondary),
-        Span::styled("also pushes it to qBittorrent.", theme.label_dim),
+        Span::styled("also pushes it to qBittorrent. ", theme.label_dim),
+        Span::styled("Tab", theme.key_badge),
+        Span::styled(" edits host and port.", theme.label_dim),
     ]));
-    frame.render_widget(footer, chunks[1]);
+    frame.render_widget(footer, footer_chunk);
+
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme.active_border)
+            .title(Span::styled(" Port Forwarding ", theme.title)),
+        popup_area,
+    );
 }
 
 fn render_split_tunnel_modal(
@@ -1698,6 +1775,7 @@ mod render_tests {
         let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
         state.modal = ActiveModal::PortForward(PortForwardModalState::from_config(
             &state.config.port_forwarding,
+            &state.config.qbittorrent.url,
         ));
 
         let mut terminal =
@@ -1728,6 +1806,63 @@ mod render_tests {
                 && rendered.contains("Forward + qBittorrent Sync"),
             "the modal must offer all three modes: {rendered}"
         );
+        assert!(
+            rendered.contains("127.0.0.1") && rendered.contains("8080"),
+            "the modal must show the default WebUI host and port: {rendered}"
+        );
+        assert!(
+            rendered.contains('╭') && rendered.contains("Port Forwarding "),
+            "the modal must have an outer border: {rendered}"
+        );
+        assert!(
+            !rendered.contains("WebUI unavailable"),
+            "a missing verdict must not warn: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_port_forward_modal_warns_when_the_webui_is_down() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        let mut modal = PortForwardModalState::from_config(
+            &state.config.port_forwarding,
+            &state.config.qbittorrent.url,
+        );
+        modal.move_right();
+        modal.move_right();
+        state.modal = ActiveModal::PortForward(modal);
+        state.qbit_webui_reachable = Some(false);
+
+        let rendered = rendered_port_forward_modal(&state);
+        assert!(
+            rendered.contains("qBittorrent WebUI unavailable"),
+            "a refused WebUI must warn while Auto-Sync is highlighted: {rendered}"
+        );
+
+        state.qbit_webui_reachable = Some(true);
+        let up = rendered_port_forward_modal(&state);
+        assert!(
+            !up.contains("WebUI unavailable"),
+            "a live WebUI must not warn: {up}"
+        );
+    }
+
+    fn rendered_port_forward_modal(state: &TuiState) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                render(frame, state);
+            })
+            .expect("draw should succeed");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
     }
 
     /// Render just the status panel and return it as one plain string.
@@ -1773,6 +1908,21 @@ mod render_tests {
         assert!(
             rendered.contains('🔌') && rendered.contains("Port:") && rendered.contains("51820"),
             "status panel must render the port with icon: {rendered}"
+        );
+
+        state.lease = None;
+        state.config.port_forwarding.mode = crate::config::PortForwardMode::Disabled;
+        state.selected_info = Some(crate::tui::state::CachedProfileInfo {
+            diagnostics: crate::nm::ProfileDiagnostics {
+                listen_port: Some(51234),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let listen = rendered_status(&state);
+        assert!(
+            listen.contains("51234"),
+            "the live listen port must show with forwarding off: {listen}"
         );
         assert!(
             rendered.contains("⏱ 42ms"),

@@ -102,6 +102,15 @@ impl QBittorrentClient {
         Ok(())
     }
 
+    /// Whether the WebUI answered a version query.
+    ///
+    /// A precondition check, not a sync: `false` means the UI is off, the
+    /// process is down, or credentials were rejected. Callers that only need
+    /// a warning must not treat that as a failed port push.
+    pub fn reachable(&mut self) -> bool {
+        self.app_version().is_ok()
+    }
+
     /// Query application version string (e.g. `v5.0.3`).
     pub fn app_version(&mut self) -> AppResult<String> {
         self.ensure_authenticated()?;
@@ -488,6 +497,26 @@ mod tests {
 
         assert_eq!(resp.status, 403);
         assert_eq!(resp.body, "Fails.");
+    }
+
+    #[test]
+    fn an_unreachable_webui_is_not_reachable() {
+        use crate::testing::{curl_available, unreachable_qbittorrent_url};
+
+        if !curl_available() {
+            eprintln!("Skipping reachability test: 'curl' is not installed.");
+            return;
+        }
+
+        let cfg = QBittorrentConfig {
+            url: unreachable_qbittorrent_url(),
+            ..Default::default()
+        };
+        let mut client = QBittorrentClient::new(&cfg).with_timeout(Duration::from_millis(200));
+        assert!(
+            !client.reachable(),
+            "a refused connection must not look like a live WebUI"
+        );
     }
 
     #[test]
