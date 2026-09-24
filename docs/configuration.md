@@ -93,17 +93,19 @@ transfer_tx = "#ebcb8b"
 # Port Forwarding (NAT-PMP)
 # ==============================================================================
 [port_forwarding]
-# Lease an incoming port from the tunnel gateway and keep renewing it.
-# Also togglable live from the TUI with `f`. Off by default: the lease is
-# renewed on a timer against the provider, so it is only requested on request.
-enabled = false
+# Policy mode: "disabled", "forward" (lease an incoming port from the tunnel
+# gateway and keep renewing it), or "forward-and-sync" (also push the leased
+# port to qBittorrent automatically). Switchable live from the TUI with `o`.
+# Off by default: the lease is renewed on a timer against the provider, so it
+# is only requested on request.
+mode = "disabled"
 
 # ==============================================================================
 # qBittorrent Dynamic Port Forwarding Sync
 # ==============================================================================
 [qbittorrent]
-# Automatically push NAT-PMP leased ports to qBittorrent WebUI on connect/renew
-enabled = false
+# Syncing is decided by [port_forwarding] mode = "forward-and-sync": the
+# daemon pushes NAT-PMP leased ports to qBittorrent WebUI on connect/renew.
 
 # WebUI HTTP/HTTPS endpoint URL
 url = "http://127.0.0.1:8080"

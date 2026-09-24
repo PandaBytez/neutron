@@ -24,7 +24,7 @@ neutron tui
 
 * **Header (Top):**
   * **Status Panel:** Live active profile, connection indicator, public IP, ping latency, download/upload throughput rates (`/proc/net/dev`), and active NAT-PMP forwarded port.
-  * **Policies Panel:** Real-time status pills for Kill Switch, Lockdown Firewall, Split Tunneling, Port Forwarding, and Auto-Connect at login.
+  * **Policies Panel:** Real-time status pills for Kill Switch, Lockdown Firewall, Split Tunneling, Port Forwarding mode (Off / ON / Auto-Sync to qBittorrent), and Auto-Connect at login.
 * **Main Body:**
   * **Left (Profile Browser):** Lists all NetworkManager WireGuard profiles with active checkmarks (`●`), favorite stars (`★`), and pool exclusion badges (`⊘`).
   * **Right (Details Pane):** Full connection diagnostics including remote peer endpoint, allowed IPs, latest handshake age, cumulative RX/TX transfer counters, persistent keepalive, and assigned interface IP.
@@ -47,7 +47,7 @@ Every action below is also searchable by name from the **Command Palette** (`Ctr
 | `t` | **Split Tunneling** | Open interactive Split Tunneling manager (Domains & Subnets) |
 | `k` | **Kill Switch** | Toggle NetworkManager-native routing kill switch |
 | `l` | **Lockdown Mode** | Toggle always-on Netfilter firewall (requires `pkexec` root) |
-| `o` | **Port Forwarding** | Toggle NAT-PMP dynamic port leasing and renewal |
+| `o` | **Port Forwarding** | Open the Port Forwarding mode modal (Off / Forward / Forward + qBittorrent Sync) |
 | `r` | **Sync Drop Directory** | Scan `~/.config/neutron/profiles/` and batch-import new `.conf` files |
 | `d` / `Delete` | **Delete Profile** | Permanently remove selected profile from NetworkManager (with confirmation) |
 | `Ctrl+P` / `:` | **Command Palette** | Searchable fuzzy popup for all commands and actions |
@@ -168,9 +168,10 @@ neutron qbit test
 # Immediately sync active NAT-PMP port to qBittorrent
 neutron qbit sync
 
-# Enable / disable automated sync
-neutron qbit enable
-neutron qbit disable
+# Enable / disable automated sync (sets the [port_forwarding] policy mode;
+# disable keeps port forwarding on and only stops the qBittorrent sync)
+neutron qbit enable    # forward-and-sync
+neutron qbit disable   # forward
 
 # Configure WebUI connection parameters
 neutron qbit config --url http://127.0.0.1:8080 --bind true
