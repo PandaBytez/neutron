@@ -658,6 +658,9 @@ struct LeaseTracker {
     expires_at: Option<std::time::Instant>,
     /// Granted lease duration, or zero if unmapped.
     lifetime: std::time::Duration,
+    /// Last poll's forwarding switch. Turning it on must not inherit a backoff
+    /// from attempts made while it was off.
+    forwarding_enabled: bool,
     /// What became of the last push to qBittorrent.
     qbit_sync: QbitSyncStatus,
     /// Last qBittorrent configuration associated with the sync verdict (BUG-055).
@@ -688,9 +691,14 @@ impl LeaseTracker {
     /// is checked once per poll just before publication, not here.
     fn begin_poll(&mut self, active_uuid: &Option<String>, forwarding_enabled: bool) -> bool {
         self.follow_tunnel(active_uuid);
+        let just_enabled = forwarding_enabled && !self.forwarding_enabled;
+        self.forwarding_enabled = forwarding_enabled;
         if !forwarding_enabled {
             self.release();
             return false;
+        }
+        if just_enabled {
+            self.attempted_at = None;
         }
         self.is_due()
     }
@@ -941,10 +949,16 @@ where
                 }
             }
 
-            if let Some(port) =
-                lease.claim_qbit_push(&app_cfg.port_forwarding.mode, &app_cfg.qbittorrent)
-            {
-                lease.qbit_sync = sync_qbittorrent_port(&client, &profile.uuid, port);
+            if app_cfg.port_forwarding.mode.syncs_to_qbittorrent() {
+                if let Some(port) =
+                    lease.claim_qbit_push(&app_cfg.port_forwarding.mode, &app_cfg.qbittorrent)
+                {
+                    lease.qbit_sync = sync_qbittorrent_port(&client, &profile.uuid, port);
+                }
+            } else {
+                // Drop the stamp so turning sync back on pushes on the next poll
+                // instead of looking like an already-applied config.
+                lease.last_qbit_config = None;
             }
         }
 
@@ -1258,8 +1272,6 @@ mod tests {
         let mode_sync = PortForwardMode::ForwardAndSync;
         let mode_forward = PortForwardMode::Forward;
 
-        // Synchronized, then sync switched off and back on with a stable
-        // port and config: qBittorrent already holds the port, so no push.
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".to_string()));
         lease.record(Some(test_mapping(51820)));
@@ -1268,16 +1280,15 @@ mod tests {
         assert!(lease.sync_needed(&mode_sync, &cfg));
         lease.last_qbit_config = Some(cfg.clone());
         lease.qbit_sync = QbitSyncStatus::Synchronized;
+        lease.qbit_attempted_at = Some(std::time::Instant::now());
 
         assert!(!lease.sync_needed(&mode_forward, &cfg));
+        lease.last_qbit_config = None;
         assert!(
-            !lease.sync_needed(&mode_sync, &cfg),
-            "returning to sync mode with the already-pushed port requires no push"
+            lease.sync_needed(&mode_sync, &cfg),
+            "turning sync back on must push without waiting for a renewal"
         );
-
-        // But a port leased while sync was off is pushed on return.
-        lease.record(Some(test_mapping(51821)));
-        assert!(lease.sync_needed(&mode_sync, &cfg));
+        assert_eq!(lease.claim_qbit_push(&mode_sync, &cfg), Some(51820));
     }
 
     #[test]
@@ -1388,6 +1399,19 @@ mod tests {
         assert!(
             !lease.begin_poll(&eu, false),
             "a released lease reports nothing due while disabled"
+        );
+    }
+
+    #[test]
+    fn enabling_forwarding_retries_immediately() {
+        let mut lease = LeaseTracker::default();
+        let eu = Some("uuid-eu".to_string());
+        assert!(lease.begin_poll(&eu, true));
+        lease.note_mapping_miss();
+        assert!(!lease.begin_poll(&eu, false));
+        assert!(
+            lease.begin_poll(&eu, true),
+            "turning forwarding on must not wait out the previous miss"
         );
     }
 
