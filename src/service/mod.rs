@@ -759,6 +759,39 @@ mod tests {
             .to_path_buf()
     }
 
+    #[test]
+    fn teardown_failure_aborts_before_any_connect() {
+        // Two profiles up, teardown broken: the selector must surface the
+        // teardown error rather than connect a replacement alongside the
+        // stuck tunnel.
+        let client = MockNmClient::new(vec![
+            profile("wg-us", "uuid-1", ProfileState::Active),
+            profile("wg-eu", "uuid-2", ProfileState::Active),
+        ])
+        .fail_disconnect();
+        let path = unique_test_config_path();
+        write_config(&path, AppConfig::default());
+
+        let error = match run_startup_random_with_selector(&client, &path, |_| 0) {
+            Ok(_) => panic!("teardown failure must abort selection, not connect a replacement"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, crate::error::AppError::CommandFailed(_)),
+            "teardown failure must abort selection: {error}"
+        );
+        assert!(
+            !client
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("connect:")),
+            "no replacement may be connected while teardown fails: {:?}",
+            client.calls()
+        );
+
+        cleanup_test_artifacts(&path);
+    }
+
     fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile {
         crate::testing::profile(name, uuid, state)
     }
