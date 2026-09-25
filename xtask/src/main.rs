@@ -45,7 +45,7 @@ fn print_help() {
           test-leaks, leak-tests      Run leak protection tests inside a Podman container\n  \
           container-shell, shell      Drop into an interactive shell inside the test container\n  \
           build-image                 Build/rebuild the neutron-sandbox container image\n  \
-          reinstall, dev-install      Rebuild and install the binary, leaving lockdown alone\n  \
+          reinstall, dev-install      Rebuild and install the binary, keeping settings intact (`cargo reinstall`)\n  \
           docs, build-docs            Build mdBook documentation for GitHub Pages\n  \
           lint                        Run cargo fmt and clippy with strict warnings\n\n\
         OPTIONS:\n  \
@@ -438,7 +438,33 @@ impl SettingsSnapshot {
 ///
 /// Extra arguments go straight to `cargo install`, so `--debug`, `--root DIR`,
 /// and `--locked` all work: `cargo xtask reinstall -- --debug`.
+/// What `cargo reinstall` does, printed for `-h` / `--help`.
+///
+/// Handled here rather than forwarded: `cargo install --help` would print
+/// cargo's help, exit 0, and the command would then claim it installed
+/// something.
+const REINSTALL_USAGE: &str = "\
+cargo reinstall [-- <cargo install flags>]
+
+Rebuilds and installs Neutron, keeping your lockdown state and your settings.
+
+  cargo reinstall                 release build, installed to $CARGO_HOME/bin
+  cargo reinstall -- --debug      much faster rebuild for iterating
+  cargo reinstall -- --root DIR   install somewhere other than CARGO_HOME
+
+Left alone: the firewall rules, the root-owned refresh helper, the polkit
+action, and every settings file (captured beforehand and restored if the
+install touches them).
+
+Left stale: the refresh helper is a copy of the binary from when lockdown
+was enabled. After changing firewall code run `neutron lockdown enable`
+once to refresh it.";
+
 fn run_reinstall(root: &Path, args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{REINSTALL_USAGE}");
+        return 0;
+    }
     println!("==> Rebuilding and installing (lockdown and settings untouched)");
     // `cargo xtask reinstall -- --debug`: the separator belongs to xtask's own
     // argument parsing, and passing it on makes cargo reject `--debug` as a
@@ -612,5 +638,29 @@ mod tests {
         let snapshot = SettingsSnapshot::capture_in(&scratch("absent"));
         assert!(snapshot.0.is_empty());
         assert!(snapshot.restore_if_changed().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reinstall_usage_tests {
+    use super::REINSTALL_USAGE;
+
+    #[test]
+    fn the_usage_says_what_is_kept_and_what_is_not() {
+        // This text is the only discoverability a new contributor has, so the
+        // two things that surprise people -- what survives, and the stale helper
+        // -- have to be in it.
+        for expected in [
+            "lockdown",
+            "settings",
+            "restored",
+            "neutron lockdown enable",
+            "cargo install",
+        ] {
+            assert!(
+                REINSTALL_USAGE.contains(expected),
+                "usage should mention {expected:?}:\n{REINSTALL_USAGE}"
+            );
+        }
     }
 }

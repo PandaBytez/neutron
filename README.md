@@ -93,6 +93,28 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
+### Day-to-day commands
+
+Most maintenance is a cargo alias, so nothing needs installing first:
+
+| Command | What it does |
+| :--- | :--- |
+| `cargo reinstall` | Rebuild and install the binary, **keeping your lockdown state and settings** |
+| `cargo lint` | `cargo fmt --check` plus strict clippy |
+| `cargo test` | Host unit and integration tests |
+| `cargo test-all` | Host tests, then the system tests in the disposable sandbox |
+| `cargo docs` | Build this documentation |
+
+`cargo reinstall` is the one to reach for while working on the app: it runs
+`cargo install --path . --force` and touches nothing privileged, so you do not
+disable lockdown and re-authenticate on every rebuild. It verifies your settings
+came through unchanged and restores them if anything touches them.
+
+Two caveats it deliberately does not hide: the root-owned refresh helper is a
+*copy* of the binary taken when lockdown was enabled, so after changing firewall
+code run `neutron lockdown enable` once to refresh it; and system tests need
+Podman — see [testing](docs/testing.md).
+
 ### Auto-Connect at Login
 
 Auto-connect is **off by default**. Press **`a`** in the TUI to enable it and install the desktop autostart entry,

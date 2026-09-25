@@ -1,5 +1,6 @@
 [alias]
 xtask = "run --package xtask --"
+reinstall = "run --package xtask -- reinstall"
 test-all = "run --package xtask -- test-all"
 test-system = "run --package xtask -- test-system"
 test-leaks = "run --package xtask -- test-leaks"
