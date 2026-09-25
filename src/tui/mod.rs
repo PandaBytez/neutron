@@ -407,6 +407,9 @@ where
 
         // Drain any incoming background action results
         while let Ok(action_res) = action_res_rx.try_recv() {
+            // Every arm means the dispatched action reported back, so the spinner
+            // has done its job -- on success and on failure alike.
+            state.end_pending();
             match action_res {
                 crate::tui::state::AsyncActionResult::KillSwitch { enable, result } => match result
                 {

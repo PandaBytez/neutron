@@ -262,14 +262,23 @@ pub fn execute_action<C: ActionClient>(
         }
         "lockdown" => {
             let enable = !state.config.lockdown_enabled;
+            // Escalation blocks on a polkit prompt, so the wait is what the user
+            // is watching. Animate it, and show elapsed time in case the prompt
+            // is a GUI dialog that has not appeared yet.
+            let label = format!(
+                "{} Lockdown Mode",
+                if enable { "Enabling" } else { "Disabling" }
+            );
+            state.begin_pending(label.clone());
             if let Some(ref tx) = action_tx {
-                state.set_status(format!(
-                    "{} Lockdown Mode...",
-                    if enable { "Enabling" } else { "Disabling" }
-                ));
+                state.set_status(format!("{label}..."));
                 let _ = tx.send(crate::tui::state::AsyncAction::Lockdown(enable));
             } else {
+                // No worker thread: this blocks the event loop, so the spinner
+                // cannot repaint. Marked anyway so the state cannot be left
+                // showing an action that already finished.
                 crate::app::set_global_lockdown(client, &state.config_path, enable)?;
+                state.end_pending();
                 state
                     .uncertain_policies
                     .remove(&crate::error::Policy::Lockdown);

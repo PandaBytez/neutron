@@ -16,8 +16,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Braille spinner frames, the same set `cargo` uses.
-const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(80);
+
+/// The frame to show for an animation that began `elapsed` ago.
+///
+/// Derived from the clock rather than a frame counter, so it is correct at any
+/// refresh rate and needs no extra state to advance. Shared by the CLI spinner
+/// and the TUI overlays so one set of frames defines "busy" everywhere.
+pub fn spinner_frame(elapsed: Duration) -> &'static str {
+    SPINNER_FRAMES[(elapsed.as_millis() / TICK.as_millis()) as usize % SPINNER_FRAMES.len()]
+}
 
 /// Run `work` behind a spinner labelled `label`, returning exactly what it
 /// returns.
@@ -40,7 +49,7 @@ pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> AppResult<T>) -> AppR
         let stop = Arc::clone(&stop);
         let label = label.to_string();
         std::thread::spawn(move || {
-            for frame in FRAMES {
+            for frame in SPINNER_FRAMES {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
@@ -64,6 +73,24 @@ pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> AppResult<T>) -> AppR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_advances_with_the_clock_and_never_leaves_the_set() {
+        // Clock-derived, so it cannot depend on how often the UI redraws.
+        let mut seen = std::collections::BTreeSet::new();
+        for ms in 0..2_000u64 {
+            let frame = spinner_frame(Duration::from_millis(ms));
+            assert!(
+                SPINNER_FRAMES.contains(&frame),
+                "{frame} is not one of the frames"
+            );
+            seen.insert(frame);
+        }
+        assert!(
+            seen.len() > 1,
+            "two seconds must cycle through more than one frame"
+        );
+    }
 
     #[test]
     fn animation_is_skipped_when_stderr_is_not_a_terminal() {

@@ -21,7 +21,13 @@ pub fn wrap_prev(index: usize, len: usize) -> usize {
     if len == 0 { 0 } else { (index + len - 1) % len }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An action dispatched to a worker thread, with the moment it was dispatched.
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    pub label: String,
+    pub started_at: std::time::Instant,
+}
+
 pub struct Toast {
     pub message: String,
     pub is_error: bool,
@@ -469,6 +475,13 @@ pub struct TuiState {
     /// Failed operations can leave applied policy different from saved intent.
     /// Reloading config or dismissing a toast must not clear this uncertainty.
     pub uncertain_policies: std::collections::BTreeSet<crate::error::Policy>,
+    /// An action handed to a worker thread that has not reported back yet.
+    ///
+    /// Tracked separately from the toast because the wait is the part that looks
+    /// frozen: a lockdown toggle blocks on a polkit prompt for as long as the
+    /// user takes to authenticate, and a static "Enabling..." line gives no
+    /// evidence anything is still alive.
+    pub pending: Option<PendingAction>,
     pub theme: Theme,
     pub rows: Vec<ProfileListRow>,
     pub profile_cache: std::collections::HashMap<String, CachedProfileInfo>,
@@ -546,6 +559,7 @@ impl TuiState {
             config_path,
             config,
             uncertain_policies: Default::default(),
+            pending: None,
             theme,
             rows: Vec::new(),
             profile_cache: std::collections::HashMap::new(),
@@ -659,6 +673,33 @@ impl TuiState {
             is_error: false,
             created_at: std::time::Instant::now(),
         });
+    }
+
+    /// Mark `label` as in flight, so the UI can animate until it reports back.
+    pub fn begin_pending(&mut self, label: impl Into<String>) {
+        self.pending = Some(PendingAction {
+            label: label.into(),
+            started_at: std::time::Instant::now(),
+        });
+    }
+
+    /// Clear the in-flight marker. Called when the worker reports, either way.
+    pub fn end_pending(&mut self) {
+        self.pending = None;
+    }
+
+    /// The animated label for the in-flight action, e.g. `⠹ Enabling Lockdown
+    /// Mode (2.4s)`. `None` when nothing is pending.
+    pub fn pending_text(&self) -> Option<String> {
+        self.pending.as_ref().map(|pending| {
+            let elapsed = pending.started_at.elapsed();
+            format!(
+                "{} {} ({:.1}s)",
+                crate::wait::spinner_frame(elapsed),
+                pending.label,
+                elapsed.as_secs_f64()
+            )
+        })
     }
 
     /// Report a failed action in a toast notification. Kept distinct from
@@ -818,6 +859,30 @@ mod tests {
         assert_eq!(
             modal.selected_highlighted_mode(),
             PortForwardMode::ForwardAndSync
+        );
+    }
+
+    #[test]
+    fn a_pending_action_renders_an_animated_label_until_it_reports_back() {
+        let mut st = TuiState::new(
+            crate::testing::temp_config_path("pending"),
+            Default::default(),
+        );
+        assert!(st.pending_text().is_none(), "nothing pending at rest");
+
+        st.begin_pending("Enabling Lockdown Mode");
+        let first = st.pending_text().expect("pending text while in flight");
+        assert!(first.contains("Enabling Lockdown Mode"), "{first}");
+        assert!(
+            crate::wait::SPINNER_FRAMES
+                .contains(&first.chars().next().expect("a frame").to_string().as_str()),
+            "must lead with a spinner frame: {first}"
+        );
+
+        st.end_pending();
+        assert!(
+            st.pending_text().is_none(),
+            "reporting back must clear the indicator, or it hangs forever"
         );
     }
 
