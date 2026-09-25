@@ -116,6 +116,20 @@ Enabling lockdown also enables firewalld at boot on systemd systems. Polkit 126+
 uses `/usr/local/share/polkit-1/actions`, supporting immutable `/usr`; older
 versions require a writable `/usr/share/polkit-1/actions`.
 
+### Resetting to factory defaults
+
+`neutron reset` returns the app to a first-run state: it withdraws every policy
+Neutron applied (the lockdown ruleset and its root-owned helper, the kill switch,
+the split-tunnel routes), clears all settings — eligibility pool, favorites,
+notes, qBittorrent credentials — and removes the autostart entry. It asks you to
+type `reset` to confirm, or takes `--yes` unattended; a non-interactive stdin
+refuses rather than wiping anything.
+
+Your WireGuard profiles are only edited to withdraw what Neutron wrote, and the
+profile drop directory is reported and left alone. Lockdown teardown runs first
+and aborts the reset on failure, so a half-finished reset can never leave a
+machine firewalled with no configuration explaining why.
+
 ### Uninstalling
 
 Run `neutron uninstall` as your normal user. It stops the tray daemon, then — in

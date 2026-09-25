@@ -72,6 +72,12 @@ enum Commands {
     /// Run the persistent system tray AppIndicator daemon in the background
     #[command(alias = "daemon")]
     Indicator,
+    /// Restore factory defaults: revoke applied policies and clear every setting
+    Reset {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Revoke everything Neutron installed outside its package, then remove the package
     Uninstall {
         /// Also delete ~/.config/neutron (settings, eligibility, qBittorrent password)
@@ -251,7 +257,128 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
         Some(Commands::Qbit { command }) => handle_qbit_command(client, command),
         Some(Commands::Uninstall { purge }) => handle_uninstall_command(client, &path, purge),
+        Some(Commands::Reset { yes }) => {
+            // A missing autostart directory means nothing was installed.
+            let autostart_dir = service::autostart::dir().ok();
+            handle_reset_command(client, &path, autostart_dir.as_deref(), yes)
+        }
     }
+}
+
+/// `neutron reset`: factory reset, back to a first-run state.
+///
+/// Everything the app *applied* is undone -- the lockdown ruleset, the refresh
+/// grant, the kill switch, the split-tunnel routes -- and every setting returns
+/// to its default. What it will not touch is anything the user owns: the profile
+/// drop directory is reported and left alone, and the WireGuard profiles
+/// themselves are only edited to withdraw policies Neutron wrote.
+fn handle_reset_command<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    autostart_dir: Option<&std::path::Path>,
+    assume_yes: bool,
+) -> AppResult<()> {
+    let before = config::load(path)?;
+    if !assume_yes && !confirm_reset(&before)? {
+        println!("Reset cancelled; nothing was changed.");
+        return Ok(());
+    }
+
+    // A running daemon keeps applying policies from the old settings, so a reset
+    // underneath it would be undone before it finished.
+    kill_other_neutron_processes();
+
+    // Firewall first, and stop on failure. The one state a half-finished reset
+    // must never leave behind is a machine firewalled with no configuration
+    // explaining why -- so the privileged, hard-to-reverse step gets the
+    // opportunity to abort while the settings are still intact.
+    let revoked_lockdown = before.lockdown_enabled || client.has_installed_lockdown_state()?;
+    if revoked_lockdown {
+        crate::wait::with_spinner("Revoking Lockdown", || client.teardown_lockdown(true))?;
+    }
+
+    // Withdraw the policies Neutron wrote into the NetworkManager profiles. Gated
+    // on saved intent so a reset on a clean install does not sweep every profile
+    // for nothing; the config is the only record of what was applied, and these
+    // are recoverable by hand, unlike a locked-down box.
+    if before.kill_switch_enabled {
+        crate::wait::with_spinner("Disabling Kill Switch", || {
+            set_global_kill_switch(client, path, false)
+        })?;
+    }
+    if before.global_split_tunnel.mode.is_enabled() || !before.global_split_tunnel.is_empty() {
+        crate::wait::with_spinner("Clearing Split Tunnel", || {
+            split_tunnel::clear_global(client, path)
+        })?;
+    }
+
+    // Defaults in place, which also empties `profile-info.json` (the notes) since
+    // the fresh config carries none.
+    config::save(path, &config::AppConfig::default())?;
+    // The autostart entry exists to honour `autoconnect_at_login`, which a fresh
+    // config has off, so a reset removes it. Resolved by the caller rather than
+    // from the environment here, so this is testable and a test can never reach
+    // the real home directory.
+    if let Some(dir) = autostart_dir {
+        service::autostart::uninstall_in(dir)?;
+    }
+
+    println!("Reset to factory defaults.");
+    println!(
+        "  lockdown rules, refresh helper, and polkit action: {}",
+        if revoked_lockdown {
+            "removed"
+        } else {
+            "were not installed"
+        }
+    );
+    println!("  settings: {}", path.display());
+    let drop_dir = config::resolve_profiles_dir(&before);
+    let inside = path.parent().is_some_and(|root| drop_dir.starts_with(root));
+    if !inside {
+        println!(
+            "  profile drop directory left in place: {}",
+            drop_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Ask before wiping everything. Deliberately needs the word `reset`, not a `y`.
+///
+/// Non-interactive stdin refuses rather than proceeding: something scripting
+/// this should say so out loud with `--yes`, not wipe a machine because a pipe
+/// happened to be attached.
+fn confirm_reset(before: &config::AppConfig) -> AppResult<bool> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        return Err(AppError::Config(
+            "neutron reset needs a terminal to confirm; pass --yes to proceed unattended".into(),
+        ));
+    }
+    let mut notes = before.excluded_profile_ids.len() + before.favorite_profile_ids.len();
+    notes += before.profile_custom_info.len();
+    eprintln!(
+        "This removes every Neutron setting -- eligibility pool, favorites, notes, \
+         qBittorrent credentials{} -- and withdraws the applied policies.",
+        if notes > 0 {
+            format!(
+                " ({notes} entr{} kept nowhere)",
+                if notes == 1 { "y" } else { "ies" }
+            )
+        } else {
+            String::new()
+        }
+    );
+    if before.lockdown_enabled {
+        eprintln!("Lockdown is on: its firewall rules and root-owned helper will be removed.");
+    }
+    eprint!("Type 'reset' to continue: ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim() == "reset")
 }
 
 /// `neutron uninstall`: revoke the app's out-of-package state, then remove the
@@ -1801,6 +1928,120 @@ mod tests {
 
     fn remove_temp_root(root: &std::path::Path) {
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reset_withdraws_every_applied_policy_and_returns_settings_to_defaults() {
+        let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
+        let home = decoy_config_home("reset");
+        let path = home.join("neutron/config.toml");
+        let autostart_dir = home.join("autostart");
+        service::autostart::install_in(&autostart_dir).expect("autostart entry should install");
+        config::save(
+            &path,
+            &config::AppConfig {
+                kill_switch_enabled: true,
+                lockdown_enabled: true,
+                excluded_profile_ids: BTreeSet::from(["uuid-1".to_string()]),
+                favorite_profile_ids: BTreeSet::from(["uuid-2".to_string()]),
+                global_split_tunnel: config::SplitTunnelConfig {
+                    mode: config::SplitTunnelMode::Include,
+                    cidrs: vec!["10.0.0.0/8".to_string()],
+                    domains: vec!["example.com".to_string()],
+                },
+                qbittorrent: config::QBittorrentConfig {
+                    password: Some("secret".to_string()),
+                    ..config::QBittorrentConfig::default()
+                },
+                general: config::GeneralConfig {
+                    autoconnect_at_login: true,
+                    ..config::GeneralConfig::default()
+                },
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+        let decoys_before = relative_paths(&home);
+
+        handle_reset_command(&client, &path, Some(&autostart_dir), true)
+            .expect("reset should succeed");
+
+        // Every applied policy withdrawn, in one pass each.
+        assert_eq!(
+            client.lockdown_calls(),
+            vec!["lockdown:teardown:rules+grant"]
+        );
+        assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:off"]);
+        assert_eq!(
+            client.split_tunnel_calls(),
+            vec!["split-tunnel-all:disabled:0:0"]
+        );
+        // Settings back to a first-run state, credentials included.
+        let after = config::load(&path).expect("config should load");
+        assert!(!after.kill_switch_enabled);
+        assert!(!after.lockdown_enabled);
+        assert!(after.excluded_profile_ids.is_empty());
+        assert!(after.favorite_profile_ids.is_empty());
+        assert!(after.global_split_tunnel.is_empty());
+        assert!(!after.global_split_tunnel.mode.is_enabled());
+        assert!(after.qbittorrent.password.is_none());
+        assert!(!after.general.autoconnect_at_login);
+        // The autostart entry mirrors that flag, so it goes with it.
+        assert!(!service::autostart::is_installed_in(&autostart_dir));
+        // Anything the user owns is untouched.
+        let survivors = relative_paths(&home);
+        assert!(
+            decoys_before
+                .iter()
+                .filter(|entry| !entry.starts_with("neutron/") && !entry.starts_with("autostart/"))
+                .all(|entry| survivors.contains(entry)),
+            "a reset must not reach outside its own state: {survivors:?}"
+        );
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn reset_on_a_clean_install_touches_nothing_privileged() {
+        // No saved intent and no installed state, so no password prompt and no
+        // sweep of every NetworkManager profile for nothing.
+        let client = crate::testing::MockNmClient::new(vec![]);
+        let home = decoy_config_home("reset-clean");
+        let path = home.join("neutron/config.toml");
+        let autostart_dir = home.join("autostart");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+
+        handle_reset_command(&client, &path, Some(&autostart_dir), true)
+            .expect("reset should succeed");
+
+        assert!(client.lockdown_calls().is_empty());
+        assert!(client.kill_switch_calls().is_empty());
+        assert!(client.split_tunnel_calls().is_empty());
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn reset_asks_for_the_word_reset_and_changes_nothing_when_refused() {
+        // Non-interactive stdin must refuse rather than wipe on a piped input.
+        let client = crate::testing::MockNmClient::new(vec![]);
+        let home = decoy_config_home("reset-refused");
+        let path = home.join("neutron/config.toml");
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+        let before = relative_paths(&home);
+
+        let error = handle_reset_command(&client, &path, None, false)
+            .expect_err("without a terminal, reset must not proceed");
+
+        assert!(error.to_string().contains("--yes"), "{error}");
+        assert!(client.lockdown_calls().is_empty());
+        assert_eq!(relative_paths(&home), before, "nothing may be deleted");
+        remove_temp_root(&home);
     }
 
     #[test]

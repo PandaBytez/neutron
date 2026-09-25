@@ -160,6 +160,23 @@ neutron lockdown disable
 while waiting on authentication and firewalld. Piped output gets a plain
 `Enabling Lockdown...` line instead.
 
+### Factory Reset
+
+```bash
+# Withdraw every applied policy and clear all settings (asks for confirmation)
+neutron reset
+
+# Unattended
+neutron reset --yes
+```
+
+Restores a first-run state: the lockdown ruleset, refresh helper, and polkit
+action are revoked, the kill switch and split-tunnel routes are withdrawn from
+every profile, settings (including the qBittorrent password) go back to
+defaults, and the autostart entry is removed. The profile drop directory is
+reported and left alone, since it holds your own files. Requires a terminal to
+confirm, or `--yes`.
+
 ### Uninstalling
 
 ```bash

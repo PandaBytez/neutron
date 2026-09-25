@@ -51,11 +51,20 @@ fi
 # The source tree is mounted rather than copied so an edit-test cycle needs no
 # image rebuild. `:z` relabels for SELinux. CARGO_TARGET_DIR is set in the image
 # to keep build output off the mount.
+# --tmpfs masks the paths Neutron writes as root. Only /src is mounted, so
+# /usr/local and /etc/polkit-1 are the *host's* own: without this, a test that
+# enables then revokes lockdown deletes the developer's real refresh helper and
+# polkit action. Netfilter isolation does not cover the filesystem.
+#
+# /usr/local/bin is left alone on purpose -- the image puts its pkexec shim there.
 podman_flags=(
     run --rm
     --privileged
     -v "$REPO_ROOT:/src:z"
     -w /src
+    --tmpfs /usr/local/libexec
+    --tmpfs /usr/local/share/polkit-1
+    --tmpfs /etc/polkit-1
 )
 
 if [ -t 0 ]; then

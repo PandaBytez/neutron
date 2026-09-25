@@ -8,6 +8,10 @@ Run these commands from the repository root with the Rust toolchain installed.
 # Check formatting and run strict Clippy across all features
 cargo lint
 
+# Rebuild and install the binary, leaving lockdown state alone (dev loop).
+# Extra flags go to `cargo install`, so --debug and --root work:
+cargo xtask reinstall -- --debug
+
 # Run default-feature unit and integration tests
 cargo test
 

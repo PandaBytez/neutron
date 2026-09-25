@@ -16,6 +16,7 @@ fn main() {
         "test-leaks" | "leak-tests" => run_leak_tests(&workspace_root, &args[1..]),
         "container-shell" | "shell" => run_container_shell(&workspace_root, &args[1..]),
         "build-image" => build_container_image(&workspace_root, true),
+        "reinstall" | "dev-install" => run_reinstall(&workspace_root, &args[1..]),
         "docs" | "build-docs" => build_docs(&workspace_root, &args[1..]),
         "lint" => run_linter(&workspace_root),
         "help" | "--help" | "-h" => {
@@ -44,6 +45,7 @@ fn print_help() {
           test-leaks, leak-tests      Run leak protection tests inside a Podman container\n  \
           container-shell, shell      Drop into an interactive shell inside the test container\n  \
           build-image                 Build/rebuild the neutron-sandbox container image\n  \
+          reinstall, dev-install      Rebuild and install the binary, leaving lockdown alone\n  \
           docs, build-docs            Build mdBook documentation for GitHub Pages\n  \
           lint                        Run cargo fmt and clippy with strict warnings\n\n\
         OPTIONS:\n  \
@@ -268,6 +270,20 @@ fn build_docs(root: &Path, args: &[String]) -> i32 {
     run_status(c.status())
 }
 
+/// Paths inside the container that Neutron writes as root, and which would
+/// otherwise land on the *host*: only `/src` is mounted, so `/usr/local` and
+/// `/etc/polkit-1` are the host's own. The sandbox's netfilter isolation does
+/// not extend to the filesystem, and a test that enables then revokes lockdown
+/// would delete the developer's real helper and polkit action.
+///
+/// Masked with container-local tmpfs. `/usr/local/bin` is deliberately left
+/// alone: the image installs its `pkexec` shim there.
+const SANDBOX_PRIVATE_PATHS: [&str; 3] = [
+    "/usr/local/libexec",
+    "/usr/local/share/polkit-1",
+    "/etc/polkit-1",
+];
+
 fn run_in_container(root: &Path, command_args: &[String]) -> i32 {
     let tool = match detect_container_tool() {
         Ok(t) => t,
@@ -292,6 +308,9 @@ fn run_in_container(root: &Path, command_args: &[String]) -> i32 {
     ])
     .args(command_args)
     .current_dir(root);
+    for path in SANDBOX_PRIVATE_PATHS {
+        cmd.arg("--tmpfs").arg(path);
+    }
 
     run_status(cmd.status())
 }
@@ -320,6 +339,9 @@ fn run_in_container_interactive(root: &Path, command_args: &[String]) -> i32 {
     ])
     .args(command_args)
     .current_dir(root);
+    for path in SANDBOX_PRIVATE_PATHS {
+        cmd.arg("--tmpfs").arg(path);
+    }
 
     run_status(cmd.status())
 }
@@ -330,6 +352,59 @@ fn run_host_tests(root: &Path) -> i32 {
         .current_dir(root)
         .status();
     run_status(status)
+}
+
+/// Rebuild and install the binary, deliberately leaving lockdown alone.
+///
+/// The point is iteration speed. `cargo install` touches nothing privileged, so
+/// working on the TUI or the UI does not mean disabling lockdown and
+/// re-authenticating through `pkexec` on every rebuild.
+///
+/// The trade-off is the refresh helper: `/usr/local/libexec/neutron-lockdown-helper`
+/// is a *copy* of the binary taken when lockdown was enabled, and it is left
+/// stale on purpose. A rule refresh runs that copy, not this build, so after
+/// changing firewall code run `neutron lockdown enable` once to refresh it.
+///
+/// Extra arguments go straight to `cargo install`, so `--debug`, `--root DIR`,
+/// and `--locked` all work: `cargo xtask reinstall -- --debug`.
+fn run_reinstall(root: &Path, args: &[String]) -> i32 {
+    println!("==> Rebuilding and installing (lockdown untouched)");
+    // `cargo xtask reinstall -- --debug`: the separator belongs to xtask's own
+    // argument parsing, and passing it on makes cargo reject `--debug` as a
+    // package name.
+    let forwarded: &[String] = match args.strip_prefix(&["--".to_string()]) {
+        Some(rest) => rest,
+        None => args,
+    };
+    let mut command = Command::new("cargo");
+    command
+        .args(["install", "--path", ".", "--force"])
+        .args(forwarded)
+        .current_dir(root);
+    if run_status(command.status()) != 0 {
+        eprintln!("Reinstall failed; nothing was changed.");
+        return 1;
+    }
+
+    let root_dir = forwarded
+        .iter()
+        .position(|a| a == "--root")
+        .and_then(|i| forwarded.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("CARGO_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    PathBuf::from(home).join(".cargo")
+                })
+        });
+    println!("Installed: {}", root_dir.join("bin/neutron").display());
+    println!("Lockdown left alone: firewall rules, refresh helper, and polkit action unchanged.");
+    println!(
+        "If you changed firewall code, run `neutron lockdown enable` once to refresh the helper copy."
+    );
+    0
 }
 
 fn run_linter(root: &Path) -> i32 {
