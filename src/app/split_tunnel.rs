@@ -280,7 +280,6 @@ mod tests {
 
         assert_eq!(client.split_tunnel_calls().len(), 1);
 
-        // Add CIDR
         let (st_cfg, changed) = add_global_cidr(&client, &path, "192.168.1.0/24").unwrap();
         assert!(changed);
         assert_eq!(st_cfg.cidrs.len(), 2);
@@ -290,7 +289,6 @@ mod tests {
         assert!(!changed);
         assert_eq!(st_cfg.cidrs.len(), 2);
 
-        // Remove CIDR
         let (st_cfg, changed) = remove_global_cidr(&client, &path, "10.0.0.0/8").unwrap();
         assert!(changed);
         assert_eq!(st_cfg.cidrs, vec!["192.168.1.0/24".to_string()]);
@@ -300,7 +298,6 @@ mod tests {
         assert!(!changed);
         assert_eq!(st_cfg.cidrs, vec!["192.168.1.0/24".to_string()]);
 
-        // Add Domain
         let (st_cfg, changed) = add_global_domain(&client, &path, "ip6-localhost").unwrap();
         assert!(changed);
         assert!(st_cfg.domains.contains(&"ip6-localhost".to_string()));
@@ -309,7 +306,6 @@ mod tests {
         let (_st_cfg, changed) = add_global_domain(&client, &path, "ip6-localhost").unwrap();
         assert!(!changed);
 
-        // Remove Domain
         let (st_cfg, changed) = remove_global_domain(&client, &path, "localhost").unwrap();
         assert!(changed);
         assert_eq!(st_cfg.domains, vec!["ip6-localhost".to_string()]);
@@ -319,7 +315,6 @@ mod tests {
         assert!(!changed);
         assert_eq!(st_cfg.domains, vec!["ip6-localhost".to_string()]);
 
-        // Clear
         clear_global(&client, &path).unwrap();
         let loaded = config::load(&path).unwrap();
         assert_eq!(loaded.global_split_tunnel.mode, SplitTunnelMode::Disabled);

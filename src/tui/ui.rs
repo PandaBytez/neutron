@@ -959,7 +959,6 @@ fn render_command_palette_modal(
     );
     frame.render_widget(search_bar, chunks[0]);
 
-    // Filtered items
     let filtered = cp.filtered_items();
     let items: Vec<ListItem> = filtered
         .iter()
