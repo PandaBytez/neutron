@@ -118,12 +118,13 @@ versions require a writable `/usr/share/polkit-1/actions`.
 
 ### Uninstalling
 
-Run `neutron uninstall` as your normal user. It stops the tray daemon, lifts
-lockdown (one password prompt, only if lockdown is on — the permanent firewalld
-rules), revokes the password-free refresh grant (the root-owned helper and its
-polkit action), removes the autostart entry, and then hands the binary to
-whichever package manager installed it: `brew uninstall neutron` for a Homebrew
-install, `cargo uninstall neutron` for a `cargo install`.
+Run `neutron uninstall` as your normal user. It stops the tray daemon, then — in
+a single privileged batch, so at most one password prompt — lifts lockdown if any
+of its state is actually present, revokes the password-free refresh grant (the
+root-owned helper and its polkit action), and removes the autostart entry. It then
+hands the binary to whichever package manager installed it: `brew uninstall
+neutron` for a Homebrew install, `cargo uninstall neutron` for a `cargo install`.
+An install that never enabled lockdown prompts for nothing at all.
 
 Those root-owned files live outside the package's own file list, and no packaging
 hook can remove them: Homebrew's `post_uninstall` runs *after* the files are gone,

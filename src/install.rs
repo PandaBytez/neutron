@@ -18,27 +18,11 @@ const UNINSTALL_ARGS: [&str; 2] = ["uninstall", PACKAGE];
 /// `$CARGO_HOME` rather than failing a decision on a slow disk.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How to remove the install, once [`resolve`] has decided. The tool and its
+/// argv are the whole answer, so they are produced by the one match that
+/// recognizes the channel; an unrecognized source is an error instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallChannel {
-    Homebrew,
-    Cargo,
-    Unknown,
-}
-
-impl std::fmt::Display for InstallChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Homebrew => "Homebrew",
-            Self::Cargo => "cargo",
-            Self::Unknown => "unknown",
-        })
-    }
-}
-
-/// How to remove the install, once [`resolve`] has decided.
-#[derive(Debug, Clone, Copy)]
 pub struct Removal {
-    pub channel: InstallChannel,
     pub program: &'static str,
     pub args: &'static [&'static str],
 }
@@ -81,35 +65,27 @@ pub fn resolve(
     cargo_list: Option<&str>,
     tool_on_path: impl Fn(&str) -> bool,
 ) -> AppResult<Removal> {
-    let channel = if is_homebrew(exe) {
-        InstallChannel::Homebrew
+    let program = if is_homebrew(exe) {
+        "brew"
     } else if cargo_has_package(cargo_list) {
-        InstallChannel::Cargo
+        "cargo"
     } else {
-        InstallChannel::Unknown
-    };
-    let program = match channel {
-        InstallChannel::Homebrew => "brew",
-        InstallChannel::Cargo => "cargo",
-        InstallChannel::Unknown => {
-            return Err(AppError::Uninstall(unrecognized(
-                exe,
-                "its path is not a Homebrew Cellar install and `cargo install --list` \
-                 does not list it",
-            )));
-        }
+        return Err(AppError::Uninstall(unrecognized(
+            exe,
+            "its path is not a Homebrew Cellar install and `cargo install --list` \
+             does not list it",
+        )));
     };
     if !tool_on_path(program) {
         return Err(AppError::Uninstall(unrecognized(
             exe,
             &format!(
-                "it looks like a {channel} install, but `{program}` is not runnable here \
-                 (an installed-from-desktop or stripped PATH is the usual cause)"
+                "it was installed by `{program}`, but `{program}` is not runnable here \
+                 (launched from a desktop entry or a stripped PATH is the usual cause)"
             ),
         )));
     }
     Ok(Removal {
-        channel,
         program,
         args: &UNINSTALL_ARGS,
     })
@@ -184,10 +160,13 @@ mod tests {
             "/home/linuxbrew/.linuxbrew/Cellar/neutron/0.1.3/bin/neutron",
             "/home/user/.local/share/homebrew/Cellar/neutron/0.1.3/bin/neutron",
         ] {
-            let removal = resolved(exe, None, &["brew"]);
-            assert_eq!(removal.channel, InstallChannel::Homebrew);
-            assert_eq!(removal.program, "brew");
-            assert_eq!(removal.args, ["uninstall", PACKAGE]);
+            assert_eq!(
+                resolved(exe, None, &["brew"]),
+                Removal {
+                    program: "brew",
+                    args: &UNINSTALL_ARGS
+                }
+            );
         }
     }
 
@@ -195,19 +174,28 @@ mod tests {
     fn a_cargo_list_entry_resolves_to_cargo_from_any_root() {
         // `--root` and `--debug` put the binary outside ~/.cargo/bin, which is
         // why the package list is the signal rather than the path.
-        let removal = resolved("/tmp/build/neutron", Some(CARGO_LIST), &["cargo"]);
-        assert_eq!(removal.channel, InstallChannel::Cargo);
-        assert_eq!(removal.program, "cargo");
+        assert_eq!(
+            resolved("/tmp/build/neutron", Some(CARGO_LIST), &["cargo"]),
+            Removal {
+                program: "cargo",
+                args: &UNINSTALL_ARGS
+            }
+        );
     }
 
     #[test]
     fn a_homebrew_path_wins_over_a_leftover_cargo_entry() {
-        let removal = resolved(
-            "/opt/homebrew/Cellar/neutron/0.1.3/bin/neutron",
-            Some(CARGO_LIST),
-            &["brew", "cargo"],
+        assert_eq!(
+            resolved(
+                "/opt/homebrew/Cellar/neutron/0.1.3/bin/neutron",
+                Some(CARGO_LIST),
+                &["brew", "cargo"],
+            ),
+            Removal {
+                program: "brew",
+                args: &UNINSTALL_ARGS
+            }
         );
-        assert_eq!(removal.channel, InstallChannel::Homebrew);
     }
 
     #[test]

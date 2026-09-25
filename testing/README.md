@@ -17,7 +17,7 @@ directory replaces it.
 | Unit + integration | host | logic, arg builders, TUI state | `cargo test` / `cargo test-all -- --host-only` | `cargo test` |
 | System — NetworkManager | container | real profiles, routing, parsers | `cargo test-system -- --nm` | `./testing/run-container-tests.sh --nm` |
 | System — firewall | container | real firewalld rules, teardown | `cargo test-system -- --firewall` | `./testing/run-container-tests.sh --firewall` |
-| System — uninstall | container | real `cargo install` / `cargo uninstall`, revocation order | `cargo test-system -- --filter system_uninstall` | `./testing/run-container-tests.sh --uninstall` |
+| System — uninstall | container | real `cargo install` / `cargo uninstall`, revocation order | `cargo test-system -- --uninstall` | `./testing/run-container-tests.sh --uninstall` |
 | Leak demonstrations | container | regression guards | `cargo test-leaks` | `./testing/run-container-tests.sh --leaks` |
 
 Every container tier runs on pull requests via the `System Tests (sandbox)` job in

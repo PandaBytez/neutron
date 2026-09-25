@@ -298,14 +298,18 @@ fn revoke_and_purge<C: NmIntrospect + FirewallClient>(
     autostart_dir: Option<&std::path::Path>,
     purge: bool,
 ) -> AppResult<()> {
-    if config::load(path)?.lockdown_enabled {
-        set_global_lockdown(client, path, false)?;
+    // Evidence, not intent: the rules outlive the setting that installed them, so
+    // a machine whose config was lost, corrupted, or already purged can still be
+    // firewalled with no way to lift it. Both checks are unprivileged, so an
+    // install that never enabled lockdown uninstalls with no password prompt.
+    if config::load(path)?.lockdown_enabled || client.has_installed_lockdown_state()? {
+        // One batch: rules and grant together, so this is a single prompt.
+        client.teardown_lockdown(true)?;
     }
-    // Unconditional: the password-free root grant belongs to the installation,
-    // not to the current lockdown state, so uninstall revokes it whether or not
-    // lockdown was ever enabled. A plain `lockdown disable` leaves it in place,
-    // which is what lets a re-enable skip a second password prompt.
-    client.revoke_refresh_grant()?;
+    // Saved intent is deliberately left as the user set it. Uninstall removes the
+    // mechanism, it does not rewrite preferences: with `--purge` the file goes
+    // anyway, and without it a reinstall restores the lockdown they chose. The
+    // lock is gone either way, so a stale `true` cannot leave them unprotected.
     if let Some(dir) = autostart_dir {
         service::autostart::uninstall_in(dir)?;
     }
@@ -328,7 +332,7 @@ fn remove_the_package(removal: &crate::install::Removal) -> AppResult<()> {
             removal.program
         )));
     }
-    println!("Removed the {} install of Neutron.", removal.channel);
+    println!("Removed the {} install of Neutron.", removal.program);
     Ok(())
 }
 
@@ -391,27 +395,6 @@ fn report_manual_unit(config_root: Option<&std::path::Path>) {
             unit.display()
         );
     }
-}
-
-/// Revoke everything Neutron installed outside its own files: the lockdown
-/// ruleset, the root-owned refresh helper, its polkit action, and the autostart
-/// entry.
-///
-/// Lockdown teardown is skipped when saved intent is already off, so an install
-/// that never enabled it uninstalls without a password prompt.
-pub fn revoke_installed_state<C: NmIntrospect + FirewallClient>(
-    client: &C,
-    path: &std::path::Path,
-    autostart_dir: Option<&std::path::Path>,
-) -> AppResult<()> {
-    if config::load(path)?.lockdown_enabled {
-        // One privileged batch: rules, helper, and polkit action together.
-        set_global_lockdown(client, path, false)?;
-    }
-    if let Some(dir) = autostart_dir {
-        service::autostart::uninstall_in(dir)?;
-    }
-    Ok(())
 }
 
 fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -> AppResult<()> {
@@ -1134,7 +1117,7 @@ mod tests {
                 .to_string()
                 .contains("application completed but saving failed")
         );
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:off"]);
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:teardown:rules"]);
         let saved = config::load(&path).unwrap();
         assert!(saved.lockdown_enabled);
         let mut state = crate::tui::state::TuiState::new(path.clone(), saved);
@@ -1441,15 +1424,14 @@ mod tests {
         let autostart_dir = home.join("autostart");
         service::autostart::install_in(&autostart_dir).expect("autostart entry should install");
 
-        // Saved intent off: no rules to lift, so no password prompt for that --
-        // but the refresh grant is still revoked, since it belongs to the install.
+        // Nothing installed and intent off: no teardown, so no password prompt.
         config::save(&path, &config::AppConfig::default()).expect("config should save");
         revoke_and_purge(&client, &path, Some(&autostart_dir), false)
             .expect("revoke should succeed");
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:revoke-grant"]);
+        assert!(client.lockdown_calls().is_empty());
         assert!(!service::autostart::is_installed_in(&autostart_dir));
 
-        // Saved intent on: the ruleset goes first, then the grant.
+        // Saved intent on: one batch for the rules and the grant together.
         config::save(
             &path,
             &config::AppConfig {
@@ -1465,14 +1447,12 @@ mod tests {
 
         assert_eq!(
             client.lockdown_calls(),
-            vec![
-                "lockdown:revoke-grant",
-                "lockdown:off",
-                "lockdown:revoke-grant"
-            ]
+            vec!["lockdown:teardown:rules+grant"]
         );
+        // Uninstall removes the mechanism, it does not rewrite preferences: a
+        // reinstall should restore the lockdown the user had chosen.
         assert!(
-            !config::load(&path)
+            config::load(&path)
                 .expect("config should load")
                 .lockdown_enabled
         );
@@ -1526,23 +1506,41 @@ mod tests {
         let error = revoke_and_purge(&client, &path, None, true)
             .expect_err("a failed teardown must abort the uninstall");
 
-        assert!(matches!(error, AppError::PolicyUpdate { .. }), "{error}");
+        // Not a `PolicyUpdate`: there is no policy left to reconcile here, and
+        // the user needs to know the uninstall stopped before it deleted
+        // anything, not that a saved preference may be stale.
+        assert!(matches!(error, AppError::Firewall(_)), "{error}");
         assert_eq!(relative_paths(&home), before, "nothing may be deleted");
         remove_temp_root(&home);
     }
 
     #[test]
-    fn an_absent_configuration_skips_the_rules_teardown_but_still_revokes_the_grant() {
-        let client = crate::testing::MockNmClient::new(vec![]);
+    fn an_absent_configuration_still_tears_down_installed_lockdown_state() {
+        // The rules outlive the setting that installed them, so a lost or
+        // already-purged config must not be what decides whether the machine
+        // gets unblocked. Evidence, not intent.
+        let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
         let path = unique_test_config_path();
 
         revoke_and_purge(&client, &path, None, false).expect("revoke should succeed");
 
         assert_eq!(
             client.lockdown_calls(),
-            vec!["lockdown:revoke-grant"],
-            "a missing config must not trigger a rules teardown"
+            vec!["lockdown:teardown:rules+grant"]
         );
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn an_install_that_never_enabled_lockdown_tears_nothing_down() {
+        // The gate is what keeps a fresh install from prompting for a password to
+        // delete three files that were never created.
+        let client = crate::testing::MockNmClient::new(vec![]);
+        let path = unique_test_config_path();
+
+        revoke_and_purge(&client, &path, None, true).expect("revoke should succeed");
+
+        assert!(client.lockdown_calls().is_empty());
         cleanup_test_config(&path);
     }
 
@@ -1590,35 +1588,50 @@ mod tests {
 
     #[test]
     fn purge_reports_but_never_deletes_a_drop_directory_outside_the_app_dir() {
-        // Both shapes matter: a sibling of the app dir, and -- far worse -- the
-        // app dir's own parent, which `profiles_dir: "~"` would resolve to.
-        for (label, outside) in [
-            (
-                "sibling-drop",
-                unique_temp_root("drop-sibling").join("drop"),
-            ),
-            ("parent-drop", {
-                let home = unique_temp_root("drop-parent");
-                home.join("drop")
-            }),
-        ] {
-            std::fs::create_dir_all(&outside).expect("drop dir should be created");
-            let outside_root = outside.parent().unwrap().to_path_buf();
-            let home = decoy_config_home(label);
-            let path = home.join("neutron/config.toml");
-            let settings = config_with_drop_dir(&outside);
-            config::save(&path, &settings).expect("config should save");
+        let home = decoy_config_home("drop-outside");
+        let path = home.join("neutron/config.toml");
+        // A sibling of the app directory: the common `~/wg-configs` shape.
+        let sibling = unique_temp_root("drop-sibling").join("drop");
+        std::fs::create_dir_all(&sibling).expect("drop dir should be created");
+        config::save(&path, &config_with_drop_dir(&sibling)).expect("config should save");
 
-            let reported = remove_app_settings(&path, true).expect("purge should succeed");
+        let reported = remove_app_settings(&path, true).expect("purge should succeed");
 
-            assert_eq!(reported, Some(outside.clone()), "{label}");
-            assert!(
-                outside.exists(),
-                "{label}: a user-chosen drop directory holds their own files"
-            );
-            remove_temp_root(&outside_root);
-            remove_temp_root(&home);
-        }
+        assert_eq!(reported, Some(sibling.clone()));
+        assert!(
+            sibling.exists(),
+            "a user-chosen drop directory holds their own files"
+        );
+        remove_temp_root(sibling.parent().unwrap());
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn purge_never_deletes_a_drop_directory_that_contains_the_config_directory() {
+        // `profiles_dir: "~"` is legal, and once expanded the drop directory is the
+        // app directory's own parent -- so a purge that recursed past the
+        // configured path would take out everything above it, decoys included.
+        let home = decoy_config_home("drop-parent");
+        let path = home.join("neutron/config.toml");
+        let decoys = relative_paths(&home);
+        config::save(&path, &config_with_drop_dir(&home)).expect("config should save");
+
+        let reported = remove_app_settings(&path, true).expect("purge should succeed");
+
+        assert_eq!(reported, Some(home.clone()), "the parent is reported");
+        assert!(
+            !home.join("neutron").exists(),
+            "the app directory itself still goes"
+        );
+        let survivors = relative_paths(&home);
+        assert!(
+            decoys
+                .iter()
+                .filter(|entry| !entry.starts_with("neutron/"))
+                .all(|entry| survivors.contains(entry)),
+            "every decoy above the app directory must survive: {survivors:?}"
+        );
+        remove_temp_root(&home);
     }
 
     #[test]
@@ -1798,7 +1811,7 @@ mod tests {
         handle_lockdown_command_with_path(&client, LockdownCommands::Disable, &path)
             .expect("disable should succeed");
 
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:off"]);
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:teardown:rules"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(!persisted.lockdown_enabled);
         cleanup_test_config(&path);
@@ -1914,7 +1927,10 @@ mod tests {
                 .lockdown_enabled
         );
 
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:on", "lockdown:off"]);
+        assert_eq!(
+            client.lockdown_calls(),
+            vec!["lockdown:on", "lockdown:teardown:rules"]
+        );
         cleanup_test_config(&path);
     }
 

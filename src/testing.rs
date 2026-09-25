@@ -170,6 +170,7 @@ pub struct MockNmClient {
     fail_kill_switch: bool,
     fail_autoconnect: bool,
     fail_lockdown: bool,
+    installed_lockdown_state: bool,
     fail_split_tunnel: bool,
     fail_import: bool,
     fail_disconnect: bool,
@@ -361,11 +362,19 @@ impl MockNmClient {
         self
     }
 
-    /// Consume this mock and return one whose `enable_lockdown`/`disable_lockdown`
+    /// Consume this mock and return one whose `enable_lockdown`/`teardown_lockdown`
     /// fail, to exercise the error path where the firewall rejects the change.
     /// The attempt is still recorded in [`Self::lockdown_calls`] first.
     pub fn fail_lockdown(mut self) -> Self {
         self.fail_lockdown = true;
+        self
+    }
+
+    /// Consume this mock and return one that reports Neutron-owned lockdown
+    /// state on the machine, so a caller tears down even when the saved config
+    /// says lockdown is off (or is gone entirely).
+    pub fn with_installed_lockdown_state(mut self) -> Self {
+        self.installed_lockdown_state = true;
         self
     }
 
@@ -836,18 +845,20 @@ impl FirewallClient for MockNmClient {
         Ok(())
     }
 
-    fn disable_lockdown(&self) -> AppResult<()> {
-        record(&self.lockdown_calls, "lockdown:off".to_string());
-
-        if self.fail_lockdown {
-            return Err(AppError::Firewall("simulated lockdown failure".to_string()));
-        }
-
-        Ok(())
+    fn has_installed_lockdown_state(&self) -> AppResult<bool> {
+        Ok(self.installed_lockdown_state)
     }
 
-    fn revoke_refresh_grant(&self) -> AppResult<()> {
-        record(&self.lockdown_calls, "lockdown:revoke-grant".to_string());
+    fn teardown_lockdown(&self, revoke_grant: bool) -> AppResult<()> {
+        record(
+            &self.lockdown_calls,
+            if revoke_grant {
+                "lockdown:teardown:rules+grant"
+            } else {
+                "lockdown:teardown:rules"
+            }
+            .to_string(),
+        );
 
         if self.fail_lockdown {
             return Err(AppError::Firewall("simulated lockdown failure".to_string()));

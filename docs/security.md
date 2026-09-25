@@ -117,10 +117,12 @@ neutron uninstall              # revoke, then brew/cargo uninstall
 neutron uninstall --purge      # also delete ~/.config/neutron
 ```
 
-`neutron uninstall` stops the tray daemon, lifts the rules, revokes the grant,
-drops the autostart entry, and then runs the removal command for the install it
-detects. Homebrew's own `post_uninstall` hook cannot do this: it runs *after* the
-files are removed, with no way to authenticate.
+`neutron uninstall` stops the tray daemon, drops the autostart entry, and then
+runs the removal command for the install it detects. The privileged work — lifting
+the rules *and* revoking the grant — is one batch, so it is at most one password
+prompt, and it is skipped entirely when the machine holds no Neutron-owned
+lockdown state. Homebrew's own `post_uninstall` hook cannot do this: it runs
+*after* the files are removed, with no way to authenticate.
 
 The install source is resolved **before** anything is deleted, and an
 unrecognized one is refused outright. Tearing down the firewall and then failing

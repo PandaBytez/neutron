@@ -96,6 +96,24 @@ fn settings(config_home: &Path) -> PathBuf {
     config_home.join(".config").join("neutron")
 }
 
+/// The root-owned files an enable installs and an uninstall must revoke.
+const HELPER: &str = "/usr/local/libexec/neutron-lockdown-helper";
+const ACTION: &str =
+    "/usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy";
+
+/// Tagged rules in the *permanent* store, which is what survives a reboot.
+fn marked_rules() -> Vec<String> {
+    let output = Command::new("firewall-cmd")
+        .args(["--permanent", "--direct", "--get-all-rules"])
+        .output()
+        .expect("firewall-cmd should run");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains("neutron-lockdown"))
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
 fn a_cargo_install_is_undone_in_one_shot_and_the_settings_are_kept() {
@@ -196,5 +214,53 @@ fn an_unrecognized_install_source_is_refused_without_deleting_anything() {
         "a refused uninstall must not delete settings"
     );
     assert!(config_home.join(".config/other-app/config.json").exists());
+    let _ = std::fs::remove_dir_all(&config_home);
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn uninstall_revokes_the_helper_polkit_action_and_firewall_rules() {
+    require_sandbox();
+    let config_home = decoy_config_home("revoke");
+
+    cargo_install();
+    // Lockdown on: installs the root-owned helper, its polkit action, and the
+    // permanent tagged rules. The sandbox's pkexec shim makes this work without
+    // a login session.
+    let enabled = run_installed(&config_home, &["lockdown", "enable"]);
+    assert!(
+        enabled.status.success(),
+        "lockdown enable failed: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    assert!(Path::new(HELPER).exists(), "the helper must be installed");
+    assert!(
+        Path::new(ACTION).exists(),
+        "the polkit action must be installed"
+    );
+    assert!(
+        !marked_rules().is_empty(),
+        "lockdown rules must be installed"
+    );
+
+    let output = run_installed(&config_home, &["uninstall"]);
+
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The three things no package manager owns, gone in one command.
+    assert!(!Path::new(HELPER).exists(), "the helper must be revoked");
+    assert!(
+        !Path::new(ACTION).exists(),
+        "the polkit action must be revoked"
+    );
+    assert!(
+        marked_rules().is_empty(),
+        "the permanent lockdown rules must be removed"
+    );
+    assert!(!installed_binary().exists(), "the install must be removed");
+    assert!(!cargo_installs_neutron());
     let _ = std::fs::remove_dir_all(&config_home);
 }

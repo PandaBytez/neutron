@@ -188,6 +188,15 @@ fn run_system_tests(root: &Path, args: &[String]) -> i32 {
             "--ignored".to_string(),
             "--test-threads=1".to_string(),
         ];
+    } else if args.iter().any(|a| a == "--uninstall") {
+        test_args = vec![
+            "test".to_string(),
+            "--test".to_string(),
+            "system_uninstall".to_string(),
+            "--".to_string(),
+            "--ignored".to_string(),
+            "--test-threads=1".to_string(),
+        ];
     } else if let Some(idx) = args.iter().position(|a| a == "--filter") {
         if let Some(pattern) = args.get(idx + 1) {
             test_args.push(pattern.clone());

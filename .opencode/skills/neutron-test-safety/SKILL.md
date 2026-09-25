@@ -14,13 +14,18 @@ Neutron interfaces directly with `nmcli` and `firewall-cmd`. Because destructive
 | **Unit & Integration** | Host | Pure argument builders, state machines, TUI actions, mocks | `cargo test` or `cargo test --all-features` |
 | **System (NetworkManager)** | Container Sandbox | Exercises real `nmcli` operations, profile creation, and default-route handling | `cargo test-system -- --nm` |
 | **System (Firewall)** | Container Sandbox | Exercises real `firewall-cmd` rules, Netfilter chains, and lockdown teardown | `cargo test-system -- --firewall` |
+| **System (Uninstall)** | Container Sandbox | Exercises a real `cargo install` / `cargo uninstall` and the revocation it depends on | `cargo test-system -- --uninstall` |
 | **Leak Regression** | Container Sandbox | Verifies Netfilter lockdown rules and routing tables for potential leaks | `cargo test-leaks` |
 | **Full Suite** | Host + Container | Runs host tests followed by all container system tests | `cargo test-all` |
+
+The container tiers also run on every pull request via the `System Tests
+(sandbox)` job in `.github/workflows/ci.yml`, so they are a gate, not a local
+courtesy.
 
 ## Safety Model & Rules
 
 ### 1. Never Run Ignored Tests Directly on Host
-- System tests in `tests/system_nm.rs` and `tests/system_firewall.rs` are marked with `#[ignore = "system test: requires the disposable sandbox"]`.
+- System tests in `tests/system_nm.rs`, `tests/system_firewall.rs`, and `tests/system_uninstall.rs` are marked with `#[ignore = "system test: requires the disposable sandbox"]`.
 - Every system test begins with `neutron::testing::require_sandbox()`, which panics if `NEUTRON_TEST_SANDBOX=1` is not set in the environment.
 - **NEVER** run `cargo test -- --ignored` on the host machine. Forcing execution outside the container will either trigger immediate panics or risk reconfiguring host network interfaces and firewalls.
 

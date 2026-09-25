@@ -278,14 +278,16 @@ fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
         std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
         "a disable must leave the grant in place"
     );
-    CliNmClient.revoke_refresh_grant().unwrap();
+    // An uninstall revokes the grant in the *same* batch as the rules, which is
+    // one prompt and one lock rather than two privileged runs.
+    CliNmClient.teardown_lockdown(true).unwrap();
     assert!(!std::path::Path::new(&action_path).exists());
     assert!(
         !std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
         "revoking the grant must remove the root-owned helper"
     );
-    // Idempotent: a second revoke has nothing left to do and must not error.
-    CliNmClient.revoke_refresh_grant().unwrap();
+    // Idempotent: a second teardown has nothing left to do and must not error.
+    CliNmClient.teardown_lockdown(true).unwrap();
 }
 
 #[test]

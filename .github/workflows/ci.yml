@@ -59,12 +59,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The sandbox image is a Fedora base with dnf-installed daemons, so
       # rebuilding it is minutes of network work. Cache it as a tarball keyed on
-      # the Containerfile; a base image or dependency bump invalidates the key.
+      # everything baked into it; the entrypoint starts NM/firewalld, so editing
+      # it must invalidate the key or CI would run a stale sandbox and go green.
       - uses: actions/cache@v4
         id: sandbox-image
         with:
           path: /tmp/neutron-sandbox.tar
-          key: sandbox-${{ runner.os }}-${{ hashFiles('testing/Containerfile') }}
+          key: sandbox-${{ runner.os }}-${{ hashFiles('testing/Containerfile', 'testing/entrypoint.sh') }}
       - if: steps.sandbox-image.outputs.cache-hit != 'true'
         run: |
           podman build -t neutron-sandbox -f testing/Containerfile .

@@ -37,7 +37,7 @@ cargo test-system
 # Select a system tier or rebuild the sandbox image
 cargo test-system -- --nm
 cargo test-system -- --firewall
-cargo test-system -- --filter system_uninstall
+cargo test-system -- --uninstall
 cargo test-system -- --rebuild
 
 # Firewall leak regression checks

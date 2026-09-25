@@ -108,30 +108,44 @@ fn installed_files() -> [String; 3] {
 }
 
 /// Whether any installed helper or polkit action is still on disk. Unprivileged
-/// `stat`, so the post-teardown check costs no extra password prompt.
+/// `stat`, so callers can gate a teardown on it without prompting.
 pub(super) fn is_installed() -> bool {
     installed_files()
         .iter()
         .any(|path| Path::new(path).exists())
 }
 
-/// Revoke the helper and its polkit action for the disable/uninstall batch.
+/// The teardown's top-level shell statements, one per entry.
+///
+/// Best effort by design, and only at the top level: a failure must not abort
+/// teardown under `set -e` on a read-only or immutable `/usr/local`, because a
+/// hard error would leave the user reading a scary message after their firewall
+/// is already open. [`is_installed`] reports real leftovers to the caller
+/// instead. Acquiring the lock *does* still abort on failure, deliberately --
+/// without it a concurrent refresh could re-add rules after the teardown.
+///
+/// The reload is guarded as one subshell for the same reason, and it is not
+/// dead work: the action's `exec.path` is a fixed path, so a cached action that
+/// outlives the file would authorize whatever executable lands there next.
+fn uninstall_statements() -> Vec<String> {
+    let mut statements: Vec<String> = installed_files()
+        .iter()
+        .map(|file| format!("rm -f -- {file} || true"))
+        .collect();
+    statements.push(format!("({}) || true", polkit_reload()));
+    statements
+}
+
+/// Render [`uninstall_statements`] into a script for the disable/uninstall batch.
 ///
 /// Both action directories are swept without probing the installed polkit
 /// version: `rm -f` on a missing path succeeds, so a wrong guess costs nothing.
-///
-/// Every command is `|| true` on purpose. Teardown must not abort on a
-/// read-only or immutable `/usr/local` (a hard failure would leave the user
-/// reading a scary error after their firewall is already open);
-/// [`is_installed`] reports real leftovers to the caller instead. The reload is
-/// best effort for the same reason, and failing it is harmless: with the helper
-/// binary gone, a stale cached action has nothing left to execute.
 pub(super) fn uninstall_script() -> String {
     let mut script = String::new();
-    for file in installed_files() {
-        script.push_str(&format!("rm -f -- {file} || true\n"));
+    for statement in uninstall_statements() {
+        script.push_str(&statement);
+        script.push('\n');
     }
-    script.push_str(&format!("({}) || true\n", polkit_reload()));
     script
 }
 
@@ -359,14 +373,14 @@ mod tests {
 
     #[test]
     fn teardown_revokes_every_installed_file_and_never_aborts() {
-        let script = uninstall_script();
+        let statements = uninstall_statements();
 
         // Every path an install writes must be swept, whatever polkit version
         // wrote it, and the authorization must go before the binary it allows.
-        let revoked: Vec<_> = script
-            .lines()
-            .filter_map(|line| line.strip_prefix("rm -f -- "))
-            .map(|line| line.trim_end_matches(" || true"))
+        let revoked: Vec<_> = statements
+            .iter()
+            .filter_map(|statement| statement.strip_prefix("rm -f -- "))
+            .map(|statement| statement.trim_end_matches(" || true"))
             .collect();
         assert_eq!(revoked, installed_files());
         assert!(
@@ -375,13 +389,20 @@ mod tests {
         );
         assert_eq!(*revoked.last().unwrap(), PATH);
 
-        // Teardown must survive a read-only /usr/local: every top-level statement
-        // is best effort so `set -e` cannot abort before `is_installed` reports
-        // it. The reload is one guarded subshell, interior lines and all.
-        for statement in script.split("(polkit_reply=") {
-            let guarded = || statement.trim_end().ends_with("|| true");
-            assert!(guarded(), "unguarded teardown statement: {statement}");
+        // Every top-level statement is best effort, so `set -e` cannot abort
+        // teardown before `is_installed` reports a real leftover.
+        for statement in &statements {
+            assert!(
+                statement.ends_with("|| true"),
+                "unguarded teardown statement: {statement}"
+            );
         }
+        // And the script is exactly those statements, nothing smuggled between.
+        assert_eq!(
+            uninstall_script(),
+            format!("{}\n", statements.join("\n")),
+            "the script must not add unguarded commands"
+        );
     }
 
     #[test]
