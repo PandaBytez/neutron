@@ -5,6 +5,7 @@ pub mod app;
 pub mod config;
 pub mod error;
 pub mod firewall;
+pub mod install;
 pub mod nm;
 pub mod portforward;
 pub mod process;

@@ -72,6 +72,12 @@ enum Commands {
     /// Run the persistent system tray AppIndicator daemon in the background
     #[command(alias = "daemon")]
     Indicator,
+    /// Revoke everything Neutron installed outside its package, then remove the package
+    Uninstall {
+        /// Also delete ~/.config/neutron (settings, eligibility, qBittorrent password)
+        #[arg(long)]
+        purge: bool,
+    },
     /// Terminate any running background daemon/processes and launch fresh instance
     Restart,
 }
@@ -244,7 +250,168 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::Lockdown { command }) => handle_lockdown_command(client, command),
         Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
         Some(Commands::Qbit { command }) => handle_qbit_command(client, command),
+        Some(Commands::Uninstall { purge }) => handle_uninstall_command(client, &path, purge),
     }
+}
+
+/// `neutron uninstall`: revoke the app's out-of-package state, then remove the
+/// package itself.
+///
+/// Order is the whole point. The permanent firewalld rules, the root-owned
+/// refresh helper, and its polkit action live outside every package manager's
+/// file list, and no packaging hook can clean them up: Homebrew's
+/// `post_uninstall` runs *after* the files are gone, with no way to
+/// authenticate. So the teardown has to happen while this binary still exists,
+/// which is why it is a subcommand rather than a package script.
+///
+/// The install source is resolved *first*, and the package removed *last*:
+/// refusing an unrecognized source is only safe if nothing has been deleted
+/// yet, and removing the binary we are running from is only safe once there is
+/// nothing left to do afterwards.
+fn handle_uninstall_command<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    purge: bool,
+) -> AppResult<()> {
+    let removal = crate::install::current()?;
+    // A live tray daemon can re-apply policies after teardown, and would keep
+    // renewing a port forward with the binary about to be gone.
+    kill_other_neutron_processes();
+    // A missing autostart directory is not a failure: nothing was installed.
+    let autostart_dir = service::autostart::dir().ok();
+    revoke_and_purge(client, path, autostart_dir.as_deref(), purge)?;
+    remove_the_package(&removal)
+}
+
+/// Revoke every Neutron-owned file outside the package: the lockdown ruleset,
+/// the root-owned refresh helper, its polkit action, the autostart entry, and
+/// (under `purge`) the configuration directory.
+///
+/// Revoke-then-purge is deliberate and load-bearing. If the privileged teardown
+/// fails -- a declined password prompt, a firewalld that rejects the batch --
+/// this returns early with the settings still on disk, so a failed teardown can
+/// never leave the user with neither protection nor configuration. Callers must
+/// resolve the install source before calling this.
+fn revoke_and_purge<C: NmIntrospect + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    autostart_dir: Option<&std::path::Path>,
+    purge: bool,
+) -> AppResult<()> {
+    if config::load(path)?.lockdown_enabled {
+        set_global_lockdown(client, path, false)?;
+    }
+    // Unconditional: the password-free root grant belongs to the installation,
+    // not to the current lockdown state, so uninstall revokes it whether or not
+    // lockdown was ever enabled. A plain `lockdown disable` leaves it in place,
+    // which is what lets a re-enable skip a second password prompt.
+    client.revoke_refresh_grant()?;
+    if let Some(dir) = autostart_dir {
+        service::autostart::uninstall_in(dir)?;
+    }
+    remove_app_settings(path, purge)?;
+    report_manual_unit(path.parent());
+    Ok(())
+}
+
+/// Hand the binary to the package manager that installed it.
+fn remove_the_package(removal: &crate::install::Removal) -> AppResult<()> {
+    // Unprivileged, no shell, inheriting the terminal so brew or cargo can
+    // report or prompt itself.
+    let status = crate::process::host_command(removal.program)
+        .args(removal.args)
+        .status()
+        .map_err(|error| AppError::CommandFailed(format!("{}: {error}", removal.program)))?;
+    if !status.success() {
+        return Err(AppError::CommandFailed(format!(
+            "{} exited with {status}; Neutron's own state is already revoked",
+            removal.program
+        )));
+    }
+    println!("Removed the {} install of Neutron.", removal.channel);
+    Ok(())
+}
+
+/// Delete the app's configuration directory when `purge` asks for it.
+///
+/// Settings are kept by default -- see [`handle_uninstall_command`] -- so this
+/// normally just reports where they are.
+///
+/// Returns a drop directory that was left behind because it lives *outside* the
+/// configuration directory: `profiles_dir` is user-configurable and may be any
+/// path (even `~`), holding `.conf` files that may never have been imported.
+/// Settings are read before the directory goes away -- that file is the only
+/// copy of the setting.
+fn remove_app_settings(
+    config_path: &std::path::Path,
+    purge: bool,
+) -> AppResult<Option<std::path::PathBuf>> {
+    let Some(parent) = config_path.parent() else {
+        return Ok(None);
+    };
+    if !purge {
+        println!("Settings kept at {}", parent.display());
+        return Ok(None);
+    }
+    // An absent or unreadable config records no drop directory, so there is
+    // nothing to report: the default path would be a guess, and a guess must
+    // never be announced as a directory of the user's we deliberately kept.
+    let profiles = if config_path.exists() {
+        config::load(config_path)
+            .map(|cfg| config::resolve_profiles_dir(&cfg))
+            .unwrap_or_default()
+    } else {
+        std::path::PathBuf::new()
+    };
+    match std::fs::remove_dir_all(parent) {
+        Ok(()) => {}
+        // Nothing to purge: an install that never wrote settings has no
+        // directory, and that must not abort an uninstall this late.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    println!("Removed {}", parent.display());
+    Ok((!profiles.as_os_str().is_empty() && !profiles.starts_with(parent)).then_some(profiles))
+}
+
+/// Point out the systemd user unit, which `systemd/README.md` has the user
+/// install by hand. It is not ours to remove -- it may have been edited, and
+/// `systemctl` needs its own reload -- but an enabled unit outliving the binary
+/// fails at every login, so name it while the user is still here.
+fn report_manual_unit(config_root: Option<&std::path::Path>) {
+    const UNIT: &str = "neutron-startup-random.service";
+    let Some(unit) = config_root.map(|root| root.join("systemd/user").join(UNIT)) else {
+        return;
+    };
+    if unit.exists() {
+        println!(
+            "systemd user unit left in place: {}\n  \
+             systemctl --user disable --now {UNIT} && rm {}",
+            unit.display(),
+            unit.display()
+        );
+    }
+}
+
+/// Revoke everything Neutron installed outside its own files: the lockdown
+/// ruleset, the root-owned refresh helper, its polkit action, and the autostart
+/// entry.
+///
+/// Lockdown teardown is skipped when saved intent is already off, so an install
+/// that never enabled it uninstalls without a password prompt.
+pub fn revoke_installed_state<C: NmIntrospect + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    autostart_dir: Option<&std::path::Path>,
+) -> AppResult<()> {
+    if config::load(path)?.lockdown_enabled {
+        // One privileged batch: rules, helper, and polkit action together.
+        set_global_lockdown(client, path, false)?;
+    }
+    if let Some(dir) = autostart_dir {
+        service::autostart::uninstall_in(dir)?;
+    }
+    Ok(())
 }
 
 fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -> AppResult<()> {
@@ -898,6 +1065,8 @@ fn resolve_profile_id(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -1262,6 +1431,355 @@ mod tests {
 
         assert!(client.lockdown_calls().is_empty());
         cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn uninstall_revokes_lockdown_and_the_autostart_entry_only_when_enabled() {
+        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let home = decoy_config_home("revoke");
+        let path = home.join("neutron/config.toml");
+        let autostart_dir = home.join("autostart");
+        service::autostart::install_in(&autostart_dir).expect("autostart entry should install");
+
+        // Saved intent off: no rules to lift, so no password prompt for that --
+        // but the refresh grant is still revoked, since it belongs to the install.
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+        revoke_and_purge(&client, &path, Some(&autostart_dir), false)
+            .expect("revoke should succeed");
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:revoke-grant"]);
+        assert!(!service::autostart::is_installed_in(&autostart_dir));
+
+        // Saved intent on: the ruleset goes first, then the grant.
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+        service::autostart::install_in(&autostart_dir).expect("autostart entry should install");
+
+        revoke_and_purge(&client, &path, Some(&autostart_dir), false)
+            .expect("revoke should succeed");
+
+        assert_eq!(
+            client.lockdown_calls(),
+            vec![
+                "lockdown:revoke-grant",
+                "lockdown:off",
+                "lockdown:revoke-grant"
+            ]
+        );
+        assert!(
+            !config::load(&path)
+                .expect("config should load")
+                .lockdown_enabled
+        );
+        assert!(!service::autostart::is_installed_in(&autostart_dir));
+        // Purge was not asked for, so the settings must have survived it.
+        assert!(path.exists());
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn revoke_removes_only_neutrons_own_autostart_entry() {
+        let client = crate::testing::MockNmClient::new(vec![]);
+        let home = decoy_config_home("autostart");
+        let path = home.join("neutron/config.toml");
+        let autostart_dir = home.join("autostart");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+        service::autostart::install_in(&autostart_dir).expect("autostart entry should install");
+
+        revoke_and_purge(&client, &path, Some(&autostart_dir), false)
+            .expect("revoke should succeed");
+
+        let before = relative_paths(&home);
+        assert!(
+            !before.contains("autostart/io.github.pandabytez.neutron-autostart.desktop"),
+            "{before:?}"
+        );
+        assert!(
+            before.contains("autostart/some-other-app.desktop"),
+            "another app's autostart entry must survive: {before:?}"
+        );
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn a_failed_teardown_keeps_the_settings() {
+        // The ordering guarantee: a declined prompt or a rejected firewall batch
+        // must not leave the user with neither protection nor configuration.
+        let client = crate::testing::MockNmClient::new(vec![]).fail_lockdown();
+        let home = decoy_config_home("failed-teardown");
+        let path = home.join("neutron/config.toml");
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+        let before = relative_paths(&home);
+
+        let error = revoke_and_purge(&client, &path, None, true)
+            .expect_err("a failed teardown must abort the uninstall");
+
+        assert!(matches!(error, AppError::PolicyUpdate { .. }), "{error}");
+        assert_eq!(relative_paths(&home), before, "nothing may be deleted");
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn an_absent_configuration_skips_the_rules_teardown_but_still_revokes_the_grant() {
+        let client = crate::testing::MockNmClient::new(vec![]);
+        let path = unique_test_config_path();
+
+        revoke_and_purge(&client, &path, None, false).expect("revoke should succeed");
+
+        assert_eq!(
+            client.lockdown_calls(),
+            vec!["lockdown:revoke-grant"],
+            "a missing config must not trigger a rules teardown"
+        );
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn uninstall_without_purge_deletes_nothing() {
+        let home = decoy_config_home("no-purge");
+        let path = home.join("neutron/config.toml");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+        let before = relative_paths(&home);
+
+        assert_eq!(
+            remove_app_settings(&path, false).expect("settings should be kept"),
+            None
+        );
+
+        assert_eq!(relative_paths(&home), before, "the default must be a no-op");
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn purge_deletes_only_the_application_directory() {
+        let home = decoy_config_home("purge");
+        let path = home.join("neutron/config.toml");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+
+        remove_app_settings(&path, true).expect("purge should succeed");
+
+        assert_eq!(
+            relative_paths(&home),
+            BTreeSet::from([
+                "autostart/".to_string(),
+                "autostart/some-other-app.desktop".to_string(),
+                "neutron-vpn/".to_string(),
+                "neutron-vpn/config.json".to_string(),
+                "other-app/".to_string(),
+                "other-app/config.json".to_string(),
+                "systemd/".to_string(),
+                "systemd/user/".to_string(),
+                "systemd/user/neutron-startup-random.service".to_string(),
+            ]),
+            "purge must remove the app directory and nothing else"
+        );
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn purge_reports_but_never_deletes_a_drop_directory_outside_the_app_dir() {
+        // Both shapes matter: a sibling of the app dir, and -- far worse -- the
+        // app dir's own parent, which `profiles_dir: "~"` would resolve to.
+        for (label, outside) in [
+            (
+                "sibling-drop",
+                unique_temp_root("drop-sibling").join("drop"),
+            ),
+            ("parent-drop", {
+                let home = unique_temp_root("drop-parent");
+                home.join("drop")
+            }),
+        ] {
+            std::fs::create_dir_all(&outside).expect("drop dir should be created");
+            let outside_root = outside.parent().unwrap().to_path_buf();
+            let home = decoy_config_home(label);
+            let path = home.join("neutron/config.toml");
+            let settings = config_with_drop_dir(&outside);
+            config::save(&path, &settings).expect("config should save");
+
+            let reported = remove_app_settings(&path, true).expect("purge should succeed");
+
+            assert_eq!(reported, Some(outside.clone()), "{label}");
+            assert!(
+                outside.exists(),
+                "{label}: a user-chosen drop directory holds their own files"
+            );
+            remove_temp_root(&outside_root);
+            remove_temp_root(&home);
+        }
+    }
+
+    #[test]
+    fn purge_does_not_follow_a_symlink_out_of_the_app_dir() {
+        // `remove_dir_all` unlinks a symlink instead of recursing into it. A
+        // future rewrite that shells out to `rm -rf` would empty the target, so
+        // pin the behaviour rather than trusting it.
+        let home = decoy_config_home("symlink");
+        let path = home.join("neutron/config.toml");
+        let target = unique_temp_root("symlink-target").join("precious");
+        std::fs::create_dir_all(&target).expect("target should be created");
+        std::fs::write(target.join("keep.txt"), "keep").expect("file should be written");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+        std::os::unix::fs::symlink(&target, home.join("neutron/escape"))
+            .expect("symlink should be created");
+
+        remove_app_settings(&path, true).expect("purge should succeed");
+
+        assert!(
+            !home.join("neutron").exists(),
+            "the symlink must be unlinked"
+        );
+        assert!(
+            target.join("keep.txt").exists(),
+            "purge must not recurse through a symlink"
+        );
+        remove_temp_root(target.parent().unwrap());
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn purge_of_a_legacy_configuration_directory_spares_the_current_one() {
+        // `default_config_path` still resolves pre-rename directories, so the
+        // resolved one is the only one that is ours to delete.
+        let home = decoy_config_home("legacy");
+        let path = home.join("neutron-vpn/config.json");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+        let current = home.join("neutron/config.toml");
+        config::save(&current, &config::AppConfig::default()).expect("config should save");
+
+        remove_app_settings(&path, true).expect("purge should succeed");
+
+        assert!(!path.parent().unwrap().exists());
+        assert!(
+            current.exists(),
+            "the current directory is not ours to delete"
+        );
+        remove_temp_root(&home);
+    }
+
+    #[test]
+    fn purge_with_a_missing_or_unreadable_configuration_still_only_purges_the_app_dir() {
+        for (label, body) in [("absent", None), ("garbage", Some("not = = toml"))] {
+            let home = decoy_config_home(label);
+            let path = home.join("neutron/config.toml");
+            if let Some(body) = body {
+                std::fs::write(&path, body).expect("config should be written");
+            }
+
+            let reported = remove_app_settings(&path, true).expect("purge should succeed");
+
+            assert_eq!(reported, None, "{label}: nothing outside was recorded");
+            assert!(!home.join("neutron").exists(), "{label}");
+            assert!(home.join("other-app/config.json").exists(), "{label}");
+            remove_temp_root(&home);
+        }
+    }
+
+    #[test]
+    fn purge_is_idempotent() {
+        // `--purge` on an install that never wrote settings must not abort the
+        // uninstall this late, and a second run must change nothing.
+        let home = decoy_config_home("idempotent");
+        let path = home.join("neutron/config.toml");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+
+        remove_app_settings(&path, true).expect("first purge should succeed");
+        let after = relative_paths(&home);
+        remove_app_settings(&path, true).expect("second purge should succeed");
+
+        assert_eq!(relative_paths(&home), after);
+        remove_temp_root(&home);
+    }
+
+    fn config_with_drop_dir(drop_dir: &std::path::Path) -> config::AppConfig {
+        config::AppConfig {
+            general: config::GeneralConfig {
+                profiles_dir: drop_dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            ..config::AppConfig::default()
+        }
+    }
+
+    /// A fake `~/.config` holding the application directory alongside decoys
+    /// that an over-eager delete would take with it: another app, the legacy
+    /// pre-rename directory, a foreign autostart entry, and the hand-installed
+    /// systemd unit.
+    fn decoy_config_home(label: &str) -> std::path::PathBuf {
+        let home = unique_temp_root(label);
+        for relative in [
+            "neutron/config.toml.policy.lock",
+            "neutron/profile-info.json",
+            "neutron/profiles/home.conf",
+            "neutron-vpn/config.json",
+            "other-app/config.json",
+            "autostart/some-other-app.desktop",
+            "systemd/user/neutron-startup-random.service",
+        ] {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("fixture directory should be created");
+            // The JSON sidecars are parsed by config::save, so they need a body
+            // it can read back rather than arbitrary text.
+            let body = if relative.ends_with(".json") {
+                "{}"
+            } else {
+                ""
+            };
+            std::fs::write(&path, body).expect("fixture file should be written");
+        }
+        home
+    }
+
+    /// Every path still present under `root`, relative and slash-terminated for
+    /// directories. Comparing whole sets is what makes "nothing unintended was
+    /// deleted" an assertion instead of a hope.
+    fn relative_paths(root: &std::path::Path) -> BTreeSet<String> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, found: &mut BTreeSet<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if path.is_dir() {
+                    found.insert(format!("{relative}/"));
+                    walk(root, &path, found);
+                } else {
+                    found.insert(relative);
+                }
+            }
+        }
+        let mut found = BTreeSet::new();
+        walk(root, root, &mut found);
+        found
+    }
+
+    fn unique_temp_root(label: &str) -> std::path::PathBuf {
+        crate::testing::temp_config_path(label)
+            .parent()
+            .expect("temp config path has a parent")
+            .to_path_buf()
+    }
+
+    fn remove_temp_root(root: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

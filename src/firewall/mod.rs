@@ -31,6 +31,11 @@
 //! to a chain-wide clear: if it cannot remove one of its own rules it reports an
 //! error rather than wipe rules it did not create.
 //!
+//! Teardown also revokes the install's other durable footprint: the root-owned
+//! helper binary and the polkit action authorizing it (see
+//! [`helper::uninstall_script`]). Both live outside any package's file list, so
+//! `crate::app`'s uninstall -- not the lockdown toggle -- is what removes them.
+//!
 //! Enforcement lives in mangle OUTPUT, before firewalld's filter-table
 //! ESTABLISHED accept on either backend. Disallowed packets are dropped there;
 //! allow rules only finish this table and do not bypass other firewall policy.
@@ -102,7 +107,23 @@ pub trait FirewallClient {
     fn refresh_lockdown(&self, activating: Option<&str>) -> AppResult<()>;
     /// Remove the lockdown ruleset, restoring normal connectivity. Idempotent:
     /// safe to call when lockdown is not currently active.
+    ///
+    /// Rules only. The password-free refresh grant is deliberately left in place,
+    /// because it belongs to the *installation* rather than to the current
+    /// lockdown state: it is installed on enable, must survive a disable so a
+    /// re-enable needs no second prompt, and is revoked by
+    /// [`Self::revoke_refresh_grant`] when the app goes away. That also keeps
+    /// this emergency path down to the one thing a locked-out user needs.
     fn disable_lockdown(&self) -> AppResult<()>;
+    /// Remove the root-owned refresh helper and the polkit action authorizing it.
+    ///
+    /// Both live outside any package's file list, so nothing else can revoke
+    /// them; this is the uninstall half of lockdown's footprint. Separate from
+    /// [`Self::disable_lockdown`] so lifting the block never silently drops a
+    /// grant the user still needs. Best effort by design -- a failure leaves the
+    /// rules lifted, since with the helper gone a stale cached action has
+    /// nothing left to execute -- and any leftover is reported.
+    fn revoke_refresh_grant(&self) -> AppResult<()>;
 }
 
 impl FirewallClient for crate::nm::CliNmClient {
@@ -152,6 +173,23 @@ impl FirewallClient for crate::nm::CliNmClient {
                      OUTPUT chain; left foreign rules untouched"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn revoke_refresh_grant(&self) -> AppResult<()> {
+        let mut script = locked_script();
+        script.push_str(&helper::uninstall_script());
+        run_script(&script, true)?;
+        // The install's other durable footprint: a root-owned helper binary and
+        // the polkit action that authorizes it. They grant password-free root
+        // execution, so report a survivor rather than leave a live grant behind.
+        if helper::is_installed() {
+            return Err(AppError::Firewall(format!(
+                "{} or its polkit action could not be deleted; remove them as root to \
+                 revoke password-free root execution",
+                helper::PATH,
+            )));
         }
         Ok(())
     }

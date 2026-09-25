@@ -116,4 +116,30 @@ Enabling lockdown also enables firewalld at boot on systemd systems. Polkit 126+
 uses `/usr/local/share/polkit-1/actions`, supporting immutable `/usr`; older
 versions require a writable `/usr/share/polkit-1/actions`.
 
+### Uninstalling
+
+Run `neutron uninstall` as your normal user. It stops the tray daemon, lifts
+lockdown (one password prompt, only if lockdown is on — the permanent firewalld
+rules), revokes the password-free refresh grant (the root-owned helper and its
+polkit action), removes the autostart entry, and then hands the binary to
+whichever package manager installed it: `brew uninstall neutron` for a Homebrew
+install, `cargo uninstall neutron` for a `cargo install`.
+
+Those root-owned files live outside the package's own file list, and no packaging
+hook can remove them: Homebrew's `post_uninstall` runs *after* the files are gone,
+with no way to authenticate. So the teardown has to happen while the binary still
+exists — which is why it is a subcommand rather than a package script. The grant
+is revoked here rather than by `neutron lockdown disable`, so turning lockdown
+off and back on again does not cost a second password prompt.
+
+`~/.config/neutron` is **kept** (eligibility pool, favorites, settings) so a
+reinstall finds it intact; add `--purge` to delete it too, which is also how the
+stored qBittorrent password goes away. A drop directory configured *outside* it
+is always left alone, since it holds your own files.
+
+An install Neutron does not recognize — an AppImage, a distro package — is
+refused with an explanation and **nothing is changed**, rather than guessing a
+package manager. If the package is already gone and rules were left behind, see
+[the manual recovery steps](docs/security.md#uninstalling-revokes-everything-it-installed).
+
 ---

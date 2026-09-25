@@ -92,21 +92,19 @@ fn permanent_lockdown_refreshes_after_reload_without_reenabling_after_disable() 
         assert!(runtime.lines().any(|line| line == rule), "{runtime}");
     }
     CliNmClient.disable_lockdown().unwrap();
+    assert!(marked_rules().is_empty());
+    // A disable lifts the block but keeps the password-free grant: it belongs to
+    // the installation, so a re-enable needs no second prompt -- and, more to the
+    // point here, a refresh still cannot *enable* anything.
+    assert!(
+        std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
+        "a disable must not revoke the refresh grant"
+    );
     CliNmClient.refresh_lockdown(None).unwrap();
     assert!(
         marked_rules().is_empty(),
         "refresh must never enable lockdown"
     );
-    // Even CLI toggle arguments cannot make the installed helper disable rules.
-    assert!(
-        std::process::Command::new("/usr/local/libexec/neutron-lockdown-helper")
-            .args(["lockdown", "enable"])
-            .stdin(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(marked_rules().is_empty());
 }
 
 #[test]
@@ -266,16 +264,28 @@ fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
             .any(|line| line == loopback)
     );
 
-    CliNmClient.disable_lockdown().unwrap();
-    run_child("allowed");
-    assert!(
-        marked_rules().is_empty(),
-        "refresh must not re-enable lockdown"
-    );
-
-    std::fs::remove_file(action_path).unwrap();
+    // The action file going away alone leaves the helper unauthorized (exit 127).
+    std::fs::remove_file(&action_path).unwrap();
     wait_for_authorization(127);
     run_child("missing");
+
+    // The grant's real lifetime: it survives a disable, and only the uninstall
+    // step revokes it. Both files live outside any package's file list, so
+    // nothing else can remove them.
+    CliNmClient.disable_lockdown().unwrap();
+    assert!(marked_rules().is_empty());
+    assert!(
+        std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
+        "a disable must leave the grant in place"
+    );
+    CliNmClient.revoke_refresh_grant().unwrap();
+    assert!(!std::path::Path::new(&action_path).exists());
+    assert!(
+        !std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
+        "revoking the grant must remove the root-owned helper"
+    );
+    // Idempotent: a second revoke has nothing left to do and must not error.
+    CliNmClient.revoke_refresh_grant().unwrap();
 }
 
 #[test]

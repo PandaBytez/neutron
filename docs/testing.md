@@ -24,16 +24,20 @@ Requires Podman or Docker. The Cargo tasks start NetworkManager and firewalld in
 a disposable container with its own network namespace. Network and firewall
 changes stay inside that sandbox.
 
+Every container tier also runs on pull requests, via the `System Tests (sandbox)`
+job, so the tests below are enforced rather than advisory.
+
 ```bash
 # Host tests across all features, then containerized system tests
 cargo test-all
 
-# Containerized system tests only
+# Containerized system tests only (this is what CI runs)
 cargo test-system
 
 # Select a system tier or rebuild the sandbox image
 cargo test-system -- --nm
 cargo test-system -- --firewall
+cargo test-system -- --filter system_uninstall
 cargo test-system -- --rebuild
 
 # Firewall leak regression checks

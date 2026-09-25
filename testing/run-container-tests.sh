@@ -6,9 +6,10 @@
 # firewall configuration, so they refuse to start unless NEUTRON_TEST_SANDBOX=1
 # -- which only this harness sets.
 #
-#   ./testing/run-container-tests.sh             # NetworkManager + firewall tiers
+#   ./testing/run-container-tests.sh             # NetworkManager + firewall + uninstall tiers
 #   ./testing/run-container-tests.sh --nm        # NetworkManager tier only
 #   ./testing/run-container-tests.sh --firewall  # firewall tier only
+#   ./testing/run-container-tests.sh --uninstall  # uninstall tier only
 #   ./testing/run-container-tests.sh --leaks     # leak regression checks
 #   ./testing/run-container-tests.sh --rebuild   # force a fresh image
 #   ./testing/run-container-tests.sh --shell     # interactive shell in the sandbox
@@ -26,9 +27,10 @@ for arg in "$@"; do
     case "$arg" in
         --rebuild)  rebuild=1 ;;
         --shell)    shell=1 ;;
-        --nm)       mode=nm ;;
-        --firewall) mode=firewall ;;
-        --leaks)    mode=leaks ;;
+        --nm)        mode=nm ;;
+        --firewall)  mode=firewall ;;
+        --uninstall) mode=uninstall ;;
+        --leaks)     mode=leaks ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -96,8 +98,12 @@ case "$mode" in
         run_tier "leak regression guards" \
             cargo test --test system_firewall -- --ignored --test-threads=1 leak_
         ;;
+    uninstall)
+        run_tier "uninstall tier" \
+            cargo test --test system_uninstall -- --ignored --test-threads=1
+        ;;
     all)
-        run_tier "System tests (NetworkManager & firewalld)" \
-            cargo test --test system_nm --test system_firewall -- --ignored --test-threads=1
+        run_tier "System tests (NetworkManager, firewalld & uninstall)" \
+            cargo test --test system_nm --test system_firewall --test system_uninstall -- --ignored --test-threads=1
         ;;
 esac

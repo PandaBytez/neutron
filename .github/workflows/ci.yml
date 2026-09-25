@@ -47,6 +47,37 @@ jobs:
       - name: Run tests (all features)
         run: cargo test --all --all-features
 
+  system-tests:
+    name: System Tests (sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # `cargo test-system` is an xtask binary, so the runner needs a toolchain
+      # even though the tests themselves are compiled inside the container.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The sandbox image is a Fedora base with dnf-installed daemons, so
+      # rebuilding it is minutes of network work. Cache it as a tarball keyed on
+      # the Containerfile; a base image or dependency bump invalidates the key.
+      - uses: actions/cache@v4
+        id: sandbox-image
+        with:
+          path: /tmp/neutron-sandbox.tar
+          key: sandbox-${{ runner.os }}-${{ hashFiles('testing/Containerfile') }}
+      - if: steps.sandbox-image.outputs.cache-hit != 'true'
+        run: |
+          podman build -t neutron-sandbox -f testing/Containerfile .
+          podman save -o /tmp/neutron-sandbox.tar neutron-sandbox
+      - if: steps.sandbox-image.outputs.cache-hit == 'true'
+        run: podman load -i /tmp/neutron-sandbox.tar
+      # No selector: this runs every ignored test in one container invocation,
+      # which matters because `podman run --rm` discards CARGO_TARGET_DIR each
+      # time. The leak guards ride along (they are #[ignore]d in
+      # system_firewall.rs), so `cargo test-leaks` would only repeat them.
+      - name: Run system tests in the disposable sandbox
+        run: cargo test-system
+
   build:
     name: Build Static Binary
     runs-on: ubuntu-latest

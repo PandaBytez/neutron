@@ -156,6 +156,24 @@ neutron lockdown enable
 neutron lockdown disable
 ```
 
+### Uninstalling
+
+```bash
+# Revoke everything outside the package, then remove the package itself
+neutron uninstall
+
+# Also delete ~/.config/neutron (settings, eligibility, qBittorrent password)
+neutron uninstall --purge
+```
+
+Run it as your normal user, not under `sudo`: the polkit prompt needs an active
+session, and Homebrew refuses to run as root. Neutron detects whether it was
+installed by Homebrew or `cargo install` and runs the matching removal, stopping
+the tray daemon, lifting the firewall rules, revoking the password-free refresh
+grant, and deleting the autostart entry first. Settings are kept unless `--purge`
+is given. An unrecognized install is refused without changing anything; see
+[security.md](security.md#uninstalling-revokes-everything-it-installed).
+
 ### NAT-PMP & qBittorrent Dynamic Port Sync
 
 ```bash

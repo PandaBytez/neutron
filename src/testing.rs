@@ -845,6 +845,16 @@ impl FirewallClient for MockNmClient {
 
         Ok(())
     }
+
+    fn revoke_refresh_grant(&self) -> AppResult<()> {
+        record(&self.lockdown_calls, "lockdown:revoke-grant".to_string());
+
+        if self.fail_lockdown {
+            return Err(AppError::Firewall("simulated lockdown failure".to_string()));
+        }
+
+        Ok(())
+    }
 }
 
 /// A qBittorrent WebUI stub for exercising the port-sync integration.
