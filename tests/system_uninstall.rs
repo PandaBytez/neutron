@@ -9,7 +9,7 @@
 //!
 //! Safety: this container is `--rm` and disposable (see the note in
 //! `testing/Containerfile`). The tests install Neutron into the container's own
-//! `CARGO_HOME` and then delete it, which is why the destructive half of
+//! custom install root and then delete it, which is why the destructive half of
 //! `neutron uninstall` is never exercised on a host.
 //!
 //! Run with: `./testing/run-container-tests.sh --uninstall`
@@ -38,23 +38,24 @@ fn decoy_config_home(label: &str) -> PathBuf {
     home
 }
 
-fn cargo_home() -> PathBuf {
-    std::env::var_os("CARGO_HOME")
+/// Deliberately *not* `$CARGO_HOME`: `cargo install --list` and `cargo uninstall`
+/// are both scoped to an install root, so the default root is the one case where
+/// a missing `--root` goes unnoticed. Installing to a custom root is what makes
+/// this suite catch that.
+fn install_root() -> PathBuf {
+    std::env::var_os("NEUTRON_TEST_INSTALL_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".cargo"))
-}
-
-fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME should be set"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/neutron-test-install"))
 }
 
 fn installed_binary() -> PathBuf {
-    cargo_home().join("bin").join("neutron")
+    install_root().join("bin").join("neutron")
 }
 
 fn cargo_installs_neutron() -> bool {
     let output = Command::new("cargo")
-        .args(["install", "--list"])
+        .args(["install", "--list", "--root"])
+        .arg(install_root())
         .output()
         .expect("cargo should run");
     String::from_utf8_lossy(&output.stdout)
@@ -65,8 +66,10 @@ fn cargo_installs_neutron() -> bool {
 /// Install Neutron the documented way, so `cargo install --list` knows about it
 /// and the channel resolves the way it will on a real machine.
 fn cargo_install() {
+    let _ = std::fs::remove_dir_all(install_root());
     let status = Command::new("cargo")
-        .args(["install", "--path", ".", "--locked", "--debug"])
+        .args(["install", "--path", ".", "--locked", "--debug", "--root"])
+        .arg(install_root())
         .status()
         .expect("cargo should run");
     assert!(status.success(), "cargo install should succeed");
@@ -77,17 +80,13 @@ fn cargo_install() {
 }
 
 /// Run the installed binary with Neutron's own view of the settings redirected
-/// into `config_home`.
-///
-/// `CARGO_HOME` is pinned to the real one: the child's `HOME` is a temporary
-/// directory, so cargo would otherwise look for `$HOME/.cargo`, find no
-/// installed packages, and the channel could not resolve to cargo at all.
+/// into `config_home`. Its install root comes from the path it was installed to,
+/// so the temporary `HOME` does not affect detection.
 fn run_installed(config_home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(installed_binary())
         .args(args)
         .env("HOME", config_home)
         .env("XDG_CONFIG_HOME", config_home.join(".config"))
-        .env("CARGO_HOME", cargo_home())
         .output()
         .expect("the installed binary should run")
 }
@@ -179,8 +178,8 @@ fn an_unrecognized_install_source_is_refused_without_deleting_anything() {
     require_sandbox();
     let config_home = decoy_config_home("unknown");
 
-    // A copy outside any cargo root, with a CARGO_HOME that lists nothing: the
-    // shape of an AppImage or a distro package. Tearing down the firewall here
+    // A copy outside any cargo install root: the shape of an AppImage or a distro
+    // package. Tearing down the firewall here
     // and then leaving the package installed would strand the user, so this must
     // fail instead -- and it must fail *before* deleting the settings.
     let stray = config_home.join("opt/neutron");
@@ -188,13 +187,10 @@ fn an_unrecognized_install_source_is_refused_without_deleting_anything() {
         .expect("stray directory should be created");
     std::fs::copy(env!("CARGO_BIN_EXE_neutron"), &stray).expect("binary should copy");
 
-    let empty_cargo_home = config_home.join("empty-cargo-home");
-    std::fs::create_dir_all(&empty_cargo_home).expect("cargo home should be created");
     let output = Command::new(&stray)
         .arg("uninstall")
         .env("HOME", &config_home)
         .env("XDG_CONFIG_HOME", config_home.join(".config"))
-        .env("CARGO_HOME", &empty_cargo_home)
         .output()
         .expect("the stray binary should run");
 

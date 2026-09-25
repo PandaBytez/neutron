@@ -12,19 +12,17 @@ use crate::error::{AppError, AppResult};
 
 /// Package name in every supported package manager.
 const PACKAGE: &str = "neutron";
-/// Both channels remove the package the same way; only the tool differs.
-const UNINSTALL_ARGS: [&str; 2] = ["uninstall", PACKAGE];
 /// `cargo install --list` is local bookkeeping, but give it room on a cold
 /// `$CARGO_HOME` rather than failing a decision on a slow disk.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How to remove the install, once [`resolve`] has decided. The tool and its
-/// argv are the whole answer, so they are produced by the one match that
+/// argv are the whole answer, so they are produced by the one branch that
 /// recognizes the channel; an unrecognized source is an error instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removal {
     pub program: &'static str,
-    pub args: &'static [&'static str],
+    pub args: Vec<String>,
 }
 
 /// Resolve the install channel for the running binary, probing the real system.
@@ -32,10 +30,10 @@ pub fn current() -> AppResult<Removal> {
     let exe = std::env::current_exe()?;
     // A Homebrew install is decisive, so the cargo probe (a subprocess) is only
     // worth its cost when the path did not already answer the question.
-    let cargo_list = if is_homebrew(&exe) {
-        None
-    } else {
-        probe_cargo_list()
+    let cargo_list = match cargo_root(&exe) {
+        _ if is_homebrew(&exe) => None,
+        Some(root) => probe_cargo_list(root),
+        None => None,
     };
     resolve(&exe, cargo_list.as_deref(), tool_on_path)
 }
@@ -52,9 +50,11 @@ pub fn current() -> AppResult<Removal> {
 /// The pair must be exactly `Cellar/neutron` so an unrelated Cellar that happens
 /// to ship a `neutron` binary is not mistaken for a tap install.
 ///
-/// Cargo is recognized by `cargo install --list` rather than by looking for
+/// Cargo is recognized by its package list rather than by looking for
 /// `~/.cargo/bin/neutron`, because `cargo install --root` puts the binary
-/// anywhere while the package list still knows about it.
+/// anywhere. Both the list *and* the removal are scoped to the root the running
+/// binary lives in, since `cargo install --list` without `--root` reports only
+/// the default root and would miss every other install.
 ///
 /// An unrecognized source, or a channel whose tool is not runnable, is an error:
 /// Neutron's own state (firewall rules, root-owned helper, polkit action) would
@@ -65,10 +65,26 @@ pub fn resolve(
     cargo_list: Option<&str>,
     tool_on_path: impl Fn(&str) -> bool,
 ) -> AppResult<Removal> {
-    let program = if is_homebrew(exe) {
-        "brew"
+    let (program, args) = if is_homebrew(exe) {
+        ("brew", vec!["uninstall".into(), PACKAGE.into()])
     } else if cargo_has_package(cargo_list) {
-        "cargo"
+        // Scoped to the root this binary actually lives in, which is the only
+        // root `cargo uninstall` can remove it from.
+        let root = cargo_root(exe).ok_or_else(|| {
+            AppError::Uninstall(unrecognized(
+                exe,
+                "cargo lists it, but the install root cannot be derived from that path",
+            ))
+        })?;
+        (
+            "cargo",
+            vec![
+                "uninstall".into(),
+                "--root".into(),
+                root.display().to_string(),
+                PACKAGE.into(),
+            ],
+        )
     } else {
         return Err(AppError::Uninstall(unrecognized(
             exe,
@@ -85,10 +101,17 @@ pub fn resolve(
             ),
         )));
     }
-    Ok(Removal {
-        program,
-        args: &UNINSTALL_ARGS,
-    })
+    Ok(Removal { program, args })
+}
+
+/// The install root a cargo-installed binary lives in: `<root>/bin/<exe>`.
+///
+/// Every cargo install lands on that shape, `--root` and `--prefix` included, so
+/// the root is the grandparent of the executable. Scoped per root rather than
+/// read from `$CARGO_HOME`, because cargo's own list and uninstall commands are
+/// scoped the same way.
+fn cargo_root(exe: &Path) -> Option<&Path> {
+    exe.parent()?.parent()
 }
 
 pub fn is_homebrew(exe: &Path) -> bool {
@@ -123,8 +146,14 @@ fn unrecognized(exe: &Path, detail: &str) -> String {
     )
 }
 
-fn probe_cargo_list() -> Option<String> {
-    crate::process::run_with_timeout("cargo", &["install", "--list"], PROBE_TIMEOUT).ok()
+fn probe_cargo_list(root: &Path) -> Option<String> {
+    let root = root.display().to_string();
+    crate::process::run_with_timeout(
+        "cargo",
+        &["install", "--list", "--root", &root],
+        PROBE_TIMEOUT,
+    )
+    .ok()
 }
 
 fn tool_on_path(program: &str) -> bool {
@@ -153,6 +182,28 @@ mod tests {
         resolve_with(exe, cargo_list, tools).expect("channel should resolve")
     }
 
+    fn brew_removal() -> Removal {
+        Removal {
+            program: "brew",
+            args: vec!["uninstall".into(), PACKAGE.into()],
+        }
+    }
+
+    fn cargo_removal(exe: &str) -> Removal {
+        Removal {
+            program: "cargo",
+            args: vec![
+                "uninstall".into(),
+                "--root".into(),
+                cargo_root(Path::new(exe))
+                    .expect("a <root>/bin/<exe> path has a root")
+                    .display()
+                    .to_string(),
+                PACKAGE.into(),
+            ],
+        }
+    }
+
     #[test]
     fn both_homebrew_prefixes_resolve_to_brew() {
         for exe in [
@@ -160,14 +211,32 @@ mod tests {
             "/home/linuxbrew/.linuxbrew/Cellar/neutron/0.1.3/bin/neutron",
             "/home/user/.local/share/homebrew/Cellar/neutron/0.1.3/bin/neutron",
         ] {
+            assert_eq!(resolved(exe, None, &["brew"]), brew_removal());
+        }
+    }
+
+    #[test]
+    fn a_cargo_removal_is_scoped_to_the_root_the_binary_lives_in() {
+        // `cargo install --list` and `cargo uninstall` both default to the
+        // default root, so without --root a `cargo install --root DIR` install is
+        // both invisible to detection and unremovable. Verified against cargo
+        // 1.96: the entries are keyed by install root.
+        for exe in [
+            "/home/user/.cargo/bin/neutron",
+            // `cargo install --path . --root "$HOME/.local"`, per systemd/README.md
+            "/home/user/.local/bin/neutron",
+            "/opt/ci/neutron/bin/neutron",
+        ] {
             assert_eq!(
-                resolved(exe, None, &["brew"]),
-                Removal {
-                    program: "brew",
-                    args: &UNINSTALL_ARGS
-                }
+                resolved(exe, Some(CARGO_LIST), &["cargo"]),
+                cargo_removal(exe),
+                "{exe}"
             );
         }
+        assert_eq!(
+            cargo_removal("/home/user/.local/bin/neutron").args,
+            vec!["uninstall", "--root", "/home/user/.local", PACKAGE]
+        );
     }
 
     #[test]
@@ -175,11 +244,8 @@ mod tests {
         // `--root` and `--debug` put the binary outside ~/.cargo/bin, which is
         // why the package list is the signal rather than the path.
         assert_eq!(
-            resolved("/tmp/build/neutron", Some(CARGO_LIST), &["cargo"]),
-            Removal {
-                program: "cargo",
-                args: &UNINSTALL_ARGS
-            }
+            resolved("/opt/ci/neutron/bin/neutron", Some(CARGO_LIST), &["cargo"]),
+            cargo_removal("/opt/ci/neutron/bin/neutron")
         );
     }
 
@@ -191,10 +257,7 @@ mod tests {
                 Some(CARGO_LIST),
                 &["brew", "cargo"],
             ),
-            Removal {
-                program: "brew",
-                args: &UNINSTALL_ARGS
-            }
+            brew_removal()
         );
     }
 

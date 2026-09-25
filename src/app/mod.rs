@@ -323,7 +323,7 @@ fn remove_the_package(removal: &crate::install::Removal) -> AppResult<()> {
     // Unprivileged, no shell, inheriting the terminal so brew or cargo can
     // report or prompt itself.
     let status = crate::process::host_command(removal.program)
-        .args(removal.args)
+        .args(&removal.args)
         .status()
         .map_err(|error| AppError::CommandFailed(format!("{}: {error}", removal.program)))?;
     if !status.success() {
