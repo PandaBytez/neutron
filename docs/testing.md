@@ -8,7 +8,7 @@ Run these commands from the repository root with the Rust toolchain installed.
 # Check formatting and run strict Clippy across all features
 cargo lint
 
-# Rebuild and install the binary, leaving lockdown state alone (dev loop).
+# Rebuild and install the binary, leaving lockdown and settings alone (dev loop).
 # Extra flags go to `cargo install`, so --debug and --root work:
 cargo xtask reinstall -- --debug
 
@@ -43,6 +43,10 @@ cargo test-system -- --nm
 cargo test-system -- --firewall
 cargo test-system -- --uninstall
 cargo test-system -- --rebuild
+
+`cargo xtask reinstall` keeps your settings as they are: the settings files are
+captured before the install and restored if anything changes them, and the
+result is reported rather than silently reverted.
 
 # Firewall leak regression checks
 cargo test-leaks
