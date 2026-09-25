@@ -12,3 +12,4 @@ pub mod process;
 pub mod service;
 pub mod testing;
 pub mod tui;
+pub mod wait;

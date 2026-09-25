@@ -156,6 +156,10 @@ neutron lockdown enable
 neutron lockdown disable
 ```
 
+`enable` and `disable` escalate and rewrite the ruleset, so they show a spinner
+while waiting on authentication and firewalld. Piped output gets a plain
+`Enabling Lockdown...` line instead.
+
 ### Uninstalling
 
 ```bash

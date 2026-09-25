@@ -624,13 +624,21 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
             println!("Lockdown saved intent: {label} (effective firewall state is not verified)");
         }
         LockdownCommands::Enable => {
-            set_global_lockdown(client, path, true)?;
+            // Escalates and rewrites the ruleset, so it blocks for as long as
+            // the user takes to authenticate. Show that something is happening.
+            crate::wait::with_spinner("Enabling Lockdown", || {
+                set_global_lockdown(client, path, true)
+            })?;
             println!(
                 "Lockdown enabled: all traffic is blocked except the WireGuard tunnel, its handshake, and DNS."
             );
         }
         LockdownCommands::Disable => {
-            set_global_lockdown(client, path, false)?;
+            // The emergency path: a user reaching for this may be locked out, so
+            // it must look alive even while the prompt is up.
+            crate::wait::with_spinner("Disabling Lockdown", || {
+                set_global_lockdown(client, path, false)
+            })?;
             println!("Lockdown disabled: normal connectivity restored.");
         }
     }
