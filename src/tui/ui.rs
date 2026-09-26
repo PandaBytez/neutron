@@ -807,12 +807,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
 
 fn render_pending_toast(frame: &mut Frame, area: Rect, text: &str, state: &TuiState) {
     let theme = &state.theme;
-    let toast_w = (text.chars().count() as u16 + 6).clamp(38, area.width.saturating_sub(4).max(38));
-    let toast_x = area.x + area.width.saturating_sub(toast_w + 2);
-    let toast_y = area.y + 1;
-    let toast_rect = Rect::new(toast_x, toast_y, toast_w, 3);
-
-    frame.render_widget(Clear, toast_rect);
+    let toast_rect = toast_frame(frame, area, toast_width(area, text.chars().count()), 3);
 
     let p = Paragraph::new(Line::from(vec![
         Span::styled(text.chars().take(1).collect::<String>(), theme.accent),
@@ -855,15 +850,8 @@ fn render_connecting_toast(
         "Waiting for WireGuard handshake..."
     };
 
-    let max_len = (action_str.chars().count() + 2).max(sub_str.chars().count()) as u16;
-    let toast_w = (max_len + 6).clamp(38, area.width.saturating_sub(4).max(38));
-    let toast_h = 4_u16;
-
-    let toast_x = area.x + area.width.saturating_sub(toast_w + 2);
-    let toast_y = area.y + 1;
-    let toast_rect = Rect::new(toast_x, toast_y, toast_w, toast_h);
-
-    frame.render_widget(Clear, toast_rect);
+    let max_len = (action_str.chars().count() + 2).max(sub_str.chars().count());
+    let toast_rect = toast_frame(frame, area, toast_width(area, max_len), 4);
 
     let lines = vec![
         Line::from(vec![
@@ -876,15 +864,36 @@ fn render_connecting_toast(
     let p = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::LEFT | Borders::RIGHT)
-                .border_type(BorderType::Thick)
-                .border_style(theme.active_border)
-                .style(Style::default().bg(theme.toast_bg)),
-        );
+        .block(toast_block(theme, theme.active_border));
 
     frame.render_widget(p, toast_rect);
+}
+
+/// A toast's box in the top-right corner, cleared before anything is drawn.
+///
+/// The static toast, the connecting one and the pending spinner are the same
+/// shape in the same place, and that placement is the part they must agree on:
+/// drawn over stale content without a `Clear` they bleed into the frame beneath.
+fn toast_frame(frame: &mut Frame, area: Rect, width: u16, height: u16) -> Rect {
+    let x = area.x + area.width.saturating_sub(width + 2);
+    let rect = Rect::new(x, area.y + 1, width, height);
+    frame.render_widget(Clear, rect);
+    rect
+}
+
+/// The box every toast wears: thick side bars, the toast background, and a border
+/// colour the caller picks (a warning for an error, the accent otherwise).
+fn toast_block(theme: &crate::tui::theme::Theme, border: Style) -> Block<'static> {
+    Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .border_type(BorderType::Thick)
+        .border_style(border)
+        .style(Style::default().bg(theme.toast_bg))
+}
+
+/// The width a toast needs for `text`, clamped to what the frame can spare.
+fn toast_width(area: Rect, text_len: usize) -> u16 {
+    (text_len as u16 + 6).clamp(38, area.width.saturating_sub(4).max(38))
 }
 
 fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast, state: &TuiState) {
@@ -898,17 +907,12 @@ fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast,
     let toast_h = (lines_count + 2).min(area.height.saturating_sub(2));
 
     // Show toast notifications in the top-right corner
-    let toast_x = area.x + area.width.saturating_sub(toast_w + 2);
-    let toast_y = area.y + 1;
-    let toast_rect = Rect::new(toast_x, toast_y, toast_w, toast_h);
-
-    frame.render_widget(Clear, toast_rect);
-
     let (bg_color, border_style, text_style) = if toast.is_error {
         (theme.toast_error_bg, theme.warning, theme.warning)
     } else {
         (theme.toast_bg, theme.active_border, theme.title)
     };
+    let toast_rect = toast_frame(frame, area, toast_w, toast_h);
 
     let msg_lines: Vec<Line> = toast
         .message
@@ -1661,7 +1665,6 @@ mod render_tests {
         }
     }
 
-    /// Render just the profile list and return its rows as plain strings.
     /// Full-frame render, so an overlay is checked where it is actually drawn
     /// rather than by inspecting the function that builds its text.
     #[test]
@@ -1703,6 +1706,7 @@ mod render_tests {
         );
     }
 
+    /// Render just the profile list and return its rows as plain strings.
     fn rendered_list(rows: Vec<ProfileListRow>, selected: usize) -> Vec<String> {
         let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
         state.rows = rows;
