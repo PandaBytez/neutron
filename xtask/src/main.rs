@@ -285,6 +285,34 @@ const SANDBOX_PRIVATE_PATHS: [&str; 3] = [
     "/etc/polkit-1",
 ];
 
+/// The argument list for one sandboxed `podman run`.
+///
+/// Built in one place because the order carries meaning: everything up to and
+/// including [`IMAGE_NAME`] is read by the container runtime, and anything after
+/// it is the command inside the container. The masking flags belong to the former
+/// -- appended after the image they are passed on to `cargo`, which is how
+/// `cargo test` ended up failing with `Unrecognized option: 'tmpfs'`.
+fn container_run_args(mount: &str, interactive: bool, command: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = ["run", "--rm"].into_iter().map(String::from).collect();
+    if interactive {
+        args.push("-it".into());
+    }
+    args.extend([
+        "--privileged".to_string(),
+        "-v".to_string(),
+        mount.to_string(),
+        "-w".to_string(),
+        "/src".to_string(),
+    ]);
+    for path in SANDBOX_PRIVATE_PATHS {
+        args.push("--tmpfs".into());
+        args.push(path.into());
+    }
+    args.push(IMAGE_NAME.into());
+    args.extend(command.iter().cloned());
+    args
+}
+
 fn run_in_container(root: &Path, command_args: &[String]) -> i32 {
     let tool = match detect_container_tool() {
         Ok(t) => t,
@@ -295,23 +323,11 @@ fn run_in_container(root: &Path, command_args: &[String]) -> i32 {
     };
 
     let mount = format!("{}:/src:z", root.display());
+    let mut command = vec!["cargo".to_string()];
+    command.extend(command_args.iter().cloned());
     let mut cmd = Command::new(tool);
-    cmd.args([
-        "run",
-        "--rm",
-        "--privileged",
-        "-v",
-        &mount,
-        "-w",
-        "/src",
-        IMAGE_NAME,
-        "cargo",
-    ])
-    .args(command_args)
-    .current_dir(root);
-    for path in SANDBOX_PRIVATE_PATHS {
-        cmd.arg("--tmpfs").arg(path);
-    }
+    cmd.args(container_run_args(&mount, false, &command))
+        .current_dir(root);
 
     run_status(cmd.status())
 }
@@ -327,22 +343,8 @@ fn run_in_container_interactive(root: &Path, command_args: &[String]) -> i32 {
 
     let mount = format!("{}:/src:z", root.display());
     let mut cmd = Command::new(tool);
-    cmd.args([
-        "run",
-        "--rm",
-        "-it",
-        "--privileged",
-        "-v",
-        &mount,
-        "-w",
-        "/src",
-        IMAGE_NAME,
-    ])
-    .args(command_args)
-    .current_dir(root);
-    for path in SANDBOX_PRIVATE_PATHS {
-        cmd.arg("--tmpfs").arg(path);
-    }
+    cmd.args(container_run_args(&mount, true, command_args))
+        .current_dir(root);
 
     run_status(cmd.status())
 }
@@ -847,6 +849,39 @@ mod tests {
             "a window and another install's daemon are reported, not killed"
         );
         let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn container_options_precede_the_image_and_the_command_follows_it() {
+        // The regression: the masking flags were appended after the image, so
+        // the runtime passed them to `cargo`, and the sandbox tier failed with
+        // "Unrecognized option: 'tmpfs'" before running a single test.
+        let command = vec!["cargo".to_string(), "test".to_string()];
+        for interactive in [false, true] {
+            let args = container_run_args("/src:/src:z", interactive, &command);
+            let image = args
+                .iter()
+                .position(|arg| arg == IMAGE_NAME)
+                .expect("the image name is in the argument list");
+
+            for (index, arg) in args.iter().enumerate().skip(image + 1) {
+                assert!(
+                    !arg.starts_with('-'),
+                    "runtime option {arg} must precede the image, not the command: {args:?}"
+                );
+            }
+            assert_eq!(
+                args.iter().filter(|arg| *arg == "--tmpfs").count(),
+                SANDBOX_PRIVATE_PATHS.len(),
+                "every masked path is still masked: {args:?}"
+            );
+            assert_eq!(
+                &args[image + 1..],
+                &command,
+                "only the command may follow the image: {args:?}"
+            );
+            assert_eq!(args.contains(&"-it".to_string()), interactive);
+        }
     }
 
     #[test]
