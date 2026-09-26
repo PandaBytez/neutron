@@ -5,6 +5,25 @@
 //! against this crate as an external library, can reuse the same mock as the
 //! in-crate unit tests. Everything here is `pub`, so it never triggers
 //! dead-code warnings in normal builds.
+//!
+//! # A test never touches the live machine
+//!
+//! Running the suite on a workstation has to be inert: no settings rewritten, no
+//! daemon killed, no real profile or firewall touched. Anything that reaches
+//! outside the process therefore takes the path it works on as an argument, and
+//! a test hands it a temporary one -- [`scratch_dir`], [`temp_config_path`], the
+//! autostart directory, the process root. The two that are easy to forget are
+//! the ones that end in a side effect rather than a read:
+//!
+//! * the process scan behind `kill_other_neutron_processes`, which SIGTERMs
+//!   every process named `neutron` -- a hardcoded `/proc` there kills the
+//!   developer's own daemon and TUI, silently, on every `cargo test`;
+//! * the lease file under `$XDG_RUNTIME_DIR`, which is what a live daemon
+//!   publishes for the TUI.
+//!
+//! A test that genuinely needs the real thing is a *system* test: marked
+//! `#[ignore = "system test: requires the disposable sandbox"]` and gated on
+//! [`require_sandbox`].
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -119,26 +138,40 @@ fn snapshot(log: &Mutex<Vec<String>>) -> Vec<String> {
     log.lock().expect("mock mutex poisoned").clone()
 }
 
-/// Create a unique temporary path for test configuration files.
-pub fn temp_config_path(label: &str) -> PathBuf {
+/// A directory of this run's own, named after `label`.
+///
+/// The clock is the only thing separating two tests that want the same label,
+/// which is why every temporary path here goes through this: a shared prefix
+/// would be a shared prefix, and a copied suffix would be one copy too few when
+/// someone adds the next one.
+fn unique_test_dir(label: &str) -> PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time should move forward")
         .as_nanos();
-    std::env::temp_dir()
-        .join(format!("neutron-vpn-test-{label}-{suffix}"))
-        .join("config.json")
+    std::env::temp_dir().join(format!("neutron-vpn-test-{label}-{suffix}"))
+}
+
+/// Create a unique temporary path for test configuration files.
+pub fn temp_config_path(label: &str) -> PathBuf {
+    unique_test_dir(label).join("config.json")
 }
 
 /// Create a unique temporary path for test TOML configuration files.
 pub fn temp_toml_config_path(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    std::env::temp_dir()
-        .join(format!("neutron-vpn-test-{label}-{suffix}"))
-        .join("config.toml")
+    unique_test_dir(label).join("config.toml")
+}
+
+/// An empty directory to stand in for `/proc`.
+///
+/// Anything that walks the process table takes the root as an argument
+/// precisely so a test can hand it this instead: the scan ends in `kill(2)`, and
+/// reaching the real `/proc` would take down the developer's own daemon and TUI
+/// as a side effect of running the suite.
+pub fn scratch_dir(label: &str) -> PathBuf {
+    let dir = unique_test_dir(label);
+    std::fs::create_dir_all(&dir).expect("scratch dir should be created");
+    dir
 }
 
 /// Clean up temporary test configuration directories.
@@ -170,6 +203,7 @@ pub struct MockNmClient {
     fail_kill_switch: bool,
     fail_autoconnect: bool,
     fail_lockdown: bool,
+    installed_lockdown_state: bool,
     fail_split_tunnel: bool,
     fail_import: bool,
     fail_disconnect: bool,
@@ -361,11 +395,19 @@ impl MockNmClient {
         self
     }
 
-    /// Consume this mock and return one whose `enable_lockdown`/`disable_lockdown`
+    /// Consume this mock and return one whose `enable_lockdown`/`teardown_lockdown`
     /// fail, to exercise the error path where the firewall rejects the change.
     /// The attempt is still recorded in [`Self::lockdown_calls`] first.
     pub fn fail_lockdown(mut self) -> Self {
         self.fail_lockdown = true;
+        self
+    }
+
+    /// Consume this mock and return one that reports Neutron-owned lockdown
+    /// state on the machine, so a caller tears down even when the saved config
+    /// says lockdown is off (or is gone entirely).
+    pub fn with_installed_lockdown_state(mut self) -> Self {
+        self.installed_lockdown_state = true;
         self
     }
 
@@ -836,8 +878,20 @@ impl FirewallClient for MockNmClient {
         Ok(())
     }
 
-    fn disable_lockdown(&self) -> AppResult<()> {
-        record(&self.lockdown_calls, "lockdown:off".to_string());
+    fn has_installed_lockdown_state(&self) -> AppResult<bool> {
+        Ok(self.installed_lockdown_state)
+    }
+
+    fn teardown_lockdown(&self, revoke_grant: bool) -> AppResult<()> {
+        record(
+            &self.lockdown_calls,
+            if revoke_grant {
+                "lockdown:teardown:rules+grant"
+            } else {
+                "lockdown:teardown:rules"
+            }
+            .to_string(),
+        );
 
         if self.fail_lockdown {
             return Err(AppError::Firewall("simulated lockdown failure".to_string()));

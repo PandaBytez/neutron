@@ -56,6 +56,10 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
     // Floating Toast Notification or Connecting Progress
     if let Some(ref conn) = state.connecting {
         render_connecting_toast(frame, size, conn, state);
+    } else if let Some(pending) = state.pending_text() {
+        // Outranks the toast it replaces: while the action is in flight the
+        // animated line *is* the status, and a static one reads as a hang.
+        render_pending_toast(frame, size, &pending, state);
     } else if let Some(toast) = state.active_toast() {
         render_toast(frame, size, toast, state);
     }
@@ -410,10 +414,7 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
 
             let (icon, icon_style) = if let Some(conn) = is_connecting {
                 let elapsed = conn.started_at.elapsed();
-                const SPINNER_FRAMES: [&str; 10] =
-                    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                let spinner =
-                    SPINNER_FRAMES[(elapsed.as_millis() / 80) as usize % SPINNER_FRAMES.len()];
+                let spinner = crate::spinner::spinner_frame(elapsed);
                 (format!("{spinner} "), theme.accent)
             } else if row.is_active {
                 ("✔ ".to_string(), theme.status_connected)
@@ -804,6 +805,27 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(footer_widget, area);
 }
 
+fn render_pending_toast(frame: &mut Frame, area: Rect, text: &str, state: &TuiState) {
+    let theme = &state.theme;
+    let toast_rect = toast_frame(frame, area, toast_width(area, text.chars().count()), 3);
+
+    let p = Paragraph::new(Line::from(vec![
+        Span::styled(text.chars().take(1).collect::<String>(), theme.accent),
+        Span::styled(text.chars().skip(1).collect::<String>(), theme.title),
+    ]))
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: true })
+    .block(
+        Block::default()
+            .borders(Borders::LEFT | Borders::RIGHT)
+            .border_type(BorderType::Thick)
+            .border_style(theme.active_border)
+            .style(Style::default().bg(theme.toast_bg)),
+    );
+
+    frame.render_widget(p, toast_rect);
+}
+
 fn render_connecting_toast(
     frame: &mut Frame,
     area: Rect,
@@ -814,8 +836,7 @@ fn render_connecting_toast(
     let elapsed = conn.started_at.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
 
-    const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let spinner = SPINNER_FRAMES[(elapsed.as_millis() / 80) as usize % SPINNER_FRAMES.len()];
+    let spinner = crate::spinner::spinner_frame(elapsed);
 
     let action_str = if conn.is_disconnect {
         format!("Disconnecting from {}... ({elapsed_secs:.1}s)", conn.name)
@@ -829,15 +850,8 @@ fn render_connecting_toast(
         "Waiting for WireGuard handshake..."
     };
 
-    let max_len = (action_str.chars().count() + 2).max(sub_str.chars().count()) as u16;
-    let toast_w = (max_len + 6).clamp(38, area.width.saturating_sub(4).max(38));
-    let toast_h = 4_u16;
-
-    let toast_x = area.x + area.width.saturating_sub(toast_w + 2);
-    let toast_y = area.y + 1;
-    let toast_rect = Rect::new(toast_x, toast_y, toast_w, toast_h);
-
-    frame.render_widget(Clear, toast_rect);
+    let max_len = (action_str.chars().count() + 2).max(sub_str.chars().count());
+    let toast_rect = toast_frame(frame, area, toast_width(area, max_len), 4);
 
     let lines = vec![
         Line::from(vec![
@@ -850,15 +864,36 @@ fn render_connecting_toast(
     let p = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::LEFT | Borders::RIGHT)
-                .border_type(BorderType::Thick)
-                .border_style(theme.active_border)
-                .style(Style::default().bg(theme.toast_bg)),
-        );
+        .block(toast_block(theme, theme.active_border));
 
     frame.render_widget(p, toast_rect);
+}
+
+/// A toast's box in the top-right corner, cleared before anything is drawn.
+///
+/// The static toast, the connecting one and the pending spinner are the same
+/// shape in the same place, and that placement is the part they must agree on:
+/// drawn over stale content without a `Clear` they bleed into the frame beneath.
+fn toast_frame(frame: &mut Frame, area: Rect, width: u16, height: u16) -> Rect {
+    let x = area.x + area.width.saturating_sub(width + 2);
+    let rect = Rect::new(x, area.y + 1, width, height);
+    frame.render_widget(Clear, rect);
+    rect
+}
+
+/// The box every toast wears: thick side bars, the toast background, and a border
+/// colour the caller picks (a warning for an error, the accent otherwise).
+fn toast_block(theme: &crate::tui::theme::Theme, border: Style) -> Block<'static> {
+    Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .border_type(BorderType::Thick)
+        .border_style(border)
+        .style(Style::default().bg(theme.toast_bg))
+}
+
+/// The width a toast needs for `text`, clamped to what the frame can spare.
+fn toast_width(area: Rect, text_len: usize) -> u16 {
+    (text_len as u16 + 6).clamp(38, area.width.saturating_sub(4).max(38))
 }
 
 fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast, state: &TuiState) {
@@ -872,17 +907,12 @@ fn render_toast(frame: &mut Frame, area: Rect, toast: &crate::tui::state::Toast,
     let toast_h = (lines_count + 2).min(area.height.saturating_sub(2));
 
     // Show toast notifications in the top-right corner
-    let toast_x = area.x + area.width.saturating_sub(toast_w + 2);
-    let toast_y = area.y + 1;
-    let toast_rect = Rect::new(toast_x, toast_y, toast_w, toast_h);
-
-    frame.render_widget(Clear, toast_rect);
-
     let (bg_color, border_style, text_style) = if toast.is_error {
         (theme.toast_error_bg, theme.warning, theme.warning)
     } else {
         (theme.toast_bg, theme.active_border, theme.title)
     };
+    let toast_rect = toast_frame(frame, area, toast_w, toast_h);
 
     let msg_lines: Vec<Line> = toast
         .message
@@ -959,7 +989,6 @@ fn render_command_palette_modal(
     );
     frame.render_widget(search_bar, chunks[0]);
 
-    // Filtered items
     let filtered = cp.filtered_items();
     let items: Vec<ListItem> = filtered
         .iter()
@@ -1634,6 +1663,47 @@ mod render_tests {
             is_favorite: false,
             custom_info: None,
         }
+    }
+
+    /// Full-frame render, so an overlay is checked where it is actually drawn
+    /// rather than by inspecting the function that builds its text.
+    #[test]
+    fn a_pending_action_draws_a_spinner_overlay_over_the_static_toast() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.set_status("Enabling Lockdown Mode...");
+        state.begin_pending("Enabling Lockdown Mode");
+
+        // 120x30 is the minimum the real layout accepts; below that the size
+        // warning takes over and no overlay is drawn.
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("Enabling Lockdown Mode"),
+            "the pending label must be on screen: {screen}"
+        );
+        assert!(
+            crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|frame| screen.contains(frame)),
+            "a spinner frame must be on screen: {screen}"
+        );
+        assert!(
+            !screen.contains("Enabling Lockdown Mode..."),
+            "the static toast must be replaced, not shown alongside: {screen}"
+        );
     }
 
     /// Render just the profile list and return its rows as plain strings.

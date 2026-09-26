@@ -90,6 +90,62 @@ When disabling Lockdown:
 3. Foreign runtime/permanent rules, custom chains, and rich rules are left untouched.
 4. Disable requires successful firewall authorization and execution; failures are reported.
 
+### Uninstalling Revokes Everything It Installed
+
+Enabling Lockdown also writes two root-owned files that no package owns, because
+they must live outside the app directory:
+
+| Path | Purpose |
+| :--- | :--- |
+| `/usr/local/libexec/neutron-lockdown-helper` | Root-owned, refresh-only copy of the binary, so a rule refresh needs no password |
+| `/usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy` | Authorizes that copy, `allow_active=yes` |
+
+Together they are the **password-free refresh grant**. Its lifetime is the
+*installation*, not the current lockdown state: `lockdown enable` installs it and
+`neutron uninstall` revokes it, while `lockdown disable` leaves it in place so a
+re-enable needs no second prompt — and so the emergency path that lifts the block
+stays limited to the one thing a locked-out user needs. Revocation sweeps both
+polkit action directories, so a downgrade from polkit 126+ cannot leave a live
+grant, then verifies from unprivileged `stat` that nothing survived; a leftover
+is reported rather than ignored.
+
+**Package managers cannot clean this up themselves**, so uninstall through the
+app:
+
+```bash
+neutron uninstall              # revoke, then brew/cargo uninstall
+neutron uninstall --purge      # also delete ~/.config/neutron
+```
+
+`neutron uninstall` stops the tray daemon, drops the autostart entry, and then
+runs the removal command for the install it detects. The privileged work — lifting
+the rules *and* revoking the grant — is one batch, so it is at most one password
+prompt, and it is skipped entirely when the machine holds no Neutron-owned
+lockdown state. Homebrew's own `post_uninstall` hook cannot do this: it runs
+*after* the files are removed, with no way to authenticate.
+
+The install source is resolved **before** anything is deleted, and an
+unrecognized one is refused outright. Tearing down the firewall and then failing
+to remove the package would leave a machine with no protection *and* an app the
+user still has to remove by hand; a refusal that changes nothing is the safer
+failure. `~/.config/neutron` is kept by default — the eligibility pool and
+favorites are tedious to rebuild, and a reinstall should find them intact —
+while `--purge` deletes it, which is also how the stored qBittorrent password goes
+away. A `profiles_dir` configured *outside* that directory is your own files, so
+it is only reported, never deleted. The teardown also runs before the purge: if
+the privileged teardown fails, the settings are left in place.
+
+If you remove the package first, `firewalld` keeps the tagged DROP rules and the
+machine stays blocked with no app left to lift them; recover by hand:
+
+```bash
+sudo firewall-cmd --permanent --direct --get-all-rules | grep neutron-lockdown
+# remove each reported rule with --remove-rule, then reload:
+sudo firewall-cmd --reload
+sudo rm -f /usr/local/libexec/neutron-lockdown-helper \
+  /usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy
+```
+
 ### Rebuild Recovery
 
 Rebuilds install tagged priority `-1` DROP guards for both address families before

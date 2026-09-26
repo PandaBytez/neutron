@@ -262,14 +262,23 @@ pub fn execute_action<C: ActionClient>(
         }
         "lockdown" => {
             let enable = !state.config.lockdown_enabled;
+            // Escalation blocks on a polkit prompt, so the wait is what the user
+            // is watching. Animate it, and show elapsed time in case the prompt
+            // is a GUI dialog that has not appeared yet.
+            let label = format!(
+                "{} Lockdown Mode",
+                if enable { "Enabling" } else { "Disabling" }
+            );
+            state.begin_pending(label.clone());
             if let Some(ref tx) = action_tx {
-                state.set_status(format!(
-                    "{} Lockdown Mode...",
-                    if enable { "Enabling" } else { "Disabling" }
-                ));
+                state.set_status(format!("{label}..."));
                 let _ = tx.send(crate::tui::state::AsyncAction::Lockdown(enable));
             } else {
+                // No worker thread: this blocks the event loop, so the spinner
+                // cannot repaint. Marked anyway so the state cannot be left
+                // showing an action that already finished.
                 crate::app::set_global_lockdown(client, &state.config_path, enable)?;
+                state.end_pending();
                 state
                     .uncertain_policies
                     .remove(&crate::error::Policy::Lockdown);
@@ -858,6 +867,12 @@ pub(crate) fn apply_profile_snapshot(
     profiles: Vec<crate::nm::WireguardProfile>,
     app_cfg: config::AppConfig,
 ) {
+    // The list arrives from a worker, so the first snapshot is the earliest
+    // point a starting selection can be made at all. Tracked as its own fact
+    // rather than inferred from an empty list: a snapshot that empties the list
+    // (every profile just deleted) would otherwise look like the first one, and
+    // the next refresh would move the cursor on its own.
+    let first_load = !state.profiles_loaded;
     state.rows = crate::app::profile_list::build_rows(
         &profiles,
         &app_cfg.excluded_profile_ids,
@@ -883,7 +898,13 @@ pub(crate) fn apply_profile_snapshot(
     state.active_profile_name = active_name;
     state.active_profile_uuid = active_uuid.clone();
 
-    if state.selected_index >= state.rows.len() {
+    if first_load {
+        // Start on the tunnel that is up: the row a user is most likely looking
+        // at. Only here, because a later refresh must not drag the cursor away
+        // from wherever it was moved to.
+        state.selected_index = state.rows.iter().position(|row| row.is_active).unwrap_or(0);
+        state.profiles_loaded = true;
+    } else if state.selected_index >= state.rows.len() {
         state.selected_index = state.rows.len().saturating_sub(1);
     }
 
@@ -1078,6 +1099,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_list_opens_on_the_active_profile_and_then_leaves_the_cursor_alone() {
+        use crate::nm::ProfileState;
+
+        let mut state = TuiState::new(
+            crate::testing::temp_config_path("tui-initial-selection"),
+            crate::config::AppConfig::default(),
+        );
+        let profiles = vec![
+            crate::testing::profile("wg-a", "uuid-a", ProfileState::Inactive),
+            crate::testing::profile("wg-b", "uuid-b", ProfileState::Active),
+            crate::testing::profile("wg-c", "uuid-c", ProfileState::Inactive),
+        ];
+        fn selected(state: &TuiState) -> Option<String> {
+            state.selected_row().map(|row| row.uuid.clone())
+        }
+
+        apply_profile_snapshot(&mut state, profiles.clone(), Default::default());
+        assert_eq!(
+            selected(&state).as_deref(),
+            Some("uuid-b"),
+            "the row that is connected is the one the user is looking at"
+        );
+
+        // The list is loaded by a worker, so a later refresh arriving with the
+        // same rows must leave the cursor where the user left it.
+        state.selected_index = 2;
+        apply_profile_snapshot(&mut state, profiles.clone(), Default::default());
+        assert_eq!(selected(&state).as_deref(), Some("uuid-c"));
+
+        // A snapshot that empties the list is not a first load. Inferring it from
+        // the empty list is what used to happen, and the next refresh with rows
+        // again would then move the cursor onto the active profile by itself.
+        apply_profile_snapshot(&mut state, Vec::new(), Default::default());
+        assert!(selected(&state).is_none(), "the list is empty");
+        apply_profile_snapshot(&mut state, profiles, Default::default());
+        assert_eq!(
+            selected(&state).as_deref(),
+            Some("uuid-a"),
+            "the selection is made once; a refresh must not make it again"
+        );
     }
 
     #[test]

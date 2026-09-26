@@ -11,13 +11,23 @@ directory replaces it.
 
 ## Tiers
 
-| Tier | Where | Covers | Preferred Command | Low-Level Shell Script |
+| Tier | Where | Covers | Preferred Command | Shell Alias |
 | --- | --- | --- | --- | --- |
 | Full suite (All tiers) | host + container | all host tests + all container tests | `cargo test-all` | `cargo test && ./testing/run-container-tests.sh` |
 | Unit + integration | host | logic, arg builders, TUI state | `cargo test` / `cargo test-all -- --host-only` | `cargo test` |
 | System — NetworkManager | container | real profiles, routing, parsers | `cargo test-system -- --nm` | `./testing/run-container-tests.sh --nm` |
 | System — firewall | container | real firewalld rules, teardown | `cargo test-system -- --firewall` | `./testing/run-container-tests.sh --firewall` |
+| System — uninstall | container | real `cargo install` / `cargo uninstall`, revocation order | `cargo test-system -- --uninstall` | `./testing/run-container-tests.sh --uninstall` |
 | Leak demonstrations | container | regression guards | `cargo test-leaks` | `./testing/run-container-tests.sh --leaks` |
+
+`./testing/run-container-tests.sh` takes the same flags and forwards to
+`cargo xtask`; it exists so the sandbox can be reached without remembering the
+task names, and deliberately holds no container flags of its own so the paths
+masked as tmpfs are listed in exactly one place.
+
+Every container tier runs on pull requests via the `System Tests (sandbox)` job in
+`.github/workflows/ci.yml`, so it is a gate rather than a local courtesy. The
+sandbox image is cached as a tarball keyed on `testing/Containerfile`.
 
 ### Custom Cargo Tasks (`cargo xtask`)
 
@@ -57,8 +67,9 @@ session classification still requires a real login session.
 
 ## Safety model
 
-The system tests create and delete real NetworkManager profiles and install a
-REJECT-all firewall ruleset. Two independent mechanisms keep that away from your
+The system tests create and delete real NetworkManager profiles, install a
+REJECT-all firewall ruleset, and install and then remove a real `cargo install`
+of Neutron itself. Two independent mechanisms keep that away from your
 machine.
 
 **1. They refuse to run outside the sandbox.** Every system test calls

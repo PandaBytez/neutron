@@ -4,6 +4,7 @@ pub mod qbittorrent;
 pub mod refresh_sync;
 pub mod split_tunnel;
 pub mod sync;
+pub mod uninstall;
 
 use clap::{Parser, Subcommand};
 
@@ -72,6 +73,18 @@ enum Commands {
     /// Run the persistent system tray AppIndicator daemon in the background
     #[command(alias = "daemon")]
     Indicator,
+    /// Restore factory defaults: revoke applied policies and clear every setting
+    Reset {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Revoke everything Neutron installed outside its package, then remove the package
+    Uninstall {
+        /// Also delete ~/.config/neutron (settings, eligibility, qBittorrent password)
+        #[arg(long)]
+        purge: bool,
+    },
     /// Terminate any running background daemon/processes and launch fresh instance
     Restart,
 }
@@ -135,7 +148,11 @@ enum QbitCommands {
         username: Option<String>,
         #[arg(long, help = "WebUI password")]
         password: Option<String>,
-        #[arg(long, help = "Bind qBittorrent to the active WireGuard interface")]
+        #[arg(
+            long,
+            value_name = "BOOL",
+            help = "Force interface binding on or off instead of deciding it from the URL"
+        )]
         bind: Option<bool>,
     },
 }
@@ -234,7 +251,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             Ok(())
         }
         Some(Commands::Restart) => {
-            kill_other_neutron_processes();
+            kill_other_neutron_processes(std::path::Path::new("/proc"));
             std::thread::sleep(std::time::Duration::from_millis(100));
             crate::tui::run(client.clone())
         }
@@ -244,6 +261,20 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::Lockdown { command }) => handle_lockdown_command(client, command),
         Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
         Some(Commands::Qbit { command }) => handle_qbit_command(client, command),
+        Some(Commands::Uninstall { purge }) => {
+            uninstall::handle_uninstall_command(client, &path, purge)
+        }
+        Some(Commands::Reset { yes }) => {
+            // A missing autostart directory means nothing was installed.
+            let autostart_dir = service::autostart::dir().ok();
+            uninstall::handle_reset_command(
+                client,
+                &path,
+                autostart_dir.as_deref(),
+                std::path::Path::new("/proc"),
+                yes,
+            )
+        }
     }
 }
 
@@ -474,13 +505,21 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
             println!("Lockdown saved intent: {label} (effective firewall state is not verified)");
         }
         LockdownCommands::Enable => {
-            set_global_lockdown(client, path, true)?;
+            // Escalates and rewrites the ruleset, so it blocks for as long as
+            // the user takes to authenticate. Show that something is happening.
+            crate::spinner::with_spinner("Enabling Lockdown", || {
+                set_global_lockdown(client, path, true)
+            })?;
             println!(
                 "Lockdown enabled: all traffic is blocked except the WireGuard tunnel, its handshake, and DNS."
             );
         }
         LockdownCommands::Disable => {
-            set_global_lockdown(client, path, false)?;
+            // The emergency path: a user reaching for this may be locked out, so
+            // it must look alive even while the prompt is up.
+            crate::spinner::with_spinner("Disabling Lockdown", || {
+                set_global_lockdown(client, path, false)
+            })?;
             println!("Lockdown disabled: normal connectivity restored.");
         }
     }
@@ -653,10 +692,10 @@ fn handle_qbit_command_with_path<C: NmClient>(
             );
             println!(
                 "Interface Binding: {}",
-                if qcfg.bind_interface {
-                    "Enabled"
+                if qcfg.binds_tunnel_interface() {
+                    "Tunnel interface"
                 } else {
-                    "Disabled"
+                    "None (WebUI is on another host)"
                 }
             );
             println!();
@@ -756,6 +795,10 @@ fn handle_qbit_command_with_path<C: NmClient>(
             }
             if let Some(bound) = report.bound_interface {
                 println!("Bound to interface: {}", bound);
+            } else if report.went_unbound(app_cfg.qbittorrent.binds_tunnel_interface()) {
+                // Said out loud, because "synchronized successfully" is otherwise
+                // the whole story and the forward still will not arrive.
+                println!("Warning: no tunnel interface to bind; the port may not be reachable.");
             }
         }
         QbitCommands::Enable => {
@@ -793,7 +836,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
                     app_cfg.qbittorrent.password = if pass.is_empty() { None } else { Some(pass) };
                 }
                 if let Some(b) = bind {
-                    app_cfg.qbittorrent.bind_interface = b;
+                    app_cfg.qbittorrent.bind_interface = Some(b);
                 }
             })?;
             println!("qBittorrent configuration updated.");
@@ -804,10 +847,12 @@ fn handle_qbit_command_with_path<C: NmClient>(
             );
             println!(
                 "Bind Interface: {}",
-                if app_cfg.qbittorrent.bind_interface {
-                    "true"
-                } else {
-                    "false"
+                match app_cfg.qbittorrent.bind_interface {
+                    Some(forced) => format!("{forced} (forced)"),
+                    None => format!(
+                        "{} (from the URL; override with --bind)",
+                        app_cfg.qbittorrent.binds_tunnel_interface()
+                    ),
                 }
             );
         }
@@ -840,42 +885,129 @@ pub fn rebuild_lockdown_if_enabled<C: FirewallClient>(
 }
 
 /// Terminate all running neutron processes on the system except the current process.
-pub fn kill_other_neutron_processes() {
-    let current_pid = std::process::id();
+/// SIGTERM every other Neutron process, so a fresh instance can take over.
+///
+/// `proc_root` is where processes are looked up: `/proc` in production, a
+/// scratch directory in tests. That parameter is not ceremony -- the scan ends
+/// in `kill(2)`, and a test that reached the real `/proc` would take down the
+/// developer's own daemon and TUI without anyone noticing what had happened.
+pub fn kill_other_neutron_processes(proc_root: &std::path::Path) {
+    #[cfg(unix)]
+    for found in neutron_processes_in(proc_root, std::process::id()) {
+        terminate(found.pid);
+    }
+    #[cfg(not(unix))]
+    let _ = proc_root;
+}
+
+/// SIGTERM the tray daemons, leaving any window alone, and report how many of
+/// them were still running afterwards.
+///
+/// A TUI is a session somebody is sitting in, and closing it is not this
+/// function's decision to make -- `uninstall` says what is still open instead.
+/// The wait matters because a daemon that is still up re-applies policies from
+/// settings that are being revoked underneath it.
+pub fn stop_daemons(proc_root: &std::path::Path, wait: std::time::Duration) -> usize {
     #[cfg(unix)]
     {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
+        let daemons: Vec<u32> = neutron_processes_in(proc_root, std::process::id())
+            .into_iter()
+            .filter(|found| found.is_daemon)
+            .map(|found| found.pid)
+            .collect();
+        for pid in &daemons {
+            terminate(*pid);
         }
-
-        let my_exe = std::env::current_exe().ok();
-
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(pid_str) = name.to_str() else {
-                    continue;
-                };
-                let Ok(pid) = pid_str.parse::<u32>() else {
-                    continue;
-                };
-                let exe_path = entry.path().join("exe");
-                let is_same_binary = match (&my_exe, std::fs::read_link(&exe_path)) {
-                    (Some(my), Ok(target)) => target == *my,
-                    _ => false,
-                };
-
-                let is_neutron_comm = std::fs::read_to_string(entry.path().join("comm"))
-                    .map(|comm| comm.trim() == "neutron")
-                    .unwrap_or(false);
-
-                if should_terminate_process(pid, current_pid, is_same_binary, is_neutron_comm) {
-                    unsafe {
-                        let _ = kill(pid as i32, 15); // SIGTERM
-                    }
-                }
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let still_running: Vec<u32> = neutron_processes_in(proc_root, std::process::id())
+                .into_iter()
+                .filter(|found| found.is_daemon && daemons.contains(&found.pid))
+                .map(|found| found.pid)
+                .collect();
+            if still_running.is_empty() || std::time::Instant::now() >= deadline {
+                return still_running.len();
             }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (proc_root, wait);
+        0
+    }
+}
+
+/// The other Neutron processes under `proc_root`, and which of them are the
+/// tray daemon rather than a window.
+///
+/// One scan for both callers: whether a process is the daemon is a property of
+/// its argv, and answering it twice would be two chances to disagree.
+#[cfg(unix)]
+fn neutron_processes_in(proc_root: &std::path::Path, current_pid: u32) -> Vec<FoundProcess> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return found;
+    };
+    let my_exe = std::env::current_exe().ok();
+
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let is_same_binary = match (&my_exe, std::fs::read_link(entry.path().join("exe"))) {
+            (Some(mine), Ok(target)) => target == *mine,
+            _ => false,
+        };
+        let is_neutron_comm = std::fs::read_to_string(entry.path().join("comm"))
+            .is_ok_and(|comm| comm.trim() == "neutron");
+
+        if should_terminate_process(pid, current_pid, is_same_binary, is_neutron_comm) {
+            found.push(FoundProcess {
+                pid,
+                is_daemon: runs_daemon_subcommand(entry.path().join("cmdline")),
+            });
+        }
+    }
+    found.sort_by_key(|process| process.pid);
+    found
+}
+
+/// A process the scan would signal, and whether it is the tray daemon.
+#[cfg(unix)]
+struct FoundProcess {
+    pid: u32,
+    is_daemon: bool,
+}
+
+/// Whether a process was started as `neutron indicator` (or its `daemon` alias).
+///
+/// argv[1] rather than "some argument": a path that happens to contain the word
+/// must not make a window look like the daemon.
+#[cfg(unix)]
+fn runs_daemon_subcommand(cmdline: std::path::PathBuf) -> bool {
+    let Ok(raw) = std::fs::read(cmdline) else {
+        return false;
+    };
+    raw.split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .nth(1)
+        .is_some_and(|arg| arg == b"indicator" || arg == b"daemon")
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SIGTERM: the daemon and a TUI both hold a terminal-independent loop, and
+    // neither needs to be interrupted mid-write.
+    unsafe {
+        let _ = kill(pid as i32, 15);
     }
 }
 
@@ -898,6 +1030,7 @@ fn resolve_profile_id(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -965,7 +1098,7 @@ mod tests {
                 .to_string()
                 .contains("application completed but saving failed")
         );
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:off"]);
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:teardown:rules"]);
         let saved = config::load(&path).unwrap();
         assert!(saved.lockdown_enabled);
         let mut state = crate::tui::state::TuiState::new(path.clone(), saved);
@@ -1060,9 +1193,82 @@ mod tests {
     }
 
     #[test]
+    fn the_process_scan_only_ever_sees_the_root_it_is_handed() {
+        // The regression this exists for: the scan used to read `/proc` itself,
+        // so every `cargo test` run SIGTERMed the developer's own daemon and TUI
+        // -- the reset tests call it, and nothing about that is visible in the
+        // test output. A hardcoded root again fails here, in a scratch dir.
+        let proc = crate::testing::scratch_dir("proc-entries");
+        let entry = |pid: u32, comm: &str| {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(&dir).expect("proc entry should be created");
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm should be written");
+        };
+        entry(4242, "neutron");
+        entry(4243, "sleep");
+
+        let found = neutron_processes_in(&proc, 42);
+
+        assert_eq!(
+            found.iter().map(|process| process.pid).collect::<Vec<_>>(),
+            vec![4242],
+            "only what is under the given root, and only processes named neutron"
+        );
+        let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn a_proc_root_that_cannot_be_read_terminates_nothing() {
+        assert!(
+            neutron_processes_in(
+                &crate::testing::scratch_dir("proc-missing").join("gone"),
+                std::process::id()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_daemon_is_told_apart_from_a_window_by_its_subcommand() {
+        // `uninstall` stops the daemon and leaves a window alone, so the scan has
+        // to answer that from argv rather than treating every Neutron process the
+        // same. A zombie has no argv at all and is neither.
+        let proc = crate::testing::scratch_dir("proc-daemons");
+        let entry = |pid: u32, argv: &[&str]| {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(&dir).expect("proc entry should be created");
+            std::fs::write(dir.join("comm"), "neutron\n").expect("comm should be written");
+            let raw: Vec<u8> = argv
+                .iter()
+                .flat_map(|arg| arg.as_bytes().iter().copied().chain(std::iter::once(0u8)))
+                .collect();
+            std::fs::write(dir.join("cmdline"), raw).expect("cmdline should be written");
+        };
+        entry(100, &["/usr/bin/neutron", "indicator"]);
+        entry(200, &["/usr/bin/neutron", "daemon"]);
+        entry(300, &["/usr/bin/neutron"]);
+        entry(400, &["/usr/bin/neutron", "tui"]);
+
+        let found = neutron_processes_in(&proc, 42);
+        let daemons: Vec<u32> = found
+            .iter()
+            .filter(|process| process.is_daemon)
+            .map(|process| process.pid)
+            .collect();
+
+        assert_eq!(
+            daemons,
+            vec![100, 200],
+            "only the daemon subcommand is the daemon"
+        );
+        assert_eq!(found.len(), 4, "a window is still a Neutron process");
+        let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    #[test]
     fn kill_switch_enable_applies_globally_and_persists() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path)
             .expect("enable should succeed");
@@ -1070,13 +1276,13 @@ mod tests {
         assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:on"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.kill_switch_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn kill_switch_disable_applies_globally_and_persists() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -1092,13 +1298,13 @@ mod tests {
         assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:off"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(!persisted.kill_switch_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn kill_switch_status_does_not_change_nm_or_config() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -1115,13 +1321,13 @@ mod tests {
         assert!(client.kill_switch_calls().is_empty());
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.kill_switch_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn kill_switch_status_defaults_to_off_without_config() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         // No config file: status reads the default (off) instead of erroring,
         // and still does not invoke NetworkManager.
@@ -1129,14 +1335,14 @@ mod tests {
             .expect("status should succeed with default config");
 
         assert!(client.kill_switch_calls().is_empty());
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn kill_switch_enable_does_not_persist_when_nm_fails() {
         let client =
             crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_kill_switch();
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         let result =
             handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path);
@@ -1153,14 +1359,14 @@ mod tests {
         assert_eq!(client.kill_switch_calls(), vec!["kill-switch-all:on"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(!persisted.kill_switch_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn kill_switch_disable_keeps_previous_state_when_nm_fails() {
         let client =
             crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_kill_switch();
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -1183,13 +1389,13 @@ mod tests {
         // A failed disable must leave the previously-enabled state intact.
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.kill_switch_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn kill_switch_enable_then_disable_round_trips_state() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path)
             .expect("enable should succeed");
@@ -1211,13 +1417,13 @@ mod tests {
             client.kill_switch_calls(),
             vec!["kill-switch-all:on", "kill-switch-all:off"]
         );
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn lockdown_enable_applies_and_persists() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path)
             .expect("enable should succeed");
@@ -1225,7 +1431,7 @@ mod tests {
         assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.lockdown_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -1234,7 +1440,7 @@ mod tests {
         // is blocked by the terminal DROP, so the ruleset has to be rebuilt
         // whenever the profile set changes.
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -1247,7 +1453,7 @@ mod tests {
         rebuild_lockdown_if_enabled(&client, &path).expect("rebuild should succeed");
 
         assert_eq!(client.lockdown_calls(), vec!["lockdown:refresh"]);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -1255,19 +1461,19 @@ mod tests {
         // Callers invoke this unconditionally after any profile change, so it
         // must not install a ruleset the user never asked for.
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(&path, &config::AppConfig::default()).expect("config should save");
 
         rebuild_lockdown_if_enabled(&client, &path).expect("rebuild should succeed");
 
         assert!(client.lockdown_calls().is_empty());
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn lockdown_disable_applies_and_persists() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -1280,16 +1486,16 @@ mod tests {
         handle_lockdown_command_with_path(&client, LockdownCommands::Disable, &path)
             .expect("disable should succeed");
 
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:off"]);
+        assert_eq!(client.lockdown_calls(), vec!["lockdown:teardown:rules"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(!persisted.lockdown_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn lockdown_status_does_not_change_firewall_or_config() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -1306,13 +1512,13 @@ mod tests {
         assert!(client.lockdown_calls().is_empty());
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.lockdown_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn lockdown_status_defaults_to_off_without_config() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         // No config file: status reads the default (off) instead of erroring,
         // and still does not invoke the firewall.
@@ -1320,14 +1526,14 @@ mod tests {
             .expect("status should succeed with default config");
 
         assert!(client.lockdown_calls().is_empty());
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn lockdown_enable_does_not_persist_when_firewall_fails() {
         let client =
             crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_lockdown();
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         let result = handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path);
 
@@ -1343,14 +1549,14 @@ mod tests {
         assert_eq!(client.lockdown_calls(), vec!["lockdown:on"]);
         let persisted = config::load(&path).expect("config should load");
         assert!(!persisted.lockdown_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn lockdown_disable_keeps_previous_state_when_firewall_fails() {
         let client =
             crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_lockdown();
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -1372,13 +1578,13 @@ mod tests {
         // A failed disable must leave the previously-enabled state intact.
         let persisted = config::load(&path).expect("config should load");
         assert!(persisted.lockdown_enabled);
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn lockdown_enable_then_disable_round_trips_state() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path)
             .expect("enable should succeed");
@@ -1396,14 +1602,17 @@ mod tests {
                 .lockdown_enabled
         );
 
-        assert_eq!(client.lockdown_calls(), vec!["lockdown:on", "lockdown:off"]);
-        cleanup_test_config(&path);
+        assert_eq!(
+            client.lockdown_calls(),
+            vec!["lockdown:on", "lockdown:teardown:rules"]
+        );
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn split_tunnel_commands_flow() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         // 1. Set mode to include
         handle_split_tunnel_command_with_path(
@@ -1454,7 +1663,7 @@ mod tests {
             config::SplitTunnelMode::Disabled
         );
 
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -1462,7 +1671,7 @@ mod tests {
         use crate::config::PortForwardMode;
 
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         handle_qbit_command_with_path(&client, QbitCommands::Enable, &path)
             .expect("enable should succeed");
@@ -1474,13 +1683,13 @@ mod tests {
         let loaded = config::load(&path).expect("config should load");
         assert_eq!(loaded.port_forwarding.mode, PortForwardMode::Forward);
 
-        cleanup_test_config(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
     fn qbit_config_updates_settings() {
         let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
-        let path = unique_test_config_path();
+        let path = crate::testing::temp_config_path("app");
 
         handle_qbit_command_with_path(
             &client,
@@ -1498,16 +1707,10 @@ mod tests {
         assert_eq!(loaded.qbittorrent.url, "http://192.168.1.100:8080");
         assert_eq!(loaded.qbittorrent.username.as_deref(), Some("myuser"));
         assert_eq!(loaded.qbittorrent.password.as_deref(), Some("mypass"));
-        assert!(loaded.qbittorrent.bind_interface);
+        // Forced, so a WebUI at an address the URL cannot place on this machine
+        // still binds.
+        assert!(loaded.qbittorrent.binds_tunnel_interface());
 
-        cleanup_test_config(&path);
-    }
-
-    fn unique_test_config_path() -> std::path::PathBuf {
-        crate::testing::temp_config_path("app")
-    }
-
-    fn cleanup_test_config(path: &std::path::Path) {
-        crate::testing::remove_temp_config(path);
+        crate::testing::remove_temp_config(&path);
     }
 }

@@ -93,6 +93,28 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
+### Day-to-day commands
+
+Most maintenance is a cargo alias, so nothing needs installing first:
+
+| Command | What it does |
+| :--- | :--- |
+| `cargo reinstall` | Rebuild and install the binary, **keeping your lockdown state and settings** |
+| `cargo lint` | `cargo fmt --check` plus strict clippy |
+| `cargo test` | Host unit and integration tests |
+| `cargo test-all` | Host tests, then the system tests in the disposable sandbox |
+| `cargo docs` | Build this documentation |
+
+`cargo reinstall` is the one to reach for while working on the app: it runs
+`cargo install --path . --force` and touches nothing privileged, so you do not
+disable lockdown and re-authenticate on every rebuild. It verifies your settings
+came through unchanged and restores them if anything touches them.
+
+Two caveats it deliberately does not hide: the root-owned refresh helper is a
+*copy* of the binary taken when lockdown was enabled, so after changing firewall
+code run `neutron lockdown enable` once to refresh it; and system tests need
+Podman — see [testing](docs/testing.md).
+
 ### Auto-Connect at Login
 
 Auto-connect is **off by default**. Press **`a`** in the TUI to enable it and install the desktop autostart entry,
@@ -115,5 +137,46 @@ Existing protection stays in place if an automatic refresh cannot be authorized.
 Enabling lockdown also enables firewalld at boot on systemd systems. Polkit 126+
 uses `/usr/local/share/polkit-1/actions`, supporting immutable `/usr`; older
 versions require a writable `/usr/share/polkit-1/actions`.
+
+### Resetting to factory defaults
+
+`neutron reset` returns the app to a first-run state: it withdraws every policy
+Neutron applied (the lockdown ruleset and its root-owned helper, the kill switch,
+the split-tunnel routes), clears all settings — eligibility pool, favorites,
+notes, qBittorrent credentials — and removes the autostart entry. It asks you to
+type `reset` to confirm, or takes `--yes` unattended; a non-interactive stdin
+refuses rather than wiping anything.
+
+Your WireGuard profiles are only edited to withdraw what Neutron wrote, and the
+profile drop directory is reported and left alone. Lockdown teardown runs first
+and aborts the reset on failure, so a half-finished reset can never leave a
+machine firewalled with no configuration explaining why.
+
+### Uninstalling
+
+Run `neutron uninstall` as your normal user. It stops the tray daemon, then — in
+a single privileged batch, so at most one password prompt — lifts lockdown if any
+of its state is actually present, revokes the password-free refresh grant (the
+root-owned helper and its polkit action), and removes the autostart entry. It then
+hands the binary to whichever package manager installed it: `brew uninstall
+neutron` for a Homebrew install, `cargo uninstall neutron` for a `cargo install`.
+An install that never enabled lockdown prompts for nothing at all.
+
+Those root-owned files live outside the package's own file list, and no packaging
+hook can remove them: Homebrew's `post_uninstall` runs *after* the files are gone,
+with no way to authenticate. So the teardown has to happen while the binary still
+exists — which is why it is a subcommand rather than a package script. The grant
+is revoked here rather than by `neutron lockdown disable`, so turning lockdown
+off and back on again does not cost a second password prompt.
+
+`~/.config/neutron` is **kept** (eligibility pool, favorites, settings) so a
+reinstall finds it intact; add `--purge` to delete it too, which is also how the
+stored qBittorrent password goes away. A drop directory configured *outside* it
+is always left alone, since it holds your own files.
+
+An install Neutron does not recognize — an AppImage, a distro package — is
+refused with an explanation and **nothing is changed**, rather than guessing a
+package manager. If the package is already gone and rules were left behind, see
+[the manual recovery steps](docs/security.md#uninstalling-revokes-everything-it-installed).
 
 ---
