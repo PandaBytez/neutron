@@ -889,17 +889,12 @@ mod tests {
         let found = running_instances_in(&scratch("no-proc"), Path::new("/nope"));
         assert!(found.daemons.is_empty() && found.others.is_empty());
     }
-}
 
-#[cfg(test)]
-mod reinstall_usage_tests {
-    use super::REINSTALL_USAGE;
-
+    /// This text is the only discoverability a new contributor has, so the
+    /// two things that surprise people -- what survives, and the stale helper
+    /// -- have to be in it.
     #[test]
     fn the_usage_says_what_is_kept_and_what_is_not() {
-        // This text is the only discoverability a new contributor has, so the
-        // two things that surprise people -- what survives, and the stale helper
-        // -- have to be in it.
         for expected in [
             "lockdown",
             "settings",

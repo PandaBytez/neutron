@@ -138,26 +138,28 @@ fn snapshot(log: &Mutex<Vec<String>>) -> Vec<String> {
     log.lock().expect("mock mutex poisoned").clone()
 }
 
-/// Create a unique temporary path for test configuration files.
-pub fn temp_config_path(label: &str) -> PathBuf {
+/// A directory of this run's own, named after `label`.
+///
+/// The clock is the only thing separating two tests that want the same label,
+/// which is why every temporary path here goes through this: a shared prefix
+/// would be a shared prefix, and a copied suffix would be one copy too few when
+/// someone adds the next one.
+fn unique_test_dir(label: &str) -> PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time should move forward")
         .as_nanos();
-    std::env::temp_dir()
-        .join(format!("neutron-vpn-test-{label}-{suffix}"))
-        .join("config.json")
+    std::env::temp_dir().join(format!("neutron-vpn-test-{label}-{suffix}"))
+}
+
+/// Create a unique temporary path for test configuration files.
+pub fn temp_config_path(label: &str) -> PathBuf {
+    unique_test_dir(label).join("config.json")
 }
 
 /// Create a unique temporary path for test TOML configuration files.
 pub fn temp_toml_config_path(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    std::env::temp_dir()
-        .join(format!("neutron-vpn-test-{label}-{suffix}"))
-        .join("config.toml")
+    unique_test_dir(label).join("config.toml")
 }
 
 /// An empty directory to stand in for `/proc`.
@@ -167,11 +169,7 @@ pub fn temp_toml_config_path(label: &str) -> PathBuf {
 /// reaching the real `/proc` would take down the developer's own daemon and TUI
 /// as a side effect of running the suite.
 pub fn scratch_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("neutron-vpn-test-{label}-{suffix}"));
+    let dir = unique_test_dir(label);
     std::fs::create_dir_all(&dir).expect("scratch dir should be created");
     dir
 }

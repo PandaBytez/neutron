@@ -896,6 +896,8 @@ pub fn kill_other_neutron_processes(proc_root: &std::path::Path) {
     for found in neutron_processes_in(proc_root, std::process::id()) {
         terminate(found.pid);
     }
+    #[cfg(not(unix))]
+    let _ = proc_root;
 }
 
 /// SIGTERM the tray daemons, leaving any window alone, and report how many of
