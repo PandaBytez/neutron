@@ -1559,6 +1559,33 @@ mod tests {
     }
 
     #[test]
+    fn split_tunnel_arg_batches_target_every_profile() {
+        use crate::config::SplitTunnelMode;
+
+        let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-eu", "uuid-2")];
+        let v4 = vec!["10.0.0.0/8".to_string()];
+        let v6: Vec<String> = Vec::new();
+
+        let batches = split_tunnel_arg_batches(&profiles, SplitTunnelMode::Exclude, &v4, &v6);
+
+        // One batch per profile, each targeting its own UUID with the same
+        // routes -- like the kill-switch and autoconnect fan-outs above.
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0],
+            split_tunnel::set_args("uuid-1", SplitTunnelMode::Exclude, &v4, &v6)
+        );
+        assert_eq!(
+            batches[1],
+            split_tunnel::set_args("uuid-2", SplitTunnelMode::Exclude, &v4, &v6)
+        );
+        assert!(
+            split_tunnel_arg_batches(&[], SplitTunnelMode::Exclude, &v4, &v6).is_empty(),
+            "no profiles means no `nmcli` calls at all"
+        );
+    }
+
+    #[test]
     fn apply_to_every_profile_continues_after_a_failure() {
         // Regression: aborting on the first failure left every later profile on
         // NetworkManager's `autoconnect=yes` default, so all of them activated

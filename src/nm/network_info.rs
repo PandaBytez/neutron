@@ -284,6 +284,55 @@ mod tests {
     }
 
     #[test]
+    fn format_display_with_partial_location() {
+        // ISP but no location: the ISP stands in for the location slot.
+        let info = PublicIpInfo {
+            ip: "1.1.1.1".to_string(),
+            country: None,
+            city: None,
+            isp: Some("Cloudflare".to_string()),
+        };
+        assert_eq!(info.format_display(), "1.1.1.1 (Cloudflare)");
+
+        // Location but no ISP: no trailing separator left behind.
+        let info = PublicIpInfo {
+            ip: "1.1.1.1".to_string(),
+            country: Some("Germany".to_string()),
+            city: None,
+            isp: None,
+        };
+        assert_eq!(info.format_display(), "1.1.1.1 (Germany)");
+    }
+
+    #[test]
+    fn json_str_reads_present_non_empty_string_fields() {
+        let value = serde_json::json!({
+            "ip": "9.9.9.9",
+            "empty": "",
+            "count": 42,
+            "nested": {"ip": "1.1.1.1"},
+        });
+        assert_eq!(json_str(&value, "ip").as_deref(), Some("9.9.9.9"));
+        assert_eq!(json_str(&value, "missing"), None);
+        assert_eq!(json_str(&value, "empty"), None);
+        assert_eq!(json_str(&value, "count"), None);
+        assert_eq!(json_str(&value, "nested"), None);
+    }
+
+    #[test]
+    fn parse_ping_latency_reads_the_time_field() {
+        let stdout = "64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=12.3 ms\n";
+        assert_eq!(parse_ping_latency(stdout), Some(12));
+        // Rounds, and the first time= token wins.
+        let stdout = "time=12.5 ms time=99.9 ms\n";
+        assert_eq!(parse_ping_latency(stdout), Some(13));
+        // No timing line, or garbage after time=, means no latency.
+        assert_eq!(parse_ping_latency("PING 1.1.1.1\n"), None);
+        assert_eq!(parse_ping_latency("time=ms\n"), None);
+        assert_eq!(parse_ping_latency(""), None);
+    }
+
+    #[test]
     fn format_speed_units() {
         assert_eq!(format_speed(500), "500 B/s");
         assert_eq!(format_speed(1500), "1.5 KB/s");

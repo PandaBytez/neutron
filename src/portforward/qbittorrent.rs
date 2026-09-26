@@ -581,6 +581,80 @@ mod tests {
     }
 
     #[test]
+    fn app_version_retries_once_after_auth_expiry() {
+        use crate::testing::MockQBittorrentWebUi;
+
+        if !crate::testing::curl_available() {
+            eprintln!("Skipping auth-expiry test: 'curl' is not installed in the environment.");
+            return;
+        }
+        // An expired session has to be re-authenticated *and* retried. With no
+        // credentials configured, `login()` returns before any HTTP, so the
+        // re-authentication half would not happen and the test would still pass.
+        // The conversation: authenticate, get a session, have that session
+        // rejected, authenticate again, and only then retry. Scripting it in that
+        // order is the point -- a client with no cookie logs in *first*, so a 403
+        // in the first slot would fail the login rather than expire a session.
+        let session = "HTTP/1.1 200 OK\r\nSet-Cookie: SID=mock_session; Path=/\r\nContent-Length: 3\r\n\r\nOk.";
+        let server = MockQBittorrentWebUi::scripted(vec![
+            session,
+            "HTTP/1.1 403 Forbidden\r\n\r\nFails.",
+            session,
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nv5.0.3",
+        ]);
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            url: server.url(),
+            username: Some("admin".to_string()),
+            password: Some("adminadmin".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            client.app_version().expect("retry should succeed"),
+            "v5.0.3"
+        );
+        assert_eq!(
+            server.paths(),
+            vec![
+                "/api/v2/auth/login",
+                "/api/v2/app/version",
+                "/api/v2/auth/login",
+                "/api/v2/app/version"
+            ],
+            "the retry must be preceded by a fresh login, not sent with the dead cookie"
+        );
+    }
+
+    #[test]
+    fn app_version_reports_persistent_failures() {
+        use crate::testing::MockQBittorrentWebUi;
+
+        if !crate::testing::curl_available() {
+            eprintln!("Skipping failure test: 'curl' is not installed in the environment.");
+            return;
+        }
+        // A 500 is not a 403, so there is nothing to re-authenticate: the call
+        // must fail outright rather than retry a status that will not change.
+        let server =
+            MockQBittorrentWebUi::scripted(vec!["HTTP/1.1 500 Internal Server Error\r\n\r\nboom"]);
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            url: server.url(),
+            ..Default::default()
+        });
+
+        let error = client.app_version().unwrap_err();
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "a broken WebUI must be reported with its status: {error}"
+        );
+        assert_eq!(
+            server.paths(),
+            vec!["/api/v2/app/version"],
+            "one attempt: a server error is not an expired session"
+        );
+    }
+
+    #[test]
     fn mock_webui_server_login_and_sync_port() {
         use crate::testing::{MockQBittorrentWebUi, curl_available};
 

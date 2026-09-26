@@ -337,6 +337,14 @@ mod tests {
     }
 
     #[test]
+    fn format_global_status_names_empty_lists() {
+        let status = format_global_status(&SplitTunnelConfig::default());
+        assert!(status.contains("disabled"));
+        assert!(status.contains("CIDRs: (none)"));
+        assert!(status.contains("Domains: (none)"));
+    }
+
+    #[test]
     fn apply_and_persist_rejects_unresolvable_domain() {
         let profile = test_profile();
         let client = MockNmClient::new(vec![profile]);

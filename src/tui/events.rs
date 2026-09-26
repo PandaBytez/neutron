@@ -1102,6 +1102,237 @@ mod tests {
     }
 
     #[test]
+    fn connection_actions_queue_on_the_worker_instead_of_blocking() {
+        // With a connect worker attached, toggle/switch/disconnect must only
+        // mark `connecting` and queue the request: the worker owns the
+        // blocking nmcli calls. Without this, the event loop would stall and
+        // the TUI would stop repainting mid-connect.
+        let client = crate::testing::MockNmClient::new(vec![
+            crate::testing::profile("wg-us", "uuid-1", crate::nm::ProfileState::Inactive),
+            crate::testing::profile("wg-eu", "uuid-2", crate::nm::ProfileState::Active),
+        ]);
+        let path = crate::testing::temp_config_path("tui-async-connect");
+        crate::config::save(&path, &crate::config::AppConfig::default())
+            .expect("config should save");
+        let mut state = TuiState::new(path.clone(), crate::config::AppConfig::default());
+        reload_profiles(&mut state, &client).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.connect_tx = Some(tx);
+
+        let inactive = state
+            .rows
+            .iter()
+            .position(|row| !row.is_active)
+            .expect("an inactive row");
+        state.selected_index = inactive;
+        let (uuid, name) = (
+            state.rows[inactive].uuid.clone(),
+            state.rows[inactive].name.clone(),
+        );
+
+        // Toggle on an inactive row queues a connect and touches nothing.
+        execute_action(&mut state, &client, "toggle").expect("toggle should queue");
+        let connecting = state
+            .connecting
+            .as_ref()
+            .expect("toggle must mark connecting");
+        assert_eq!(connecting.uuid, uuid);
+        assert!(!connecting.is_disconnect);
+        assert_eq!(rx.try_recv(), Ok((uuid.clone(), name.clone(), true)));
+        assert!(
+            client.calls().is_empty(),
+            "queued connects must not run inline: {:?}",
+            client.calls()
+        );
+
+        // A second action while connecting is a no-op, not a second queue entry.
+        execute_action(&mut state, &client, "toggle").expect("repeat toggle should be ignored");
+        assert!(rx.try_recv().is_err());
+        state.connecting = None;
+
+        // Switch queues a connect for the selected row.
+        execute_action(&mut state, &client, "switch").expect("switch should queue");
+        assert!(state.connecting.as_ref().is_some_and(|c| !c.is_disconnect));
+        assert_eq!(rx.try_recv(), Ok((uuid.clone(), name.clone(), true)));
+        state.connecting = None;
+
+        // Switch on the active row is a no-op.
+        let active = state
+            .rows
+            .iter()
+            .position(|row| row.is_active)
+            .expect("an active row");
+        state.selected_index = active;
+        execute_action(&mut state, &client, "switch").expect("active switch should be ignored");
+        assert!(state.connecting.is_none());
+        assert!(rx.try_recv().is_err());
+
+        // Disconnect queues a teardown for the active profile.
+        execute_action(&mut state, &client, "disconnect").expect("disconnect should queue");
+        let connecting = state
+            .connecting
+            .as_ref()
+            .expect("disconnect must mark connecting");
+        assert!(connecting.is_disconnect);
+        assert_eq!(
+            rx.try_recv(),
+            Ok((String::new(), connecting.name.clone(), false))
+        );
+        assert!(
+            client.calls().is_empty(),
+            "queued disconnects must not run inline: {:?}",
+            client.calls()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_queues_on_the_worker_instead_of_blocking() {
+        use crate::tui::state::AsyncAction;
+
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "wg-del",
+            "uuid-del",
+            crate::nm::ProfileState::Inactive,
+        )]);
+        let path = crate::testing::temp_config_path("tui-async-delete");
+        crate::config::save(&path, &crate::config::AppConfig::default())
+            .expect("config should save");
+        let mut state = TuiState::new(path.clone(), crate::config::AppConfig::default());
+        reload_profiles(&mut state, &client).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.action_tx = Some(tx);
+
+        execute_action(&mut state, &client, "delete").expect("delete should open the modal");
+        assert!(matches!(state.modal, ActiveModal::ConfirmDelete { .. }));
+
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .expect("confirm should queue");
+        assert_eq!(state.modal, ActiveModal::None);
+        assert_eq!(state.status_message, "Deleting profile in background...");
+        match rx.try_recv() {
+            Ok(AsyncAction::Delete(uuid)) => assert_eq!(uuid, "uuid-del"),
+            other => panic!("expected a queued delete, got {other:?}"),
+        }
+        assert!(
+            client.calls().is_empty(),
+            "queued deletes must not run inline: {:?}",
+            client.calls()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn theme_apply_failure_reports_an_error() {
+        // config::update cannot create the config when a file blocks its
+        // parent directory, so applying a theme must toast an error rather
+        // than pretend the theme changed.
+        let blocker = crate::testing::temp_config_path("tui-theme-blocker");
+        std::fs::create_dir_all(blocker.parent().expect("blocker has a parent"))
+            .expect("blocker dir should be created");
+        std::fs::write(&blocker, "not a directory").expect("blocker should exist");
+        let path = blocker.join("config.toml");
+        let mut state = TuiState::new(path, crate::config::AppConfig::default());
+        state.modal = ActiveModal::ThemePicker(crate::tui::state::ThemePickerState::default());
+
+        handle_key_event(
+            &mut state,
+            &crate::testing::MockNmClient::default(),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .expect("theme apply must not abort");
+        assert!(
+            state.status_is_error,
+            "a failed theme save must raise an error toast, not a confirmation"
+        );
+
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn sync_with_nothing_new_reports_a_refresh() {
+        let client = crate::testing::MockNmClient::default();
+        let inbox = std::env::temp_dir().join(format!(
+            "neutron-sync-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&inbox).expect("inbox should be created");
+        let path = crate::testing::temp_config_path("tui-sync-refresh");
+        let mut app_cfg = crate::config::AppConfig::default();
+        app_cfg.general.profiles_dir = inbox.to_string_lossy().to_string();
+        crate::config::save(&path, &app_cfg).expect("config should save");
+        let mut state = TuiState::new(path.clone(), app_cfg);
+        assert!(state.action_tx.is_none());
+
+        execute_action(&mut state, &client, "sync").expect("sync should succeed");
+        assert_eq!(state.status_message, "Refreshed profiles.");
+        assert!(!state.status_is_error);
+
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sync_with_an_unreadable_inbox_reports_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Directory permissions do not stop root, so the read failure below
+        // cannot be triggered deterministically as root.
+        if crate::testing::running_as_root() {
+            eprintln!(
+                "Skipping unreadable-inbox test: running as root ignores directory permissions."
+            );
+            return;
+        }
+        let client = crate::testing::MockNmClient::default();
+        let inbox = std::env::temp_dir().join(format!(
+            "neutron-sync-unreadable-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&inbox).expect("inbox should be created");
+        // Strip every permission: listing needs read, so 0o555 would still
+        // list. (ensure_profiles_dir only chmods on creation, so this sticks.)
+        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o000))
+            .expect("inbox should be made unreadable");
+        let path = crate::testing::temp_config_path("tui-sync-error");
+        let mut app_cfg = crate::config::AppConfig::default();
+        app_cfg.general.profiles_dir = inbox.to_string_lossy().to_string();
+        crate::config::save(&path, &app_cfg).expect("config should save");
+        let mut state = TuiState::new(path.clone(), app_cfg);
+
+        execute_action(&mut state, &client, "sync").expect("sync must not abort");
+        assert!(
+            state.status_is_error,
+            "an unreadable inbox must raise an error toast, not a confirmation"
+        );
+        assert!(
+            state
+                .status_message
+                .contains("Failed to read profiles directory"),
+            "the toast must say what failed: {}",
+            state.status_message
+        );
+
+        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn the_list_opens_on_the_active_profile_and_then_leaves_the_cursor_alone() {
         use crate::nm::ProfileState;
 

@@ -1109,6 +1109,68 @@ mod tests {
     }
 
     #[test]
+    fn live_removal_only_targets_marked_rules_in_managed_chains() {
+        // Both scope variants must enumerate, filter, and remove one marked
+        // rule at a time -- never a chain-wide wipe, never a foreign rule.
+        for permanent in [true, false] {
+            let script = live_removal_script(permanent, true);
+            if permanent {
+                assert!(
+                    script.contains("firewall-cmd --permanent --direct --get-all-rules"),
+                    "permanent teardown must list permanent rules: {script}"
+                );
+            } else {
+                assert!(
+                    !script.contains("--permanent"),
+                    "runtime teardown must not touch permanent rules: {script}"
+                );
+            }
+            for chain in [
+                "ipv4:mangle:OUTPUT",
+                "ipv6:mangle:OUTPUT",
+                "ipv4:filter:OUTPUT",
+                "ipv6:filter:OUTPUT",
+            ] {
+                assert!(
+                    script.contains(chain),
+                    "teardown must stay inside managed chains ({chain}): {script}"
+                );
+            }
+            assert!(
+                script.contains("[ \"$#\" -ge 5 ] || continue"),
+                "teardown must skip malformed lines: {script}"
+            );
+            assert!(
+                script.contains(&format!("'{LOCKDOWN_MARKER}'")),
+                "teardown must key off the exact marker: {script}"
+            );
+            assert!(
+                script.contains("--remove-rule \"$@\""),
+                "teardown must remove one rule at a time: {script}"
+            );
+            assert!(
+                !script.contains("--remove-rules"),
+                "teardown must never wipe a whole chain: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_removal_guard_line_follows_keep_guards() {
+        // During a rebuild the fail-closed guards must survive the sweep
+        // (`$4` is the rule priority; -1 marks a guard); on disable the
+        // guards go too.
+        assert!(
+            live_removal_script(true, true).contains("[ \"$4\" != -1 ] || continue"),
+            "guards must be kept on rebuild"
+        );
+        assert!(
+            !live_removal_script(true, false).contains("$4"),
+            "guards must be removed on disable"
+        );
+    }
+
+    #[test]
     fn parse_marked_removals_ignores_a_foreign_rule_with_its_own_comment() {
         // A foreign rule that uses the comment match with a *different* comment
         // must be left alone: teardown keys off our exact marker, not the mere

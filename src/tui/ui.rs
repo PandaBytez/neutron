@@ -1843,6 +1843,47 @@ mod render_tests {
     }
 
     #[test]
+    fn the_split_modal_warns_about_lockdown_only_when_active() {
+        let render_with_lockdown = |lockdown_enabled: bool| -> String {
+            let config = AppConfig {
+                lockdown_enabled,
+                ..AppConfig::default()
+            };
+            let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
+            state.modal = ActiveModal::SplitTunnel(SplitTunnelModalState::from_config(
+                &state.config.global_split_tunnel,
+            ));
+
+            let mut terminal =
+                Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+            terminal
+                .draw(|frame| {
+                    render(frame, &state);
+                })
+                .expect("draw should succeed");
+
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
+                .join("\n")
+        };
+
+        assert!(
+            render_with_lockdown(true).contains("Lockdown Active"),
+            "the split modal must warn while lockdown drops non-tunnel traffic"
+        );
+        assert!(
+            !render_with_lockdown(false).contains("Lockdown Active"),
+            "the warning must not appear when lockdown is off"
+        );
+    }
+
+    #[test]
     fn the_port_forward_modal_renders_all_three_modes() {
         let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
         state.modal = ActiveModal::PortForward(PortForwardModalState::from_config(

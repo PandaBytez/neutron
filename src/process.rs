@@ -160,6 +160,29 @@ mod tests {
     }
 
     #[test]
+    fn format_command_error_prefers_stderr_over_prefix() {
+        let status = std::process::Command::new("false")
+            .status()
+            .expect("false should run");
+        assert_eq!(
+            format_command_error("prefix", status, "oops\n"),
+            "oops (exit 1)"
+        );
+
+        let status = std::process::Command::new("true")
+            .status()
+            .expect("true should run");
+        assert_eq!(
+            format_command_error("prefix", status, ""),
+            "prefix (exit 0)"
+        );
+        assert_eq!(
+            format_command_error("prefix", status, "   \n"),
+            "prefix (exit 0)"
+        );
+    }
+
+    #[test]
     fn host_command_creates_command_for_program() {
         let command = host_command("nmcli");
 
