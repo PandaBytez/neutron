@@ -97,28 +97,9 @@ where
     // reporting it missing until the first periodic tick.
     events::refresh_lease(&mut state);
 
-    if let Some(active_idx) = state.rows.iter().position(|r| r.is_active) {
-        state.selected_index = active_idx;
-    } else {
-        state.selected_index = 0;
-    }
-    events::update_diagnostics(&mut state, &client);
-
+    // The profile list itself is loaded by the refresh worker below, which is
+    // also where the initial selection is made: there are no rows to focus yet.
     let (cache_tx, cache_rx) = std::sync::mpsc::channel();
-    let cache_tx_for_rows = cache_tx.clone();
-    let client_for_cache = client.clone();
-    let rows_to_cache: Vec<(String, bool)> = state
-        .rows
-        .iter()
-        .map(|r| (r.uuid.clone(), r.is_active))
-        .collect();
-    thread::spawn(move || {
-        for (uuid, is_active) in rows_to_cache {
-            let info = events::fetch_profile_info(&client_for_cache, &uuid, is_active);
-            let _ = cache_tx_for_rows.send((uuid, info));
-        }
-    });
-
     let (diag_req_tx, diag_req_rx) = std::sync::mpsc::channel::<(String, bool)>();
     state.diag_tx = Some(diag_req_tx);
     let client_for_diag = client.clone();
