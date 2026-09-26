@@ -246,12 +246,72 @@ pub struct QBittorrentConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    #[serde(default)]
-    pub bind_interface: bool,
+    /// Override for binding qBittorrent to the tunnel's interface. `None` -- the
+    /// default, and what an unset config file means -- derives it from the URL
+    /// (see [`webui_is_local`]), so the common case needs no setting.
+    ///
+    /// Set it only for what the URL cannot answer: qBittorrent on this same
+    /// machine but reached at a bridge address, where it binds (`true`), or a
+    /// WebUI on another host that must keep its own interface (`false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_interface: Option<bool>,
 }
 
 fn default_qbittorrent_url() -> String {
     "http://127.0.0.1:8080".to_string()
+}
+
+/// Host and port of a WebUI URL. Scheme and path stay put so editing the
+/// address does not drop `http://` or a non-root path.
+pub fn split_webui_url(url: &str) -> (String, String) {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return (host.to_string(), port.to_string());
+    }
+    (
+        authority.to_string(),
+        default_qbittorrent_url()
+            .rsplit_once(':')
+            .map(|(_, port)| port.to_string())
+            .unwrap_or_else(|| "8080".to_string()),
+    )
+}
+
+pub fn join_webui_url(url: &str, host: &str, port: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let path = rest.find(['/', '?', '#']).map(|i| &rest[i..]).unwrap_or("");
+    format!("{scheme}://{host}:{port}{path}")
+}
+
+/// Whether a WebUI at this URL runs on this machine.
+///
+/// A port pushed over NAT-PMP only arrives through the tunnel, so a local
+/// qBittorrent has to listen on the tunnel interface for the forward to work at
+/// all. A WebUI on another host cannot: it has no such device, and naming one
+/// there would keep it from listening anywhere. Hence no setting to get wrong --
+/// the URL already answers the question for the setups that make up almost all
+/// of them. The ones it cannot answer (this machine's own bridge address, say)
+/// are what [`QBittorrentConfig::bind_interface`] is for.
+pub fn webui_is_local(url: &str) -> bool {
+    let (host, _) = split_webui_url(url);
+    // Case-insensitively: `http://LOCALHOST:8080` reaches the same WebUI.
+    host.starts_with("127.")
+        || host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("::1")
+        || host.eq_ignore_ascii_case("[::1]")
+}
+
+impl QBittorrentConfig {
+    /// Whether a port push binds qBittorrent to the tunnel's interface: the
+    /// explicit override when there is one, otherwise what the URL implies.
+    pub fn binds_tunnel_interface(&self) -> bool {
+        self.bind_interface
+            .unwrap_or_else(|| webui_is_local(&self.url))
+    }
 }
 
 impl Default for QBittorrentConfig {
@@ -261,7 +321,7 @@ impl Default for QBittorrentConfig {
             url: default_qbittorrent_url(),
             username: None,
             password: None,
-            bind_interface: false,
+            bind_interface: None,
         }
     }
 }
@@ -884,7 +944,7 @@ mod tests {
                 url: "http://192.168.1.50:8080".to_string(),
                 username: Some("admin".to_string()),
                 password: Some("secret123".to_string()),
-                bind_interface: true,
+                bind_interface: Some(true),
                 ..Default::default()
             },
             ..AppConfig::default()
@@ -897,7 +957,42 @@ mod tests {
         assert_eq!(loaded.qbittorrent.url, "http://192.168.1.50:8080");
         assert_eq!(loaded.qbittorrent.username.as_deref(), Some("admin"));
         assert_eq!(loaded.qbittorrent.password.as_deref(), Some("secret123"));
-        assert!(loaded.qbittorrent.bind_interface);
+        assert_eq!(loaded.qbittorrent.bind_interface, Some(true));
+        let (host, port) = split_webui_url(&loaded.qbittorrent.url);
+        assert_eq!((host.as_str(), port.as_str()), ("192.168.1.50", "8080"));
+        assert_eq!(
+            join_webui_url("http://127.0.0.1:8080/qbittorrent", "10.0.0.2", "9090"),
+            "http://10.0.0.2:9090/qbittorrent"
+        );
+        // Unset means "decide from the URL": a local WebUI binds, one on another
+        // host is left alone. The override is what the cases a URL cannot answer
+        // have to spell out.
+        let unset = |url: &str| QBittorrentConfig {
+            url: url.to_string(),
+            ..Default::default()
+        };
+        assert!(unset("http://127.0.0.1:8080").binds_tunnel_interface());
+        assert!(!unset("http://192.168.1.50:8080").binds_tunnel_interface());
+        for forced in [Some(false), Some(true)] {
+            for url in ["http://127.0.0.1:8080", "http://192.168.1.50:8080"] {
+                let config = QBittorrentConfig {
+                    url: url.to_string(),
+                    bind_interface: forced,
+                    ..Default::default()
+                };
+                assert_eq!(config.binds_tunnel_interface(), forced.unwrap());
+            }
+        }
+        assert!(!webui_is_local("http://192.168.1.50:8080"));
+        for local in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.2:8080/qbit",
+            "http://localhost:8080",
+            "http://LOCALHOST:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(webui_is_local(local), "{local} is this machine");
+        }
         cleanup(&path);
     }
 

@@ -44,6 +44,19 @@ pub struct QBittorrentSyncReport {
     pub app_version: Option<String>,
 }
 
+impl QBittorrentSyncReport {
+    /// Whether this push left qBittorrent listening somewhere the forwarded port
+    /// will never arrive.
+    ///
+    /// A WebUI on another host is left on its own interface on purpose -- it has
+    /// no tunnel device to bind -- so only a *local* one that ended up unbound is
+    /// a problem. The CLI and the tray daemon both report it, so the question is
+    /// answered here rather than re-derived (differently) at each call site.
+    pub fn went_unbound(&self, binds_tunnel_interface: bool) -> bool {
+        binds_tunnel_interface && self.bound_interface.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QBittorrentClient {
     base_url: String,
@@ -58,10 +71,14 @@ impl QBittorrentClient {
     pub fn new(config: &QBittorrentConfig) -> Self {
         let base_url = config.url.trim_end_matches('/').to_string();
         Self {
+            // A NAT-PMP port is only reachable through the tunnel, so a qBittorrent
+            // on this machine has to listen on the tunnel's interface. Decided by
+            // the URL unless the user spelled it out (see
+            // `QBittorrentConfig::binds_tunnel_interface`).
+            bind_interface: config.binds_tunnel_interface(),
             base_url,
             username: config.username.clone().filter(|u| !u.trim().is_empty()),
             password: config.password.clone().filter(|p| !p.is_empty()),
-            bind_interface: config.bind_interface,
             cookie: None,
             timeout: DEFAULT_TIMEOUT,
         }
@@ -100,6 +117,15 @@ impl QBittorrentClient {
         }
 
         Ok(())
+    }
+
+    /// Whether the WebUI answered a version query.
+    ///
+    /// A precondition check, not a sync: `false` means the UI is off, the
+    /// process is down, or credentials were rejected. Callers that only need
+    /// a warning must not treat that as a failed port push.
+    pub fn reachable(&mut self) -> bool {
+        self.app_version().is_ok()
     }
 
     /// Query application version string (e.g. `v5.0.3`).
@@ -167,9 +193,13 @@ impl QBittorrentClient {
         })
     }
 
-    /// Update listening port and optionally bind network interface.
+    /// Update the listening port, and with it the tunnel's interface when the
+    /// WebUI is local and the interface is known.
+    ///
+    /// An unknown interface leaves qBittorrent's binding alone: the port still
+    /// lands, and naming a device that does not exist would keep it from
+    /// listening anywhere at all.
     pub fn set_listen_port(&mut self, port: u16, interface_name: Option<&str>) -> AppResult<()> {
-        self.validate_binding(interface_name)?;
         self.ensure_authenticated()?;
         let url = self.endpoint_url("api/v2/app/setPreferences");
 
@@ -177,9 +207,7 @@ impl QBittorrentClient {
             "listen_port": port
         });
 
-        if self.bind_interface
-            && let Some(iface) = interface_name
-        {
+        if let Some(iface) = self.bind_target(interface_name) {
             payload["current_network_interface"] = serde_json::Value::String(iface.to_string());
         }
 
@@ -202,18 +230,13 @@ impl QBittorrentClient {
         port: u16,
         interface_name: Option<&str>,
     ) -> AppResult<QBittorrentSyncReport> {
-        self.validate_binding(interface_name)?;
         let version = self.app_version().ok();
         let current_prefs = self.get_preferences().ok();
         let previous_port = current_prefs.as_ref().map(|p| p.listen_port);
 
         self.set_listen_port(port, interface_name)?;
 
-        let bound_interface = if self.bind_interface {
-            interface_name.map(String::from)
-        } else {
-            None
-        };
+        let bound_interface = self.bind_target(interface_name).map(String::from);
 
         Ok(QBittorrentSyncReport {
             previous_port,
@@ -221,6 +244,17 @@ impl QBittorrentClient {
             bound_interface,
             app_version: version,
         })
+    }
+
+    /// The interface qBittorrent should listen on: the tunnel's, but only for a
+    /// WebUI on this machine and only when the tunnel actually named one.
+    fn bind_target<'a>(&self, interface_name: Option<&'a str>) -> Option<&'a str> {
+        if !self.bind_interface {
+            return None;
+        }
+        interface_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
     }
 
     fn ensure_authenticated(&mut self) -> AppResult<()> {
@@ -237,15 +271,6 @@ impl QBittorrentClient {
             None,
             self.cookie.as_deref(),
         )?)
-    }
-
-    fn validate_binding(&self, interface: Option<&str>) -> AppResult<()> {
-        if self.bind_interface && interface.is_none_or(|name| name.trim().is_empty()) {
-            return Err(AppError::QBittorrent(
-                "interface binding is enabled but the tunnel interface is unavailable; preferences were not changed".into(),
-            ));
-        }
-        Ok(())
     }
 
     fn http_post_urlencoded(
@@ -491,12 +516,31 @@ mod tests {
     }
 
     #[test]
+    fn an_unreachable_webui_is_not_reachable() {
+        use crate::testing::{curl_available, unreachable_qbittorrent_url};
+
+        if !curl_available() {
+            eprintln!("Skipping reachability test: 'curl' is not installed.");
+            return;
+        }
+
+        let cfg = QBittorrentConfig {
+            url: unreachable_qbittorrent_url(),
+            ..Default::default()
+        };
+        let mut client = QBittorrentClient::new(&cfg).with_timeout(Duration::from_millis(200));
+        assert!(
+            !client.reachable(),
+            "a refused connection must not look like a live WebUI"
+        );
+    }
+
+    #[test]
     fn client_url_formatting() {
         let cfg = QBittorrentConfig {
             url: "http://127.0.0.1:8080/".to_string(),
             username: None,
             password: None,
-            bind_interface: false,
             ..Default::default()
         };
         let client = QBittorrentClient::new(&cfg);
@@ -647,15 +691,14 @@ mod tests {
         }
 
         let server = MockQBittorrentWebUi::start();
-        let base = |bind_interface: bool, authenticated: bool| QBittorrentConfig {
+        let base = |authenticated: bool| QBittorrentConfig {
             url: server.url(),
             username: authenticated.then(|| "admin".to_string()),
             password: authenticated.then(|| "adminadmin".to_string()),
-            bind_interface,
             ..Default::default()
         };
 
-        let mut client = QBittorrentClient::new(&base(true, true));
+        let mut client = QBittorrentClient::new(&base(true));
         client.login().expect("login should succeed");
         assert_eq!(
             client.cookie.as_deref(),
@@ -677,25 +720,68 @@ mod tests {
         );
         assert_eq!(synced.new_port, 55432);
         assert_eq!(synced.bound_interface.as_deref(), Some("wg0"));
+        assert!(
+            server.last_set_preferences().contains("wg0"),
+            "a local WebUI must be told to listen on the tunnel interface"
+        );
 
-        // Binding is opt-in, so an interface offered while it is off is ignored.
-        let no_bind = QBittorrentClient::new(&base(false, false))
-            .sync_port(55433, Some("wg0"))
-            .expect("sync should succeed without bind");
-        assert_eq!(no_bind.new_port, 55433);
-        assert_eq!(no_bind.bound_interface, None);
-
-        for previously_bound in [false, true] {
-            QBittorrentClient::new(&base(previously_bound, false))
-                .set_listen_port(55433, Some("wg-old"))
-                .unwrap();
-            let before = server.last_set_preferences();
-            for interface in [None, Some(""), Some(" ")] {
-                let mut client = QBittorrentClient::new(&base(true, false));
-                assert!(client.sync_port(55434, interface).is_err());
-                assert!(client.set_listen_port(55434, interface).is_err());
-                assert_eq!(server.last_set_preferences(), before);
-            }
+        // A tunnel that named no interface: the port still lands and no device
+        // that does not exist is bound, which is the half that used to fail the
+        // whole push.
+        for interface in [None, Some(""), Some(" ")] {
+            let mut client = QBittorrentClient::new(&base(false));
+            let report = client
+                .sync_port(55433, interface)
+                .expect("port-only sync should succeed");
+            assert_eq!(report.bound_interface, None);
+            let pushed = server.last_set_preferences();
+            assert!(
+                !pushed.contains("current_network_interface"),
+                "a missing interface must not be bound as a device: {pushed}"
+            );
+            assert!(
+                pushed.contains("listen_port"),
+                "the port must be applied: {pushed}"
+            );
         }
+
+        // A WebUI on another host has no tunnel interface to bind, so the
+        // interface is left out of the payload there. The override is what
+        // covers a WebUI on this machine that the URL does not look local.
+        let remote = QBittorrentClient::new(&QBittorrentConfig {
+            url: "http://192.168.1.50:8080".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(remote.bind_target(Some("wg0")), None);
+        let forced = QBittorrentClient::new(&QBittorrentConfig {
+            url: "http://192.168.1.50:8080".to_string(),
+            bind_interface: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(forced.bind_target(Some("wg0")), Some("wg0"));
+    }
+
+    #[test]
+    fn only_a_local_webui_left_unbound_is_worth_reporting() {
+        // One question, asked in the CLI and in the tray daemon, so it is
+        // answered once. A remote WebUI is unbound on purpose; a local one is
+        // not, and there the forward will not arrive.
+        let unbound = QBittorrentSyncReport {
+            previous_port: Some(40000),
+            new_port: 51820,
+            bound_interface: None,
+            app_version: Some("v5.0.3".to_string()),
+        };
+        let bound = QBittorrentSyncReport {
+            bound_interface: Some("wg0".to_string()),
+            ..unbound.clone()
+        };
+
+        assert!(unbound.went_unbound(true), "a local WebUI must be told");
+        assert!(
+            !unbound.went_unbound(false),
+            "a remote one has no device to bind"
+        );
+        assert!(!bound.went_unbound(true), "bound is bound");
     }
 }

@@ -21,7 +21,13 @@ pub fn wrap_prev(index: usize, len: usize) -> usize {
     if len == 0 { 0 } else { (index + len - 1) % len }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An action dispatched to a worker thread, with the moment it was dispatched.
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    pub label: String,
+    pub started_at: std::time::Instant,
+}
+
 pub struct Toast {
     pub message: String,
     pub is_error: bool,
@@ -395,15 +401,23 @@ impl SplitTunnelModalState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortForwardFocus {
+    Mode,
+    Host,
+    Port,
+}
+
 /// Mode selector for the port-forwarding policy, opened with `[o]`.
 ///
-/// A single-purpose modal rather than a full editor: the policy is just the
-/// [`PortForwardMode`], so it needs the same navigate-and-confirm selector as
-/// [`SplitTunnelModalState`]'s top row and nothing else.
+/// Host and port edit the saved WebUI URL. The scheme and path stay as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForwardModalState {
     pub mode: PortForwardMode,
     pub highlighted_mode: usize,
+    pub focus: PortForwardFocus,
+    pub host: String,
+    pub port: String,
 }
 
 impl PortForwardModalState {
@@ -413,12 +427,20 @@ impl PortForwardModalState {
         PortForwardMode::ForwardAndSync,
     ];
 
-    pub fn from_config(pf: &PortForwardConfig) -> Self {
+    pub fn from_config(pf: &PortForwardConfig, webui_url: &str) -> Self {
         let highlighted_mode = Self::MODES.iter().position(|&m| m == pf.mode).unwrap_or(0);
+        let (host, port) = crate::config::split_webui_url(webui_url);
         Self {
             mode: pf.mode,
             highlighted_mode,
+            focus: PortForwardFocus::Mode,
+            host,
+            port,
         }
+    }
+
+    pub fn webui_url(&self, current: &str) -> String {
+        crate::config::join_webui_url(current, self.host.trim(), self.port.trim())
     }
 
     pub fn selected_highlighted_mode(&self) -> PortForwardMode {
@@ -453,10 +475,23 @@ pub struct TuiState {
     /// Failed operations can leave applied policy different from saved intent.
     /// Reloading config or dismissing a toast must not clear this uncertainty.
     pub uncertain_policies: std::collections::BTreeSet<crate::error::Policy>,
+    /// An action handed to a worker thread that has not reported back yet.
+    ///
+    /// Tracked separately from the toast because the wait is the part that looks
+    /// frozen: a lockdown toggle blocks on a polkit prompt for as long as the
+    /// user takes to authenticate, and a static "Enabling..." line gives no
+    /// evidence anything is still alive.
+    pub pending: Option<PendingAction>,
     pub theme: Theme,
     pub rows: Vec<ProfileListRow>,
     pub profile_cache: std::collections::HashMap<String, CachedProfileInfo>,
     pub selected_index: usize,
+    /// Whether a profile snapshot has been applied yet.
+    ///
+    /// Its own fact rather than "the list is non-empty": an empty list is also
+    /// what a machine with no profiles looks like, and treating that as the first
+    /// load would let the next refresh move the cursor by itself.
+    pub profiles_loaded: bool,
     pub selected_info: Option<CachedProfileInfo>,
     pub active_profile_name: Option<String>,
     pub active_profile_uuid: Option<String>,
@@ -469,6 +504,11 @@ pub struct TuiState {
     /// render thread on a UDP round trip -- and still go stale, since the TUI
     /// only learns of a tunnel change while it happens to be open.
     pub lease: Option<LeaseState>,
+    /// Last WebUI probe while the port-forward modal is open.
+    /// `None` means still checking; `Some(false)` blocks Auto-Sync.
+    pub qbit_webui_reachable: Option<bool>,
+    /// When the current verdict was taken, so the open panel can recheck.
+    pub qbit_webui_checked_at: Option<std::time::Instant>,
     pub public_ip_info: Option<PublicIpInfo>,
     pub download_rate: u64,
     pub upload_rate: u64,
@@ -497,6 +537,7 @@ pub enum AsyncAction {
     Autoconnect(bool),
     Sync,
     Delete(String),
+    ProbeQbitWebUi,
 }
 
 pub enum AsyncActionResult {
@@ -514,6 +555,7 @@ pub enum AsyncActionResult {
     },
     Sync(crate::error::AppResult<crate::app::sync::SyncReport>),
     Delete(crate::error::AppResult<String>),
+    ProbeQbitWebUi(bool),
 }
 
 impl TuiState {
@@ -523,14 +565,18 @@ impl TuiState {
             config_path,
             config,
             uncertain_policies: Default::default(),
+            pending: None,
             theme,
             rows: Vec::new(),
             profile_cache: std::collections::HashMap::new(),
             selected_index: 0,
+            profiles_loaded: false,
             selected_info: None,
             active_profile_name: None,
             active_profile_uuid: None,
             lease: None,
+            qbit_webui_reachable: None,
+            qbit_webui_checked_at: None,
             public_ip_info: None,
             download_rate: 0,
             upload_rate: 0,
@@ -551,7 +597,7 @@ impl TuiState {
         }
     }
 
-    pub fn apply_split_tunnel<C: crate::nm::NmClient>(
+    pub fn apply_split_tunnel<C: crate::nm::NmPolicy>(
         &mut self,
         client: &C,
         new_cfg: SplitTunnelConfig,
@@ -564,11 +610,7 @@ impl TuiState {
             self.pending_split = Some(new_cfg);
             Ok(())
         } else {
-            crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
-                client,
-                &self.config_path,
-                &new_cfg,
-            )?;
+            crate::app::split_tunnel::apply_split_config(client, &self.config_path, &new_cfg)?;
             self.uncertain_policies
                 .remove(&crate::error::Policy::SplitTunnel);
             self.set_status("Split tunneling saved; reconnect to apply routing changes.");
@@ -638,6 +680,33 @@ impl TuiState {
             is_error: false,
             created_at: std::time::Instant::now(),
         });
+    }
+
+    /// Mark `label` as in flight, so the UI can animate until it reports back.
+    pub fn begin_pending(&mut self, label: impl Into<String>) {
+        self.pending = Some(PendingAction {
+            label: label.into(),
+            started_at: std::time::Instant::now(),
+        });
+    }
+
+    /// Clear the in-flight marker. Called when the worker reports, either way.
+    pub fn end_pending(&mut self) {
+        self.pending = None;
+    }
+
+    /// The animated label for the in-flight action, e.g. `⠹ Enabling Lockdown
+    /// Mode (2.4s)`. `None` when nothing is pending.
+    pub fn pending_text(&self) -> Option<String> {
+        self.pending.as_ref().map(|pending| {
+            let elapsed = pending.started_at.elapsed();
+            format!(
+                "{} {} ({:.1}s)",
+                crate::spinner::spinner_frame(elapsed),
+                pending.label,
+                elapsed.as_secs_f64()
+            )
+        })
     }
 
     /// Report a failed action in a toast notification. Kept distinct from
@@ -816,7 +885,7 @@ mod tests {
             mode: PortForwardMode::ForwardAndSync,
             ..Default::default()
         };
-        let modal = PortForwardModalState::from_config(&pf);
+        let modal = PortForwardModalState::from_config(&pf, "http://127.0.0.1:8080");
         assert_eq!(modal.mode, PortForwardMode::ForwardAndSync);
         assert_eq!(modal.highlighted_mode, 2);
         assert_eq!(
@@ -826,8 +895,35 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_action_renders_an_animated_label_until_it_reports_back() {
+        let mut st = TuiState::new(
+            crate::testing::temp_config_path("pending"),
+            Default::default(),
+        );
+        assert!(st.pending_text().is_none(), "nothing pending at rest");
+
+        st.begin_pending("Enabling Lockdown Mode");
+        let first = st.pending_text().expect("pending text while in flight");
+        assert!(first.contains("Enabling Lockdown Mode"), "{first}");
+        assert!(
+            crate::spinner::SPINNER_FRAMES
+                .contains(&first.chars().next().expect("a frame").to_string().as_str()),
+            "must lead with a spinner frame: {first}"
+        );
+
+        st.end_pending();
+        assert!(
+            st.pending_text().is_none(),
+            "reporting back must clear the indicator, or it hangs forever"
+        );
+    }
+
+    #[test]
     fn port_forward_modal_arrow_navigation_wraps() {
-        let mut modal = PortForwardModalState::from_config(&PortForwardConfig::default());
+        let mut modal = PortForwardModalState::from_config(
+            &PortForwardConfig::default(),
+            "http://127.0.0.1:8080",
+        );
         assert_eq!(modal.highlighted_mode, 0);
 
         modal.move_right();

@@ -46,6 +46,8 @@ pub enum AppError {
     TunnelUnhealthy(String),
     #[error("no eligible profile found for random startup")]
     NoEligibleProfile,
+    #[error("{0}")]
+    Uninstall(String),
     #[error("port forwarding failed: {0}")]
     PortForward(String),
     #[error("qbittorrent error: {0}")]

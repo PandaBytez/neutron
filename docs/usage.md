@@ -156,6 +156,45 @@ neutron lockdown enable
 neutron lockdown disable
 ```
 
+`enable` and `disable` escalate and rewrite the ruleset, so they show a spinner
+while waiting on authentication and firewalld. Piped output gets a plain
+`Enabling Lockdown...` line instead.
+
+### Factory Reset
+
+```bash
+# Withdraw every applied policy and clear all settings (asks for confirmation)
+neutron reset
+
+# Unattended
+neutron reset --yes
+```
+
+Restores a first-run state: the lockdown ruleset, refresh helper, and polkit
+action are revoked, the kill switch and split-tunnel routes are withdrawn from
+every profile, settings (including the qBittorrent password) go back to
+defaults, and the autostart entry is removed. The profile drop directory is
+reported and left alone, since it holds your own files. Requires a terminal to
+confirm, or `--yes`.
+
+### Uninstalling
+
+```bash
+# Revoke everything outside the package, then remove the package itself
+neutron uninstall
+
+# Also delete ~/.config/neutron (settings, eligibility, qBittorrent password)
+neutron uninstall --purge
+```
+
+Run it as your normal user, not under `sudo`: the polkit prompt needs an active
+session, and Homebrew refuses to run as root. Neutron detects whether it was
+installed by Homebrew or `cargo install` and runs the matching removal. It stops
+the tray daemon, deletes the autostart entry, and -- in one privileged batch, and
+only if any lockdown state is present -- lifts the firewall rules and revokes the
+password-free refresh grant. Settings are kept unless `--purge` is given. An unrecognized install is refused without changing anything; see
+[security.md](security.md#uninstalling-revokes-everything-it-installed).
+
 ### NAT-PMP & qBittorrent Dynamic Port Sync
 
 ```bash
@@ -173,8 +212,8 @@ neutron qbit sync
 neutron qbit enable    # forward-and-sync
 neutron qbit disable   # forward
 
-# Configure WebUI connection parameters
-neutron qbit config --url http://127.0.0.1:8080 --bind true
+# Configure WebUI connection parameters (--bind forces interface binding on/off)
+neutron qbit config --url http://127.0.0.1:8080
 ```
 
 ### System Tray AppIndicator & Background Daemon

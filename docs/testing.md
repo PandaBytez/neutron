@@ -8,6 +8,10 @@ Run these commands from the repository root with the Rust toolchain installed.
 # Check formatting and run strict Clippy across all features
 cargo lint
 
+# Rebuild and install the binary, leaving lockdown and settings alone (dev loop).
+# Extra flags go to `cargo install`, so --debug and --root work:
+cargo xtask reinstall -- --debug
+
 # Run default-feature unit and integration tests
 cargo test
 
@@ -24,17 +28,25 @@ Requires Podman or Docker. The Cargo tasks start NetworkManager and firewalld in
 a disposable container with its own network namespace. Network and firewall
 changes stay inside that sandbox.
 
+Every container tier also runs on pull requests, via the `System Tests (sandbox)`
+job, so the tests below are enforced rather than advisory.
+
 ```bash
 # Host tests across all features, then containerized system tests
 cargo test-all
 
-# Containerized system tests only
+# Containerized system tests only (this is what CI runs)
 cargo test-system
 
 # Select a system tier or rebuild the sandbox image
 cargo test-system -- --nm
 cargo test-system -- --firewall
+cargo test-system -- --uninstall
 cargo test-system -- --rebuild
+
+`cargo xtask reinstall` keeps your settings as they are: the settings files are
+captured before the install and restored if anything changes them, and the
+result is reported rather than silently reverted.
 
 # Firewall leak regression checks
 cargo test-leaks

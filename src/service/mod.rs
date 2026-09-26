@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::config;
 use crate::error::{AppError, AppResult};
-use crate::nm::{NmClient, WireguardProfile};
+use crate::nm::{NmClient, NmPolicy, WireguardProfile};
 
 pub mod autostart;
 pub mod indicator;
@@ -37,7 +37,7 @@ pub fn run_startup_random_with_path<C: NmClient>(
 ///
 /// Best-effort: failures are logged, since callers must still work on a system
 /// where the flag could not be cleared.
-fn normalize_autoconnect<C: NmClient>(client: &C) {
+fn normalize_autoconnect<C: NmPolicy>(client: &C) {
     if let Err(error) = client.set_autoconnect_all(false) {
         warn!("failed to disable NetworkManager autoconnect: {error}");
     }
@@ -186,7 +186,7 @@ where
 /// Neither direction disturbs a tunnel that is already up -- an active profile
 /// is a deliberate connection, and toggling a preference is not a request to
 /// drop traffic.
-pub fn set_autoconnect_at_login<C: NmClient>(
+pub fn set_autoconnect_at_login<C: NmPolicy>(
     client: &C,
     path: &Path,
     enable: bool,
@@ -214,7 +214,7 @@ pub fn reconcile_autoconnect_at_login_in(
     Ok(())
 }
 
-fn set_autoconnect_at_login_in<C: NmClient>(
+fn set_autoconnect_at_login_in<C: NmPolicy>(
     client: &C,
     path: &Path,
     autostart_dir: &Path,
@@ -249,7 +249,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::config::AppConfig;
-    use crate::nm::{ProfileState, WireguardProfile};
+    use crate::nm::{NmLifecycle, ProfileState, WireguardProfile};
     use crate::testing::MockNmClient;
 
     use super::*;

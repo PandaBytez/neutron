@@ -97,28 +97,9 @@ where
     // reporting it missing until the first periodic tick.
     events::refresh_lease(&mut state);
 
-    if let Some(active_idx) = state.rows.iter().position(|r| r.is_active) {
-        state.selected_index = active_idx;
-    } else {
-        state.selected_index = 0;
-    }
-    events::update_diagnostics(&mut state, &client);
-
+    // The profile list itself is loaded by the refresh worker below, which is
+    // also where the initial selection is made: there are no rows to focus yet.
     let (cache_tx, cache_rx) = std::sync::mpsc::channel();
-    let cache_tx_for_rows = cache_tx.clone();
-    let client_for_cache = client.clone();
-    let rows_to_cache: Vec<(String, bool)> = state
-        .rows
-        .iter()
-        .map(|r| (r.uuid.clone(), r.is_active))
-        .collect();
-    thread::spawn(move || {
-        for (uuid, is_active) in rows_to_cache {
-            let info = events::fetch_profile_info(&client_for_cache, &uuid, is_active);
-            let _ = cache_tx_for_rows.send((uuid, info));
-        }
-    });
-
     let (diag_req_tx, diag_req_rx) = std::sync::mpsc::channel::<(String, bool)>();
     state.diag_tx = Some(diag_req_tx);
     let client_for_diag = client.clone();
@@ -191,6 +172,18 @@ where
                     })();
                     crate::tui::state::AsyncActionResult::Delete(r)
                 }
+                crate::tui::state::AsyncAction::ProbeQbitWebUi => {
+                    let reachable = crate::config::load(&config_path_for_action)
+                        .map(|cfg| {
+                            crate::portforward::qbittorrent::QBittorrentClient::new(
+                                &cfg.qbittorrent,
+                            )
+                            .with_timeout(std::time::Duration::from_secs(1))
+                            .reachable()
+                        })
+                        .unwrap_or(false);
+                    crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable)
+                }
             };
             let _ = action_res_tx.send(res);
         }
@@ -235,30 +228,11 @@ where
             while let Ok(newer_cfg) = split_tunnel_rx.try_recv() {
                 cfg = newer_cfg;
             }
-            let res = if cfg.mode.is_enabled() {
-                crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
-                    &client_for_st,
-                    &config_path_for_st,
-                    &cfg,
-                )
-            } else {
-                let current = crate::config::load(&config_path_for_st);
-                let mode_changed = current
-                    .map(|c| c.global_split_tunnel.mode != cfg.mode)
-                    .unwrap_or(false);
-                if mode_changed {
-                    crate::app::split_tunnel::apply_and_persist_global_split_tunnel(
-                        &client_for_st,
-                        &config_path_for_st,
-                        &cfg,
-                    )
-                } else {
-                    crate::config::update(&config_path_for_st, |c| {
-                        c.global_split_tunnel = cfg.clone()
-                    })
-                    .map(|_| ())
-                }
-            };
+            let res = crate::app::split_tunnel::apply_split_config(
+                &client_for_st,
+                &config_path_for_st,
+                &cfg,
+            );
             let _ = st_res_tx.send((cfg, res));
         }
     });
@@ -393,6 +367,7 @@ where
             // anything NetworkManager reports, so it has to be re-read on a tick
             // rather than only when the profile list changes.
             events::refresh_lease(state);
+            events::refresh_qbit_webui_probe(state);
 
             if let Some((uuid, _, true)) = state.selected_identity() {
                 if let Some(ref tx) = state.diag_tx {
@@ -554,6 +529,9 @@ fn drain_action_results(
     needs_profile_refresh: &mut bool,
 ) {
     while let Ok(action_res) = rx.try_recv() {
+        // Every arm means the dispatched action reported back, so the spinner
+        // has done its job -- on success and on failure alike.
+        state.end_pending();
         match action_res {
             crate::tui::state::AsyncActionResult::KillSwitch { enable, result } => match result {
                 Ok(()) => {
@@ -627,6 +605,11 @@ fn drain_action_results(
                 }
                 Err(err) => state.set_error(&err),
             },
+            crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable) => {
+                if matches!(state.modal, crate::tui::state::ActiveModal::PortForward(_)) {
+                    state.qbit_webui_reachable = Some(reachable);
+                }
+            }
         }
     }
 }
@@ -765,6 +748,7 @@ impl PublicIpLookupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nm::NmLifecycle;
 
     #[test]
     fn profile_worker_can_block_while_ui_processes_input_and_then_retry() {

@@ -262,14 +262,23 @@ pub fn execute_action<C: ActionClient>(
         }
         "lockdown" => {
             let enable = !state.config.lockdown_enabled;
+            // Escalation blocks on a polkit prompt, so the wait is what the user
+            // is watching. Animate it, and show elapsed time in case the prompt
+            // is a GUI dialog that has not appeared yet.
+            let label = format!(
+                "{} Lockdown Mode",
+                if enable { "Enabling" } else { "Disabling" }
+            );
+            state.begin_pending(label.clone());
             if let Some(ref tx) = action_tx {
-                state.set_status(format!(
-                    "{} Lockdown Mode...",
-                    if enable { "Enabling" } else { "Disabling" }
-                ));
+                state.set_status(format!("{label}..."));
                 let _ = tx.send(crate::tui::state::AsyncAction::Lockdown(enable));
             } else {
+                // No worker thread: this blocks the event loop, so the spinner
+                // cannot repaint. Marked anyway so the state cannot be left
+                // showing an action that already finished.
                 crate::app::set_global_lockdown(client, &state.config_path, enable)?;
+                state.end_pending();
                 state
                     .uncertain_policies
                     .remove(&crate::error::Policy::Lockdown);
@@ -294,10 +303,14 @@ pub fn execute_action<C: ActionClient>(
         "port_forwarding" => {
             // A mode, not a switch: Disabled, Forward, or ForwardAndSync.
             // Committed inside the modal, which also reloads and reports.
+            state.qbit_webui_reachable = None;
+            state.qbit_webui_checked_at = None;
             state.modal =
                 ActiveModal::PortForward(crate::tui::state::PortForwardModalState::from_config(
                     &state.config.port_forwarding,
+                    &state.config.qbittorrent.url,
                 ));
+            refresh_qbit_webui_probe(state);
         }
         "sync" => {
             if let Some(ref tx) = action_tx {
@@ -609,19 +622,58 @@ fn handle_port_forward_key<C: ActionClient>(
 
     let mut commit = None;
     let mut close_modal = false;
+    let mut blocked = false;
 
+    let mut url_changed = false;
     if let ActiveModal::PortForward(ref mut modal) = state.modal {
+        let typing = matches!(
+            modal.focus,
+            crate::tui::state::PortForwardFocus::Host | crate::tui::state::PortForwardFocus::Port
+        );
         match key.code {
+            KeyCode::Esc if typing && field_nonempty(modal) => clear_focused_field(modal),
             KeyCode::Esc | KeyCode::Char('q') => close_modal = true,
-            KeyCode::Left => modal.move_left(),
-            KeyCode::Right => modal.move_right(),
-            KeyCode::Char(' ') | KeyCode::Enter => {
-                modal.mode = modal.selected_highlighted_mode();
-                commit = Some(modal.mode);
-                close_modal = true;
+            KeyCode::Tab | KeyCode::Down => next_focus(modal),
+            KeyCode::BackTab | KeyCode::Up => prev_focus(modal),
+            KeyCode::Left if !typing => modal.move_left(),
+            KeyCode::Right if !typing => modal.move_right(),
+            KeyCode::Char(' ') | KeyCode::Enter if !typing => {
+                let mode = modal.selected_highlighted_mode();
+                // Only a failed probe refuses. Unknown is still checking, and
+                // saying the WebUI is down would be a lie.
+                if mode == PortForwardMode::ForwardAndSync
+                    && state.qbit_webui_reachable == Some(false)
+                {
+                    blocked = true;
+                } else {
+                    modal.mode = mode;
+                    commit = Some(mode);
+                    close_modal = true;
+                }
+            }
+            KeyCode::Backspace if typing => {
+                pop_focused_field(modal);
+                url_changed = true;
+            }
+            KeyCode::Char(c) if typing && c.is_ascii() && c != ' ' => {
+                push_focused_field(modal, c);
+                url_changed = true;
             }
             _ => {}
         }
+    }
+
+    if url_changed {
+        persist_webui_url(state)?;
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = None;
+        refresh_qbit_webui_probe(state);
+    }
+
+    if blocked {
+        state.set_error(&crate::error::AppError::QBittorrent(
+            "qBittorrent WebUI unavailable; Auto-Sync was not enabled".into(),
+        ));
     }
 
     if let Some(mode) = commit {
@@ -648,9 +700,107 @@ fn handle_port_forward_key<C: ActionClient>(
 
     if close_modal {
         state.modal = ActiveModal::None;
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = None;
     }
 
     Ok(())
+}
+
+fn field_nonempty(modal: &crate::tui::state::PortForwardModalState) -> bool {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => !modal.host.is_empty(),
+        crate::tui::state::PortForwardFocus::Port => !modal.port.is_empty(),
+        crate::tui::state::PortForwardFocus::Mode => false,
+    }
+}
+
+fn clear_focused_field(modal: &mut crate::tui::state::PortForwardModalState) {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => modal.host.clear(),
+        crate::tui::state::PortForwardFocus::Port => modal.port.clear(),
+        crate::tui::state::PortForwardFocus::Mode => {}
+    }
+}
+
+fn pop_focused_field(modal: &mut crate::tui::state::PortForwardModalState) {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => {
+            modal.host.pop();
+        }
+        crate::tui::state::PortForwardFocus::Port => {
+            modal.port.pop();
+        }
+        crate::tui::state::PortForwardFocus::Mode => {}
+    }
+}
+
+fn push_focused_field(modal: &mut crate::tui::state::PortForwardModalState, c: char) {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => modal.host.push(c),
+        crate::tui::state::PortForwardFocus::Port if c.is_ascii_digit() && modal.port.len() < 5 => {
+            modal.port.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn next_focus(modal: &mut crate::tui::state::PortForwardModalState) {
+    modal.focus = match modal.focus {
+        crate::tui::state::PortForwardFocus::Mode => crate::tui::state::PortForwardFocus::Host,
+        crate::tui::state::PortForwardFocus::Host => crate::tui::state::PortForwardFocus::Port,
+        crate::tui::state::PortForwardFocus::Port => crate::tui::state::PortForwardFocus::Mode,
+    };
+}
+
+fn prev_focus(modal: &mut crate::tui::state::PortForwardModalState) {
+    modal.focus = match modal.focus {
+        crate::tui::state::PortForwardFocus::Mode => crate::tui::state::PortForwardFocus::Port,
+        crate::tui::state::PortForwardFocus::Host => crate::tui::state::PortForwardFocus::Mode,
+        crate::tui::state::PortForwardFocus::Port => crate::tui::state::PortForwardFocus::Host,
+    };
+}
+
+fn persist_webui_url(state: &mut TuiState) -> AppResult<()> {
+    let ActiveModal::PortForward(ref modal) = state.modal else {
+        return Ok(());
+    };
+    let url = modal.webui_url(&state.config.qbittorrent.url);
+    if url == state.config.qbittorrent.url {
+        return Ok(());
+    }
+    config::update(&state.config_path, |cfg| cfg.qbittorrent.url = url.clone())?;
+    state.config.qbittorrent.url = url;
+    Ok(())
+}
+
+const QBIT_WEBUI_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Probe the WebUI while the port-forward panel is open, then again every 5s.
+///
+/// A probe still inside that window is left alone. One that never answered
+/// is sent again, so a dropped send cannot leave Auto-Sync looking unchecked
+/// for the rest of the session. Closing the panel clears both.
+pub fn refresh_qbit_webui_probe(state: &mut TuiState) {
+    if !matches!(state.modal, ActiveModal::PortForward(_)) {
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = None;
+        return;
+    }
+    let in_flight = state.qbit_webui_reachable.is_none() && state.qbit_webui_checked_at.is_some();
+    let due = state
+        .qbit_webui_checked_at
+        .is_none_or(|at| at.elapsed() >= QBIT_WEBUI_REFRESH);
+    if !due {
+        return;
+    }
+    if !in_flight {
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = Some(std::time::Instant::now());
+    }
+    if let Some(ref tx) = state.action_tx {
+        let _ = tx.send(crate::tui::state::AsyncAction::ProbeQbitWebUi);
+    }
 }
 
 /// Drop `list[*selected]`, keeping `*selected` inside the shortened list.
@@ -717,6 +867,12 @@ pub(crate) fn apply_profile_snapshot(
     profiles: Vec<crate::nm::WireguardProfile>,
     app_cfg: config::AppConfig,
 ) {
+    // The list arrives from a worker, so the first snapshot is the earliest
+    // point a starting selection can be made at all. Tracked as its own fact
+    // rather than inferred from an empty list: a snapshot that empties the list
+    // (every profile just deleted) would otherwise look like the first one, and
+    // the next refresh would move the cursor on its own.
+    let first_load = !state.profiles_loaded;
     state.rows = crate::app::profile_list::build_rows(
         &profiles,
         &app_cfg.excluded_profile_ids,
@@ -742,7 +898,13 @@ pub(crate) fn apply_profile_snapshot(
     state.active_profile_name = active_name;
     state.active_profile_uuid = active_uuid.clone();
 
-    if state.selected_index >= state.rows.len() {
+    if first_load {
+        // Start on the tunnel that is up: the row a user is most likely looking
+        // at. Only here, because a later refresh must not drag the cursor away
+        // from wherever it was moved to.
+        state.selected_index = state.rows.iter().position(|row| row.is_active).unwrap_or(0);
+        state.profiles_loaded = true;
+    } else if state.selected_index >= state.rows.len() {
         state.selected_index = state.rows.len().saturating_sub(1);
     }
 
@@ -881,9 +1043,20 @@ mod tests {
         assert!(matches!(state.modal, ActiveModal::PortForward(_)));
 
         // Right, Right, Enter selects ForwardAndSync and commits it.
+        // A live WebUI is required; tests have no probe worker.
         press(&mut state, KeyCode::Right);
         press(&mut state, KeyCode::Right);
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::Char('1'));
+        press(&mut state, KeyCode::Char('0'));
+        press(&mut state, KeyCode::BackTab);
+        state.qbit_webui_reachable = Some(true);
         press(&mut state, KeyCode::Enter);
+        assert!(
+            state.config.qbittorrent.url.contains("127.0.0.110"),
+            "typed host digits must persist: {}",
+            state.config.qbittorrent.url
+        );
 
         assert_eq!(state.modal, ActiveModal::None);
         assert_eq!(
@@ -903,6 +1076,17 @@ mod tests {
             "the confirmation must name the mode that was applied: {}",
             state.status_message
         );
+
+        // A failed probe blocks the same commit. No worker here, so the
+        // verdict is injected the way a finished probe would leave it.
+        execute_action(&mut state, &client, "port_forwarding").expect("modal should open");
+        state.qbit_webui_reachable = Some(false);
+        press(&mut state, KeyCode::Enter);
+        assert!(
+            matches!(state.modal, ActiveModal::PortForward(_)),
+            "Auto-Sync must stay open when the WebUI probe failed"
+        );
+        assert!(state.status_is_error, "the refusal must be an error");
 
         // Left moves the highlight, but Esc closes without applying.
         execute_action(&mut state, &client, "port_forwarding").expect("modal should open");
@@ -1146,6 +1330,49 @@ mod tests {
         std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&inbox);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_list_opens_on_the_active_profile_and_then_leaves_the_cursor_alone() {
+        use crate::nm::ProfileState;
+
+        let mut state = TuiState::new(
+            crate::testing::temp_config_path("tui-initial-selection"),
+            crate::config::AppConfig::default(),
+        );
+        let profiles = vec![
+            crate::testing::profile("wg-a", "uuid-a", ProfileState::Inactive),
+            crate::testing::profile("wg-b", "uuid-b", ProfileState::Active),
+            crate::testing::profile("wg-c", "uuid-c", ProfileState::Inactive),
+        ];
+        fn selected(state: &TuiState) -> Option<String> {
+            state.selected_row().map(|row| row.uuid.clone())
+        }
+
+        apply_profile_snapshot(&mut state, profiles.clone(), Default::default());
+        assert_eq!(
+            selected(&state).as_deref(),
+            Some("uuid-b"),
+            "the row that is connected is the one the user is looking at"
+        );
+
+        // The list is loaded by a worker, so a later refresh arriving with the
+        // same rows must leave the cursor where the user left it.
+        state.selected_index = 2;
+        apply_profile_snapshot(&mut state, profiles.clone(), Default::default());
+        assert_eq!(selected(&state).as_deref(), Some("uuid-c"));
+
+        // A snapshot that empties the list is not a first load. Inferring it from
+        // the empty list is what used to happen, and the next refresh with rows
+        // again would then move the cursor onto the active profile by itself.
+        apply_profile_snapshot(&mut state, Vec::new(), Default::default());
+        assert!(selected(&state).is_none(), "the list is empty");
+        apply_profile_snapshot(&mut state, profiles, Default::default());
+        assert_eq!(
+            selected(&state).as_deref(),
+            Some("uuid-a"),
+            "the selection is made once; a refresh must not make it again"
+        );
     }
 
     #[test]

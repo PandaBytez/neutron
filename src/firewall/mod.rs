@@ -31,6 +31,11 @@
 //! to a chain-wide clear: if it cannot remove one of its own rules it reports an
 //! error rather than wipe rules it did not create.
 //!
+//! Teardown also revokes the install's other durable footprint: the root-owned
+//! helper binary and the polkit action authorizing it (see
+//! [`helper::uninstall_script`]). Both live outside any package's file list, so
+//! `crate::app`'s uninstall -- not the lockdown toggle -- is what removes them.
+//!
 //! Enforcement lives in mangle OUTPUT, before firewalld's filter-table
 //! ESTABLISHED accept on either backend. Disallowed packets are dropped there;
 //! allow rules only finish this table and do not bypass other firewall policy.
@@ -100,9 +105,31 @@ pub trait FirewallClient {
     /// Refresh an already enabled policy without interactive authorization.
     /// `activating` identifies the NM profile whose first traffic must be protected.
     fn refresh_lockdown(&self, activating: Option<&str>) -> AppResult<()>;
-    /// Remove the lockdown ruleset, restoring normal connectivity. Idempotent:
-    /// safe to call when lockdown is not currently active.
-    fn disable_lockdown(&self) -> AppResult<()>;
+    /// Whether this machine currently holds any Neutron-owned lockdown state:
+    /// tagged rules, the root-owned refresh helper, or its polkit action.
+    ///
+    /// Entirely unprivileged reads, so a caller can decide whether a teardown is
+    /// worth a password prompt. Deliberately evidence-based rather than
+    /// config-based: the rules outlive the setting that installed them, so a
+    /// machine whose config was lost or purged can still be firewalled.
+    fn has_installed_lockdown_state(&self) -> AppResult<bool>;
+    /// Remove the lockdown ruleset in one privileged batch, and revoke the
+    /// password-free refresh grant when `revoke_grant` is set. Idempotent: safe
+    /// to call when lockdown is not currently active.
+    ///
+    /// `revoke_grant` is the whole difference between the two callers. A plain
+    /// disable leaves the grant alone, because it belongs to the *installation*
+    /// rather than to the current lockdown state: it is installed on enable,
+    /// must survive a disable so a re-enable needs no second prompt, and is
+    /// revoked when the app goes away. An uninstall sets it, so rules and grant
+    /// leave in a single `pkexec` batch -- one password prompt either way.
+    fn teardown_lockdown(&self, revoke_grant: bool) -> AppResult<()>;
+
+    /// Lift the block, leaving the refresh grant in place: the plain
+    /// "lockdown off" operation every toggle and the emergency path use.
+    fn disable_lockdown(&self) -> AppResult<()> {
+        self.teardown_lockdown(false)
+    }
 }
 
 impl FirewallClient for crate::nm::CliNmClient {
@@ -132,11 +159,26 @@ impl FirewallClient for crate::nm::CliNmClient {
         helper::refresh(activating)
     }
 
-    fn disable_lockdown(&self) -> AppResult<()> {
-        // Remove only Neutron rules from permanent and runtime configuration.
+    fn has_installed_lockdown_state(&self) -> AppResult<bool> {
+        if helper::is_installed() {
+            return Ok(true);
+        }
+        for family in FAMILIES {
+            if family_has_marked_rule(family)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn teardown_lockdown(&self, revoke_grant: bool) -> AppResult<()> {
+        // One batch, one prompt, whether this is a plain disable or an uninstall.
         let mut script = locked_script();
         script.push_str(&live_removal_script(true, false));
         script.push_str(&live_removal_script(false, false));
+        if revoke_grant {
+            script.push_str(&helper::uninstall_script());
+        }
         run_script(&script, true)?;
 
         // Strictly scoped teardown: only our own tagged rules are ever removed,
@@ -153,6 +195,16 @@ impl FirewallClient for crate::nm::CliNmClient {
                 )));
             }
         }
+        // The install's other durable footprint: a root-owned helper binary and
+        // the polkit action that authorizes it. They grant password-free root
+        // execution, so report a survivor rather than leave a live grant behind.
+        if revoke_grant && helper::is_installed() {
+            return Err(AppError::Firewall(format!(
+                "{} or its polkit action could not be deleted; remove them as root to \
+                 revoke password-free root execution",
+                helper::PATH,
+            )));
+        }
         Ok(())
     }
 }
@@ -165,13 +217,30 @@ impl FirewallClient for crate::nm::CliNmClient {
 /// enable/disable read the current rules freely and confine privilege to the
 /// single batched write below (see [`crate::process::host_command`]).
 fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
-    let output = crate::process::host_command(FIREWALL_CMD)
+    read_marked_rules_with(family, table, FIREWALL_CMD)
+}
+
+/// [`read_marked_rules`] against a named binary, so the "no firewalld here" case
+/// is reachable from a test without a machine that lacks firewalld.
+fn read_marked_rules_with(family: &str, table: &str, tool: &str) -> AppResult<String> {
+    let output = crate::process::host_command(tool)
         .args(direct_args("--get-rules", family, table))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| AppError::Firewall(error.to_string()))?;
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        // No `firewall-cmd` at all: a machine that does not run firewalld cannot
+        // have firewalld rules, so there is nothing to find. Erroring here instead
+        // made the evidence check abort `neutron uninstall` and `neutron reset`
+        // outright, so an install on such a machine could never be removed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(String::new());
+        }
+        Err(error) => return Err(AppError::Firewall(error.to_string())),
+    };
 
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
@@ -640,6 +709,23 @@ fn reload_batch() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_without_firewall_cmd_reports_no_rules_rather_than_failing() {
+        // The evidence check behind `neutron uninstall` and `neutron reset` asks
+        // firewalld what is installed. On a machine that does not run it, the
+        // answer is "nothing" -- and treating the missing binary as an error
+        // made both commands abort, so such an install could never be removed.
+        let missing = std::path::Path::new("/nonexistent/firewall-cmd");
+        assert!(!missing.exists(), "the fixture path must not exist");
+
+        assert_eq!(
+            read_marked_rules_with("ipv4", "filter", missing.to_str().expect("utf-8 path"))
+                .expect("a missing tool is not an error"),
+            "",
+            "no firewalld means no firewalld rules"
+        );
+    }
 
     #[test]
     fn every_rebuild_prefix_retains_complete_policy_or_guard() {

@@ -2,7 +2,7 @@
 //! selected profile, and the login selector then refuses to pick it.
 
 use neutron::config::{self, AppConfig};
-use neutron::nm::{NmClient, ProfileState};
+use neutron::nm::{NmLifecycle, ProfileState};
 use neutron::service::{self, StartupRandomResult};
 use neutron::testing::{self, MockNmClient, profile};
 use neutron::tui::events::execute_action;

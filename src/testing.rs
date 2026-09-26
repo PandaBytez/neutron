@@ -5,6 +5,25 @@
 //! against this crate as an external library, can reuse the same mock as the
 //! in-crate unit tests. Everything here is `pub`, so it never triggers
 //! dead-code warnings in normal builds.
+//!
+//! # A test never touches the live machine
+//!
+//! Running the suite on a workstation has to be inert: no settings rewritten, no
+//! daemon killed, no real profile or firewall touched. Anything that reaches
+//! outside the process therefore takes the path it works on as an argument, and
+//! a test hands it a temporary one -- [`scratch_dir`], [`temp_config_path`], the
+//! autostart directory, the process root. The two that are easy to forget are
+//! the ones that end in a side effect rather than a read:
+//!
+//! * the process scan behind `kill_other_neutron_processes`, which SIGTERMs
+//!   every process named `neutron` -- a hardcoded `/proc` there kills the
+//!   developer's own daemon and TUI, silently, on every `cargo test`;
+//! * the lease file under `$XDG_RUNTIME_DIR`, which is what a live daemon
+//!   publishes for the TUI.
+//!
+//! A test that genuinely needs the real thing is a *system* test: marked
+//! `#[ignore = "system test: requires the disposable sandbox"]` and gated on
+//! [`require_sandbox`].
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,7 +33,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, AppResult};
 use crate::firewall::FirewallClient;
-use crate::nm::{NmClient, ProfileState, WireguardProfile, WireguardTunnel};
+use crate::nm::{
+    NmIntrospect, NmLifecycle, NmPolicy, ProfileState, WireguardProfile, WireguardTunnel,
+};
 
 fn record(log: &Mutex<Vec<String>>, entry: String) {
     log.lock().expect("mock mutex poisoned").push(entry);
@@ -117,26 +138,40 @@ fn snapshot(log: &Mutex<Vec<String>>) -> Vec<String> {
     log.lock().expect("mock mutex poisoned").clone()
 }
 
-/// Create a unique temporary path for test configuration files.
-pub fn temp_config_path(label: &str) -> PathBuf {
+/// A directory of this run's own, named after `label`.
+///
+/// The clock is the only thing separating two tests that want the same label,
+/// which is why every temporary path here goes through this: a shared prefix
+/// would be a shared prefix, and a copied suffix would be one copy too few when
+/// someone adds the next one.
+fn unique_test_dir(label: &str) -> PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time should move forward")
         .as_nanos();
-    std::env::temp_dir()
-        .join(format!("neutron-vpn-test-{label}-{suffix}"))
-        .join("config.json")
+    std::env::temp_dir().join(format!("neutron-vpn-test-{label}-{suffix}"))
+}
+
+/// Create a unique temporary path for test configuration files.
+pub fn temp_config_path(label: &str) -> PathBuf {
+    unique_test_dir(label).join("config.json")
 }
 
 /// Create a unique temporary path for test TOML configuration files.
 pub fn temp_toml_config_path(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    std::env::temp_dir()
-        .join(format!("neutron-vpn-test-{label}-{suffix}"))
-        .join("config.toml")
+    unique_test_dir(label).join("config.toml")
+}
+
+/// An empty directory to stand in for `/proc`.
+///
+/// Anything that walks the process table takes the root as an argument
+/// precisely so a test can hand it this instead: the scan ends in `kill(2)`, and
+/// reaching the real `/proc` would take down the developer's own daemon and TUI
+/// as a side effect of running the suite.
+pub fn scratch_dir(label: &str) -> PathBuf {
+    let dir = unique_test_dir(label);
+    std::fs::create_dir_all(&dir).expect("scratch dir should be created");
+    dir
 }
 
 /// Clean up temporary test configuration directories.
@@ -168,6 +203,7 @@ pub struct MockNmClient {
     fail_kill_switch: bool,
     fail_autoconnect: bool,
     fail_lockdown: bool,
+    installed_lockdown_state: bool,
     fail_split_tunnel: bool,
     fail_import: bool,
     fail_disconnect: bool,
@@ -360,11 +396,19 @@ impl MockNmClient {
         self
     }
 
-    /// Consume this mock and return one whose `enable_lockdown`/`disable_lockdown`
+    /// Consume this mock and return one whose `enable_lockdown`/`teardown_lockdown`
     /// fail, to exercise the error path where the firewall rejects the change.
     /// The attempt is still recorded in [`Self::lockdown_calls`] first.
     pub fn fail_lockdown(mut self) -> Self {
         self.fail_lockdown = true;
+        self
+    }
+
+    /// Consume this mock and return one that reports Neutron-owned lockdown
+    /// state on the machine, so a caller tears down even when the saved config
+    /// says lockdown is off (or is gone entirely).
+    pub fn with_installed_lockdown_state(mut self) -> Self {
+        self.installed_lockdown_state = true;
         self
     }
 
@@ -476,11 +520,75 @@ impl MockNmClient {
     }
 }
 
-impl NmClient for MockNmClient {
+impl NmPolicy for MockNmClient {
     fn reapply_active_routes(&self) -> AppResult<()> {
         record(&self.calls, "reapply-active-routes".into());
         Ok(())
     }
+
+    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
+        record(
+            &self.kill_switch_calls,
+            format!("kill-switch-all:{}", if enable { "on" } else { "off" }),
+        );
+
+        if self.fail_kill_switch {
+            return Err(AppError::CommandFailed(
+                "simulated kill-switch failure".to_string(),
+            ));
+        }
+
+        self.apply_to_all(|uuid| crate::nm::kill_switch::set_args(uuid, enable, true));
+        Ok(())
+    }
+
+    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
+        record(
+            &self.autoconnect_calls,
+            format!("autoconnect-all:{}", if enable { "on" } else { "off" }),
+        );
+
+        if self.fail_autoconnect {
+            return Err(AppError::CommandFailed(
+                "simulated autoconnect failure".to_string(),
+            ));
+        }
+
+        self.apply_to_all(|uuid| crate::nm::autoconnect::set_args(uuid, enable));
+        Ok(())
+    }
+
+    fn apply_split_tunnel_all(
+        &self,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()> {
+        record(
+            &self.split_tunnel_calls,
+            format!(
+                "split-tunnel-all:{}:{}:{}",
+                mode,
+                v4_routes.len(),
+                v6_routes.len()
+            ),
+        );
+
+        if self.fail_split_tunnel {
+            return Err(AppError::CommandFailed(
+                "simulated split-tunnel failure".to_string(),
+            ));
+        }
+
+        self.apply_to_all(|uuid| {
+            crate::nm::split_tunnel::set_args(uuid, mode, v4_routes, v6_routes)
+        });
+        Ok(())
+    }
+}
+
+/// Lifecycle seam.
+impl NmLifecycle for MockNmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
         if self.fail_list
             || self
@@ -635,45 +743,6 @@ impl NmClient for MockNmClient {
         Ok(())
     }
 
-    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
-        record(
-            &self.kill_switch_calls,
-            format!("kill-switch-all:{}", if enable { "on" } else { "off" }),
-        );
-
-        if self.fail_kill_switch {
-            return Err(AppError::CommandFailed(
-                "simulated kill-switch failure".to_string(),
-            ));
-        }
-
-        self.apply_to_all(|uuid| crate::nm::kill_switch::set_args(uuid, enable, true));
-        Ok(())
-    }
-
-    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
-        record(
-            &self.autoconnect_calls,
-            format!("autoconnect-all:{}", if enable { "on" } else { "off" }),
-        );
-
-        if self.fail_autoconnect {
-            return Err(AppError::CommandFailed(
-                "simulated autoconnect failure".to_string(),
-            ));
-        }
-
-        self.apply_to_all(|uuid| crate::nm::autoconnect::set_args(uuid, enable));
-        Ok(())
-    }
-
-    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
-        if self.fail_list {
-            return Err(AppError::CommandFailed("simulated".to_string()));
-        }
-        Ok(self.tunnels.clone())
-    }
-
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
         record(&self.imported, path.display().to_string());
         if self.fail_import {
@@ -729,6 +798,37 @@ impl NmClient for MockNmClient {
         Ok(format!("Imported {}", path.display()))
     }
 
+    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
+        record(&self.calls, format!("delete:{}", uuid));
+        self.deleted
+            .lock()
+            .expect("mock mutex poisoned")
+            .insert(uuid.to_string());
+        self.active
+            .lock()
+            .expect("mock mutex poisoned")
+            .retain(|u| u != uuid);
+        self.settings
+            .lock()
+            .expect("mock mutex poisoned")
+            .remove(uuid);
+        self.extra_profiles
+            .lock()
+            .expect("mock mutex poisoned")
+            .retain(|p| p.uuid != uuid);
+        Ok(())
+    }
+}
+
+/// Introspection seam.
+impl NmIntrospect for MockNmClient {
+    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
+        if self.fail_list {
+            return Err(AppError::CommandFailed("simulated".to_string()));
+        }
+        Ok(self.tunnels.clone())
+    }
+
     fn get_profile_diagnostics(
         &self,
         _uuid: &str,
@@ -743,6 +843,7 @@ impl NmClient for MockNmClient {
             transfer_rx: "100.00 KiB".to_string(),
             transfer_tx: "50.00 KiB".to_string(),
             keepalive: "25".to_string(),
+            listen_port: None,
         })
     }
 
@@ -767,55 +868,6 @@ impl NmClient for MockNmClient {
     fn tunnel_dns(&self, _uuid: &str) -> Option<String> {
         Some("10.2.0.1".to_string())
     }
-
-    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
-        record(&self.calls, format!("delete:{}", uuid));
-        self.deleted
-            .lock()
-            .expect("mock mutex poisoned")
-            .insert(uuid.to_string());
-        self.active
-            .lock()
-            .expect("mock mutex poisoned")
-            .retain(|u| u != uuid);
-        self.settings
-            .lock()
-            .expect("mock mutex poisoned")
-            .remove(uuid);
-        self.extra_profiles
-            .lock()
-            .expect("mock mutex poisoned")
-            .retain(|p| p.uuid != uuid);
-        Ok(())
-    }
-
-    fn apply_split_tunnel_all(
-        &self,
-        mode: crate::config::SplitTunnelMode,
-        v4_routes: &[String],
-        v6_routes: &[String],
-    ) -> AppResult<()> {
-        record(
-            &self.split_tunnel_calls,
-            format!(
-                "split-tunnel-all:{}:{}:{}",
-                mode,
-                v4_routes.len(),
-                v6_routes.len()
-            ),
-        );
-
-        if self.fail_split_tunnel {
-            return Err(AppError::CommandFailed(
-                "simulated split-tunnel failure".to_string(),
-            ));
-        }
-
-        self.apply_to_all(|uuid| {
-            crate::nm::split_tunnel::set_args(uuid, mode, v4_routes, v6_routes)
-        });
-        Ok(())
-    }
 }
 
 impl FirewallClient for MockNmClient {
@@ -837,8 +889,20 @@ impl FirewallClient for MockNmClient {
         Ok(())
     }
 
-    fn disable_lockdown(&self) -> AppResult<()> {
-        record(&self.lockdown_calls, "lockdown:off".to_string());
+    fn has_installed_lockdown_state(&self) -> AppResult<bool> {
+        Ok(self.installed_lockdown_state)
+    }
+
+    fn teardown_lockdown(&self, revoke_grant: bool) -> AppResult<()> {
+        record(
+            &self.lockdown_calls,
+            if revoke_grant {
+                "lockdown:teardown:rules+grant"
+            } else {
+                "lockdown:teardown:rules"
+            }
+            .to_string(),
+        );
 
         if self.fail_lockdown {
             return Err(AppError::Firewall("simulated lockdown failure".to_string()));

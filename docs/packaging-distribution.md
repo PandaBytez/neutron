@@ -7,10 +7,19 @@ Neutron is designed for easy distribution across all major Linux packaging ecosy
 ## Packaging Channels Overview
 
 | Format | Target Platform | Dependencies | Standalone? | Build Command |
-| :--- | :--- | :--- | :---: | :--- |
+| :---: | :--- | :--- | :---: | :--- |
 | **Homebrew** | Linux / Linuxbrew | Zero (Pure Rust TUI/CLI) | Yes | `brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron` |
 | **Static Musl** | Headless Servers, SSH | Zero (Static musl binary) | Yes | `cargo build --target x86_64-unknown-linux-musl` |
 | **Arch AUR** | Arch Linux, Manjaro | System dependencies | Native | `makepkg -si` |
+
+`cargo install` is also supported. `neutron uninstall` detects which of these
+installed the running binary and hands it to the matching package manager
+(`brew uninstall neutron` or `cargo uninstall neutron`) after revoking the
+firewall rules and root-owned helper that no package manager owns. Any other
+install shape -- AppImage, distro package -- is refused rather than guessed at,
+so remove it by hand; see
+[security.md](security.md#uninstalling-revokes-everything-it-installed).
+
 
 ---
 

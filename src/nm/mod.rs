@@ -63,13 +63,32 @@ pub struct ProfileDiagnostics {
     pub transfer_rx: String,
     pub transfer_tx: String,
     pub keepalive: String,
+    /// Live `wg show` listen port. Independent of NAT-PMP forwarding.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
 }
 
-pub trait NmClient {
+/// Connection lifecycle: listing, bringing tunnels up/down, importing, deleting.
+/// Narrow seam for profile-set changes and activation.
+pub trait NmLifecycle {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>>;
     fn connect(&self, profile_identifier: &str) -> AppResult<()>;
     fn disconnect_active(&self) -> AppResult<()>;
     fn switch_to(&self, profile_identifier: &str) -> AppResult<()>;
+    /// Import a WireGuard configuration file as a new NetworkManager profile,
+    /// returning NetworkManager's confirmation message. Keeps NetworkManager the
+    /// single source of truth (no local copy of the config is kept).
+    fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String>;
+    /// Permanently delete a NetworkManager profile. NetworkManager deactivates
+    /// the connection first if it is currently active. Any Neutron-side metadata
+    /// that referenced the profile (provider comments, startup eligibility) is
+    /// cleaned up too so stale entries don't accumulate.
+    fn delete_profile(&self, uuid: &str) -> AppResult<()>;
+}
+
+/// Global routing policy sweeps applied to *every* WireGuard profile.
+/// Narrow seam for the policy paths in `crate::app`.
+pub trait NmPolicy {
     /// Apply (or remove) the kill-switch routing policy on *every* WireGuard
     /// profile. The kill switch is a global setting, so this is enforced across
     /// all profiles rather than per profile. The change is persisted to each
@@ -81,14 +100,24 @@ pub trait NmClient {
     /// Left alone, each profile carries NM's `autoconnect=yes` default and they
     /// all activate together at boot. See [`crate::nm::autoconnect`].
     fn set_autoconnect_all(&self, enable: bool) -> AppResult<()>;
+    /// Apply split-tunnel routing rules to *every* WireGuard profile.
+    fn apply_split_tunnel_all(
+        &self,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()>;
+    /// Apply saved routes to currently active devices without reconnecting.
+    fn reapply_active_routes(&self) -> AppResult<()>;
+}
+
+/// Read-only introspection: tunnels, diagnostics, addresses.
+/// Narrow seam for status rendering and port-forward lookups.
+pub trait NmIntrospect {
     /// Discover the interface name and peer endpoints of every WireGuard
     /// profile. Used to build the lockdown firewall allow-list so the tunnel
     /// and its handshake keep working while all other traffic is blocked.
     fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>>;
-    /// Import a WireGuard configuration file as a new NetworkManager profile,
-    /// returning NetworkManager's confirmation message. Keeps NetworkManager the
-    /// single source of truth (no local copy of the config is kept).
-    fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String>;
     /// Get read-only WireGuard diagnostics for a specific profile connection.
     fn get_profile_diagnostics(&self, uuid: &str, is_active: bool)
     -> AppResult<ProfileDiagnostics>;
@@ -107,21 +136,15 @@ pub trait NmClient {
     fn tunnel_interface(&self, uuid: &str) -> Option<String>;
     /// The tunnel's configured DNS servers (e.g. `10.2.0.1`).
     fn tunnel_dns(&self, uuid: &str) -> Option<String>;
-    /// Permanently delete a NetworkManager profile. NetworkManager deactivates
-    /// the connection first if it is currently active. Any Neutron-side metadata
-    /// that referenced the profile (provider comments, startup eligibility) is
-    /// cleaned up too so stale entries don't accumulate.
-    fn delete_profile(&self, uuid: &str) -> AppResult<()>;
-    /// Apply split-tunnel routing rules to *every* WireGuard profile.
-    fn apply_split_tunnel_all(
-        &self,
-        mode: crate::config::SplitTunnelMode,
-        v4_routes: &[String],
-        v6_routes: &[String],
-    ) -> AppResult<()>;
-    /// Apply saved routes to currently active devices without reconnecting.
-    fn reapply_active_routes(&self) -> AppResult<()>;
 }
+
+/// The full client: lifecycle + policy + introspection.
+///
+/// Kept so existing broad bounds keep compiling; new code should bind on the
+/// narrow seam it actually needs (`NmLifecycle`, `NmPolicy`, `NmIntrospect`).
+pub trait NmClient: NmLifecycle + NmPolicy + NmIntrospect {}
+
+impl<T: NmLifecycle + NmPolicy + NmIntrospect> NmClient for T {}
 
 fn confirm_teardown(
     result: AppResult<()>,
@@ -194,7 +217,7 @@ fn extract_interface_comments(path: &std::path::Path) -> String {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CliNmClient;
 
-impl NmClient for CliNmClient {
+impl NmLifecycle for CliNmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
         let connections = run_nmcli(&["-t", "-f", "NAME,UUID,TYPE", "connection", "show"])?;
         let active = run_nmcli(&[
@@ -288,51 +311,6 @@ impl NmClient for CliNmClient {
         activate(&target.uuid)
     }
 
-    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
-        let profiles = self.list_wireguard_profiles()?;
-        // NOTE: unlike `set_autoconnect_all` below, this still aborts on the
-        // first failure, so later profiles keep their previous kill-switch
-        // value while the caller sees a single error. Converting it to
-        // `apply_to_every_profile` is a behavior change to a security-relevant
-        // setting and is deliberately left out of the autoconnect fix.
-        for args in kill_switch_arg_batches(&profiles, enable, profile_has_ipv6) {
-            run_nmcli_owned(&args)?;
-        }
-        Ok(())
-    }
-
-    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
-        let profiles = self.list_wireguard_profiles()?;
-        let batches = autoconnect_arg_batches(&profiles, enable);
-        apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
-    }
-
-    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
-        let profiles = self.list_wireguard_profiles()?;
-        let mut tunnels = Vec::new();
-        for profile in &profiles {
-            // `-g` (get-values) prints only the property value, so no field
-            // prefix has to be stripped.
-            let interface = run_nmcli(&[
-                "-g",
-                "connection.interface-name",
-                "connection",
-                "show",
-                &profile.uuid,
-            ])
-            .map(|value| parse_interface_name(&value))?;
-            let endpoints =
-                run_nmcli(&["-g", "wireguard.peers", "connection", "show", &profile.uuid])
-                    .map(|value| extract_endpoints(&value))?;
-            tunnels.push(WireguardTunnel {
-                interface,
-                endpoints,
-                is_active: profile.is_active(),
-            });
-        }
-        Ok(tunnels)
-    }
-
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
         let path_str = path
             .to_str()
@@ -380,6 +358,102 @@ impl NmClient for CliNmClient {
         }
 
         Ok(output)
+    }
+
+    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
+        // NetworkManager deactivates the connection automatically before
+        // removing it, so an active profile can be deleted directly.
+        run_nmcli(&["connection", "delete", uuid])?;
+
+        // Drop any Neutron-side metadata keyed by this UUID so it doesn't linger
+        // after the profile is gone. Best-effort: a config failure here must not
+        // mask the successful deletion.
+        if let Ok(config_path) = crate::config::default_config_path() {
+            let _ = crate::config::update(&config_path, |cfg| {
+                crate::config::forget_profile(cfg, uuid);
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Policy sweep implementations; grouped by seam, not by call order.
+impl NmPolicy for CliNmClient {
+    fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
+        let profiles = self.list_wireguard_profiles()?;
+        // NOTE: unlike `set_autoconnect_all` below, this still aborts on the
+        // first failure, so later profiles keep their previous kill-switch
+        // value while the caller sees a single error. Converting it to
+        // `apply_to_every_profile` is a behavior change to a security-relevant
+        // setting and is deliberately left out of the autoconnect fix.
+        for args in kill_switch_arg_batches(&profiles, enable, profile_has_ipv6) {
+            run_nmcli_owned(&args)?;
+        }
+        Ok(())
+    }
+
+    fn set_autoconnect_all(&self, enable: bool) -> AppResult<()> {
+        let profiles = self.list_wireguard_profiles()?;
+        let batches = autoconnect_arg_batches(&profiles, enable);
+        apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
+    }
+
+    fn apply_split_tunnel_all(
+        &self,
+        mode: crate::config::SplitTunnelMode,
+        v4_routes: &[String],
+        v6_routes: &[String],
+    ) -> AppResult<()> {
+        let profiles = self.list_wireguard_profiles()?;
+        let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
+        apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
+    }
+
+    fn reapply_active_routes(&self) -> AppResult<()> {
+        for profile in self
+            .list_wireguard_profiles()?
+            .iter()
+            .filter(|p| p.is_active())
+        {
+            let interface = tunnel_interface_name(&profile.uuid).ok_or_else(|| {
+                AppError::Config(format!(
+                    "missing interface for active profile {}",
+                    profile.uuid
+                ))
+            })?;
+            run_nmcli(&["device", "reapply", &interface])?;
+        }
+        Ok(())
+    }
+}
+
+/// Read-only introspection of tunnels, diagnostics and addresses.
+impl NmIntrospect for CliNmClient {
+    fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
+        let profiles = self.list_wireguard_profiles()?;
+        let mut tunnels = Vec::new();
+        for profile in &profiles {
+            // `-g` (get-values) prints only the property value, so no field
+            // prefix has to be stripped.
+            let interface = run_nmcli(&[
+                "-g",
+                "connection.interface-name",
+                "connection",
+                "show",
+                &profile.uuid,
+            ])
+            .map(|value| parse_interface_name(&value))?;
+            let endpoints =
+                run_nmcli(&["-g", "wireguard.peers", "connection", "show", &profile.uuid])
+                    .map(|value| extract_endpoints(&value))?;
+            tunnels.push(WireguardTunnel {
+                interface,
+                endpoints,
+                is_active: profile.is_active(),
+            });
+        }
+        Ok(tunnels)
     }
 
     fn get_profile_diagnostics(
@@ -443,51 +517,6 @@ impl NmClient for CliNmClient {
             return None;
         }
         Some(trimmed.replace(',', ", "))
-    }
-
-    fn delete_profile(&self, uuid: &str) -> AppResult<()> {
-        // NetworkManager deactivates the connection automatically before
-        // removing it, so an active profile can be deleted directly.
-        run_nmcli(&["connection", "delete", uuid])?;
-
-        // Drop any Neutron-side metadata keyed by this UUID so it doesn't linger
-        // after the profile is gone. Best-effort: a config failure here must not
-        // mask the successful deletion.
-        if let Ok(config_path) = crate::config::default_config_path() {
-            let _ = crate::config::update(&config_path, |cfg| {
-                crate::config::forget_profile(cfg, uuid);
-            });
-        }
-
-        Ok(())
-    }
-
-    fn apply_split_tunnel_all(
-        &self,
-        mode: crate::config::SplitTunnelMode,
-        v4_routes: &[String],
-        v6_routes: &[String],
-    ) -> AppResult<()> {
-        let profiles = self.list_wireguard_profiles()?;
-        let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
-        apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
-    }
-
-    fn reapply_active_routes(&self) -> AppResult<()> {
-        for profile in self
-            .list_wireguard_profiles()?
-            .iter()
-            .filter(|p| p.is_active())
-        {
-            let interface = tunnel_interface_name(&profile.uuid).ok_or_else(|| {
-                AppError::Config(format!(
-                    "missing interface for active profile {}",
-                    profile.uuid
-                ))
-            })?;
-            run_nmcli(&["device", "reapply", &interface])?;
-        }
-        Ok(())
     }
 }
 
@@ -577,6 +606,7 @@ fn settings_to_diagnostics(
         transfer_rx: "0 B".to_string(),
         transfer_tx: "0 B".to_string(),
         keepalive: or_na(&settings.keepalive),
+        listen_port: None,
     }
 }
 
@@ -592,6 +622,14 @@ fn overlay_wg_dump(diagnostics: &mut ProfileDiagnostics, dump: &str) {
         let columns: Vec<&str> = interface_line.split('\t').collect();
         if let Some(public_key) = columns.get(1).filter(|value| !value.is_empty()) {
             diagnostics.public_key = (*public_key).to_string();
+        }
+        // `off` is WireGuard's random-port placeholder, not a bound port.
+        if let Some(port) = columns
+            .get(2)
+            .filter(|value| !value.is_empty() && **value != "off")
+            .and_then(|value| value.parse().ok())
+        {
+            diagnostics.listen_port = Some(port);
         }
     }
 
@@ -1672,6 +1710,7 @@ mod tests {
         overlay_wg_dump(&mut diagnostics, &dump);
 
         assert_eq!(diagnostics.public_key, "ifacekey");
+        assert_eq!(diagnostics.listen_port, Some(51820));
         assert_eq!(diagnostics.endpoint, "9.9.9.9:51820");
         assert_eq!(diagnostics.allowed_ips, "10.0.0.0/8");
         assert_eq!(diagnostics.transfer_rx, "2.00 KiB");
@@ -1707,9 +1746,10 @@ mod tests {
         let mut diagnostics =
             settings_to_diagnostics(&PeerSettings::default(), "wg0".to_string(), true);
 
-        overlay_wg_dump(&mut diagnostics, "privkey\tifacekey\t51820\toff\n");
+        overlay_wg_dump(&mut diagnostics, "privkey\tifacekey\toff\toff\n");
 
         assert_eq!(diagnostics.public_key, "ifacekey");
+        assert_eq!(diagnostics.listen_port, None, "`off` is not a bound port");
         assert_eq!(diagnostics.transfer_rx, "0 B", "no peer line, no counters");
     }
 

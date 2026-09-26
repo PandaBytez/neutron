@@ -4,15 +4,21 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use super::*;
-use crate::nm::NmClient;
+use crate::nm::{NmIntrospect, NmLifecycle};
 
 pub const NAME: &str = "neutron-lockdown-helper";
-const PATH: &str = "/usr/local/libexec/neutron-lockdown-helper";
+pub(super) const PATH: &str = "/usr/local/libexec/neutron-lockdown-helper";
 pub(super) const LOCK_PATH: &str = "/run/neutron-lockdown.lock";
 const ACTION_ID: &str = "io.github.pandabytez.neutron.lockdown-refresh";
 const LEGACY_POLICY_PATH: &str = "/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules";
+/// Action directory polkit only reads at startup (see [`action_directory`]).
+const LOCAL_ACTION_DIR: &str = "/usr/local/share/polkit-1/actions";
+/// The directory older polkit releases read. Never written by a current install,
+/// but swept by [`uninstall_script`] so a downgrade cannot leave a live grant.
+const SHARED_ACTION_DIR: &str = "/usr/share/polkit-1/actions";
 
 pub(super) fn install_script() -> AppResult<String> {
     let executable = std::env::current_exe()?;
@@ -44,13 +50,8 @@ pub(super) fn install_script() -> AppResult<String> {
     let policy_end = "</annotate>\n  </action>\n</policyconfig>\n";
     // A newly created local actions directory may not invalidate polkit's
     // cache. Reload the authority by its D-Bus owner's PID, not by process name.
-    let reload = if action_dir == "/usr/local/share/polkit-1/actions" {
-        "polkit_reply=$(dbus-send --system --print-reply --dest=org.freedesktop.DBus \
-         /org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID \
-         string:org.freedesktop.PolicyKit1)\n\
-         polkit_pid=${polkit_reply##*uint32 }\n\
-         case \"$polkit_pid\" in ''|*[!0-9]*) echo 'Invalid polkit daemon PID' >&2; exit 1;; esac\n\
-         kill -HUP \"$polkit_pid\"\n"
+    let reload = if action_dir == LOCAL_ACTION_DIR {
+        polkit_reload()
     } else {
         ""
     };
@@ -82,6 +83,72 @@ pub(super) fn install_script() -> AppResult<String> {
     ))
 }
 
+/// Ask the running polkit authority to drop its cached action files, by the
+/// D-Bus owner's PID rather than by process name.
+fn polkit_reload() -> &'static str {
+    "polkit_reply=$(dbus-send --system --print-reply --dest=org.freedesktop.DBus \
+     /org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID \
+     string:org.freedesktop.PolicyKit1)\n\
+     polkit_pid=${polkit_reply##*uint32 }\n\
+     case \"$polkit_pid\" in ''|*[!0-9]*) echo 'Invalid polkit daemon PID' >&2; exit 1;; esac\n\
+     kill -HUP \"$polkit_pid\"\n"
+}
+
+/// Every root-owned file an install leaves behind, none of which any package
+/// manager owns -- so they outlive the app unless teardown revokes them.
+///
+/// Order is revoke-then-delete: the polkit authorization goes first, so the
+/// binary is never briefly reachable through a policy that outlives it.
+fn installed_files() -> [String; 3] {
+    [
+        format!("{LOCAL_ACTION_DIR}/{ACTION_ID}.policy"),
+        format!("{SHARED_ACTION_DIR}/{ACTION_ID}.policy"),
+        PATH.to_string(),
+    ]
+}
+
+/// Whether any installed helper or polkit action is still on disk. Unprivileged
+/// `stat`, so callers can gate a teardown on it without prompting.
+pub(super) fn is_installed() -> bool {
+    installed_files()
+        .iter()
+        .any(|path| Path::new(path).exists())
+}
+
+/// The teardown's top-level shell statements, one per entry.
+///
+/// Best effort by design, and only at the top level: a failure must not abort
+/// teardown under `set -e` on a read-only or immutable `/usr/local`, because a
+/// hard error would leave the user reading a scary message after their firewall
+/// is already open. [`is_installed`] reports real leftovers to the caller
+/// instead. Acquiring the lock *does* still abort on failure, deliberately --
+/// without it a concurrent refresh could re-add rules after the teardown.
+///
+/// The reload is guarded as one subshell for the same reason, and it is not
+/// dead work: the action's `exec.path` is a fixed path, so a cached action that
+/// outlives the file would authorize whatever executable lands there next.
+fn uninstall_statements() -> Vec<String> {
+    let mut statements: Vec<String> = installed_files()
+        .iter()
+        .map(|file| format!("rm -f -- {file} || true"))
+        .collect();
+    statements.push(format!("({}) || true", polkit_reload()));
+    statements
+}
+
+/// Render [`uninstall_statements`] into a script for the disable/uninstall batch.
+///
+/// Both action directories are swept without probing the installed polkit
+/// version: `rm -f` on a missing path succeeds, so a wrong guess costs nothing.
+pub(super) fn uninstall_script() -> String {
+    let mut script = String::new();
+    for statement in uninstall_statements() {
+        script.push_str(&statement);
+        script.push('\n');
+    }
+    script
+}
+
 fn action_directory(version: &str) -> AppResult<&'static str> {
     let release = version
         .split_whitespace()
@@ -97,9 +164,9 @@ fn action_directory(version: &str) -> AppResult<&'static str> {
     // Local action directories were added in polkit 126. Older releases only
     // read /usr/share; newer ones can also install on immutable /usr systems.
     Ok(if release >= 126 {
-        "/usr/local/share/polkit-1/actions"
+        LOCAL_ACTION_DIR
     } else {
-        "/usr/share/polkit-1/actions"
+        SHARED_ACTION_DIR
     })
 }
 
@@ -382,6 +449,40 @@ mod tests {
         }
         assert!(action_directory("unexpected output").is_err());
         assert!(action_directory("").is_err());
+    }
+
+    #[test]
+    fn teardown_revokes_every_installed_file_and_never_aborts() {
+        let statements = uninstall_statements();
+
+        // Every path an install writes must be swept, whatever polkit version
+        // wrote it, and the authorization must go before the binary it allows.
+        let revoked: Vec<_> = statements
+            .iter()
+            .filter_map(|statement| statement.strip_prefix("rm -f -- "))
+            .map(|statement| statement.trim_end_matches(" || true"))
+            .collect();
+        assert_eq!(revoked, installed_files());
+        assert!(
+            revoked[0].ends_with(".policy") && revoked[1].ends_with(".policy"),
+            "authorization is revoked first: {revoked:?}"
+        );
+        assert_eq!(*revoked.last().unwrap(), PATH);
+
+        // Every top-level statement is best effort, so `set -e` cannot abort
+        // teardown before `is_installed` reports a real leftover.
+        for statement in &statements {
+            assert!(
+                statement.ends_with("|| true"),
+                "unguarded teardown statement: {statement}"
+            );
+        }
+        // And the script is exactly those statements, nothing smuggled between.
+        assert_eq!(
+            uninstall_script(),
+            format!("{}\n", statements.join("\n")),
+            "the script must not add unguarded commands"
+        );
     }
 
     #[test]

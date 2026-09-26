@@ -129,7 +129,29 @@ fn is_process_alive(pid: u32) -> bool {
     if !proc.join("self").exists() {
         return true;
     }
-    proc.join(pid.to_string()).exists()
+    let stat = proc.join(pid.to_string()).join("stat");
+    if !stat.exists() {
+        return false;
+    }
+    // A zombie is listed in `/proc` but has already exited -- only a parent that
+    // never waits keeps one around, and the daemon is exactly that case: the
+    // TUI spawns it, drops the handle, and never joins it. So a killed daemon
+    // lingers as a zombie for as long as its TUI runs, and counting that as
+    // alive would hold the lease against a process that is gone. That is what
+    // makes a replacement daemon stand down at its ownership check.
+    std::fs::read_to_string(&stat)
+        .map(|stat| !is_zombie(&stat))
+        .unwrap_or(true)
+}
+
+/// Whether a `/proc/<pid>/stat` line describes a process waiting to be reaped.
+///
+/// The state is the field after the comm, which is parenthesised and can itself
+/// contain spaces and parentheses, so the last `)` is what ends it.
+fn is_zombie(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z")
 }
 
 /// Where the daemon publishes the lease.
@@ -252,6 +274,19 @@ mod tests {
     #[test]
     fn a_just_written_lease_is_fresh() {
         assert!(held_at(now_secs()).is_fresh());
+    }
+
+    #[test]
+    fn a_reaped_lease_is_not_an_owner_but_a_zombie_is_not_alive_either() {
+        // `Z` is what a daemon the TUI spawned and never joined looks like after
+        // it is killed, so it must not pass for a live publisher: the lease
+        // would otherwise keep a replacement daemon standing down.
+        assert!(is_zombie("4242 (neutron) Z 1 4242 4242 0 -1 4194560"));
+        assert!(is_zombie("4242 (a b) c) Z 1 2"));
+        assert!(!is_zombie("4242 (neutron) S 1 4242"));
+        assert!(!is_zombie("garbage"));
+        assert!(is_process_alive(std::process::id()));
+        assert!(!is_process_alive(0));
     }
 
     #[test]

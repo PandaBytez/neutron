@@ -39,6 +39,10 @@ Primary goals:
 - Never execute shell commands constructed from untrusted user input.
 - Avoid storing private keys or secrets outside NetworkManager profile storage.
 - Do not auto-modify profile settings silently without clear user action.
+- No test may touch the live machine: settings, daemon, profiles, firewall.
+  Anything reaching outside the process takes its path as an argument so a test
+  can pass a temporary one (see the module docs in `src/testing.rs`). A test
+  that needs the real system is a sandbox-gated system test.
 
 ## Definition of Done (per feature)
 
