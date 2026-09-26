@@ -702,7 +702,7 @@ impl TuiState {
             let elapsed = pending.started_at.elapsed();
             format!(
                 "{} {} ({:.1}s)",
-                crate::wait::spinner_frame(elapsed),
+                crate::spinner::spinner_frame(elapsed),
                 pending.label,
                 elapsed.as_secs_f64()
             )
@@ -881,7 +881,7 @@ mod tests {
         let first = st.pending_text().expect("pending text while in flight");
         assert!(first.contains("Enabling Lockdown Mode"), "{first}");
         assert!(
-            crate::wait::SPINNER_FRAMES
+            crate::spinner::SPINNER_FRAMES
                 .contains(&first.chars().next().expect("a frame").to_string().as_str()),
             "must lead with a spinner frame: {first}"
         );

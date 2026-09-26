@@ -1,12 +1,14 @@
-//! A progress indicator for CLI commands that block.
+//! Spinners, and the frames they share.
 //!
-//! `neutron lockdown enable` goes through `pkexec` and then a batched
-//! `firewall-cmd` run, which can sit for a while on a password prompt. Without
-//! anything on screen that reads as a hung process rather than a slow one.
+//! One table defines "busy" for both callers, and they need to agree: the CLI's
+//! [`with_spinner`] animates `neutron lockdown enable` while `pkexec` waits on a
+//! password prompt, and the TUI's overlays animate the same wait from
+//! [`spinner_frame`]. Either without movement reads as a hung process rather
+//! than a slow one.
 //!
-//! Animation only when stderr is a terminal: piped or captured output gets a
-//! plain line instead, so CI logs and the system tests' captured output stay
-//! free of control characters.
+//! The CLI animates only when stderr is a terminal: piped or captured output
+//! gets a plain line instead, so CI logs and the system tests' captured output
+//! stay free of control characters.
 
 use crate::error::AppResult;
 

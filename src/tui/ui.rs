@@ -414,7 +414,7 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
 
             let (icon, icon_style) = if let Some(conn) = is_connecting {
                 let elapsed = conn.started_at.elapsed();
-                let spinner = crate::wait::spinner_frame(elapsed);
+                let spinner = crate::spinner::spinner_frame(elapsed);
                 (format!("{spinner} "), theme.accent)
             } else if row.is_active {
                 ("✔ ".to_string(), theme.status_connected)
@@ -836,7 +836,7 @@ fn render_connecting_toast(
     let elapsed = conn.started_at.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
 
-    let spinner = crate::wait::spinner_frame(elapsed);
+    let spinner = crate::spinner::spinner_frame(elapsed);
 
     let action_str = if conn.is_disconnect {
         format!("Disconnecting from {}... ({elapsed_secs:.1}s)", conn.name)
@@ -1695,7 +1695,7 @@ mod render_tests {
             "the pending label must be on screen: {screen}"
         );
         assert!(
-            crate::wait::SPINNER_FRAMES
+            crate::spinner::SPINNER_FRAMES
                 .iter()
                 .any(|frame| screen.contains(frame)),
             "a spinner frame must be on screen: {screen}"

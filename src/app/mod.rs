@@ -507,7 +507,7 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
         LockdownCommands::Enable => {
             // Escalates and rewrites the ruleset, so it blocks for as long as
             // the user takes to authenticate. Show that something is happening.
-            crate::wait::with_spinner("Enabling Lockdown", || {
+            crate::spinner::with_spinner("Enabling Lockdown", || {
                 set_global_lockdown(client, path, true)
             })?;
             println!(
@@ -517,7 +517,7 @@ fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
         LockdownCommands::Disable => {
             // The emergency path: a user reaching for this may be locked out, so
             // it must look alive even while the prompt is up.
-            crate::wait::with_spinner("Disabling Lockdown", || {
+            crate::spinner::with_spinner("Disabling Lockdown", || {
                 set_global_lockdown(client, path, false)
             })?;
             println!("Lockdown disabled: normal connectivity restored.");

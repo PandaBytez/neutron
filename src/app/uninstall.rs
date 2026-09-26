@@ -57,12 +57,12 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     // for nothing; the config is the only record of what was applied, and these
     // are recoverable by hand, unlike a locked-down box.
     if before.kill_switch_enabled {
-        crate::wait::with_spinner("Disabling Kill Switch", || {
+        crate::spinner::with_spinner("Disabling Kill Switch", || {
             set_global_kill_switch(client, path, false)
         })?;
     }
     if before.global_split_tunnel.mode.is_enabled() || !before.global_split_tunnel.is_empty() {
-        crate::wait::with_spinner("Clearing Split Tunnel", || {
+        crate::spinner::with_spinner("Clearing Split Tunnel", || {
             split_tunnel::clear_global(client, path)
         })?;
     }
