@@ -582,21 +582,30 @@ mod tests {
 
     #[test]
     fn app_version_retries_once_after_auth_expiry() {
-        use crate::testing::curl_available;
-        use std::sync::atomic::Ordering;
+        use crate::testing::MockQBittorrentWebUi;
 
-        if !curl_available() {
+        if !crate::testing::curl_available() {
             eprintln!("Skipping auth-expiry test: 'curl' is not installed in the environment.");
             return;
         }
-        // First version call looks like an expired session; the client must
-        // re-authenticate and retry exactly once rather than fail outright.
-        let (url, hits, done, handle) = scripted_webui(vec![
+        // An expired session has to be re-authenticated *and* retried. With no
+        // credentials configured, `login()` returns before any HTTP, so the
+        // re-authentication half would not happen and the test would still pass.
+        // The conversation: authenticate, get a session, have that session
+        // rejected, authenticate again, and only then retry. Scripting it in that
+        // order is the point -- a client with no cookie logs in *first*, so a 403
+        // in the first slot would fail the login rather than expire a session.
+        let session = "HTTP/1.1 200 OK\r\nSet-Cookie: SID=mock_session; Path=/\r\nContent-Length: 3\r\n\r\nOk.";
+        let server = MockQBittorrentWebUi::scripted(vec![
+            session,
             "HTTP/1.1 403 Forbidden\r\n\r\nFails.",
-            "HTTP/1.1 200 OK\r\n\r\nv5.0.3",
+            session,
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nv5.0.3",
         ]);
         let mut client = QBittorrentClient::new(&QBittorrentConfig {
-            url,
+            url: server.url(),
+            username: Some("admin".to_string()),
+            password: Some("adminadmin".to_string()),
             ..Default::default()
         });
 
@@ -605,27 +614,31 @@ mod tests {
             "v5.0.3"
         );
         assert_eq!(
-            hits.load(Ordering::SeqCst),
-            2,
-            "an expired session must be retried exactly once"
+            server.paths(),
+            vec![
+                "/api/v2/auth/login",
+                "/api/v2/app/version",
+                "/api/v2/auth/login",
+                "/api/v2/app/version"
+            ],
+            "the retry must be preceded by a fresh login, not sent with the dead cookie"
         );
-
-        done.store(true, Ordering::SeqCst);
-        let _ = handle.join();
     }
 
     #[test]
     fn app_version_reports_persistent_failures() {
-        use crate::testing::curl_available;
+        use crate::testing::MockQBittorrentWebUi;
 
-        if !curl_available() {
+        if !crate::testing::curl_available() {
             eprintln!("Skipping failure test: 'curl' is not installed in the environment.");
             return;
         }
-        let (url, _, done, handle) =
-            scripted_webui(vec!["HTTP/1.1 500 Internal Server Error\r\n\r\nboom"]);
+        // A 500 is not a 403, so there is nothing to re-authenticate: the call
+        // must fail outright rather than retry a status that will not change.
+        let server =
+            MockQBittorrentWebUi::scripted(vec!["HTTP/1.1 500 Internal Server Error\r\n\r\nboom"]);
         let mut client = QBittorrentClient::new(&QBittorrentConfig {
-            url,
+            url: server.url(),
             ..Default::default()
         });
 
@@ -634,51 +647,11 @@ mod tests {
             error.to_string().contains("HTTP 500"),
             "a broken WebUI must be reported with its status: {error}"
         );
-
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = handle.join();
-    }
-
-    /// A WebUI stub answering each request with the next scripted response
-    /// (repeating the last), counting requests so tests can assert retries.
-    fn scripted_webui(
-        responses: Vec<&'static str>,
-    ) -> (
-        String,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
-        std::thread::JoinHandle<()>,
-    ) {
-        use std::io::{Read, Write};
-        use std::sync::atomic::Ordering;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let port = listener.local_addr().expect("address").port();
-
-        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seen = hits.clone();
-        let stop = done.clone();
-        let handle = std::thread::spawn(move || {
-            let mut index = 0;
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buffer = [0u8; 2048];
-                    let read = stream.read(&mut buffer).unwrap_or(0);
-                    if read == 0 {
-                        continue;
-                    }
-                    seen.fetch_add(1, Ordering::Relaxed);
-                    let body = responses[index.min(responses.len() - 1)];
-                    let _ = stream.write_all(body.as_bytes());
-                    index += 1;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-
-        (format!("http://127.0.0.1:{port}"), hits, done, handle)
+        assert_eq!(
+            server.paths(),
+            vec!["/api/v2/app/version"],
+            "one attempt: a server error is not an expired session"
+        );
     }
 
     #[test]

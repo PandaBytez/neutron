@@ -867,10 +867,6 @@ mod tests {
         (state, path)
     }
 
-    fn drain_cleanup(path: &std::path::Path) {
-        crate::testing::remove_temp_config(path);
-    }
-
     #[test]
     fn stale_ip_replies_are_discarded() {
         let (mut state, path) = drain_state("drain-ip");
@@ -896,7 +892,7 @@ mod tests {
         drain_ip_updates(&mut state, &rx, &coord);
         assert_eq!(state.public_ip_info, Some(current));
 
-        drain_cleanup(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -934,7 +930,7 @@ mod tests {
         drain_profile_cache(&mut state, &cache_rx);
         assert!(state.profile_cache.contains_key("uuid-2"));
 
-        drain_cleanup(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -976,7 +972,7 @@ mod tests {
         drain_connection_results(&mut state, &conn_rx, &coord, &mut needs_refresh);
         assert!(state.status_is_error);
 
-        drain_cleanup(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -993,7 +989,7 @@ mod tests {
         assert!(state.pending_split.is_none());
         assert_eq!(state.config.global_split_tunnel, applied);
 
-        drain_cleanup(&path);
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -1098,7 +1094,62 @@ mod tests {
         drain_action_results(&mut state, &rx, &mut needs_refresh);
         assert!(state.status_is_error);
 
-        drain_cleanup(&path);
+        // The WebUI probe verdict, and the two Err arms that reload intent from
+        // disk. Without the first, the port-forward panel would wait forever for
+        // a verdict that arrives and is thrown away.
+        state.qbit_webui_reachable = None;
+        state.modal = crate::tui::state::ActiveModal::PortForward(
+            crate::tui::state::PortForwardModalState::from_config(
+                &crate::config::PortForwardConfig::default(),
+                "http://127.0.0.1:8080",
+            ),
+        );
+        tx.send(AsyncActionResult::ProbeQbitWebUi(true)).unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(state.qbit_webui_reachable, Some(true));
+
+        // ...and ignored for any other modal, so a probe finishing after the
+        // panel closed cannot reopen a stale decision.
+        state.modal = crate::tui::state::ActiveModal::None;
+        state.qbit_webui_reachable = None;
+        tx.send(AsyncActionResult::ProbeQbitWebUi(false)).unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(state.qbit_webui_reachable, None);
+
+        // An Err reverts to what is on disk rather than to the attempted value,
+        // so each flag is set first and must come back down: the config on disk
+        // was just written without either.
+        crate::config::save(&path, &crate::config::AppConfig::default())
+            .expect("config should save");
+        let boom = || Err(crate::error::AppError::CommandFailed("boom".into()));
+
+        state.config.lockdown_enabled = true;
+        tx.send(AsyncActionResult::Lockdown {
+            enable: true,
+            result: boom(),
+        })
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error, "a failed policy must toast");
+        assert!(
+            !state.config.lockdown_enabled,
+            "and revert to the intent on disk, not to the attempt"
+        );
+
+        state.config.general.autoconnect_at_login = true;
+        tx.send(AsyncActionResult::Autoconnect {
+            enable: true,
+            result: boom(),
+        })
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+        assert!(
+            !state.config.general.autoconnect_at_login,
+            "and revert to the intent on disk, not to the attempt"
+        );
+
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -1164,6 +1215,6 @@ mod tests {
             "a failed snapshot must schedule a retry instead of spinning"
         );
 
-        drain_cleanup(&path);
+        crate::testing::remove_temp_config(&path);
     }
 }
