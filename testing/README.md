@@ -144,14 +144,15 @@ Two constraints worth knowing:
 - **Tests run single-threaded.** They share one NetworkManager and one
   firewalld; parallel runs interleave and produce irreproducible failures.
 
-## Optional features
+## qBittorrent integration tests
 
-The qBittorrent integration is behind a Cargo feature and is **off by default**:
+The qBittorrent integration is a stable built-in: no feature flag needed.
 
 ```sh
-cargo test --features qbittorrent
-./testing/run-container-tests.sh --shell   # then: cargo test --features qbittorrent
+cargo test
+./testing/run-container-tests.sh --shell   # then: cargo test
 ```
 
 It drives a third-party Web API from paths that fire automatically on every
-reconnect, and has not been validated against a real qBittorrent instance.
+reconnect. Tests that reach the WebUI skip themselves when `curl` is absent
+rather than reporting a failure that says nothing about the code under test.

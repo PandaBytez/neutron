@@ -71,6 +71,61 @@ impl SplitTunnelConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PortForwardMode {
+    #[default]
+    Disabled,
+    /// Lease a NAT-PMP port from the tunnel gateway without pushing it
+    /// anywhere.
+    Forward,
+    /// Lease the port and automatically push it to qBittorrent.
+    /// `lowercase` would serialize this as "forwardandsync", so the one
+    /// long variant carries an explicit spelling shared by serde,
+    /// `Display`, docs, and the TOML example.
+    #[serde(rename = "forward-and-sync")]
+    ForwardAndSync,
+}
+
+impl PortForwardMode {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, PortForwardMode::Disabled)
+    }
+
+    pub fn syncs_to_qbittorrent(&self) -> bool {
+        matches!(self, PortForwardMode::ForwardAndSync)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortForwardMode::Disabled => "disabled",
+            PortForwardMode::Forward => "forward",
+            PortForwardMode::ForwardAndSync => "forward-and-sync",
+        }
+    }
+}
+
+impl std::str::FromStr for PortForwardMode {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().trim() {
+            "disabled" | "off" | "none" => Ok(PortForwardMode::Disabled),
+            "forward" | "on" | "port-forward" => Ok(PortForwardMode::Forward),
+            "forward-and-sync" | "auto-sync" | "qbit" => Ok(PortForwardMode::ForwardAndSync),
+            other => Err(AppError::Config(format!(
+                "invalid port-forward mode '{other}'; expected 'disabled', 'forward', or 'forward-and-sync'"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for PortForwardMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneralConfig {
     #[serde(default = "default_profiles_dir")]
@@ -141,15 +196,50 @@ impl Default for ThemeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(from = "PortForwardConfigDe")]
 pub struct PortForwardConfig {
     #[serde(default)]
-    pub enabled: bool,
+    pub mode: PortForwardMode,
+    /// Legacy `enabled` flag, deserialized only so configs written before
+    /// the mode existed keep loading; reconciled into `mode` in [`load`]
+    /// and never serialized back.
+    #[serde(skip_serializing)]
+    pub legacy_enabled: bool,
+    /// Whether the file explicitly set `mode`. Absent `mode` and explicit
+    /// `mode = "disabled"` both deserialize to `Disabled` and would be
+    /// indistinguishable, so the reconcile step in [`load`] needs this to
+    /// know an explicit choice always wins over legacy flags.
+    #[serde(skip_serializing)]
+    pub mode_explicit: bool,
+}
+
+/// Deserialization shadow of [`PortForwardConfig`]: `mode` arrives as an
+/// `Option` so presence survives into [`PortForwardConfig::mode_explicit`].
+#[derive(Debug, Default, Deserialize)]
+struct PortForwardConfigDe {
+    #[serde(default)]
+    mode: Option<PortForwardMode>,
+    #[serde(default, alias = "enabled")]
+    legacy_enabled: bool,
+}
+
+impl From<PortForwardConfigDe> for PortForwardConfig {
+    fn from(de: PortForwardConfigDe) -> Self {
+        Self {
+            mode: de.mode.unwrap_or_default(),
+            legacy_enabled: de.legacy_enabled,
+            mode_explicit: de.mode.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QBittorrentConfig {
-    #[serde(default)]
-    pub enabled: bool,
+    /// Legacy sync toggle, deserialized only so pre-mode configs keep
+    /// loading; the port-forward mode decides syncing now (see
+    /// [`PortForwardMode`]).
+    #[serde(default, alias = "enabled", skip_serializing)]
+    pub legacy_enabled: bool,
     #[serde(default = "default_qbittorrent_url")]
     pub url: String,
     #[serde(default)]
@@ -164,10 +254,36 @@ fn default_qbittorrent_url() -> String {
     "http://127.0.0.1:8080".to_string()
 }
 
+/// Host and port of a WebUI URL. Scheme and path stay put so editing the
+/// address does not drop `http://` or a non-root path.
+pub fn split_webui_url(url: &str) -> (String, String) {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return (host.to_string(), port.to_string());
+    }
+    (
+        authority.to_string(),
+        default_qbittorrent_url()
+            .rsplit_once(':')
+            .map(|(_, port)| port.to_string())
+            .unwrap_or_else(|| "8080".to_string()),
+    )
+}
+
+pub fn join_webui_url(url: &str, host: &str, port: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let path = rest.find(['/', '?', '#']).map(|i| &rest[i..]).unwrap_or("");
+    format!("{scheme}://{host}:{port}{path}")
+}
+
 impl Default for QBittorrentConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            legacy_enabled: false,
             url: default_qbittorrent_url(),
             username: None,
             password: None,
@@ -233,6 +349,17 @@ pub fn load(path: &Path) -> AppResult<AppConfig> {
         // The sidecar is authoritative, even when empty: a failed settings
         // save must not resurrect deleted notes from the old inline field.
         config.profile_custom_info = info;
+    }
+    // Reconcile pre-mode configs: two independent booleans collapsed into
+    // one mode. An explicit `mode` always wins (tracked separately because
+    // absent `mode` and explicit `mode = "disabled"` both read as
+    // `Disabled`); legacy flags only promote when no mode was given.
+    if !config.port_forwarding.mode_explicit {
+        if config.qbittorrent.legacy_enabled && config.port_forwarding.legacy_enabled {
+            config.port_forwarding.mode = PortForwardMode::ForwardAndSync;
+        } else if config.port_forwarding.legacy_enabled {
+            config.port_forwarding.mode = PortForwardMode::Forward;
+        }
     }
     Ok(config)
 }
@@ -690,15 +817,101 @@ mod tests {
     }
 
     #[test]
+    fn port_forward_mode_parsing_and_display() {
+        assert_eq!(
+            "forward".parse::<PortForwardMode>().unwrap(),
+            PortForwardMode::Forward
+        );
+        assert_eq!(
+            "forward-and-sync".parse::<PortForwardMode>().unwrap(),
+            PortForwardMode::ForwardAndSync
+        );
+        assert_eq!(
+            "disabled".parse::<PortForwardMode>().unwrap(),
+            PortForwardMode::Disabled
+        );
+        assert_eq!(
+            "off".parse::<PortForwardMode>().unwrap(),
+            PortForwardMode::Disabled
+        );
+        assert_eq!(
+            "auto-sync".parse::<PortForwardMode>().unwrap(),
+            PortForwardMode::ForwardAndSync
+        );
+        assert!("invalid".parse::<PortForwardMode>().is_err());
+
+        assert_eq!(PortForwardMode::Forward.to_string(), "forward");
+        assert_eq!(
+            PortForwardMode::ForwardAndSync.to_string(),
+            "forward-and-sync"
+        );
+        assert_eq!(PortForwardMode::Disabled.to_string(), "disabled");
+
+        assert!(PortForwardMode::Forward.is_enabled());
+        assert!(PortForwardMode::ForwardAndSync.is_enabled());
+        assert!(!PortForwardMode::Disabled.is_enabled());
+        assert!(PortForwardMode::ForwardAndSync.syncs_to_qbittorrent());
+        assert!(!PortForwardMode::Forward.syncs_to_qbittorrent());
+        assert!(!PortForwardMode::Disabled.syncs_to_qbittorrent());
+    }
+
+    #[test]
+    fn legacy_enabled_flags_migrate_to_mode() {
+        let write_fixture = |label: &str, body: &str| -> PathBuf {
+            let path = unique_path(label);
+            fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+                .expect("fixture dir should be created");
+            fs::write(&path, body).expect("legacy fixture should write");
+            path
+        };
+
+        let path = write_fixture(
+            "pf-legacy-both",
+            "[port_forwarding]\nenabled = true\n[qbittorrent]\nenabled = true\n",
+        );
+        let loaded = load(&path).expect("legacy config should load");
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::ForwardAndSync);
+        cleanup(&path);
+
+        let path = write_fixture("pf-legacy-forward", "[port_forwarding]\nenabled = true\n");
+        let loaded = load(&path).expect("legacy config should load");
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::Forward);
+        cleanup(&path);
+
+        // An explicit mode always wins over legacy flags.
+        let path = write_fixture(
+            "pf-mode-wins",
+            "[port_forwarding]\nmode = \"forward\"\nenabled = true\n[qbittorrent]\nenabled = true\n",
+        );
+        let loaded = load(&path).expect("config should load");
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::Forward);
+        cleanup(&path);
+
+        // Explicit `mode = "disabled"` is a real choice, not an absent mode:
+        // stale legacy flags must not promote it.
+        let path = write_fixture(
+            "pf-explicit-disabled-wins",
+            "[port_forwarding]\nmode = \"disabled\"\nenabled = true\n[qbittorrent]\nenabled = true\n",
+        );
+        let loaded = load(&path).expect("config should load");
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::Disabled);
+        cleanup(&path);
+    }
+
+    #[test]
     fn roundtrips_qbittorrent_config() {
         let path = unique_path("qbittorrent-config");
         let config = AppConfig {
+            port_forwarding: PortForwardConfig {
+                mode: PortForwardMode::ForwardAndSync,
+                ..Default::default()
+            },
             qbittorrent: QBittorrentConfig {
-                enabled: true,
                 url: "http://192.168.1.50:8080".to_string(),
                 username: Some("admin".to_string()),
                 password: Some("secret123".to_string()),
                 bind_interface: true,
+                ..Default::default()
             },
             ..AppConfig::default()
         };
@@ -706,11 +919,17 @@ mod tests {
         save(&path, &config).expect("config should save");
         let loaded = load(&path).expect("config should load");
 
-        assert!(loaded.qbittorrent.enabled);
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::ForwardAndSync);
         assert_eq!(loaded.qbittorrent.url, "http://192.168.1.50:8080");
         assert_eq!(loaded.qbittorrent.username.as_deref(), Some("admin"));
         assert_eq!(loaded.qbittorrent.password.as_deref(), Some("secret123"));
         assert!(loaded.qbittorrent.bind_interface);
+        let (host, port) = split_webui_url(&loaded.qbittorrent.url);
+        assert_eq!((host.as_str(), port.as_str()), ("192.168.1.50", "8080"));
+        assert_eq!(
+            join_webui_url("http://127.0.0.1:8080/qbittorrent", "10.0.0.2", "9090"),
+            "http://10.0.0.2:9090/qbittorrent"
+        );
         cleanup(&path);
     }
 
@@ -718,16 +937,19 @@ mod tests {
     fn roundtrips_port_forwarding_config() {
         let path = unique_path("port-forwarding-config");
         let default_cfg = AppConfig::default();
-        assert!(!default_cfg.port_forwarding.enabled);
+        assert_eq!(default_cfg.port_forwarding.mode, PortForwardMode::Disabled);
 
         let config = AppConfig {
-            port_forwarding: PortForwardConfig { enabled: true },
+            port_forwarding: PortForwardConfig {
+                mode: PortForwardMode::Forward,
+                ..Default::default()
+            },
             ..AppConfig::default()
         };
 
         save(&path, &config).expect("config should save");
         let loaded = load(&path).expect("config should load");
-        assert!(loaded.port_forwarding.enabled);
+        assert_eq!(loaded.port_forwarding.mode, PortForwardMode::Forward);
         cleanup(&path);
     }
 

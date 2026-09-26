@@ -39,6 +39,7 @@ pub fn handle_key_event<C: ActionClient>(
             handle_delete_key(state, client, key, &uuid)?;
         }
         ActiveModal::SplitTunnel(_) => handle_split_tunnel_key(state, client, key)?,
+        ActiveModal::PortForward(_) => handle_port_forward_key(state, client, key)?,
         ActiveModal::None => handle_normal_key(state, client, key)?,
     }
     Ok(())
@@ -291,20 +292,16 @@ pub fn execute_action<C: ActionClient>(
             }
         }
         "port_forwarding" => {
-            let enable = !state.config.port_forwarding.enabled;
-            // Persisted before the reload below, which re-reads the config from
-            // disk into `state.config` and would otherwise revert the toggle.
-            config::update(&state.config_path, |cfg| {
-                cfg.port_forwarding.enabled = enable
-            })?;
-            state.config.port_forwarding.enabled = enable;
-
-            // Nothing local to drop: the daemon owns the lease and picks the
-            // new setting up on its next poll, which the periodic lease refresh
-            // then shows. Reloaded anyway so the rest of the view stays current.
-            reload_profiles(state, client)?;
-
-            state.set_status(format!("{} NAT-PMP Port Forwarding.", enabled_verb(enable)));
+            // A mode, not a switch: Disabled, Forward, or ForwardAndSync.
+            // Committed inside the modal, which also reloads and reports.
+            state.qbit_webui_reachable = None;
+            state.qbit_webui_checked_at = None;
+            state.modal =
+                ActiveModal::PortForward(crate::tui::state::PortForwardModalState::from_config(
+                    &state.config.port_forwarding,
+                    &state.config.qbittorrent.url,
+                ));
+            refresh_qbit_webui_probe(state);
         }
         "sync" => {
             if let Some(ref tx) = action_tx {
@@ -329,7 +326,6 @@ pub fn execute_action<C: ActionClient>(
                 }
             }
         }
-        #[cfg(feature = "qbittorrent")]
         "qbit_sync" => {
             // Both halves come from the daemon's lease: the port is only
             // meaningful together with the tunnel it was obtained for, which is
@@ -362,7 +358,7 @@ pub fn execute_action<C: ActionClient>(
                 // Distinguished, because the three causes have three different
                 // fixes and one message for all of them sends the user looking
                 // in the wrong place.
-                None if !state.config.port_forwarding.enabled => {
+                None if !state.config.port_forwarding.mode.is_enabled() => {
                     state.set_status("No forwarded port: NAT-PMP port forwarding is off.")
                 }
                 None if state.lease.is_none() => {
@@ -372,18 +368,6 @@ pub fn execute_action<C: ActionClient>(
                     "No forwarded port yet (connect to a profile that offers NAT-PMP).",
                 ),
             }
-        }
-        #[cfg(feature = "qbittorrent")]
-        "qbit_toggle" => {
-            let enable = !state.config.qbittorrent.enabled;
-            config::update(&state.config_path, |cfg| cfg.qbittorrent.enabled = enable)?;
-            state.config.qbittorrent.enabled = enable;
-            state.set_status(format!(
-                "{} qBittorrent Port Forward Auto-Sync.",
-                enabled_verb(enable)
-            ));
-            // No local verdict to reset: the daemon reads this setting on its
-            // next poll and republishes what it decides.
         }
         "delete" => {
             if let Some(row) = state.selected_row() {
@@ -617,6 +601,199 @@ fn handle_split_tunnel_key<C: NmClient>(
     Ok(())
 }
 
+/// Commit the highlighted port-forward mode, mirroring the split tunnel's
+/// mode selector: `Left`/`Right` move, `Space`/`Enter` applies and closes,
+/// `Esc`/`q` cancels without touching the saved policy.
+fn handle_port_forward_key<C: ActionClient>(
+    state: &mut TuiState,
+    client: &C,
+    key: KeyEvent,
+) -> AppResult<()> {
+    use crate::config::PortForwardMode;
+
+    let mut commit = None;
+    let mut close_modal = false;
+    let mut blocked = false;
+
+    let mut url_changed = false;
+    if let ActiveModal::PortForward(ref mut modal) = state.modal {
+        let typing = matches!(
+            modal.focus,
+            crate::tui::state::PortForwardFocus::Host | crate::tui::state::PortForwardFocus::Port
+        );
+        match key.code {
+            KeyCode::Esc if typing && field_nonempty(modal) => clear_focused_field(modal),
+            KeyCode::Esc | KeyCode::Char('q') => close_modal = true,
+            KeyCode::Tab | KeyCode::Down => next_focus(modal),
+            KeyCode::BackTab | KeyCode::Up => prev_focus(modal),
+            KeyCode::Left if !typing => modal.move_left(),
+            KeyCode::Right if !typing => modal.move_right(),
+            KeyCode::Char(' ') | KeyCode::Enter if !typing => {
+                let mode = modal.selected_highlighted_mode();
+                // Only a failed probe refuses. Unknown is still checking, and
+                // saying the WebUI is down would be a lie.
+                if mode == PortForwardMode::ForwardAndSync
+                    && state.qbit_webui_reachable == Some(false)
+                {
+                    blocked = true;
+                } else {
+                    modal.mode = mode;
+                    commit = Some(mode);
+                    close_modal = true;
+                }
+            }
+            KeyCode::Backspace if typing => {
+                pop_focused_field(modal);
+                url_changed = true;
+            }
+            KeyCode::Char(c) if typing && c.is_ascii() && c != ' ' => {
+                push_focused_field(modal, c);
+                url_changed = true;
+            }
+            _ => {}
+        }
+    }
+
+    if url_changed {
+        persist_webui_url(state)?;
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = None;
+        refresh_qbit_webui_probe(state);
+    }
+
+    if blocked {
+        state.set_error(&crate::error::AppError::QBittorrent(
+            "qBittorrent WebUI unavailable; Auto-Sync was not enabled".into(),
+        ));
+    }
+
+    if let Some(mode) = commit {
+        // Persisted before the reload below, which re-reads the config from
+        // disk into `state.config` and would otherwise revert the choice.
+        config::update(&state.config_path, |cfg| {
+            cfg.port_forwarding.mode = mode;
+        })?;
+        state.config.port_forwarding.mode = mode;
+        let summary = match mode {
+            PortForwardMode::Disabled => "Disabled NAT-PMP Port Forwarding.",
+            PortForwardMode::Forward => "Enabled NAT-PMP Port Forwarding.",
+            PortForwardMode::ForwardAndSync => {
+                "Enabled NAT-PMP Port Forwarding with qBittorrent Auto-Sync."
+            }
+        };
+        state.set_status(summary);
+
+        // Nothing local to drop: the daemon owns the lease and picks the
+        // new setting up on its next poll, which the periodic lease refresh
+        // then shows. Reloaded anyway so the rest of the view stays current.
+        reload_profiles(state, client)?;
+    }
+
+    if close_modal {
+        state.modal = ActiveModal::None;
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = None;
+    }
+
+    Ok(())
+}
+
+fn field_nonempty(modal: &crate::tui::state::PortForwardModalState) -> bool {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => !modal.host.is_empty(),
+        crate::tui::state::PortForwardFocus::Port => !modal.port.is_empty(),
+        crate::tui::state::PortForwardFocus::Mode => false,
+    }
+}
+
+fn clear_focused_field(modal: &mut crate::tui::state::PortForwardModalState) {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => modal.host.clear(),
+        crate::tui::state::PortForwardFocus::Port => modal.port.clear(),
+        crate::tui::state::PortForwardFocus::Mode => {}
+    }
+}
+
+fn pop_focused_field(modal: &mut crate::tui::state::PortForwardModalState) {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => {
+            modal.host.pop();
+        }
+        crate::tui::state::PortForwardFocus::Port => {
+            modal.port.pop();
+        }
+        crate::tui::state::PortForwardFocus::Mode => {}
+    }
+}
+
+fn push_focused_field(modal: &mut crate::tui::state::PortForwardModalState, c: char) {
+    match modal.focus {
+        crate::tui::state::PortForwardFocus::Host => modal.host.push(c),
+        crate::tui::state::PortForwardFocus::Port if c.is_ascii_digit() && modal.port.len() < 5 => {
+            modal.port.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn next_focus(modal: &mut crate::tui::state::PortForwardModalState) {
+    modal.focus = match modal.focus {
+        crate::tui::state::PortForwardFocus::Mode => crate::tui::state::PortForwardFocus::Host,
+        crate::tui::state::PortForwardFocus::Host => crate::tui::state::PortForwardFocus::Port,
+        crate::tui::state::PortForwardFocus::Port => crate::tui::state::PortForwardFocus::Mode,
+    };
+}
+
+fn prev_focus(modal: &mut crate::tui::state::PortForwardModalState) {
+    modal.focus = match modal.focus {
+        crate::tui::state::PortForwardFocus::Mode => crate::tui::state::PortForwardFocus::Port,
+        crate::tui::state::PortForwardFocus::Host => crate::tui::state::PortForwardFocus::Mode,
+        crate::tui::state::PortForwardFocus::Port => crate::tui::state::PortForwardFocus::Host,
+    };
+}
+
+fn persist_webui_url(state: &mut TuiState) -> AppResult<()> {
+    let ActiveModal::PortForward(ref modal) = state.modal else {
+        return Ok(());
+    };
+    let url = modal.webui_url(&state.config.qbittorrent.url);
+    if url == state.config.qbittorrent.url {
+        return Ok(());
+    }
+    config::update(&state.config_path, |cfg| cfg.qbittorrent.url = url.clone())?;
+    state.config.qbittorrent.url = url;
+    Ok(())
+}
+
+const QBIT_WEBUI_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Probe the WebUI while the port-forward panel is open, then again every 5s.
+///
+/// A probe still inside that window is left alone. One that never answered
+/// is sent again, so a dropped send cannot leave Auto-Sync looking unchecked
+/// for the rest of the session. Closing the panel clears both.
+pub fn refresh_qbit_webui_probe(state: &mut TuiState) {
+    if !matches!(state.modal, ActiveModal::PortForward(_)) {
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = None;
+        return;
+    }
+    let in_flight = state.qbit_webui_reachable.is_none() && state.qbit_webui_checked_at.is_some();
+    let due = state
+        .qbit_webui_checked_at
+        .is_none_or(|at| at.elapsed() >= QBIT_WEBUI_REFRESH);
+    if !due {
+        return;
+    }
+    if !in_flight {
+        state.qbit_webui_reachable = None;
+        state.qbit_webui_checked_at = Some(std::time::Instant::now());
+    }
+    if let Some(ref tx) = state.action_tx {
+        let _ = tx.send(crate::tui::state::AsyncAction::ProbeQbitWebUi);
+    }
+}
+
 /// Drop `list[*selected]`, keeping `*selected` inside the shortened list.
 fn remove_selected(list: &mut Vec<String>, selected: &mut usize) {
     if *selected >= list.len() {
@@ -814,14 +991,17 @@ mod tests {
         // NAT-PMP leases are renewed on a timer against the provider's gateway,
         // so they are opt-in: a user who never asked for a forwarded port must
         // never have one requested on their behalf.
-        assert!(
-            !crate::config::AppConfig::default().port_forwarding.enabled,
+        assert_eq!(
+            crate::config::AppConfig::default().port_forwarding.mode,
+            crate::config::PortForwardMode::Disabled,
             "port forwarding must default to off"
         );
     }
 
     #[test]
-    fn toggling_port_forwarding_persists() {
+    fn committing_a_port_forward_mode_persists() {
+        use crate::config::PortForwardMode;
+
         let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
             "wg-eu",
             "uuid-eu",
@@ -832,24 +1012,69 @@ mod tests {
             .expect("config should save");
         let mut state = TuiState::new(path.clone(), crate::config::AppConfig::default());
 
-        execute_action(&mut state, &client, "port_forwarding").expect("toggle should succeed");
-        assert!(state.config.port_forwarding.enabled);
+        let press = |state: &mut TuiState, code: KeyCode| {
+            handle_key_event(state, &client, KeyEvent::new(code, KeyModifiers::NONE))
+                .expect("key should be handled");
+        };
+
+        // The action opens the mode selector rather than flipping a switch.
+        execute_action(&mut state, &client, "port_forwarding").expect("modal should open");
+        assert!(matches!(state.modal, ActiveModal::PortForward(_)));
+
+        // Right, Right, Enter selects ForwardAndSync and commits it.
+        // A live WebUI is required; tests have no probe worker.
+        press(&mut state, KeyCode::Right);
+        press(&mut state, KeyCode::Right);
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::Char('1'));
+        press(&mut state, KeyCode::Char('0'));
+        press(&mut state, KeyCode::BackTab);
+        state.qbit_webui_reachable = Some(true);
+        press(&mut state, KeyCode::Enter);
         assert!(
+            state.config.qbittorrent.url.contains("127.0.0.110"),
+            "typed host digits must persist: {}",
+            state.config.qbittorrent.url
+        );
+
+        assert_eq!(state.modal, ActiveModal::None);
+        assert_eq!(
+            state.config.port_forwarding.mode,
+            PortForwardMode::ForwardAndSync
+        );
+        assert_eq!(
             crate::config::load(&path)
                 .expect("config should load")
                 .port_forwarding
-                .enabled,
-            "the toggle must survive a restart, not just live in memory"
+                .mode,
+            PortForwardMode::ForwardAndSync,
+            "the mode must survive a restart, not just live in memory"
+        );
+        assert!(
+            state.status_message.contains("Auto-Sync"),
+            "the confirmation must name the mode that was applied: {}",
+            state.status_message
         );
 
-        execute_action(&mut state, &client, "port_forwarding").expect("toggle should succeed");
-
-        assert!(!state.config.port_forwarding.enabled);
+        // A failed probe blocks the same commit. No worker here, so the
+        // verdict is injected the way a finished probe would leave it.
+        execute_action(&mut state, &client, "port_forwarding").expect("modal should open");
+        state.qbit_webui_reachable = Some(false);
+        press(&mut state, KeyCode::Enter);
         assert!(
-            !crate::config::load(&path)
-                .expect("config should load")
-                .port_forwarding
-                .enabled
+            matches!(state.modal, ActiveModal::PortForward(_)),
+            "Auto-Sync must stay open when the WebUI probe failed"
+        );
+        assert!(state.status_is_error, "the refusal must be an error");
+
+        // Left moves the highlight, but Esc closes without applying.
+        execute_action(&mut state, &client, "port_forwarding").expect("modal should open");
+        press(&mut state, KeyCode::Left);
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.modal, ActiveModal::None);
+        assert_eq!(
+            state.config.port_forwarding.mode,
+            PortForwardMode::ForwardAndSync
         );
 
         let _ = std::fs::remove_file(&path);
@@ -1264,7 +1489,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "qbittorrent"))]
+#[cfg(test)]
 mod qbittorrent_tests {
     use super::*;
     use crate::config::AppConfig;
@@ -1277,7 +1502,7 @@ mod qbittorrent_tests {
     /// A TUI holding the daemon's lease, with qBittorrent pointed at `url`.
     fn state_holding_lease(url: String) -> (TuiState, MockNmClient) {
         let mut config = AppConfig::default();
-        config.qbittorrent.enabled = true;
+        config.port_forwarding.mode = crate::config::PortForwardMode::ForwardAndSync;
         config.qbittorrent.url = url;
 
         let path = temp_config_path("tui-qbit");

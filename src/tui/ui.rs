@@ -8,13 +8,12 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::config::SplitTunnelMode;
+use crate::config::{PortForwardMode, SplitTunnelMode};
 use crate::nm::network_info::format_speed;
-#[cfg(feature = "qbittorrent")]
 use crate::service::lease::QbitSyncStatus;
 use crate::tui::state::{
-    ActiveModal, CommandPaletteState, SplitTunnelFocus, SplitTunnelModalState, ThemePickerState,
-    TuiState,
+    ActiveModal, CommandPaletteState, PortForwardFocus, PortForwardModalState, SplitTunnelFocus,
+    SplitTunnelModalState, ThemePickerState, TuiState,
 };
 pub const MIN_WIDTH: u16 = 120;
 pub const MIN_HEIGHT: u16 = 30;
@@ -47,6 +46,7 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
         ActiveModal::ThemePicker(tp) => render_theme_picker_modal(frame, size, tp, state),
         ActiveModal::Help => render_help_modal(frame, size, state),
         ActiveModal::SplitTunnel(st) => render_split_tunnel_modal(frame, size, st, state),
+        ActiveModal::PortForward(pf) => render_port_forward_modal(frame, size, pf, state),
         ActiveModal::ConfirmDelete { name, .. } => {
             render_confirm_delete_modal(frame, size, name, state)
         }
@@ -156,10 +156,19 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     // publishing one there is nothing renewing a port, so that is reported as
     // its own state rather than as a bare "N/A" -- otherwise a stopped daemon
     // looks like a provider that does not offer port forwarding.
+    // The tunnel that is up, not the highlighted row. Selecting another
+    // profile must not hide the live listen port.
+    let listen_port = state
+        .active_profile_uuid
+        .as_ref()
+        .and_then(|uuid| state.profile_cache.get(uuid))
+        .and_then(|info| info.diagnostics.listen_port);
     let (port_val, port_val_style) = if let Some(port) = state.forwarded_port() {
         (format!("{port}"), theme.accent)
-    } else if !state.config.port_forwarding.enabled {
-        ("Disabled".to_string(), theme.label_dim)
+    } else if let Some(port) = listen_port {
+        (format!("{port}"), theme.text_primary)
+    } else if !state.config.port_forwarding.mode.is_enabled() {
+        ("--".to_string(), theme.label_dim)
     } else if state.lease.is_none() {
         ("No daemon".to_string(), theme.warning)
     } else if state.active_profile_name.is_some() {
@@ -238,9 +247,8 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
 ///
 /// Styled with the same pills as the connection badge so it reads as live state
 /// rather than as another static label.
-#[cfg(feature = "qbittorrent")]
 fn qbit_sync_badge(state: &TuiState) -> Vec<Span<'static>> {
-    if !state.config.qbittorrent.enabled {
+    if !state.config.port_forwarding.mode.syncs_to_qbittorrent() {
         return Vec::new();
     }
 
@@ -257,12 +265,6 @@ fn qbit_sync_badge(state: &TuiState) -> Vec<Span<'static>> {
     };
 
     vec![Span::raw("  "), Span::styled(label, style)]
-}
-
-/// No badge when the `qbittorrent` feature is compiled out.
-#[cfg(not(feature = "qbittorrent"))]
-fn qbit_sync_badge(_: &TuiState) -> Vec<Span<'static>> {
-    Vec::new()
 }
 
 fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -295,7 +297,11 @@ fn render_policies_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     } else {
         (lock_val, lock_val_style)
     };
-    let (pf_val, pf_val_style) = toggle_status(state.config.port_forwarding.enabled);
+    let (pf_val, pf_val_style) = match state.config.port_forwarding.mode {
+        PortForwardMode::Disabled => ("OFF".to_string(), theme.label_dim),
+        PortForwardMode::Forward => ("ON".to_string(), theme.status_connected),
+        PortForwardMode::ForwardAndSync => ("Auto-Sync".to_string(), theme.accent),
+    };
 
     let split_count = state.config.global_split_tunnel.cidrs.len()
         + state.config.global_split_tunnel.domains.len();
@@ -1153,6 +1159,145 @@ fn render_help_modal(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(help_widget, popup_area);
 }
 
+/// Port-forwarding policy modal: a single mode selector with the same
+/// navigate-and-confirm interaction as the split tunnel's top row.
+///
+/// Small on purpose: the policy is just the [`PortForwardMode`], so there
+/// are no panels to tab through -- `Left`/`Right` move the highlight and
+/// `Space`/`Enter` commits.
+fn render_port_forward_modal(
+    frame: &mut Frame,
+    area: Rect,
+    pf: &PortForwardModalState,
+    state: &TuiState,
+) {
+    let theme = &state.theme;
+    let show_webui_warning = state.qbit_webui_reachable == Some(false);
+    let popup_area = centered_rect(75, if show_webui_warning { 50 } else { 40 }, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut constraints = vec![
+        Constraint::Length(3), // Mode Selector
+        Constraint::Length(3), // WebUI host and port
+    ];
+    if show_webui_warning {
+        constraints.push(Constraint::Length(2));
+    }
+    constraints.push(Constraint::Length(2)); // Explanation footer
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .margin(1)
+        .split(popup_area);
+
+    let mut mode_spans = vec![Span::styled(" Mode:  ", theme.text_secondary)];
+    for (idx, mode) in PortForwardModalState::MODES.iter().enumerate() {
+        let label = match mode {
+            PortForwardMode::Disabled => "Disabled",
+            PortForwardMode::Forward => "Forward",
+            PortForwardMode::ForwardAndSync => "Forward + qBittorrent Sync",
+        };
+        let is_current = pf.mode == *mode;
+        let is_cursor = pf.highlighted_mode == idx;
+        let text = format!(" [ {label} ] ");
+        let style = if is_cursor && is_current {
+            theme.selected_item
+        } else if is_cursor {
+            theme.key_badge_accent
+        } else if is_current {
+            theme.status_pill_connected
+        } else {
+            theme.key_badge
+        };
+        mode_spans.push(Span::styled(text, style));
+        mode_spans.push(Span::raw("  "));
+    }
+
+    let mode_style = if pf.focus == PortForwardFocus::Mode {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let mode_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(mode_style)
+        .title(Span::styled(
+            " Port Forwarding Mode (←/→ Navigate, Space/Enter Select) ",
+            theme.title,
+        ));
+
+    let mode_widget = Paragraph::new(Line::from(mode_spans)).block(mode_block);
+    frame.render_widget(mode_widget, chunks[0]);
+
+    let host_style = if pf.focus == PortForwardFocus::Host {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let port_style = if pf.focus == PortForwardFocus::Port {
+        theme.active_border
+    } else {
+        theme.border
+    };
+    let endpoint = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(chunks[1]);
+    frame.render_widget(
+        Paragraph::new(pf.host.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(host_style)
+                .title(" WebUI host "),
+        ),
+        endpoint[0],
+    );
+    frame.render_widget(
+        Paragraph::new(pf.port.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(port_style)
+                .title(" port "),
+        ),
+        endpoint[1],
+    );
+
+    let footer_chunk = if show_webui_warning {
+        let warn = Paragraph::new(Line::from(vec![
+            Span::styled(" ⚠ qBittorrent WebUI unavailable: ", theme.warning),
+            Span::styled(
+                "enable Web UI (Tools → Options → Web UI). Auto-Sync cannot be selected until it answers.",
+                theme.text_secondary,
+            ),
+        ]));
+        frame.render_widget(warn, chunks[2]);
+        chunks[3]
+    } else {
+        chunks[2]
+    };
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" Forward ", theme.text_secondary),
+        Span::styled("leases a NAT-PMP port. ", theme.label_dim),
+        Span::styled("Forward + qBittorrent Sync ", theme.text_secondary),
+        Span::styled("also pushes it to qBittorrent. ", theme.label_dim),
+        Span::styled("Tab", theme.key_badge),
+        Span::styled(" edits host and port.", theme.label_dim),
+    ]));
+    frame.render_widget(footer, footer_chunk);
+
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme.active_border)
+            .title(Span::styled(" Port Forwarding ", theme.title)),
+        popup_area,
+    );
+}
+
 fn render_split_tunnel_modal(
     frame: &mut Frame,
     area: Rect,
@@ -1608,6 +1753,120 @@ mod render_tests {
         );
     }
 
+    #[test]
+    fn the_policies_panel_names_the_port_forward_mode() {
+        let mut config = AppConfig::default();
+        config.port_forwarding.mode = PortForwardMode::Forward;
+        let on = rendered_policies(config).join("\n");
+        assert!(
+            on.contains("[o] Port Forward:") && on.contains("ON"),
+            "Forward mode must render ON: {on}"
+        );
+
+        let mut config = AppConfig::default();
+        config.port_forwarding.mode = PortForwardMode::ForwardAndSync;
+        let sync = rendered_policies(config).join("\n");
+        assert!(
+            sync.contains("[o] Port Forward:") && sync.contains("Auto-Sync"),
+            "ForwardAndSync mode must render Auto-Sync: {sync}"
+        );
+    }
+
+    #[test]
+    fn the_port_forward_modal_renders_all_three_modes() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        state.modal = ActiveModal::PortForward(PortForwardModalState::from_config(
+            &state.config.port_forwarding,
+            &state.config.qbittorrent.url,
+        ));
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                render(frame, &state);
+            })
+            .expect("draw should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Port Forwarding Mode"),
+            "the modal must title itself: {rendered}"
+        );
+        assert!(
+            rendered.contains("Disabled")
+                && rendered.contains("Forward")
+                && rendered.contains("Forward + qBittorrent Sync"),
+            "the modal must offer all three modes: {rendered}"
+        );
+        assert!(
+            rendered.contains("127.0.0.1") && rendered.contains("8080"),
+            "the modal must show the default WebUI host and port: {rendered}"
+        );
+        assert!(
+            rendered.contains('╭') && rendered.contains("Port Forwarding "),
+            "the modal must have an outer border: {rendered}"
+        );
+        assert!(
+            !rendered.contains("WebUI unavailable"),
+            "a missing verdict must not warn: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_port_forward_modal_warns_when_the_webui_is_down() {
+        let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
+        let mut modal = PortForwardModalState::from_config(
+            &state.config.port_forwarding,
+            &state.config.qbittorrent.url,
+        );
+        modal.move_right();
+        modal.move_right();
+        state.modal = ActiveModal::PortForward(modal);
+        state.qbit_webui_reachable = Some(false);
+
+        let rendered = rendered_port_forward_modal(&state);
+        assert!(
+            rendered.contains("qBittorrent WebUI unavailable"),
+            "a refused WebUI must warn while Auto-Sync is highlighted: {rendered}"
+        );
+
+        state.qbit_webui_reachable = Some(true);
+        let up = rendered_port_forward_modal(&state);
+        assert!(
+            !up.contains("WebUI unavailable"),
+            "a live WebUI must not warn: {up}"
+        );
+    }
+
+    fn rendered_port_forward_modal(state: &TuiState) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+        terminal
+            .draw(|frame| {
+                render(frame, state);
+            })
+            .expect("draw should succeed");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
     /// Render just the status panel and return it as one plain string.
     fn rendered_status(state: &TuiState) -> String {
         rendered_status_at(state, 78)
@@ -1652,6 +1911,33 @@ mod render_tests {
             rendered.contains('🔌') && rendered.contains("Port:") && rendered.contains("51820"),
             "status panel must render the port with icon: {rendered}"
         );
+
+        state.lease = None;
+        state.config.port_forwarding.mode = crate::config::PortForwardMode::Disabled;
+        state.active_profile_uuid = Some("uuid-us".to_string());
+        state.profile_cache.insert(
+            "uuid-us".to_string(),
+            crate::tui::state::CachedProfileInfo {
+                diagnostics: crate::nm::ProfileDiagnostics {
+                    listen_port: Some(51234),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Highlighting a different profile must not replace the live port.
+        state.selected_info = Some(crate::tui::state::CachedProfileInfo {
+            diagnostics: crate::nm::ProfileDiagnostics {
+                listen_port: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let listen = rendered_status(&state);
+        assert!(
+            listen.contains("51234") && !listen.contains("Port: 1"),
+            "the live listen port must show with forwarding off: {listen}"
+        );
         assert!(
             rendered.contains("⏱ 42ms"),
             "status panel must render ping next to connected: {rendered}"
@@ -1662,7 +1948,6 @@ mod render_tests {
         );
     }
 
-    #[cfg(feature = "qbittorrent")]
     mod qbittorrent_badge {
         use super::*;
         use crate::service::lease::{LeaseState, QbitSyncStatus};
@@ -1683,8 +1968,7 @@ mod render_tests {
         /// The same tunnel, but with no daemon publishing a lease.
         fn state_without_daemon() -> TuiState {
             let mut config = AppConfig::default();
-            config.qbittorrent.enabled = true;
-            config.port_forwarding.enabled = true;
+            config.port_forwarding.mode = PortForwardMode::ForwardAndSync;
 
             let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), config);
             state.active_profile_name = Some("wg-us".to_string());
@@ -1697,7 +1981,7 @@ mod render_tests {
             // everyone who does not use it would be noise -- and would read as a
             // failure, since nothing is ever synced.
             let mut state = synced_state(QbitSyncStatus::Synchronized);
-            state.config.qbittorrent.enabled = false;
+            state.config.port_forwarding.mode = PortForwardMode::Forward;
 
             let rendered = rendered_status(&state);
 

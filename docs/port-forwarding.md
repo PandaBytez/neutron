@@ -46,12 +46,14 @@ Neutron derives the default NAT-PMP gateway IP automatically:
 
 ## Auto-Renewal Lifecycle
 
-Port forwarding is **off by default** — a lease is renewed on a timer against the provider's gateway, so it is never requested unless asked for. Turn it on with **`o`** in the TUI (or via the Command Palette), or set it in `~/.config/neutron/config.toml`:
+Port forwarding is **off by default** — a lease is renewed on a timer against the provider's gateway, so it is never requested unless asked for. Press **`o`** in the TUI to open the Port Forwarding mode modal and pick **Disabled**, **Forward** (lease only), or **Forward + qBittorrent Sync** (lease and push to qBittorrent), or set it in `~/.config/neutron/config.toml`:
 
 ```toml
 [port_forwarding]
-enabled = true
+mode = "forward-and-sync"
 ```
+
+Legacy configs with the old `enabled` flags keep loading: `[port_forwarding] enabled = true` becomes `forward`, and additionally `[qbittorrent] enabled = true` becomes `forward-and-sync`.
 
 1. **Lease Grant**: Upon receiving a success packet, the granted port number is stored in memory and displayed in the UI banner.
 2. **Periodic Renewal Timer**: A background timer runs at `RENEW_INTERVAL` (every 45 seconds) to refresh the lease with the gateway.
@@ -91,9 +93,9 @@ neutron qbit test
 # Immediately forward the active leased port to qBittorrent
 neutron qbit sync
 
-# Enable / disable automated background port synchronization
-neutron qbit enable
-neutron qbit disable
+# Sync mode control (sets the [port_forwarding] policy mode)
+neutron qbit enable    # forward-and-sync: lease and auto-sync
+neutron qbit disable   # forward: lease only, port forwarding stays on
 
 # Configure WebUI parameters & optional interface binding
 neutron qbit config --url http://127.0.0.1:8080 --bind true
