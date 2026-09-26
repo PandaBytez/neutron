@@ -110,11 +110,21 @@ pub fn resolve(
 /// the root is the grandparent of the executable. Scoped per root rather than
 /// read from `$CARGO_HOME`, because cargo's own list and uninstall commands are
 /// scoped the same way.
+///
+/// The `bin` is checked rather than assumed. A binary at some other shape -- a
+/// distro package, a symlink farm, a developer's `target/debug` -- has no root
+/// cargo would recognise, and handing cargo one anyway produces an argv that
+/// addresses a directory it does not own. Refusing is the honest answer; the
+/// caller reports it.
 fn cargo_root(exe: &Path) -> Option<&Path> {
-    exe.parent()?.parent()
+    let bin = exe.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    bin.parent()
 }
 
-pub fn is_homebrew(exe: &Path) -> bool {
+fn is_homebrew(exe: &Path) -> bool {
     let components: Vec<_> = exe
         .components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -247,6 +257,29 @@ mod tests {
             resolved("/opt/ci/neutron/bin/neutron", Some(CARGO_LIST), &["cargo"]),
             cargo_removal("/opt/ci/neutron/bin/neutron")
         );
+    }
+
+    #[test]
+    fn a_path_that_is_not_root_bin_exe_is_refused_rather_than_addressed() {
+        // The commit that scoped detection to the install root promised to refuse
+        // a binary whose path has no such shape. It only refused incidentally,
+        // because the guessed root's package list came back empty: a cargo list
+        // that happens to name neutron would have produced an argv addressing a
+        // root that does not exist.
+        for exe in [
+            "/home/user/proj/target/debug/neutron",
+            "/home/user/proj/neutron",
+            "/home/user/proj/build/neutron",
+        ] {
+            let error = resolve(Path::new(exe), Some(CARGO_LIST), |program| {
+                program == "cargo"
+            })
+            .expect_err("a path that is not <root>/bin/<exe> must be refused");
+            assert!(
+                error.to_string().contains(exe),
+                "the refusal must name the path it refused: {error}"
+            );
+        }
     }
 
     #[test]
