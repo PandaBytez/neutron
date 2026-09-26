@@ -182,6 +182,12 @@ pub fn remove_temp_config(path: &Path) {
 }
 
 /// Test helper to create a WireguardProfile.
+/// An inactive profile: what most lifecycle tests want, and what a two-argument
+/// `profile` in a test module usually meant.
+pub fn inactive(name: &str, uuid: &str) -> WireguardProfile {
+    profile(name, uuid, ProfileState::Inactive)
+}
+
 pub fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile {
     WireguardProfile {
         name: name.to_string(),
@@ -256,6 +262,43 @@ impl MockNmClient {
     pub fn with_config_path(mut self, path: PathBuf) -> Self {
         self.config_path = Some(path);
         self
+    }
+
+    /// The config this mock reads policies from: what a test injected, or -- like
+    /// the real client -- the user's own.
+    fn policy_config_path(&self) -> Option<PathBuf> {
+        self.config_path
+            .clone()
+            .or_else(|| crate::config::default_config_path().ok())
+    }
+
+    /// The kill-switch and split-tunnel arguments the real client would pin on
+    /// `identifier` for this config.
+    ///
+    /// One implementation for connect, switch and import: they differ only in
+    /// *when* they run. Three copies is three places for an injected path to be
+    /// forgotten, which is how `switch_to` and `import_wireguard_profile` came to
+    /// read the developer's real settings while `connect` honoured the temp one.
+    fn apply_policy_args(&self, identifier: &str, config_path: &Path) {
+        let Ok(app_cfg) = crate::config::load(config_path) else {
+            return;
+        };
+        if app_cfg.kill_switch_enabled {
+            self.apply_args(&crate::nm::kill_switch::set_args(identifier, true, true));
+        }
+        if app_cfg.global_split_tunnel.mode.is_enabled() {
+            let (v4, v6) = crate::nm::split_tunnel::routes_for(
+                app_cfg.global_split_tunnel.mode,
+                &app_cfg.global_split_tunnel.cidrs,
+                &app_cfg.global_split_tunnel.domains,
+            );
+            self.apply_args(&crate::nm::split_tunnel::set_args(
+                identifier,
+                app_cfg.global_split_tunnel.mode,
+                &v4,
+                &v6,
+            ));
+        }
     }
 
     pub fn with_sweep_barrier(self, barrier: Arc<std::sync::Barrier>) -> Self {
@@ -635,34 +678,11 @@ impl NmLifecycle for MockNmClient {
             profile_identifier,
             true,
         ));
-        let cfg_path = self
-            .config_path
-            .clone()
-            .or_else(|| crate::config::default_config_path().ok());
-        if let Some(config_path) = cfg_path {
+        if let Some(config_path) = self.policy_config_path() {
+            // Under the policy lock, as the real client does, so a concurrent
+            // toggle cannot be read half-applied.
             let _ = crate::config::coordinate_policy(&config_path, || {
-                if let Ok(app_cfg) = crate::config::load(&config_path) {
-                    if app_cfg.kill_switch_enabled {
-                        self.apply_args(&crate::nm::kill_switch::set_args(
-                            profile_identifier,
-                            true,
-                            true,
-                        ));
-                    }
-                    if app_cfg.global_split_tunnel.mode.is_enabled() {
-                        let (v4, v6) = crate::nm::split_tunnel::routes_for(
-                            app_cfg.global_split_tunnel.mode,
-                            &app_cfg.global_split_tunnel.cidrs,
-                            &app_cfg.global_split_tunnel.domains,
-                        );
-                        self.apply_args(&crate::nm::split_tunnel::set_args(
-                            profile_identifier,
-                            app_cfg.global_split_tunnel.mode,
-                            &v4,
-                            &v6,
-                        ));
-                    }
-                }
+                self.apply_policy_args(profile_identifier, &config_path);
                 Ok(())
             });
         }
@@ -710,29 +730,8 @@ impl NmLifecycle for MockNmClient {
             profile_identifier,
             true,
         ));
-        if let Ok(config_path) = crate::config::default_config_path()
-            && let Ok(app_cfg) = crate::config::load(&config_path)
-        {
-            if app_cfg.kill_switch_enabled {
-                self.apply_args(&crate::nm::kill_switch::set_args(
-                    profile_identifier,
-                    true,
-                    true,
-                ));
-            }
-            if app_cfg.global_split_tunnel.mode.is_enabled() {
-                let (v4, v6) = crate::nm::split_tunnel::routes_for(
-                    app_cfg.global_split_tunnel.mode,
-                    &app_cfg.global_split_tunnel.cidrs,
-                    &app_cfg.global_split_tunnel.domains,
-                );
-                self.apply_args(&crate::nm::split_tunnel::set_args(
-                    profile_identifier,
-                    app_cfg.global_split_tunnel.mode,
-                    &v4,
-                    &v6,
-                ));
-            }
+        if let Some(config_path) = self.policy_config_path() {
+            self.apply_policy_args(profile_identifier, &config_path);
         }
         if self.unhealthy {
             return Err(AppError::TunnelUnhealthy(format!(
@@ -774,25 +773,8 @@ impl NmLifecycle for MockNmClient {
 
         // When imported while global security settings are active, the new profile
         // immediately inherits kill switch and split-tunnel settings.
-        if let Ok(config_path) = crate::config::default_config_path()
-            && let Ok(app_cfg) = crate::config::load(&config_path)
-        {
-            if app_cfg.kill_switch_enabled {
-                self.apply_args(&crate::nm::kill_switch::set_args(&uuid, true, true));
-            }
-            if app_cfg.global_split_tunnel.mode.is_enabled() {
-                let (v4, v6) = crate::nm::split_tunnel::routes_for(
-                    app_cfg.global_split_tunnel.mode,
-                    &app_cfg.global_split_tunnel.cidrs,
-                    &app_cfg.global_split_tunnel.domains,
-                );
-                self.apply_args(&crate::nm::split_tunnel::set_args(
-                    &uuid,
-                    app_cfg.global_split_tunnel.mode,
-                    &v4,
-                    &v6,
-                ));
-            }
+        if let Some(config_path) = self.policy_config_path() {
+            self.apply_policy_args(&uuid, &config_path);
         }
 
         Ok(format!("Imported {}", path.display()))
@@ -922,9 +904,52 @@ impl FirewallClient for MockNmClient {
 /// that push a port -- the TUI, the tray daemon and the CLI -- need it.
 pub struct MockQBittorrentWebUi {
     port: u16,
-    set_preferences: Arc<Mutex<String>>,
+    log: Arc<RequestLog>,
     done: Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What a stub was asked for, so a test can assert on the conversation rather
+/// than on a count.
+#[derive(Default)]
+pub struct RequestLog {
+    paths: Mutex<Vec<String>>,
+    set_preferences: Mutex<String>,
+}
+
+impl RequestLog {
+    /// The request target of every call received, in order.
+    pub fn paths(&self) -> Vec<String> {
+        self.paths
+            .lock()
+            .map(|paths| paths.clone())
+            .unwrap_or_default()
+    }
+
+    /// The raw `setPreferences` request last received, empty if none was.
+    pub fn last_set_preferences(&self) -> String {
+        self.set_preferences
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
+    }
+
+    fn record(&self, request: &str) {
+        if let Ok(mut paths) = self.paths.lock() {
+            paths.push(
+                request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        if request.contains("/api/v2/app/setPreferences")
+            && let Ok(mut slot) = self.set_preferences.lock()
+        {
+            *slot = request.to_string();
+        }
+    }
 }
 
 impl MockQBittorrentWebUi {
@@ -936,6 +961,46 @@ impl MockQBittorrentWebUi {
 
     /// Start the stub on an ephemeral loopback port.
     pub fn start() -> Self {
+        Self::spawn(|request| {
+            // Login is answered even though the default config sends no
+            // credentials: without it, merely configuring a username would turn
+            // every test into a confusing 404.
+            if request.contains("/api/v2/auth/login") {
+                "HTTP/1.1 200 OK\r\nSet-Cookie: SID=mock_session; Path=/\r\nContent-Length: 3\r\n\r\nOk."
+            } else if request.contains("/api/v2/app/version") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nv5.0.3"
+            } else if request.contains("/api/v2/app/preferences") {
+                "HTTP/1.1 200 OK\r\n\r\n{\"listen_port\": 40000}"
+            } else if request.contains("/api/v2/app/setPreferences") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                "HTTP/1.1 404 Not Found\r\n\r\n"
+            }
+        })
+    }
+
+    /// A stub that answers each request with the next of `responses`, repeating
+    /// the last one.
+    ///
+    /// For the paths where the client is supposed to *react* to a failure -- an
+    /// expired session, a rejected write -- where routing by request would have
+    /// to model a state machine the test is trying to provoke.
+    pub fn scripted(responses: Vec<&'static str>) -> Self {
+        let index = Arc::new(Mutex::new(0usize));
+        Self::spawn(move |_| {
+            let mut slot = index.lock().expect("mock mutex poisoned");
+            let response = responses[(*slot).min(responses.len() - 1)];
+            *slot += 1;
+            response
+        })
+    }
+
+    /// The listening stub every variant is built on: one accept loop, one
+    /// shutdown flag, one place that records what came in.
+    fn spawn<F>(respond: F) -> Self
+    where
+        F: Fn(&str) -> &'static str + Send + 'static,
+    {
         use std::io::{Read, Write};
         use std::sync::atomic::Ordering;
 
@@ -943,37 +1008,21 @@ impl MockQBittorrentWebUi {
         listener.set_nonblocking(true).expect("nonblocking");
         let port = listener.local_addr().expect("address").port();
 
-        let set_preferences = Arc::new(Mutex::new(String::new()));
+        let log = Arc::new(RequestLog::default());
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let recorded = set_preferences.clone();
+        let recorded = log.clone();
         let stop = done.clone();
         let handle = std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut buffer = [0u8; 2048];
                     let read = stream.read(&mut buffer).unwrap_or(0);
+                    if read == 0 {
+                        continue;
+                    }
                     let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-
-                    // Login is answered even though the default config sends no
-                    // credentials: without it, merely configuring a username
-                    // would turn every test into a confusing 404.
-                    let response = if request.contains("/api/v2/auth/login") {
-                        "HTTP/1.1 200 OK\r\nSet-Cookie: SID=mock_session; Path=/\r\nContent-Length: 3\r\n\r\nOk."
-                    } else if request.contains("/api/v2/app/version") {
-                        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nv5.0.3"
-                    } else if request.contains("/api/v2/app/preferences") {
-                        "HTTP/1.1 200 OK\r\n\r\n{\"listen_port\": 40000}"
-                    } else if request.contains("/api/v2/app/setPreferences") {
-                        if let Ok(mut slot) = recorded.lock() {
-                            *slot = request;
-                        }
-                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-                    } else {
-                        "HTTP/1.1 404 Not Found\r\n\r\n"
-                    };
-
-                    let _ = stream.write_all(response.as_bytes());
+                    recorded.record(&request);
+                    let _ = stream.write_all(respond(&request).as_bytes());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -981,7 +1030,7 @@ impl MockQBittorrentWebUi {
 
         Self {
             port,
-            set_preferences,
+            log,
             done,
             handle: Some(handle),
         }
@@ -992,12 +1041,14 @@ impl MockQBittorrentWebUi {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// The request targets received, in order.
+    pub fn paths(&self) -> Vec<String> {
+        self.log.paths()
+    }
+
     /// The raw `setPreferences` request last received, empty if none was.
     pub fn last_set_preferences(&self) -> String {
-        self.set_preferences
-            .lock()
-            .map(|slot| slot.clone())
-            .unwrap_or_default()
+        self.log.last_set_preferences()
     }
 }
 
