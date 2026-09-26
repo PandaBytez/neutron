@@ -262,7 +262,15 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
         Some(Commands::Qbit { command }) => handle_qbit_command(client, command),
         Some(Commands::Uninstall { purge }) => {
-            uninstall::handle_uninstall_command(client, &path, purge)
+            // A missing autostart directory is not a failure: nothing was installed.
+            let autostart_dir = service::autostart::dir().ok();
+            uninstall::handle_uninstall_command(
+                client,
+                &path,
+                autostart_dir.as_deref(),
+                std::path::Path::new("/proc"),
+                purge,
+            )
         }
         Some(Commands::Reset { yes }) => {
             // A missing autostart directory means nothing was installed.

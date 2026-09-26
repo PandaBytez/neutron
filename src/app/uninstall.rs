@@ -15,7 +15,7 @@ use crate::app::split_tunnel;
 use crate::config;
 use crate::error::{AppError, AppResult};
 use crate::firewall::FirewallClient;
-use crate::nm::{NmClient, NmIntrospect};
+use crate::nm::NmClient;
 use crate::service;
 
 /// `neutron reset`: factory reset, back to a first-run state.
@@ -35,7 +35,7 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     proc_root: &std::path::Path,
     assume_yes: bool,
 ) -> AppResult<()> {
-    let before = load_for_teardown(path);
+    let (before, settings_readable) = load_for_teardown(path);
     if !assume_yes && !confirm_reset(&before)? {
         println!("Reset cancelled; nothing was changed.");
         return Ok(());
@@ -56,6 +56,19 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     // on saved intent so a reset on a clean install does not sweep every profile
     // for nothing; the config is the only record of what was applied, and these
     // are recoverable by hand, unlike a locked-down box.
+    //
+    // Which is also why an unreadable config cannot withdraw them: the settings
+    // that said they were on are the ones that could not be read, and the fresh
+    // config written below erases the record either way. So the routes stay in
+    // NetworkManager and the user is told, with the commands that finish the job.
+    if !settings_readable {
+        eprintln!(
+            "Warning: the settings could not be read, so the kill switch and split-tunnel \
+             routes Neutron wrote into your profiles could not be matched to the profiles \
+             they were written to. If either was on, finish with:\n  \
+             neutron kill-switch disable\n  neutron split-tunnel clear"
+        );
+    }
     if before.kill_switch_enabled {
         crate::spinner::with_spinner("Disabling Kill Switch", || {
             set_global_kill_switch(client, path, false)
@@ -81,29 +94,30 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
         }
     );
     println!("  settings: {}", path.display());
-    report_drop_dir(path, &before);
+    report_drop_dir(path.parent(), &config::resolve_profiles_dir(&before));
     if still_running > 0 {
         println!("  {still_running} daemon(s) did not exit; close them before logging in again.");
     }
     Ok(())
 }
 
-/// The saved settings, or defaults when they cannot be read.
+/// The saved settings, and whether they could be read at all.
 ///
-/// Teardown is gated on evidence, never on this, precisely because the settings
-/// may be the thing that is broken: a config that no longer parses must not be
-/// able to stop the command that would leave the machine firewalled. Reading it
-/// still decides what else to withdraw, so the failure is reported rather than
-/// swallowed.
-fn load_for_teardown(path: &std::path::Path) -> config::AppConfig {
+/// The firewall teardown is gated on evidence, never on this, precisely because
+/// the settings may be the thing that is broken: a config that no longer parses
+/// must not be able to stop the command that would leave the machine firewalled.
+/// Reading it still decides what else to withdraw, so the failure is reported
+/// rather than swallowed -- and the flag is what lets the caller say that the
+/// profile policies were left behind.
+fn load_for_teardown(path: &std::path::Path) -> (config::AppConfig, bool) {
     match config::load(path) {
-        Ok(cfg) => cfg,
+        Ok(cfg) => (cfg, true),
         Err(error) => {
             println!(
                 "Settings at {} could not be read ({error}); continuing from evidence on disk.",
                 path.display()
             );
-            config::AppConfig::default()
+            (config::AppConfig::default(), false)
         }
     }
 }
@@ -138,14 +152,11 @@ fn revoke_installed_state<C: FirewallClient>(
 /// `profiles_dir` is user-configurable and may be any path, holding `.conf`
 /// files that may never have been imported. Reported by both commands, and never
 /// deleted: these are the user's files, not the app's.
-fn report_drop_dir(config_path: &std::path::Path, cfg: &config::AppConfig) {
-    let drop_dir = config::resolve_profiles_dir(cfg);
-    let inside = config_path
-        .parent()
-        .is_some_and(|root| drop_dir.starts_with(root));
+fn report_drop_dir(config_root: Option<&std::path::Path>, drop_dir: &std::path::Path) {
+    let inside = config_root.is_some_and(|root| drop_dir.starts_with(root));
     if !inside {
         println!(
-            "  profile drop directory left in place: {}",
+            "Profile drop directory left in place: {}",
             drop_dir.display()
         );
     }
@@ -202,55 +213,34 @@ fn confirm_reset(before: &config::AppConfig) -> AppResult<bool> {
 /// refusing an unrecognized source is only safe if nothing has been deleted
 /// yet, and removing the binary we are running from is only safe once there is
 /// nothing left to do afterwards.
+/// `proc_root` and `autostart_dir` are parameters for the same reason they are
+/// on [`handle_reset_command`]: both are paths outside the process, and the
+/// daemon stop ends in `kill(2)`.
 pub fn handle_uninstall_command<C: NmClient + FirewallClient>(
     client: &C,
     path: &std::path::Path,
+    autostart_dir: Option<&std::path::Path>,
+    proc_root: &std::path::Path,
     purge: bool,
 ) -> AppResult<()> {
     let removal = crate::install::current()?;
     // A live tray daemon can re-apply policies after teardown, and would keep
     // renewing a port forward with the binary about to be gone. A window is a
     // session somebody is in, so it is left open and reported below.
-    let still_running = crate::app::stop_daemons(
-        std::path::Path::new("/proc"),
-        std::time::Duration::from_secs(2),
-    );
-    // A missing autostart directory is not a failure: nothing was installed.
-    let autostart_dir = service::autostart::dir().ok();
-    revoke_and_purge(client, path, autostart_dir.as_deref(), purge)?;
+    let still_running = crate::app::stop_daemons(proc_root, std::time::Duration::from_secs(2));
+    revoke_installed_state(client, autostart_dir)?;
     if still_running > 0 {
         println!(
             "{still_running} Neutron daemon(s) did not exit; they can re-apply policies until closed."
         );
     }
-    remove_the_package(&removal)
-}
-
-/// Revoke every Neutron-owned file outside the package: the lockdown ruleset,
-/// the root-owned refresh helper, its polkit action, the autostart entry, and
-/// (under `purge`) the configuration directory.
-///
-/// Revoke-then-purge is deliberate and load-bearing. If the privileged teardown
-/// fails -- a declined password prompt, a firewalld that rejects the batch --
-/// this returns early with the settings still on disk, so a failed teardown can
-/// never leave the user with neither protection nor configuration. Callers must
-/// resolve the install source before calling this.
-pub fn revoke_and_purge<C: NmIntrospect + FirewallClient>(
-    client: &C,
-    path: &std::path::Path,
-    autostart_dir: Option<&std::path::Path>,
-    purge: bool,
-) -> AppResult<()> {
-    revoke_installed_state(client, autostart_dir)?;
-    // Saved intent is deliberately left as the user set it. Uninstall removes the
-    // mechanism, it does not rewrite preferences: with `--purge` the file goes
-    // anyway, and without it a reinstall restores the lockdown they chose. The
-    // lock is gone either way, so a stale `true` cannot leave them unprotected.
+    // The package goes before the settings, not after. This binary is the only
+    // thing that can lift the ruleset, so revocation has to come first -- but a
+    // `brew` or `cargo uninstall` that then fails must not have taken the
+    // eligibility pool, the favourites and the qBittorrent password with it.
+    remove_the_package(&removal)?;
     if let Some(drop_dir) = remove_app_settings(path, purge)? {
-        println!(
-            "Profile drop directory left in place: {}",
-            drop_dir.display()
-        );
+        report_drop_dir(path.parent(), &drop_dir);
     }
     report_manual_unit(path.parent());
     Ok(())
@@ -363,8 +353,8 @@ mod tests {
         config::save(&path, &config::AppConfig::default()).expect("config should save");
         service::autostart::install_in(&autostart_dir).expect("autostart entry should install");
 
-        revoke_and_purge(&client, &path, Some(&autostart_dir), false)
-            .expect("revoke should succeed");
+        revoke_installed_state(&client, Some(&autostart_dir)).expect("revoke should succeed");
+        remove_app_settings(&path, false).expect("settings should be kept");
 
         let before = relative_paths(&home);
         assert!(
@@ -399,8 +389,9 @@ mod tests {
         .expect("config should save");
         let before = relative_paths(&home);
 
-        let error = revoke_and_purge(&client, &path, None, true)
+        let error = revoke_installed_state(&client, None)
             .expect_err("a failed teardown must abort the uninstall");
+        // Nothing after the teardown ran: the settings are still there.
 
         // Not a `PolicyUpdate`: there is no policy left to reconcile here, and
         // the user needs to know the uninstall stopped before it deleted
@@ -418,7 +409,8 @@ mod tests {
         let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
         let path = unique_test_config_path();
 
-        revoke_and_purge(&client, &path, None, false).expect("revoke should succeed");
+        revoke_installed_state(&client, None).expect("revoke should succeed");
+        remove_app_settings(&path, false).expect("settings should be kept");
 
         assert_eq!(
             client.lockdown_calls(),
@@ -434,7 +426,8 @@ mod tests {
         let client = crate::testing::MockNmClient::new(vec![]);
         let path = unique_test_config_path();
 
-        revoke_and_purge(&client, &path, None, true).expect("revoke should succeed");
+        revoke_installed_state(&client, None).expect("revoke should succeed");
+        remove_app_settings(&path, true).expect("purge should succeed");
 
         assert!(client.lockdown_calls().is_empty());
         cleanup_test_config(&path);
@@ -457,7 +450,8 @@ mod tests {
         )
         .expect("config should save");
 
-        revoke_and_purge(&client, &path, None, true).expect("revoke should succeed");
+        revoke_installed_state(&client, None).expect("revoke should succeed");
+        remove_app_settings(&path, true).expect("purge should succeed");
 
         assert!(
             client.lockdown_calls().is_empty(),
@@ -479,7 +473,8 @@ mod tests {
             .expect("config directory should be created");
         std::fs::write(&path, "this is not valid toml = = =").expect("corrupt config should write");
 
-        revoke_and_purge(&client, &path, None, true).expect("revoke should succeed");
+        revoke_installed_state(&client, None).expect("revoke should succeed");
+        remove_app_settings(&path, true).expect("purge should succeed");
 
         assert_eq!(
             client.lockdown_calls(),
