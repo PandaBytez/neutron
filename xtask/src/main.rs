@@ -1,6 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const IMAGE_NAME: &str = "neutron-sandbox";
 
@@ -456,6 +457,10 @@ Left alone: the firewall rules, the root-owned refresh helper, the polkit
 action, and every settings file (captured beforehand and restored if the
 install touches them).
 
+Restarted: the tray/lease daemon, if it was running. An install replaces the
+binary underneath a running process, which would otherwise go on using the old
+build until the next login. A running Neutron window is reported, not closed.
+
 Left stale: the refresh helper is a copy of the binary from when lockdown
 was enabled. After changing firewall code run `neutron lockdown enable`
 once to refresh it.";
@@ -497,8 +502,17 @@ fn run_reinstall(root: &Path, args: &[String]) -> i32 {
                     PathBuf::from(home).join(".cargo")
                 })
         });
-    println!("Installed: {}", root_dir.join("bin/neutron").display());
+    let program = root_dir.join("bin/neutron");
+    println!("Installed: {}", program.display());
     println!("Lockdown left alone: firewall rules, refresh helper, and polkit action unchanged.");
+    match restart_daemon(Path::new("/proc"), &program) {
+        Ok(Some(pid)) => println!("Daemon restarted on this build (pid {pid})."),
+        Ok(None) => println!("No daemon was running, so none was started."),
+        Err(reason) => eprintln!("Warning: the running daemon still has the old build -- {reason}"),
+    }
+    for (pid, argv0) in running_instances(&program).others {
+        println!("Left running: pid {pid} ({argv0}) still has the build it started with.");
+    }
     let restored = settings.restore_if_changed();
     if restored.is_empty() {
         println!("Settings unchanged: {}.", settings.describe());
@@ -517,6 +531,144 @@ fn run_reinstall(root: &Path, args: &[String]) -> i32 {
         "If you changed firewall code, run `neutron lockdown enable` once to refresh the helper copy."
     );
     0
+}
+
+/// The running Neutron processes, split by what this task may do to them.
+struct Instances {
+    /// The tray/lease daemons running `program` -- the ones to replace.
+    daemons: Vec<u32>,
+    /// Every other Neutron process as `(pid, argv[0])`: a window the developer
+    /// is sitting in, or a daemon belonging to a different install. Reported,
+    /// never touched.
+    others: Vec<(u32, String)>,
+}
+
+/// Read `/proc` for the running Neutron processes.
+///
+/// Scoped to the binary that was just installed, deliberately: `cargo reinstall
+/// -- --root DIR` writes somewhere else, and swapping the daemon of the install
+/// the developer actually uses for that build would hand it the bus name and the
+/// lease. Read out of `/proc` rather than off the bus because a build tool has
+/// no use for a D-Bus dependency.
+fn running_instances_in(proc: &Path, program: &Path) -> Instances {
+    let mut found = Instances {
+        daemons: Vec::new(),
+        others: Vec::new(),
+    };
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let dir = entry.path();
+        if !std::fs::read_to_string(dir.join("comm")).is_ok_and(|c| c.trim() == "neutron") {
+            continue;
+        }
+        // argv is NUL-terminated, so the split yields a trailing empty field.
+        // A process with no argv at all is a zombie: it has exited and is only
+        // waiting to be reaped, which is what a daemon killed under a TUI looks
+        // like for as long as that TUI runs. Treating it as running would both
+        // stall the restart and report a window that is not there.
+        let args: Vec<String> = std::fs::read(dir.join("cmdline"))
+            .map(|raw| {
+                raw.split(|byte| *byte == 0)
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .filter(|arg| !arg.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(argv0) = args.first() else {
+            continue;
+        };
+        // `daemon` is the alias the CLI accepts for the same subcommand.
+        if Path::new(argv0) == program
+            && matches!(
+                args.get(1).map(String::as_str),
+                Some("indicator" | "daemon")
+            )
+        {
+            found.daemons.push(pid);
+        } else {
+            found.others.push((pid, argv0.clone()));
+        }
+    }
+    found.daemons.sort_unstable();
+    found.others.sort_unstable();
+    found
+}
+
+fn running_instances(program: &Path) -> Instances {
+    running_instances_in(Path::new("/proc"), program)
+}
+
+/// Stop the running daemon and start the freshly installed one, reporting the
+/// pid it came back on. `Ok(None)` means there was no daemon to replace.
+///
+/// This has to happen here rather than being left to the next login: `cargo
+/// install` replaces the binary by rename, so a running process keeps its old
+/// inode and goes on renewing leases and pushing ports with pre-reinstall code,
+/// silently. `Ok(Some(_))`/`Err` are about the daemon only -- the install itself
+/// already succeeded, so a failure here is reported, not fatal.
+fn restart_daemon(proc: &Path, program: &Path) -> Result<Option<u32>, String> {
+    const EXIT_WAIT: Duration = Duration::from_secs(2);
+    const START_WAIT: Duration = Duration::from_secs(2);
+
+    let daemons = running_instances_in(proc, program).daemons;
+    if daemons.is_empty() {
+        return Ok(None);
+    }
+    for pid in &daemons {
+        // `kill` rather than kill(2): no unsafe in a build tool, and it is
+        // coreutils wherever NetworkManager runs.
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    if !wait_until(EXIT_WAIT, || {
+        running_instances_in(proc, program).daemons.is_empty()
+    }) {
+        // Starting a second daemon now would only have the two fight over the
+        // bus name.
+        return Err("it ignored SIGTERM; quit it and run `neutron indicator` yourself".into());
+    }
+    // `setsid` detaches the daemon from this task's session, or the terminal
+    // that ran the build would take it down with SIGHUP on exit.
+    Command::new("setsid")
+        .arg(program)
+        .arg("indicator")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("it could not be started: {e}"))?;
+    if !wait_until(START_WAIT, || {
+        !running_instances_in(proc, program).daemons.is_empty()
+    }) {
+        return Err(format!(
+            "it did not come back up; start it with `{} indicator`",
+            program.display()
+        ));
+    }
+    Ok(running_instances_in(proc, program).daemons.first().copied())
+}
+
+fn wait_until(timeout: Duration, done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn run_linter(root: &Path) -> i32 {
@@ -639,6 +791,69 @@ mod tests {
         assert!(snapshot.0.is_empty());
         assert!(snapshot.restore_if_changed().is_empty());
     }
+
+    /// A `/proc` entry as the scan sees it: a numeric directory with `comm` and
+    /// NUL-separated `cmdline`.
+    fn process(proc: &Path, pid: u32, comm: &str, argv: &[&str]) {
+        let dir = proc.join(pid.to_string());
+        std::fs::create_dir_all(&dir).expect("proc dir should be created");
+        std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm should be written");
+        let raw: Vec<u8> = argv
+            .iter()
+            .flat_map(|a| a.as_bytes().iter().copied().chain(std::iter::once(0u8)))
+            .collect();
+        std::fs::write(dir.join("cmdline"), raw).expect("cmdline should be written");
+    }
+
+    #[test]
+    fn the_daemon_is_told_apart_from_a_window_a_zombie_and_another_install() {
+        // Every case here is one way a restart goes wrong: killing the window a
+        // developer is working in, skipping the daemon that has to be replaced,
+        // waiting on a zombie that will never be reaped, or handing a throwaway
+        // `--root` build the real install's bus name.
+        let proc = scratch("processes");
+        let installed = Path::new("/home/u/.cargo/bin/neutron");
+        process(
+            &proc,
+            100,
+            "neutron",
+            &["/home/u/.cargo/bin/neutron", "indicator"],
+        );
+        process(
+            &proc,
+            101,
+            "neutron",
+            &["/home/u/.cargo/bin/neutron", "daemon"],
+        );
+        process(&proc, 200, "neutron", &["/home/u/.cargo/bin/neutron"]);
+        process(&proc, 300, "nmcli", &["nmcli", "monitor"]);
+        process(&proc, 400, "neutron", &["/usr/bin/neutron", "indicator"]);
+        // A daemon killed under a TUI lingers with an empty argv.
+        process(&proc, 500, "neutron", &[]);
+
+        let found = running_instances_in(&proc, installed);
+
+        assert_eq!(
+            found.daemons,
+            vec![100, 101],
+            "only this install's daemons, under either subcommand name"
+        );
+        assert_eq!(
+            found.others,
+            vec![
+                (200, "/home/u/.cargo/bin/neutron".to_string()),
+                (400, "/usr/bin/neutron".to_string()),
+            ],
+            "a window and another install's daemon are reported, not killed"
+        );
+        let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn a_proc_root_that_cannot_be_read_reports_nothing_running() {
+        let found = running_instances_in(&scratch("no-proc"), Path::new("/nope"));
+        assert!(found.daemons.is_empty() && found.others.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -656,6 +871,7 @@ mod reinstall_usage_tests {
             "restored",
             "neutron lockdown enable",
             "cargo install",
+            "daemon",
         ] {
             assert!(
                 REINSTALL_USAGE.contains(expected),
