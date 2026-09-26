@@ -272,7 +272,19 @@ pub fn execute_action<C: ActionClient>(
             state.begin_pending(label.clone());
             if let Some(ref tx) = action_tx {
                 state.set_status(format!("{label}..."));
-                let _ = tx.send(crate::tui::state::AsyncAction::Lockdown(enable));
+                // A dropped dispatch would leave the overlay spinning forever:
+                // `end_pending` only runs when the worker reports back, and here
+                // there is no worker left to report. The same shape the split-tunnel
+                // worker reports when it goes away.
+                if tx
+                    .send(crate::tui::state::AsyncAction::Lockdown(enable))
+                    .is_err()
+                {
+                    state.end_pending();
+                    state.set_error(&crate::error::AppError::Config(
+                        "the policy worker has stopped; restart Neutron and try again".into(),
+                    ));
+                }
             } else {
                 // No worker thread: this blocks the event loop, so the spinner
                 // cannot repaint. Marked anyway so the state cannot be left
