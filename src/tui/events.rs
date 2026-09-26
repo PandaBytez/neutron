@@ -868,8 +868,11 @@ pub(crate) fn apply_profile_snapshot(
     app_cfg: config::AppConfig,
 ) {
     // The list arrives from a worker, so the first snapshot is the earliest
-    // point a starting selection can be made at all.
-    let first_load = state.rows.is_empty();
+    // point a starting selection can be made at all. Tracked as its own fact
+    // rather than inferred from an empty list: a snapshot that empties the list
+    // (every profile just deleted) would otherwise look like the first one, and
+    // the next refresh would move the cursor on its own.
+    let first_load = !state.profiles_loaded;
     state.rows = crate::app::profile_list::build_rows(
         &profiles,
         &app_cfg.excluded_profile_ids,
@@ -900,6 +903,7 @@ pub(crate) fn apply_profile_snapshot(
         // at. Only here, because a later refresh must not drag the cursor away
         // from wherever it was moved to.
         state.selected_index = state.rows.iter().position(|row| row.is_active).unwrap_or(0);
+        state.profiles_loaded = true;
     } else if state.selected_index >= state.rows.len() {
         state.selected_index = state.rows.len().saturating_sub(1);
     }
@@ -1124,8 +1128,20 @@ mod tests {
         // The list is loaded by a worker, so a later refresh arriving with the
         // same rows must leave the cursor where the user left it.
         state.selected_index = 2;
-        apply_profile_snapshot(&mut state, profiles, Default::default());
+        apply_profile_snapshot(&mut state, profiles.clone(), Default::default());
         assert_eq!(selected(&state).as_deref(), Some("uuid-c"));
+
+        // A snapshot that empties the list is not a first load. Inferring it from
+        // the empty list is what used to happen, and the next refresh with rows
+        // again would then move the cursor onto the active profile by itself.
+        apply_profile_snapshot(&mut state, Vec::new(), Default::default());
+        assert!(selected(&state).is_none(), "the list is empty");
+        apply_profile_snapshot(&mut state, profiles, Default::default());
+        assert_eq!(
+            selected(&state).as_deref(),
+            Some("uuid-a"),
+            "the selection is made once; a refresh must not make it again"
+        );
     }
 
     #[test]

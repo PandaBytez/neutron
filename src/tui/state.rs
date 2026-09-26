@@ -486,6 +486,12 @@ pub struct TuiState {
     pub rows: Vec<ProfileListRow>,
     pub profile_cache: std::collections::HashMap<String, CachedProfileInfo>,
     pub selected_index: usize,
+    /// Whether a profile snapshot has been applied yet.
+    ///
+    /// Its own fact rather than "the list is non-empty": an empty list is also
+    /// what a machine with no profiles looks like, and treating that as the first
+    /// load would let the next refresh move the cursor by itself.
+    pub profiles_loaded: bool,
     pub selected_info: Option<CachedProfileInfo>,
     pub active_profile_name: Option<String>,
     pub active_profile_uuid: Option<String>,
@@ -564,6 +570,7 @@ impl TuiState {
             rows: Vec::new(),
             profile_cache: std::collections::HashMap::new(),
             selected_index: 0,
+            profiles_loaded: false,
             selected_info: None,
             active_profile_name: None,
             active_profile_uuid: None,
