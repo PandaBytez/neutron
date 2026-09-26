@@ -257,10 +257,7 @@ fn default_qbittorrent_url() -> String {
 /// Host and port of a WebUI URL. Scheme and path stay put so editing the
 /// address does not drop `http://` or a non-root path.
 pub fn split_webui_url(url: &str) -> (String, String) {
-    let rest = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url);
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     if let Some((host, port)) = authority.rsplit_once(':')
         && !host.is_empty()

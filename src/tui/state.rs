@@ -823,8 +823,10 @@ mod tests {
 
     #[test]
     fn port_forward_modal_arrow_navigation_wraps() {
-        let mut modal =
-            PortForwardModalState::from_config(&PortForwardConfig::default(), "http://127.0.0.1:8080");
+        let mut modal = PortForwardModalState::from_config(
+            &PortForwardConfig::default(),
+            "http://127.0.0.1:8080",
+        );
         assert_eq!(modal.highlighted_mode, 0);
 
         modal.move_right();
