@@ -10,8 +10,8 @@
 //! on disk, so a failed teardown never leaves the user with neither protection
 //! nor configuration.
 
+use crate::app::set_global_kill_switch;
 use crate::app::split_tunnel;
-use crate::app::{kill_other_neutron_processes, set_global_kill_switch};
 use crate::config;
 use crate::error::{AppError, AppResult};
 use crate::firewall::FirewallClient;
@@ -35,24 +35,22 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     proc_root: &std::path::Path,
     assume_yes: bool,
 ) -> AppResult<()> {
-    let before = config::load(path)?;
+    let before = load_for_teardown(path);
     if !assume_yes && !confirm_reset(&before)? {
         println!("Reset cancelled; nothing was changed.");
         return Ok(());
     }
 
     // A running daemon keeps applying policies from the old settings, so a reset
-    // underneath it would be undone before it finished.
-    kill_other_neutron_processes(proc_root);
+    // underneath it would be undone before it finished. A window is somebody's
+    // session, so it is left open and named at the end.
+    let still_running = crate::app::stop_daemons(proc_root, std::time::Duration::from_secs(2));
 
     // Firewall first, and stop on failure. The one state a half-finished reset
     // must never leave behind is a machine firewalled with no configuration
     // explaining why -- so the privileged, hard-to-reverse step gets the
     // opportunity to abort while the settings are still intact.
-    let revoked_lockdown = before.lockdown_enabled || client.has_installed_lockdown_state()?;
-    if revoked_lockdown {
-        crate::wait::with_spinner("Revoking Lockdown", || client.teardown_lockdown(true))?;
-    }
+    let revoked_lockdown = revoke_installed_state(client, autostart_dir)?;
 
     // Withdraw the policies Neutron wrote into the NetworkManager profiles. Gated
     // on saved intent so a reset on a clean install does not sweep every profile
@@ -72,13 +70,6 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     // Defaults in place, which also empties `profile-info.json` (the notes) since
     // the fresh config carries none.
     config::save(path, &config::AppConfig::default())?;
-    // The autostart entry exists to honour `autoconnect_at_login`, which a fresh
-    // config has off, so a reset removes it. Resolved by the caller rather than
-    // from the environment here, so this is testable and a test can never reach
-    // the real home directory.
-    if let Some(dir) = autostart_dir {
-        service::autostart::uninstall_in(dir)?;
-    }
 
     println!("Reset to factory defaults.");
     println!(
@@ -90,15 +81,74 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
         }
     );
     println!("  settings: {}", path.display());
-    let drop_dir = config::resolve_profiles_dir(&before);
-    let inside = path.parent().is_some_and(|root| drop_dir.starts_with(root));
+    report_drop_dir(path, &before);
+    if still_running > 0 {
+        println!("  {still_running} daemon(s) did not exit; close them before logging in again.");
+    }
+    Ok(())
+}
+
+/// The saved settings, or defaults when they cannot be read.
+///
+/// Teardown is gated on evidence, never on this, precisely because the settings
+/// may be the thing that is broken: a config that no longer parses must not be
+/// able to stop the command that would leave the machine firewalled. Reading it
+/// still decides what else to withdraw, so the failure is reported rather than
+/// swallowed.
+fn load_for_teardown(path: &std::path::Path) -> config::AppConfig {
+    match config::load(path) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            println!(
+                "Settings at {} could not be read ({error}); continuing from evidence on disk.",
+                path.display()
+            );
+            config::AppConfig::default()
+        }
+    }
+}
+
+/// Withdraw what the installation applied outside the package: the permanent
+/// ruleset, the root-owned refresh helper and its polkit action, and the
+/// autostart entry. Returns whether the privileged teardown ran.
+///
+/// Evidence, not intent. The rules outlive the setting that installed them, so
+/// gating on saved config left a machine whose config was lost, corrupt or
+/// already purged stuck firewalled with no binary to lift it -- and gating on
+/// intent instead prompts for a password to delete files that were never
+/// created. Both checks are unprivileged.
+fn revoke_installed_state<C: FirewallClient>(
+    client: &C,
+    autostart_dir: Option<&std::path::Path>,
+) -> AppResult<bool> {
+    let installed = client.has_installed_lockdown_state()?;
+    if installed {
+        // One batch: rules and grant together, so this is a single prompt.
+        client.teardown_lockdown(true)?;
+    }
+    if let Some(dir) = autostart_dir {
+        service::autostart::uninstall_in(dir)?;
+    }
+    Ok(installed)
+}
+
+/// Name a drop directory that was left behind because it lives outside the
+/// configuration directory.
+///
+/// `profiles_dir` is user-configurable and may be any path, holding `.conf`
+/// files that may never have been imported. Reported by both commands, and never
+/// deleted: these are the user's files, not the app's.
+fn report_drop_dir(config_path: &std::path::Path, cfg: &config::AppConfig) {
+    let drop_dir = config::resolve_profiles_dir(cfg);
+    let inside = config_path
+        .parent()
+        .is_some_and(|root| drop_dir.starts_with(root));
     if !inside {
         println!(
             "  profile drop directory left in place: {}",
             drop_dir.display()
         );
     }
-    Ok(())
 }
 
 /// Ask before wiping everything. Deliberately needs the word `reset`, not a `y`.
@@ -159,11 +209,20 @@ pub fn handle_uninstall_command<C: NmClient + FirewallClient>(
 ) -> AppResult<()> {
     let removal = crate::install::current()?;
     // A live tray daemon can re-apply policies after teardown, and would keep
-    // renewing a port forward with the binary about to be gone.
-    kill_other_neutron_processes(std::path::Path::new("/proc"));
+    // renewing a port forward with the binary about to be gone. A window is a
+    // session somebody is in, so it is left open and reported below.
+    let still_running = crate::app::stop_daemons(
+        std::path::Path::new("/proc"),
+        std::time::Duration::from_secs(2),
+    );
     // A missing autostart directory is not a failure: nothing was installed.
     let autostart_dir = service::autostart::dir().ok();
     revoke_and_purge(client, path, autostart_dir.as_deref(), purge)?;
+    if still_running > 0 {
+        println!(
+            "{still_running} Neutron daemon(s) did not exit; they can re-apply policies until closed."
+        );
+    }
     remove_the_package(&removal)
 }
 
@@ -182,22 +241,17 @@ pub fn revoke_and_purge<C: NmIntrospect + FirewallClient>(
     autostart_dir: Option<&std::path::Path>,
     purge: bool,
 ) -> AppResult<()> {
-    // Evidence, not intent: the rules outlive the setting that installed them, so
-    // a machine whose config was lost, corrupted, or already purged can still be
-    // firewalled with no way to lift it. Both checks are unprivileged, so an
-    // install that never enabled lockdown uninstalls with no password prompt.
-    if config::load(path)?.lockdown_enabled || client.has_installed_lockdown_state()? {
-        // One batch: rules and grant together, so this is a single prompt.
-        client.teardown_lockdown(true)?;
-    }
+    revoke_installed_state(client, autostart_dir)?;
     // Saved intent is deliberately left as the user set it. Uninstall removes the
     // mechanism, it does not rewrite preferences: with `--purge` the file goes
     // anyway, and without it a reinstall restores the lockdown they chose. The
     // lock is gone either way, so a stale `true` cannot leave them unprotected.
-    if let Some(dir) = autostart_dir {
-        service::autostart::uninstall_in(dir)?;
+    if let Some(drop_dir) = remove_app_settings(path, purge)? {
+        println!(
+            "Profile drop directory left in place: {}",
+            drop_dir.display()
+        );
     }
-    remove_app_settings(path, purge)?;
     report_manual_unit(path.parent());
     Ok(())
 }
@@ -328,7 +382,11 @@ mod tests {
     fn a_failed_teardown_keeps_the_settings() {
         // The ordering guarantee: a declined prompt or a rejected firewall batch
         // must not leave the user with neither protection nor configuration.
-        let client = crate::testing::MockNmClient::new(vec![]).fail_lockdown();
+        // Evidence, not the saved setting: the setting is what a corrupt or
+        // purged config cannot be relied on to report.
+        let client = crate::testing::MockNmClient::new(vec![])
+            .fail_lockdown()
+            .with_installed_lockdown_state();
         let home = decoy_config_home("failed-teardown");
         let path = home.join("neutron/config.toml");
         config::save(
@@ -380,6 +438,57 @@ mod tests {
 
         assert!(client.lockdown_calls().is_empty());
         cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn a_stale_lockdown_setting_with_nothing_installed_tears_nothing_down() {
+        // The setting can outlive what it installed -- a ruleset removed by hand,
+        // a config restored from an old backup. Trusting it would ask for a
+        // password to delete files that are not there and, on a machine where
+        // something *is* still installed, would not be the thing that decides.
+        let client = crate::testing::MockNmClient::new(vec![]);
+        let path = unique_test_config_path();
+        config::save(
+            &path,
+            &config::AppConfig {
+                lockdown_enabled: true,
+                ..config::AppConfig::default()
+            },
+        )
+        .expect("config should save");
+
+        revoke_and_purge(&client, &path, None, true).expect("revoke should succeed");
+
+        assert!(
+            client.lockdown_calls().is_empty(),
+            "intent is not evidence: {:?}",
+            client.lockdown_calls()
+        );
+        cleanup_test_config(&path);
+    }
+
+    #[test]
+    fn a_corrupt_config_does_not_stop_the_teardown() {
+        // The failure this command exists for is a machine that cannot be reached
+        // any other way, so a config that no longer parses must not be able to
+        // block it. The setting is unreadable *and* the state is installed: the
+        // evidence check is the only way to that teardown.
+        let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
+        let path = unique_test_config_path();
+        std::fs::create_dir_all(path.parent().expect("config path has a parent"))
+            .expect("config directory should be created");
+        std::fs::write(&path, "this is not valid toml = = =").expect("corrupt config should write");
+
+        revoke_and_purge(&client, &path, None, true).expect("revoke should succeed");
+
+        assert_eq!(
+            client.lockdown_calls(),
+            vec!["lockdown:teardown:rules+grant"]
+        );
+        assert!(
+            !path.exists(),
+            "purge still runs once the teardown has been revoked"
+        );
     }
 
     #[test]

@@ -217,13 +217,30 @@ impl FirewallClient for crate::nm::CliNmClient {
 /// enable/disable read the current rules freely and confine privilege to the
 /// single batched write below (see [`crate::process::host_command`]).
 fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
-    let output = crate::process::host_command(FIREWALL_CMD)
+    read_marked_rules_with(family, table, FIREWALL_CMD)
+}
+
+/// [`read_marked_rules`] against a named binary, so the "no firewalld here" case
+/// is reachable from a test without a machine that lacks firewalld.
+fn read_marked_rules_with(family: &str, table: &str, tool: &str) -> AppResult<String> {
+    let output = crate::process::host_command(tool)
         .args(direct_args("--get-rules", family, table))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| AppError::Firewall(error.to_string()))?;
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        // No `firewall-cmd` at all: a machine that does not run firewalld cannot
+        // have firewalld rules, so there is nothing to find. Erroring here instead
+        // made the evidence check abort `neutron uninstall` and `neutron reset`
+        // outright, so an install on such a machine could never be removed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(String::new());
+        }
+        Err(error) => return Err(AppError::Firewall(error.to_string())),
+    };
 
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
@@ -692,6 +709,23 @@ fn reload_batch() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_without_firewall_cmd_reports_no_rules_rather_than_failing() {
+        // The evidence check behind `neutron uninstall` and `neutron reset` asks
+        // firewalld what is installed. On a machine that does not run it, the
+        // answer is "nothing" -- and treating the missing binary as an error
+        // made both commands abort, so such an install could never be removed.
+        let missing = std::path::Path::new("/nonexistent/firewall-cmd");
+        assert!(!missing.exists(), "the fixture path must not exist");
+
+        assert_eq!(
+            read_marked_rules_with("ipv4", "filter", missing.to_str().expect("utf-8 path"))
+                .expect("a missing tool is not an error"),
+            "",
+            "no firewalld means no firewalld rules"
+        );
+    }
 
     #[test]
     fn every_rebuild_prefix_retains_complete_policy_or_guard() {

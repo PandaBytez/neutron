@@ -894,30 +894,60 @@ pub fn rebuild_lockdown_if_enabled<C: FirewallClient>(
 /// in `kill(2)`, and a test that reached the real `/proc` would take down the
 /// developer's own daemon and TUI without anyone noticing what had happened.
 pub fn kill_other_neutron_processes(proc_root: &std::path::Path) {
-    let current_pid = std::process::id();
     #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-
-        for pid in neutron_pids_in(proc_root, current_pid) {
-            unsafe {
-                let _ = kill(pid as i32, 15); // SIGTERM
-            }
-        }
+    for found in neutron_processes_in(proc_root, std::process::id()) {
+        terminate(found.pid);
     }
-    let _ = current_pid;
 }
 
-/// The pids under `proc_root` that [`kill_other_neutron_processes`] would
-/// terminate: another instance of this binary, or anything else named
-/// `neutron`.
+/// SIGTERM the tray daemons, leaving any window alone, and report how many of
+/// them were still running afterwards.
+///
+/// A TUI is a session somebody is sitting in, and closing it is not this
+/// function's decision to make -- `uninstall` says what is still open instead.
+/// The wait matters because a daemon that is still up re-applies policies from
+/// settings that are being revoked underneath it.
+pub fn stop_daemons(proc_root: &std::path::Path, wait: std::time::Duration) -> usize {
+    #[cfg(unix)]
+    {
+        let daemons: Vec<u32> = neutron_processes_in(proc_root, std::process::id())
+            .into_iter()
+            .filter(|found| found.is_daemon)
+            .map(|found| found.pid)
+            .collect();
+        for pid in &daemons {
+            terminate(*pid);
+        }
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let still_running: Vec<u32> = neutron_processes_in(proc_root, std::process::id())
+                .into_iter()
+                .filter(|found| found.is_daemon && daemons.contains(&found.pid))
+                .map(|found| found.pid)
+                .collect();
+            if still_running.is_empty() || std::time::Instant::now() >= deadline {
+                return still_running.len();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (proc_root, wait);
+        0
+    }
+}
+
+/// The other Neutron processes under `proc_root`, and which of them are the
+/// tray daemon rather than a window.
+///
+/// One scan for both callers: whether a process is the daemon is a property of
+/// its argv, and answering it twice would be two chances to disagree.
 #[cfg(unix)]
-fn neutron_pids_in(proc_root: &std::path::Path, current_pid: u32) -> Vec<u32> {
-    let mut pids = Vec::new();
+fn neutron_processes_in(proc_root: &std::path::Path, current_pid: u32) -> Vec<FoundProcess> {
+    let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(proc_root) else {
-        return pids;
+        return found;
     };
     let my_exe = std::env::current_exe().ok();
 
@@ -937,11 +967,48 @@ fn neutron_pids_in(proc_root: &std::path::Path, current_pid: u32) -> Vec<u32> {
             .is_ok_and(|comm| comm.trim() == "neutron");
 
         if should_terminate_process(pid, current_pid, is_same_binary, is_neutron_comm) {
-            pids.push(pid);
+            found.push(FoundProcess {
+                pid,
+                is_daemon: runs_daemon_subcommand(entry.path().join("cmdline")),
+            });
         }
     }
-    pids.sort_unstable();
-    pids
+    found.sort_by_key(|process| process.pid);
+    found
+}
+
+/// A process the scan would signal, and whether it is the tray daemon.
+#[cfg(unix)]
+struct FoundProcess {
+    pid: u32,
+    is_daemon: bool,
+}
+
+/// Whether a process was started as `neutron indicator` (or its `daemon` alias).
+///
+/// argv[1] rather than "some argument": a path that happens to contain the word
+/// must not make a window look like the daemon.
+#[cfg(unix)]
+fn runs_daemon_subcommand(cmdline: std::path::PathBuf) -> bool {
+    let Ok(raw) = std::fs::read(cmdline) else {
+        return false;
+    };
+    raw.split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .nth(1)
+        .is_some_and(|arg| arg == b"indicator" || arg == b"daemon")
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SIGTERM: the daemon and a TUI both hold a terminal-independent loop, and
+    // neither needs to be interrupted mid-write.
+    unsafe {
+        let _ = kill(pid as i32, 15);
+    }
 }
 
 fn should_terminate_process(
@@ -1140,10 +1207,10 @@ mod tests {
         entry(4242, "neutron");
         entry(4243, "sleep");
 
-        let pids = neutron_pids_in(&proc, 42);
+        let found = neutron_processes_in(&proc, 42);
 
         assert_eq!(
-            pids,
+            found.iter().map(|process| process.pid).collect::<Vec<_>>(),
             vec![4242],
             "only what is under the given root, and only processes named neutron"
         );
@@ -1153,12 +1220,49 @@ mod tests {
     #[test]
     fn a_proc_root_that_cannot_be_read_terminates_nothing() {
         assert!(
-            neutron_pids_in(
+            neutron_processes_in(
                 &crate::testing::scratch_dir("proc-missing").join("gone"),
                 std::process::id()
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn the_daemon_is_told_apart_from_a_window_by_its_subcommand() {
+        // `uninstall` stops the daemon and leaves a window alone, so the scan has
+        // to answer that from argv rather than treating every Neutron process the
+        // same. A zombie has no argv at all and is neither.
+        let proc = crate::testing::scratch_dir("proc-daemons");
+        let entry = |pid: u32, argv: &[&str]| {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(&dir).expect("proc entry should be created");
+            std::fs::write(dir.join("comm"), "neutron\n").expect("comm should be written");
+            let raw: Vec<u8> = argv
+                .iter()
+                .flat_map(|arg| arg.as_bytes().iter().copied().chain(std::iter::once(0u8)))
+                .collect();
+            std::fs::write(dir.join("cmdline"), raw).expect("cmdline should be written");
+        };
+        entry(100, &["/usr/bin/neutron", "indicator"]);
+        entry(200, &["/usr/bin/neutron", "daemon"]);
+        entry(300, &["/usr/bin/neutron"]);
+        entry(400, &["/usr/bin/neutron", "tui"]);
+
+        let found = neutron_processes_in(&proc, 42);
+        let daemons: Vec<u32> = found
+            .iter()
+            .filter(|process| process.is_daemon)
+            .map(|process| process.pid)
+            .collect();
+
+        assert_eq!(
+            daemons,
+            vec![100, 200],
+            "only the daemon subcommand is the daemon"
+        );
+        assert_eq!(found.len(), 4, "a window is still a Neutron process");
+        let _ = std::fs::remove_dir_all(&proc);
     }
 
     #[test]
