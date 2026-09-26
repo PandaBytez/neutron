@@ -250,7 +250,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             Ok(())
         }
         Some(Commands::Restart) => {
-            kill_other_neutron_processes();
+            kill_other_neutron_processes(std::path::Path::new("/proc"));
             std::thread::sleep(std::time::Duration::from_millis(100));
             crate::tui::run(client.clone())
         }
@@ -264,7 +264,13 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         Some(Commands::Reset { yes }) => {
             // A missing autostart directory means nothing was installed.
             let autostart_dir = service::autostart::dir().ok();
-            handle_reset_command(client, &path, autostart_dir.as_deref(), yes)
+            handle_reset_command(
+                client,
+                &path,
+                autostart_dir.as_deref(),
+                std::path::Path::new("/proc"),
+                yes,
+            )
         }
     }
 }
@@ -276,10 +282,14 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
 /// to its default. What it will not touch is anything the user owns: the profile
 /// drop directory is reported and left alone, and the WireGuard profiles
 /// themselves are only edited to withdraw policies Neutron wrote.
+/// `proc_root` is passed in for the same reason `autostart_dir` is: the process
+/// scan ends in `kill(2)`, so a test has to be able to aim it at a scratch
+/// directory rather than at the real `/proc`.
 fn handle_reset_command<C: NmClient + FirewallClient>(
     client: &C,
     path: &std::path::Path,
     autostart_dir: Option<&std::path::Path>,
+    proc_root: &std::path::Path,
     assume_yes: bool,
 ) -> AppResult<()> {
     let before = config::load(path)?;
@@ -290,7 +300,7 @@ fn handle_reset_command<C: NmClient + FirewallClient>(
 
     // A running daemon keeps applying policies from the old settings, so a reset
     // underneath it would be undone before it finished.
-    kill_other_neutron_processes();
+    kill_other_neutron_processes(proc_root);
 
     // Firewall first, and stop on failure. The one state a half-finished reset
     // must never leave behind is a machine firewalled with no configuration
@@ -407,7 +417,7 @@ fn handle_uninstall_command<C: NmClient + FirewallClient>(
     let removal = crate::install::current()?;
     // A live tray daemon can re-apply policies after teardown, and would keep
     // renewing a port forward with the binary about to be gone.
-    kill_other_neutron_processes();
+    kill_other_neutron_processes(std::path::Path::new("/proc"));
     // A missing autostart directory is not a failure: nothing was installed.
     let autostart_dir = service::autostart::dir().ok();
     revoke_and_purge(client, path, autostart_dir.as_deref(), purge)?;
@@ -1137,7 +1147,13 @@ pub fn rebuild_lockdown_if_enabled<C: FirewallClient>(
 }
 
 /// Terminate all running neutron processes on the system except the current process.
-pub fn kill_other_neutron_processes() {
+/// SIGTERM every other Neutron process, so a fresh instance can take over.
+///
+/// `proc_root` is where processes are looked up: `/proc` in production, a
+/// scratch directory in tests. That parameter is not ceremony -- the scan ends
+/// in `kill(2)`, and a test that reached the real `/proc` would take down the
+/// developer's own daemon and TUI without anyone noticing what had happened.
+pub fn kill_other_neutron_processes(proc_root: &std::path::Path) {
     let current_pid = std::process::id();
     #[cfg(unix)]
     {
@@ -1145,35 +1161,47 @@ pub fn kill_other_neutron_processes() {
             fn kill(pid: i32, sig: i32) -> i32;
         }
 
-        let my_exe = std::env::current_exe().ok();
-
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(pid_str) = name.to_str() else {
-                    continue;
-                };
-                let Ok(pid) = pid_str.parse::<u32>() else {
-                    continue;
-                };
-                let exe_path = entry.path().join("exe");
-                let is_same_binary = match (&my_exe, std::fs::read_link(&exe_path)) {
-                    (Some(my), Ok(target)) => target == *my,
-                    _ => false,
-                };
-
-                let is_neutron_comm = std::fs::read_to_string(entry.path().join("comm"))
-                    .map(|comm| comm.trim() == "neutron")
-                    .unwrap_or(false);
-
-                if should_terminate_process(pid, current_pid, is_same_binary, is_neutron_comm) {
-                    unsafe {
-                        let _ = kill(pid as i32, 15); // SIGTERM
-                    }
-                }
+        for pid in neutron_pids_in(proc_root, current_pid) {
+            unsafe {
+                let _ = kill(pid as i32, 15); // SIGTERM
             }
         }
     }
+    let _ = current_pid;
+}
+
+/// The pids under `proc_root` that [`kill_other_neutron_processes`] would
+/// terminate: another instance of this binary, or anything else named
+/// `neutron`.
+#[cfg(unix)]
+fn neutron_pids_in(proc_root: &std::path::Path, current_pid: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return pids;
+    };
+    let my_exe = std::env::current_exe().ok();
+
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let is_same_binary = match (&my_exe, std::fs::read_link(entry.path().join("exe"))) {
+            (Some(mine), Ok(target)) => target == *mine,
+            _ => false,
+        };
+        let is_neutron_comm = std::fs::read_to_string(entry.path().join("comm"))
+            .is_ok_and(|comm| comm.trim() == "neutron");
+
+        if should_terminate_process(pid, current_pid, is_same_binary, is_neutron_comm) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids
 }
 
 fn should_terminate_process(
@@ -1356,6 +1384,42 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn the_process_scan_only_ever_sees_the_root_it_is_handed() {
+        // The regression this exists for: the scan used to read `/proc` itself,
+        // so every `cargo test` run SIGTERMed the developer's own daemon and TUI
+        // -- the reset tests call it, and nothing about that is visible in the
+        // test output. A hardcoded root again fails here, in a scratch dir.
+        let proc = crate::testing::scratch_dir("proc-entries");
+        let entry = |pid: u32, comm: &str| {
+            let dir = proc.join(pid.to_string());
+            std::fs::create_dir_all(&dir).expect("proc entry should be created");
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm should be written");
+        };
+        entry(4242, "neutron");
+        entry(4243, "sleep");
+
+        let pids = neutron_pids_in(&proc, 42);
+
+        assert_eq!(
+            pids,
+            vec![4242],
+            "only what is under the given root, and only processes named neutron"
+        );
+        let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn a_proc_root_that_cannot_be_read_terminates_nothing() {
+        assert!(
+            neutron_pids_in(
+                &crate::testing::scratch_dir("proc-missing").join("gone"),
+                std::process::id()
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1975,8 +2039,14 @@ mod tests {
         .expect("config should save");
         let decoys_before = relative_paths(&home);
 
-        handle_reset_command(&client, &path, Some(&autostart_dir), true)
-            .expect("reset should succeed");
+        handle_reset_command(
+            &client,
+            &path,
+            Some(&autostart_dir),
+            &scratch_proc_root(),
+            true,
+        )
+        .expect("reset should succeed");
 
         // Every applied policy withdrawn, in one pass each.
         assert_eq!(
@@ -2022,8 +2092,14 @@ mod tests {
         let autostart_dir = home.join("autostart");
         config::save(&path, &config::AppConfig::default()).expect("config should save");
 
-        handle_reset_command(&client, &path, Some(&autostart_dir), true)
-            .expect("reset should succeed");
+        handle_reset_command(
+            &client,
+            &path,
+            Some(&autostart_dir),
+            &scratch_proc_root(),
+            true,
+        )
+        .expect("reset should succeed");
 
         assert!(client.lockdown_calls().is_empty());
         assert!(client.kill_switch_calls().is_empty());
@@ -2047,7 +2123,7 @@ mod tests {
         .expect("config should save");
         let before = relative_paths(&home);
 
-        let error = handle_reset_command(&client, &path, None, false)
+        let error = handle_reset_command(&client, &path, None, &scratch_proc_root(), false)
             .expect_err("without a terminal, reset must not proceed");
 
         assert!(error.to_string().contains("--yes"), "{error}");
@@ -2302,6 +2378,12 @@ mod tests {
 
     fn unique_test_config_path() -> std::path::PathBuf {
         crate::testing::temp_config_path("app")
+    }
+
+    /// An empty stand-in for `/proc`, so a test's process scan finds nothing and
+    /// the real daemon and TUI are never signalled.
+    fn scratch_proc_root() -> std::path::PathBuf {
+        crate::testing::scratch_dir("proc-root")
     }
 
     fn cleanup_test_config(path: &std::path::Path) {
