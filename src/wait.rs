@@ -49,14 +49,8 @@ pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> AppResult<T>) -> AppR
         let stop = Arc::clone(&stop);
         let label = label.to_string();
         std::thread::spawn(move || {
-            for frame in SPINNER_FRAMES {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                eprint!("\r{label} {frame}");
-                let _ = std::io::stderr().flush();
-                std::thread::sleep(TICK);
-            }
+            let mut err = std::io::stderr();
+            animate(&mut err, &label, &stop, TICK);
         })
     };
 
@@ -68,6 +62,27 @@ pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> AppResult<T>) -> AppR
     eprint!("\r\x1b[2K");
     let _ = std::io::stderr().flush();
     result
+}
+
+/// Repaint one frame at a time until `stop` is set.
+///
+/// Cycling the frame table once and returning would freeze the line after
+/// `SPINNER_FRAMES.len() * tick` -- under a second -- and leave it static for the
+/// rest of a polkit prompt, which is the one wait this exists for. The flag is
+/// the only exit.
+///
+/// Takes the writer and the tick so the loop can be tested without a terminal.
+fn animate<W: Write>(out: &mut W, label: &str, stop: &AtomicBool, tick: Duration) {
+    let mut frame = 0;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = write!(out, "\r{label} {}", SPINNER_FRAMES[frame]);
+        frame = (frame + 1) % SPINNER_FRAMES.len();
+        let _ = out.flush();
+        std::thread::sleep(tick);
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +118,37 @@ mod tests {
         );
         let r: AppResult<()> = with_spinner("Label", || Ok(()));
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn the_animation_keeps_cycling_until_it_is_stopped() {
+        // The regression: the animation thread walked the frame table once and
+        // returned, so a spinner froze after under a second -- exactly the
+        // polkit wait it exists for. Frames are counted by the number of repaints
+        // rather than by elapsed time, with a tick short enough to keep the test
+        // quick and far above the point where a slow machine would notice.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut painted: Vec<u8> = Vec::new();
+        animate(
+            &mut painted,
+            "Enabling Lockdown",
+            &stop,
+            Duration::from_millis(2),
+        );
+        stopper.join().expect("stopper should not panic");
+
+        let repaints = String::from_utf8_lossy(&painted).matches('\r').count();
+        assert!(
+            repaints > SPINNER_FRAMES.len() * 2,
+            "expected repeated cycles, got {repaints} repaints: {painted:?}"
+        );
     }
 
     #[test]
