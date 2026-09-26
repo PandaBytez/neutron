@@ -147,7 +147,11 @@ enum QbitCommands {
         username: Option<String>,
         #[arg(long, help = "WebUI password")]
         password: Option<String>,
-        #[arg(long, help = "Bind qBittorrent to the active WireGuard interface")]
+        #[arg(
+            long,
+            value_name = "BOOL",
+            help = "Force interface binding on or off instead of deciding it from the URL"
+        )]
         bind: Option<bool>,
     },
 }
@@ -938,10 +942,10 @@ fn handle_qbit_command_with_path<C: NmClient>(
             );
             println!(
                 "Interface Binding: {}",
-                if qcfg.bind_interface {
-                    "Enabled"
+                if qcfg.binds_tunnel_interface() {
+                    "Tunnel interface"
                 } else {
-                    "Disabled"
+                    "None (WebUI is on another host)"
                 }
             );
             println!();
@@ -1041,6 +1045,12 @@ fn handle_qbit_command_with_path<C: NmClient>(
             }
             if let Some(bound) = report.bound_interface {
                 println!("Bound to interface: {}", bound);
+            } else if app_cfg.qbittorrent.binds_tunnel_interface() {
+                // The port is in, but a local qBittorrent is still listening
+                // wherever it was: the tunnel named no interface to bind, so the
+                // forward will not reach it. Said out loud, because "synchronized
+                // successfully" is otherwise the whole story.
+                println!("Warning: no tunnel interface to bind; the port may not be reachable.");
             }
         }
         QbitCommands::Enable => {
@@ -1078,7 +1088,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
                     app_cfg.qbittorrent.password = if pass.is_empty() { None } else { Some(pass) };
                 }
                 if let Some(b) = bind {
-                    app_cfg.qbittorrent.bind_interface = b;
+                    app_cfg.qbittorrent.bind_interface = Some(b);
                 }
             })?;
             println!("qBittorrent configuration updated.");
@@ -1089,10 +1099,12 @@ fn handle_qbit_command_with_path<C: NmClient>(
             );
             println!(
                 "Bind Interface: {}",
-                if app_cfg.qbittorrent.bind_interface {
-                    "true"
-                } else {
-                    "false"
+                match app_cfg.qbittorrent.bind_interface {
+                    Some(forced) => format!("{forced} (forced)"),
+                    None => format!(
+                        "{} (from the URL; override with --bind)",
+                        app_cfg.qbittorrent.binds_tunnel_interface()
+                    ),
                 }
             );
         }
@@ -2281,7 +2293,9 @@ mod tests {
         assert_eq!(loaded.qbittorrent.url, "http://192.168.1.100:8080");
         assert_eq!(loaded.qbittorrent.username.as_deref(), Some("myuser"));
         assert_eq!(loaded.qbittorrent.password.as_deref(), Some("mypass"));
-        assert!(loaded.qbittorrent.bind_interface);
+        // Forced, so a WebUI at an address the URL cannot place on this machine
+        // still binds.
+        assert!(loaded.qbittorrent.binds_tunnel_interface());
 
         cleanup_test_config(&path);
     }

@@ -97,6 +97,20 @@ neutron qbit sync
 neutron qbit enable    # forward-and-sync: lease and auto-sync
 neutron qbit disable   # forward: lease only, port forwarding stays on
 
-# Configure WebUI parameters & optional interface binding
-neutron qbit config --url http://127.0.0.1:8080 --bind true
+# Configure WebUI parameters (host, port, credentials)
+neutron qbit config --url http://127.0.0.1:8080
+```
+
+### Interface Binding
+
+A forwarded port only arrives on the tunnel's interface, so a **local** qBittorrent (any `127.0.0.1`/`localhost`/`[::1]` WebUI URL, native, Flatpak or container) is bound to it along with the port — no setting to turn on. A WebUI on **another host** is left on whatever interface it already uses, since it has no tunnel device to bind.
+
+The URL is what decides that. For the two cases it cannot, say so explicitly:
+
+```bash
+# qBittorrent on this machine but reached at a container bridge address: bind.
+neutron qbit config --url http://172.17.0.1:8080 --bind true
+
+# A WebUI on another host that must keep its own interface: do not bind.
+neutron qbit config --url http://192.168.1.50:8080 --bind false
 ```

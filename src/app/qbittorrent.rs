@@ -23,10 +23,12 @@ use crate::portforward::qbittorrent::{QBittorrentClient, QBittorrentSyncReport};
 /// profile diagnostics, because the latter substitutes the uuid when no
 /// interface name is configured. Binding to that substitute would point
 /// qBittorrent at a device that does not exist and silently drop every incoming
-/// connection. A missing interface is an error when binding is requested.
+/// connection. A missing interface is not an error: the port is pushed and the
+/// binding is left alone.
 ///
-/// Whether the interface is applied at all is the user's call, via
-/// [`QBittorrentConfig::bind_interface`].
+/// Whether the interface is applied at all follows from the WebUI URL: a local
+/// qBittorrent listens on the tunnel, because a NAT-PMP port only arrives there
+/// (see [`crate::config::webui_is_local`]).
 pub fn sync_port<C: NmIntrospect>(
     client: &C,
     config: &QBittorrentConfig,
@@ -49,7 +51,6 @@ mod tests {
             url,
             username: None,
             password: None,
-            bind_interface: true,
             ..Default::default()
         }
     }
@@ -89,24 +90,19 @@ mod tests {
     }
 
     #[test]
-    fn a_tunnel_without_an_interface_refuses_requested_binding() {
+    fn a_tunnel_without_an_interface_still_gets_the_port() {
         // `get_profile_diagnostics` substitutes the uuid when NetworkManager
         // reports no interface name, because the details pane needs something to
         // print. Binding qBittorrent to that label would point its socket at a
-        // device that does not exist and drop every incoming connection, so the
-        // push must fail without changing any preferences instead.
+        // device that does not exist, so the push applies the port and leaves
+        // the binding alone instead of naming a device.
         if !curl_available() {
             return;
         }
         let server = MockQBittorrentWebUi::start();
         let client = MockNmClient::default().without_tunnel_interface();
 
-        assert!(sync_port(&client, &config(server.url()), "uuid-eu", 51820).is_err());
-        assert!(server.last_set_preferences().is_empty());
-
-        let mut optional = config(server.url());
-        optional.bind_interface = false;
-        sync_port(&client, &optional, "uuid-eu", 51820).expect("port-only sync should succeed");
+        sync_port(&client, &config(server.url()), "uuid-eu", 51820).expect("port sync should work");
 
         let pushed = server.last_set_preferences();
         assert!(

@@ -212,8 +212,8 @@ neutron qbit sync
 neutron qbit enable    # forward-and-sync
 neutron qbit disable   # forward
 
-# Configure WebUI connection parameters
-neutron qbit config --url http://127.0.0.1:8080 --bind true
+# Configure WebUI connection parameters (--bind forces interface binding on/off)
+neutron qbit config --url http://127.0.0.1:8080
 ```
 
 ### System Tray AppIndicator & Background Daemon

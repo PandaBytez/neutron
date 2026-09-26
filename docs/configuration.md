@@ -114,8 +114,12 @@ url = "http://127.0.0.1:8080"
 # username = "admin"
 # password = "your-webui-password"
 
-# Bind qBittorrent network interface to the active WireGuard interface
-bind_interface = false
+# Interface binding. Omitted, it is decided from the URL: a local WebUI is bound
+# to the tunnel's interface along with the port, because a forwarded port only
+# arrives there. Set it only for what a URL cannot answer -- a qBittorrent on this
+# machine reached at a container bridge address (true), or a WebUI on another host
+# that must keep its own interface (false).
+# bind_interface = true
 ```
 
 ---
