@@ -795,11 +795,9 @@ fn handle_qbit_command_with_path<C: NmClient>(
             }
             if let Some(bound) = report.bound_interface {
                 println!("Bound to interface: {}", bound);
-            } else if app_cfg.qbittorrent.binds_tunnel_interface() {
-                // The port is in, but a local qBittorrent is still listening
-                // wherever it was: the tunnel named no interface to bind, so the
-                // forward will not reach it. Said out loud, because "synchronized
-                // successfully" is otherwise the whole story.
+            } else if report.went_unbound(app_cfg.qbittorrent.binds_tunnel_interface()) {
+                // Said out loud, because "synchronized successfully" is otherwise
+                // the whole story and the forward still will not arrive.
                 println!("Warning: no tunnel interface to bind; the port may not be reachable.");
             }
         }

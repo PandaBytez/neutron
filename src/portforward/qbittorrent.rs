@@ -44,6 +44,19 @@ pub struct QBittorrentSyncReport {
     pub app_version: Option<String>,
 }
 
+impl QBittorrentSyncReport {
+    /// Whether this push left qBittorrent listening somewhere the forwarded port
+    /// will never arrive.
+    ///
+    /// A WebUI on another host is left on its own interface on purpose -- it has
+    /// no tunnel device to bind -- so only a *local* one that ended up unbound is
+    /// a problem. The CLI and the tray daemon both report it, so the question is
+    /// answered here rather than re-derived (differently) at each call site.
+    pub fn went_unbound(&self, binds_tunnel_interface: bool) -> bool {
+        binds_tunnel_interface && self.bound_interface.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QBittorrentClient {
     base_url: String,
@@ -645,5 +658,29 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(forced.bind_target(Some("wg0")), Some("wg0"));
+    }
+
+    #[test]
+    fn only_a_local_webui_left_unbound_is_worth_reporting() {
+        // One question, asked in the CLI and in the tray daemon, so it is
+        // answered once. A remote WebUI is unbound on purpose; a local one is
+        // not, and there the forward will not arrive.
+        let unbound = QBittorrentSyncReport {
+            previous_port: Some(40000),
+            new_port: 51820,
+            bound_interface: None,
+            app_version: Some("v5.0.3".to_string()),
+        };
+        let bound = QBittorrentSyncReport {
+            bound_interface: Some("wg0".to_string()),
+            ..unbound.clone()
+        };
+
+        assert!(unbound.went_unbound(true), "a local WebUI must be told");
+        assert!(
+            !unbound.went_unbound(false),
+            "a remote one has no device to bind"
+        );
+        assert!(!bound.went_unbound(true), "bound is bound");
     }
 }

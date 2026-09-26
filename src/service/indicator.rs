@@ -630,11 +630,10 @@ fn sync_qbittorrent_port<C: NmIntrospect>(client: &C, uuid: &str, port: u16) -> 
                 "qBittorrent port synced to {port} (interface: {:?})",
                 report.bound_interface
             );
-            if report.bound_interface.is_none() && config.qbittorrent.binds_tunnel_interface() {
-                // The port is in, but nothing says to listen on the tunnel, so
-                // the forward will not arrive. Worth a warning: the lease and the
-                // badge both look healthy, and only the incoming traffic says
-                // otherwise.
+            // The port is in, but nothing says to listen on the tunnel, so the
+            // forward will not arrive. Worth a warning: the lease and the badge
+            // both look healthy, and only the incoming traffic says otherwise.
+            if report.went_unbound(config.qbittorrent.binds_tunnel_interface()) {
                 warn!(
                     "qBittorrent is local but no tunnel interface was bound for port {port}; \
                      check that the active profile has an interface configured"
