@@ -293,7 +293,7 @@ fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'stati
             let autostart_dir = service::autostart::dir().ok();
             uninstall::handle_uninstall_command(
                 client,
-                &path,
+                path,
                 autostart_dir.as_deref(),
                 std::path::Path::new("/proc"),
                 purge,
