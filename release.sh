@@ -13,7 +13,13 @@ TAP_DIR="$(cd "$ROOT_DIR/../homebrew-tap" 2>/dev/null && pwd || true)"
 
 if [ $# -lt 1 ]; then
     echo -e "${RED}Error:${NC} Version/tag argument required."
-    echo "Usage: ./release.sh <tag> (e.g. ./release.sh v0.1.0 or ./release --v0.1.0)"
+    echo "Usage: ./release.sh <tag> [notes-file] (e.g. ./release.sh v0.1.0 or ./release --v0.1.0)"
+    echo "  With a notes file the release uses it verbatim; without one, GitHub generates notes."
+    exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+    echo -e "${RED}Error:${NC} gh is required (release page and CI artifact download)."
     exit 1
 fi
 
@@ -94,7 +100,56 @@ fi
 
 echo -e "${GREEN}==>${NC} SHA256: ${YELLOW}${SHA256}${NC}"
 
-# 6. Update homebrew-tap if available
+# 6. Wait for the CI run on this commit and take its static binary
+COMMIT_SHA="$(git rev-parse HEAD)"
+CI_RUN=""
+for i in {1..90}; do
+    CI_RUN=$(gh run list --commit "$COMMIT_SHA" --workflow CI --json databaseId --limit 1 --jq '.[0].databaseId // empty' 2>/dev/null || true)
+    if [ -n "$CI_RUN" ]; then
+        RUN_STATUS=$(gh run view "$CI_RUN" --json status --jq '.status')
+        if [ "$RUN_STATUS" = "completed" ]; then
+            break
+        fi
+    fi
+    echo "  Waiting for CI on ${COMMIT_SHA}... (attempt $i/90)"
+    sleep 20
+done
+
+if [ -z "$CI_RUN" ] || [ "${RUN_STATUS:-}" != "completed" ]; then
+    echo -e "${RED}Error:${NC} No completed CI run for $COMMIT_SHA; refusing to ship an unbuilt binary."
+    exit 1
+fi
+
+if [ "$(gh run view "$CI_RUN" --json conclusion --jq '.conclusion')" != "success" ]; then
+    echo -e "${RED}Error:${NC} CI run $CI_RUN did not pass; refusing to publish its binary."
+    exit 1
+fi
+
+echo -e "${BLUE}==>${NC} Downloading the static binary from CI run ${CI_RUN}..."
+ASSET_DIR="$(mktemp -d)"
+trap 'rm -rf "$ASSET_DIR"' EXIT
+gh run download "$CI_RUN" -n neutron-linux-x86_64 -D "$ASSET_DIR"
+
+BIN_TAR="neutron-${TAG}-linux-x86_64.tar.gz"
+tar -czf "$ASSET_DIR/$BIN_TAR" -C "$ASSET_DIR" neutron
+( cd "$ASSET_DIR" && sha256sum "$BIN_TAR" > "neutron-${TAG}-SHA256SUMS" )
+
+# 7. Publish the release page, or leave an existing one untouched on a rerun
+if gh release view "$TAG" >/dev/null 2>&1; then
+    echo -e "${YELLOW}Notice:${NC} Release $TAG already exists; leaving its notes and assets alone."
+else
+    echo -e "${BLUE}==>${NC} Publishing release ${TAG}..."
+    if [ -n "${2:-}" ]; then
+        gh release create "$TAG" --title "Neutron $TAG" --notes-file "$2" \
+            "$ASSET_DIR/$BIN_TAR" "$ASSET_DIR/neutron-${TAG}-SHA256SUMS"
+    else
+        gh release create "$TAG" --title "Neutron $TAG" --generate-notes \
+            "$ASSET_DIR/$BIN_TAR" "$ASSET_DIR/neutron-${TAG}-SHA256SUMS"
+    fi
+    echo -e "${GREEN}==>${NC} Release ${TAG} published with the static binary and its checksums."
+fi
+
+# 8. Update homebrew-tap if available
 if [ -d "$TAP_DIR" ] && [ -f "$TAP_DIR/Formula/neutron.rb" ]; then
     echo -e "${BLUE}==>${NC} Updating Homebrew formula in ${TAP_DIR}..."
     cd "$TAP_DIR"
@@ -113,13 +168,17 @@ if [ -d "$TAP_DIR" ] && [ -f "$TAP_DIR/Formula/neutron.rb" ]; then
         echo "Homebrew formula was already up to date."
     fi
 else
-    echo -e "${YELLOW}Notice:${NC} homebrew-tap repository not found at $TAP_DIR. Skipping tap update."
+    echo -e "${RED}Error:${NC} homebrew-tap not found at $TAP_DIR"
+    echo "Expected a sibling clone, otherwise the tap ships a version behind and nobody notices:"
+    echo "  git clone https://github.com/PandaBytez/homebrew-tap $ROOT_DIR/../homebrew-tap"
+    exit 1
 fi
 
 cd "$ROOT_DIR"
 echo ""
 echo -e "${GREEN}🎉 Release ${TAG} published successfully!${NC}"
 echo -e "   - Release Tag: ${TAG}"
-echo -e "   - Archive URL: ${TARBALL_URL}"
-echo -e "   - SHA256:      ${SHA256}"
-echo -e "   - Homebrew:    Updated in homebrew-tap"
+echo -e "   - Release URL:  https://github.com/PandaBytez/neutron/releases/tag/${TAG}"
+echo -e "   - Archive URL:  ${TARBALL_URL}"
+echo -e "   - SHA256:       ${SHA256}"
+echo -e "   - Homebrew:     Updated in homebrew-tap"
