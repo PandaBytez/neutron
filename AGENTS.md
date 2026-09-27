@@ -50,3 +50,11 @@ Primary goals:
 - Error paths handled with user-visible messages where relevant.
 - `cargo fmt`, `cargo clippy`, and `cargo test` pass.
 - README and TODO updated if scope changes.
+
+## Definition of Done (per release)
+
+- `./release.sh <tag> [notes-file]` is the only supported way to cut a release:
+  it bumps the version, tags, pushes, publishes the GitHub release with the
+  static binary CI built, and updates the `homebrew-tap` formula. Do not create
+  releases or tap commits by hand; the tap lives as a sibling clone and its
+  sha256 comes from the published archive, which the script verifies.
