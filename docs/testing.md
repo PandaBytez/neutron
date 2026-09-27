@@ -44,16 +44,17 @@ cargo test-system -- --firewall
 cargo test-system -- --uninstall
 cargo test-system -- --rebuild
 
-`cargo xtask reinstall` keeps your settings as they are: the settings files are
-captured before the install and restored if anything changes them, and the
-result is reported rather than silently reverted.
-
 # Firewall leak regression checks
 cargo test-leaks
 
 # Interactive sandbox for investigation
 cargo xtask container-shell
 ```
+
+`cargo xtask reinstall` keeps your settings as they are: the settings files are
+captured before the install and restored if anything changes them, and the
+result is reported rather than silently reverted. It also restarts the tray
+daemon, because an install replaces the binary underneath a running process.
 
 Never run `cargo test -- --ignored` directly on the host or set
 `NEUTRON_TEST_SANDBOX=1` there. The sandbox sets that marker for tests guarded by

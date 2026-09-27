@@ -395,6 +395,17 @@ pub fn load(path: &Path) -> AppResult<AppConfig> {
             config.port_forwarding.mode = PortForwardMode::Forward;
         }
     }
+    // Same story, one field over: v0.1.3 wrote `bind_interface` unconditionally
+    // -- a plain `bool` with no `skip_serializing_if` -- so *every* existing
+    // config carries `bind_interface = false`. Read as the tri-state override
+    // that is a forced "never bind", which would switch the feature off for
+    // exactly the installs the URL-derived default exists for: a local qBittorrent
+    // would stop being bound to the tunnel and the forward would never arrive.
+    // An explicit `false` is therefore read for what it was -- the old default.
+    // `--bind true` still forces it on, and `--bind false` clears a force.
+    if config.qbittorrent.bind_interface == Some(false) {
+        config.qbittorrent.bind_interface = None;
+    }
     Ok(config)
 }
 
@@ -887,6 +898,60 @@ mod tests {
         assert!(PortForwardMode::ForwardAndSync.syncs_to_qbittorrent());
         assert!(!PortForwardMode::Forward.syncs_to_qbittorrent());
         assert!(!PortForwardMode::Disabled.syncs_to_qbittorrent());
+    }
+
+    #[test]
+    fn a_pre_tri_state_config_still_binds_a_local_webui() {
+        // v0.1.3 wrote `bind_interface` unconditionally, so every upgraded
+        // install has `bind_interface = false` in its config. Read as the
+        // tri-state override that is a forced "never bind" -- and the feature the
+        // override was added for would then never reach a single existing user.
+        let path = unique_path("pf-legacy-bind");
+        fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+            .expect("fixture dir should be created");
+        fs::write(
+            &path,
+            "[qbittorrent]\nurl = \"http://127.0.0.1:8080\"\nbind_interface = false\n",
+        )
+        .expect("legacy fixture should write");
+
+        let loaded = load(&path).expect("legacy config should load");
+
+        assert_eq!(
+            loaded.qbittorrent.bind_interface, None,
+            "the old default must not be read as an explicit choice"
+        );
+        assert!(
+            loaded.qbittorrent.binds_tunnel_interface(),
+            "a local WebUI is bound to the tunnel again"
+        );
+        // And it stops being written back, so the choice cannot harden.
+        save(&path, &loaded).expect("config should save");
+        let body = fs::read_to_string(&path).expect("config should read back");
+        assert!(
+            !body.contains("bind_interface"),
+            "the reconciled field must not be re-serialized: {body}"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_explicit_true_still_forces_the_binding() {
+        let path = unique_path("pf-forced-bind");
+        fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+            .expect("fixture dir should be created");
+        // A WebUI on another host, which the URL says cannot bind: the override
+        // is the documented way to say it should anyway.
+        fs::write(
+            &path,
+            "[qbittorrent]\nurl = \"http://192.168.1.50:8080\"\nbind_interface = true\n",
+        )
+        .expect("fixture should write");
+
+        let loaded = load(&path).expect("config should load");
+
+        assert!(loaded.qbittorrent.binds_tunnel_interface());
+        cleanup(&path);
     }
 
     #[test]
