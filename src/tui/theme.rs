@@ -393,4 +393,29 @@ mod tests {
         assert_ne!(mono.selected_item.bg, Some(Color::White));
         assert_eq!(mono.title.fg, Some(Color::Rgb(225, 225, 225)));
     }
+
+    #[test]
+    fn from_config_applies_color_overrides() {
+        use crate::config::ThemeConfig;
+
+        let plain = ThemeConfig {
+            preset: "nord".to_string(),
+            ..Default::default()
+        };
+        let base = Theme::from_config(&plain);
+
+        let mut customized = plain.clone();
+        customized.active_border = Some("#ff0000".to_string());
+        customized.status_connected = Some("green".to_string());
+        let themed = Theme::from_config(&customized);
+        assert_eq!(themed.active_border.fg, Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(themed.status_connected.fg, Some(Color::Green));
+        // Untouched slots keep the preset value.
+        assert_eq!(themed.status_disconnected, base.status_disconnected);
+
+        // An invalid override leaves the preset value in place.
+        customized.active_border = Some("not-a-color".to_string());
+        let fallback = Theme::from_config(&customized);
+        assert_eq!(fallback.active_border, base.active_border);
+    }
 }

@@ -172,4 +172,37 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn install_and_uninstall_surface_io_failures() {
+        let base = std::env::temp_dir().join(format!(
+            "neutron-vpn-autostart-fail-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // A file blocks the entry directory: creation must fail loudly,
+        // not pretend the entry was installed.
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, "x").expect("blocker should be written");
+        assert!(
+            install_in(&blocker).is_err(),
+            "install into an uncreatable directory must fail"
+        );
+
+        // The entry path is a directory: unlink fails with something other
+        // than NotFound, which must surface rather than read as "absent".
+        let dir = base.join("dir");
+        std::fs::create_dir_all(dir.join(entry_name())).expect("entry dir should exist");
+        let error = uninstall_in(&dir).unwrap_err();
+        assert!(
+            matches!(error, AppError::Io(_)),
+            "a non-NotFound removal failure must surface: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
