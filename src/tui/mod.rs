@@ -337,146 +337,27 @@ where
 
     while !state.should_quit {
         // Drain any incoming public IP updates from background worker, checking generation (BUG-037)
-        while let Ok((generation_id, info)) = ip_rx.try_recv() {
-            if generation_id == ip_coord.generation.load(Ordering::SeqCst) {
-                state.public_ip_info = info;
-            }
-        }
+        drain_ip_updates(&mut *state, ip_rx, ip_coord);
 
         // Drain any incoming latency updates
-        while let Ok(ms) = lat_rx.try_recv() {
-            state.latency_ms = Some(ms);
-        }
+        drain_latency_updates(&mut *state, lat_rx);
 
         // Drain any background profile cache updates
-        while let Ok((uuid, info)) = cache_rx.try_recv() {
-            let matches_sel = state
-                .selected_identity()
-                .map(|(u, _, _)| u == uuid)
-                .unwrap_or(false);
-            if matches_sel {
-                state.selected_info = Some(info.clone());
-            }
-            state.profile_cache.insert(uuid, info);
-        }
+        drain_profile_cache(&mut *state, cache_rx);
 
         // Drain any incoming background connection/disconnection results
-        while let Ok((name, res, is_connect)) = conn_res_rx.try_recv() {
-            state.connecting = None;
-            match res {
-                Ok(()) => {
-                    if is_connect {
-                        state.set_status(format!("Connected '{name}'."));
-                    } else {
-                        state.set_status(format!("Disconnected '{name}'."));
-                        state.public_ip_info = None;
-                    }
-                    ip_coord.request_refresh();
-                    needs_profile_refresh = true;
-                }
-                Err(err) => {
-                    state.set_error(&err);
-                    needs_profile_refresh = true;
-                }
-            }
-        }
+        drain_connection_results(
+            &mut *state,
+            conn_res_rx,
+            ip_coord,
+            &mut needs_profile_refresh,
+        );
 
         // Drain any incoming background split tunneling application results (BUG-063)
-        while let Ok((applied_cfg, res)) = st_res_rx.try_recv() {
-            state.finish_split(applied_cfg, res);
-        }
+        drain_split_results(&mut *state, st_res_rx);
 
         // Drain any incoming background action results
-        while let Ok(action_res) = action_res_rx.try_recv() {
-            // Every arm means the dispatched action reported back, so the spinner
-            // has done its job -- on success and on failure alike.
-            state.end_pending();
-            match action_res {
-                crate::tui::state::AsyncActionResult::KillSwitch { enable, result } => match result
-                {
-                    Ok(()) => {
-                        state
-                            .uncertain_policies
-                            .remove(&crate::error::Policy::KillSwitch);
-                        state.config.kill_switch_enabled = enable;
-                        state.set_status(format!(
-                            "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
-                            events::enabled_verb(enable)
-                        ));
-                    }
-                    Err(err) => {
-                        state.set_error(&err);
-                        if let Ok(persisted) = crate::config::load(&state.config_path) {
-                            state.config.kill_switch_enabled = persisted.kill_switch_enabled;
-                        }
-                    }
-                },
-                crate::tui::state::AsyncActionResult::Lockdown { enable, result } => match result {
-                    Ok(()) => {
-                        state
-                            .uncertain_policies
-                            .remove(&crate::error::Policy::Lockdown);
-                        state.config.lockdown_enabled = enable;
-                        state
-                            .set_status(format!("{} Lockdown Mode.", events::enabled_verb(enable)));
-                    }
-                    Err(err) => {
-                        state.set_error(&err);
-                        if let Ok(persisted) = crate::config::load(&state.config_path) {
-                            state.config.lockdown_enabled = persisted.lockdown_enabled;
-                        }
-                    }
-                },
-                crate::tui::state::AsyncActionResult::Autoconnect { enable, result } => {
-                    match result {
-                        Ok(()) => {
-                            state.config.general.autoconnect_at_login = enable;
-                            state.set_status(format!(
-                                "{} Auto Connect at Login.",
-                                events::enabled_verb(enable)
-                            ));
-                        }
-                        Err(err) => {
-                            state.set_error(&err);
-                            if let Ok(persisted) = crate::config::load(&state.config_path) {
-                                state.config.general.autoconnect_at_login =
-                                    persisted.general.autoconnect_at_login;
-                            }
-                        }
-                    }
-                }
-                crate::tui::state::AsyncActionResult::Sync(result) => match result {
-                    Ok(report) => {
-                        needs_profile_refresh = true;
-                        if !report.errors.is_empty() {
-                            state.set_error(&crate::error::AppError::Config(
-                                report.errors.join("; "),
-                            ));
-                        } else if report.imported.is_empty() {
-                            state.set_status("Refreshed profiles.");
-                        } else {
-                            state.set_status(format!(
-                                "Imported {} new profile(s).",
-                                report.imported.len()
-                            ));
-                        }
-                    }
-                    Err(err) => state.set_error(&err),
-                },
-                crate::tui::state::AsyncActionResult::Delete(result) => match result {
-                    Ok(_) => {
-                        state.set_status("Profile deleted.");
-                        needs_profile_refresh = true;
-                    }
-                    Err(err) => state.set_error(&err),
-                },
-                crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable) => {
-                    if matches!(state.modal, crate::tui::state::ActiveModal::PortForward(_)) {
-                        state.qbit_webui_reachable = Some(reachable);
-                    }
-                }
-            }
-        }
+        drain_action_results(&mut *state, action_res_rx, &mut needs_profile_refresh);
 
         // Periodically refresh active profile diagnostics / total data every 1.5s in sync with throughput rates
         if last_diag_sample.elapsed() >= Duration::from_millis(1500) {
@@ -520,26 +401,15 @@ where
         }
 
         while let Ok(result) = snapshot_rx.try_recv() {
-            refresh_in_flight = false;
-            let prev_active_uuid = state.active_profile_uuid.clone();
-            match result {
-                Ok((profiles, cfg)) => {
-                    events::apply_profile_snapshot(state, profiles, cfg);
-                    events::update_diagnostics(state, client);
-                    if state.active_profile_uuid != prev_active_uuid {
-                        if state.active_profile_uuid.is_none() {
-                            state.public_ip_info = None;
-                        }
-                        ip_coord.request_refresh();
-                    }
-                }
-                Err(err) => {
-                    // Do not drop the refresh requirement on transient errors (BUG-048)
-                    state.set_error(&err);
-                    needs_profile_refresh = true;
-                    retry_at = std::time::Instant::now() + Duration::from_secs(1);
-                }
-            }
+            drain_profile_snapshot(
+                &mut *state,
+                client,
+                result,
+                ip_coord,
+                &mut refresh_in_flight,
+                &mut needs_profile_refresh,
+                &mut retry_at,
+            );
         }
         if needs_profile_refresh
             && !refresh_in_flight
@@ -573,6 +443,208 @@ where
     }
 
     Ok(())
+}
+
+/// Drain one round of background-worker replies into `state`.
+///
+/// Each drain below is a free function rather than inline loop code so the
+/// result handling -- the part that decides toasts, refreshes, and retries --
+/// is unit-testable without a real terminal. The event loop calls them in
+/// the same order the inline drains ran.
+fn drain_ip_updates(
+    state: &mut TuiState,
+    rx: &std::sync::mpsc::Receiver<(u64, Option<crate::nm::network_info::PublicIpInfo>)>,
+    ip_coord: &PublicIpLookupCoordinator,
+) {
+    // Stale generations are discarded: a slow lookup must not overwrite a
+    // newer answer (BUG-037).
+    while let Ok((generation_id, info)) = rx.try_recv() {
+        if generation_id == ip_coord.generation.load(Ordering::SeqCst) {
+            state.public_ip_info = info;
+        }
+    }
+}
+
+fn drain_latency_updates(state: &mut TuiState, rx: &std::sync::mpsc::Receiver<u32>) {
+    while let Ok(ms) = rx.try_recv() {
+        state.latency_ms = Some(ms);
+    }
+}
+
+fn drain_profile_cache(
+    state: &mut TuiState,
+    rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
+) {
+    while let Ok((uuid, info)) = rx.try_recv() {
+        let matches_sel = state
+            .selected_identity()
+            .map(|(u, _, _)| u == uuid)
+            .unwrap_or(false);
+        if matches_sel {
+            state.selected_info = Some(info.clone());
+        }
+        state.profile_cache.insert(uuid, info);
+    }
+}
+
+fn drain_connection_results(
+    state: &mut TuiState,
+    rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
+    ip_coord: &PublicIpLookupCoordinator,
+    needs_profile_refresh: &mut bool,
+) {
+    while let Ok((name, res, is_connect)) = rx.try_recv() {
+        state.connecting = None;
+        match res {
+            Ok(()) => {
+                if is_connect {
+                    state.set_status(format!("Connected '{name}'."));
+                } else {
+                    state.set_status(format!("Disconnected '{name}'."));
+                    state.public_ip_info = None;
+                }
+                ip_coord.request_refresh();
+                *needs_profile_refresh = true;
+            }
+            Err(err) => {
+                state.set_error(&err);
+                *needs_profile_refresh = true;
+            }
+        }
+    }
+}
+
+fn drain_split_results(
+    state: &mut TuiState,
+    rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
+) {
+    while let Ok((applied_cfg, res)) = rx.try_recv() {
+        state.finish_split(applied_cfg, res);
+    }
+}
+
+fn drain_action_results(
+    state: &mut TuiState,
+    rx: &std::sync::mpsc::Receiver<crate::tui::state::AsyncActionResult>,
+    needs_profile_refresh: &mut bool,
+) {
+    while let Ok(action_res) = rx.try_recv() {
+        // Every arm means the dispatched action reported back, so the spinner
+        // has done its job -- on success and on failure alike.
+        state.end_pending();
+        match action_res {
+            crate::tui::state::AsyncActionResult::KillSwitch { enable, result } => match result {
+                Ok(()) => {
+                    state
+                        .uncertain_policies
+                        .remove(&crate::error::Policy::KillSwitch);
+                    state.config.kill_switch_enabled = enable;
+                    state.set_status(format!(
+                        "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
+                        events::enabled_verb(enable)
+                    ));
+                }
+                Err(err) => {
+                    state.set_error(&err);
+                    if let Ok(persisted) = crate::config::load(&state.config_path) {
+                        state.config.kill_switch_enabled = persisted.kill_switch_enabled;
+                    }
+                }
+            },
+            crate::tui::state::AsyncActionResult::Lockdown { enable, result } => match result {
+                Ok(()) => {
+                    state
+                        .uncertain_policies
+                        .remove(&crate::error::Policy::Lockdown);
+                    state.config.lockdown_enabled = enable;
+                    state.set_status(format!("{} Lockdown Mode.", events::enabled_verb(enable)));
+                }
+                Err(err) => {
+                    state.set_error(&err);
+                    if let Ok(persisted) = crate::config::load(&state.config_path) {
+                        state.config.lockdown_enabled = persisted.lockdown_enabled;
+                    }
+                }
+            },
+            crate::tui::state::AsyncActionResult::Autoconnect { enable, result } => match result {
+                Ok(()) => {
+                    state.config.general.autoconnect_at_login = enable;
+                    state.set_status(format!(
+                        "{} Auto Connect at Login.",
+                        events::enabled_verb(enable)
+                    ));
+                }
+                Err(err) => {
+                    state.set_error(&err);
+                    if let Ok(persisted) = crate::config::load(&state.config_path) {
+                        state.config.general.autoconnect_at_login =
+                            persisted.general.autoconnect_at_login;
+                    }
+                }
+            },
+            crate::tui::state::AsyncActionResult::Sync(result) => match result {
+                Ok(report) => {
+                    *needs_profile_refresh = true;
+                    if !report.errors.is_empty() {
+                        state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+                    } else if report.imported.is_empty() {
+                        state.set_status("Refreshed profiles.");
+                    } else {
+                        state.set_status(format!(
+                            "Imported {} new profile(s).",
+                            report.imported.len()
+                        ));
+                    }
+                }
+                Err(err) => state.set_error(&err),
+            },
+            crate::tui::state::AsyncActionResult::Delete(result) => match result {
+                Ok(_) => {
+                    state.set_status("Profile deleted.");
+                    *needs_profile_refresh = true;
+                }
+                Err(err) => state.set_error(&err),
+            },
+            crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable) => {
+                if matches!(state.modal, crate::tui::state::ActiveModal::PortForward(_)) {
+                    state.qbit_webui_reachable = Some(reachable);
+                }
+            }
+        }
+    }
+}
+
+fn drain_profile_snapshot<C>(
+    state: &mut TuiState,
+    client: &C,
+    result: AppResult<(Vec<crate::nm::WireguardProfile>, crate::config::AppConfig)>,
+    ip_coord: &PublicIpLookupCoordinator,
+    refresh_in_flight: &mut bool,
+    needs_profile_refresh: &mut bool,
+    retry_at: &mut std::time::Instant,
+) where
+    C: NmClient + FirewallClient + Clone + Send + Sync + 'static,
+{
+    *refresh_in_flight = false;
+    let prev_active_uuid = state.active_profile_uuid.clone();
+    match result {
+        Ok((profiles, cfg)) => {
+            events::apply_profile_snapshot(state, profiles, cfg);
+            events::update_diagnostics(state, client);
+            if state.active_profile_uuid != prev_active_uuid {
+                if state.active_profile_uuid.is_none() {
+                    state.public_ip_info = None;
+                }
+                ip_coord.request_refresh();
+            }
+        }
+        Err(err) => {
+            // Do not drop the refresh requirement on transient errors (BUG-048)
+            state.set_error(&err);
+            *needs_profile_refresh = true;
+            *retry_at = std::time::Instant::now() + Duration::from_secs(1);
+        }
+    }
 }
 
 fn start_nm_monitor_loop(events: Arc<AtomicU64>, slot: MonitorChild) {
@@ -676,6 +748,7 @@ impl PublicIpLookupCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nm::NmLifecycle;
 
     #[test]
     fn profile_worker_can_block_while_ui_processes_input_and_then_retry() {
@@ -785,5 +858,363 @@ mod tests {
             Ok(Some(status)) => assert!(!status.success()),
             other => panic!("expected child to be reaped, got {other:?}"),
         }
+    }
+
+    fn drain_state(label: &str) -> (TuiState, std::path::PathBuf) {
+        let path = crate::testing::temp_config_path(label);
+        crate::config::save(&path, &config::AppConfig::default()).expect("config should save");
+        let state = TuiState::new(path.clone(), config::AppConfig::default());
+        (state, path)
+    }
+
+    #[test]
+    fn stale_ip_replies_are_discarded() {
+        let (mut state, path) = drain_state("drain-ip");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let coord = PublicIpLookupCoordinator::new(tx.clone());
+
+        // A reply from an older generation must not overwrite current state.
+        let stale = crate::nm::network_info::PublicIpInfo {
+            ip: "9.9.9.9".to_string(),
+            ..Default::default()
+        };
+        coord.generation.fetch_add(5, Ordering::SeqCst);
+        tx.send((0, Some(stale))).unwrap();
+        drain_ip_updates(&mut state, &rx, &coord);
+        assert!(state.public_ip_info.is_none());
+
+        // The current generation applies.
+        let current = crate::nm::network_info::PublicIpInfo {
+            ip: "1.1.1.1".to_string(),
+            ..Default::default()
+        };
+        tx.send((5, Some(current.clone()))).unwrap();
+        drain_ip_updates(&mut state, &rx, &coord);
+        assert_eq!(state.public_ip_info, Some(current));
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn latency_and_cache_drains_update_state() {
+        let (mut state, path) = drain_state("drain-lat-cache");
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "wg-us",
+            "uuid-1",
+            crate::nm::ProfileState::Inactive,
+        )]);
+        crate::tui::events::reload_profiles(&mut state, &client).unwrap();
+
+        let (lat_tx, lat_rx) = std::sync::mpsc::channel();
+        lat_tx.send(42).unwrap();
+        drain_latency_updates(&mut state, &lat_rx);
+        assert_eq!(state.latency_ms, Some(42));
+
+        // A cache reply for the selected row also refreshes the details pane.
+        let (cache_tx, cache_rx) = std::sync::mpsc::channel();
+        let info = crate::tui::state::CachedProfileInfo::default();
+        cache_tx.send(("uuid-1".to_string(), info)).unwrap();
+        state.selected_index = state
+            .rows
+            .iter()
+            .position(|row| row.uuid == "uuid-1")
+            .unwrap();
+        drain_profile_cache(&mut state, &cache_rx);
+        assert!(state.profile_cache.contains_key("uuid-1"));
+        assert!(state.selected_info.is_some());
+
+        // A reply for another row only fills the cache.
+        cache_tx
+            .send(("uuid-2".to_string(), Default::default()))
+            .unwrap();
+        drain_profile_cache(&mut state, &cache_rx);
+        assert!(state.profile_cache.contains_key("uuid-2"));
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn connection_results_report_and_clear_connecting() {
+        let (mut state, path) = drain_state("drain-conn");
+        let (tx, _) = std::sync::mpsc::channel();
+        let coord = PublicIpLookupCoordinator::new(tx);
+        let (conn_tx, conn_rx) = std::sync::mpsc::channel();
+        let mut needs_refresh = false;
+
+        state.connecting = Some(crate::tui::state::ConnectingState {
+            uuid: "uuid-1".to_string(),
+            name: "wg-us".to_string(),
+            is_disconnect: false,
+            started_at: std::time::Instant::now(),
+        });
+        conn_tx.send(("wg-us".to_string(), Ok(()), true)).unwrap();
+        drain_connection_results(&mut state, &conn_rx, &coord, &mut needs_refresh);
+        assert!(state.connecting.is_none());
+        assert_eq!(state.status_message, "Connected 'wg-us'.");
+        assert!(needs_refresh);
+
+        state.public_ip_info = Some(crate::nm::network_info::PublicIpInfo {
+            ip: "1.1.1.1".to_string(),
+            ..Default::default()
+        });
+        conn_tx.send(("wg-us".to_string(), Ok(()), false)).unwrap();
+        drain_connection_results(&mut state, &conn_rx, &coord, &mut needs_refresh);
+        assert_eq!(state.status_message, "Disconnected 'wg-us'.");
+        assert!(state.public_ip_info.is_none());
+
+        conn_tx
+            .send((
+                "wg-us".to_string(),
+                Err(crate::error::AppError::CommandFailed("boom".into())),
+                true,
+            ))
+            .unwrap();
+        drain_connection_results(&mut state, &conn_rx, &coord, &mut needs_refresh);
+        assert!(state.status_is_error);
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn split_results_delegate_to_finish_split() {
+        let (mut state, path) = drain_state("drain-split");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let applied = crate::config::SplitTunnelConfig {
+            mode: crate::config::SplitTunnelMode::Include,
+            cidrs: vec!["10.0.0.0/8".to_string()],
+            domains: Vec::new(),
+        };
+        tx.send((applied.clone(), Ok(()))).unwrap();
+        drain_split_results(&mut state, &rx);
+        assert!(state.pending_split.is_none());
+        assert_eq!(state.config.global_split_tunnel, applied);
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn action_results_cover_every_variant() {
+        use crate::tui::state::AsyncActionResult;
+
+        let (mut state, path) = drain_state("drain-actions");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut needs_refresh = false;
+
+        // KillSwitch Ok clears uncertainty and records the new intent.
+        state
+            .uncertain_policies
+            .insert(crate::error::Policy::KillSwitch);
+        tx.send(AsyncActionResult::KillSwitch {
+            enable: true,
+            result: Ok(()),
+        })
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.config.kill_switch_enabled);
+        assert!(!state.status_is_error);
+        assert!(
+            !state
+                .uncertain_policies
+                .contains(&crate::error::Policy::KillSwitch)
+        );
+
+        // KillSwitch Err toasts and reverts to what is on disk (off).
+        tx.send(AsyncActionResult::KillSwitch {
+            enable: true,
+            result: Err(crate::error::AppError::CommandFailed("boom".into())),
+        })
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+        assert!(!state.config.kill_switch_enabled);
+
+        // Lockdown + Autoconnect Ok paths record intent.
+        tx.send(AsyncActionResult::Lockdown {
+            enable: true,
+            result: Ok(()),
+        })
+        .unwrap();
+        tx.send(AsyncActionResult::Autoconnect {
+            enable: true,
+            result: Ok(()),
+        })
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.config.lockdown_enabled);
+        assert!(state.config.general.autoconnect_at_login);
+
+        // Sync report variants: errors toast, empty refreshes, imports count.
+        tx.send(AsyncActionResult::Sync(Ok(crate::app::sync::SyncReport {
+            imported: vec![],
+            skipped: 0,
+            errors: vec!["bad.conf: boom".to_string()],
+        })))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+        assert!(state.status_message.contains("bad.conf"));
+        assert!(needs_refresh);
+
+        needs_refresh = false;
+        tx.send(AsyncActionResult::Sync(Ok(
+            crate::app::sync::SyncReport::default(),
+        )))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(state.status_message, "Refreshed profiles.");
+        assert!(needs_refresh);
+
+        tx.send(AsyncActionResult::Sync(Ok(crate::app::sync::SyncReport {
+            imported: vec!["a".to_string(), "b".to_string()],
+            skipped: 0,
+            errors: vec![],
+        })))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(state.status_message, "Imported 2 new profile(s).");
+
+        tx.send(AsyncActionResult::Sync(Err(
+            crate::error::AppError::CommandFailed("boom".into()),
+        )))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+
+        // Delete Ok refreshes, Delete Err toasts.
+        tx.send(AsyncActionResult::Delete(Ok("uuid-1".to_string())))
+            .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(state.status_message, "Profile deleted.");
+        assert!(needs_refresh);
+
+        tx.send(AsyncActionResult::Delete(Err(
+            crate::error::AppError::CommandFailed("boom".into()),
+        )))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+
+        // The WebUI probe verdict, and the two Err arms that reload intent from
+        // disk. Without the first, the port-forward panel would wait forever for
+        // a verdict that arrives and is thrown away.
+        state.qbit_webui_reachable = None;
+        state.modal = crate::tui::state::ActiveModal::PortForward(
+            crate::tui::state::PortForwardModalState::from_config(
+                &crate::config::PortForwardConfig::default(),
+                "http://127.0.0.1:8080",
+            ),
+        );
+        tx.send(AsyncActionResult::ProbeQbitWebUi(true)).unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(state.qbit_webui_reachable, Some(true));
+
+        // ...and ignored for any other modal, so a probe finishing after the
+        // panel closed cannot reopen a stale decision.
+        state.modal = crate::tui::state::ActiveModal::None;
+        state.qbit_webui_reachable = None;
+        tx.send(AsyncActionResult::ProbeQbitWebUi(false)).unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(state.qbit_webui_reachable, None);
+
+        // An Err reverts to what is on disk rather than to the attempted value,
+        // so each flag is set first and must come back down: the config on disk
+        // was just written without either.
+        crate::config::save(&path, &crate::config::AppConfig::default())
+            .expect("config should save");
+        let boom = || Err(crate::error::AppError::CommandFailed("boom".into()));
+
+        state.config.lockdown_enabled = true;
+        tx.send(AsyncActionResult::Lockdown {
+            enable: true,
+            result: boom(),
+        })
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error, "a failed policy must toast");
+        assert!(
+            !state.config.lockdown_enabled,
+            "and revert to the intent on disk, not to the attempt"
+        );
+
+        state.config.general.autoconnect_at_login = true;
+        tx.send(AsyncActionResult::Autoconnect {
+            enable: true,
+            result: boom(),
+        })
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+        assert!(
+            !state.config.general.autoconnect_at_login,
+            "and revert to the intent on disk, not to the attempt"
+        );
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn snapshot_results_apply_and_retry() {
+        let (mut state, path) = drain_state("drain-snapshot");
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "wg-us",
+            "uuid-1",
+            crate::nm::ProfileState::Active,
+        )]);
+        crate::tui::events::reload_profiles(&mut state, &client).unwrap();
+        assert_eq!(state.active_profile_uuid.as_deref(), Some("uuid-1"));
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let coord = PublicIpLookupCoordinator::new(tx);
+        let mut in_flight = true;
+        let mut needs_refresh = false;
+        let mut retry_at = std::time::Instant::now();
+
+        // A snapshot where the tunnel went down clears the public IP.
+        state.public_ip_info = Some(crate::nm::network_info::PublicIpInfo {
+            ip: "1.1.1.1".to_string(),
+            ..Default::default()
+        });
+        client
+            .delete_profile("uuid-1")
+            .expect("delete should succeed");
+        let (profiles, cfg) = (
+            client.list_wireguard_profiles().unwrap(),
+            config::AppConfig::default(),
+        );
+        drain_profile_snapshot(
+            &mut state,
+            &client,
+            Ok((profiles, cfg)),
+            &coord,
+            &mut in_flight,
+            &mut needs_refresh,
+            &mut retry_at,
+        );
+        assert!(!in_flight);
+        assert!(state.active_profile_uuid.is_none());
+        assert!(
+            state.public_ip_info.is_none(),
+            "a vanished tunnel must not keep showing its old public IP"
+        );
+
+        // A transient failure keeps the refresh requirement and backs off.
+        let before = std::time::Instant::now();
+        drain_profile_snapshot(
+            &mut state,
+            &client,
+            Err(crate::error::AppError::CommandFailed("boom".into())),
+            &coord,
+            &mut in_flight,
+            &mut needs_refresh,
+            &mut retry_at,
+        );
+        assert!(state.status_is_error);
+        assert!(needs_refresh);
+        assert!(
+            retry_at > before,
+            "a failed snapshot must schedule a retry instead of spinning"
+        );
+
+        crate::testing::remove_temp_config(&path);
     }
 }

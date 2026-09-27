@@ -244,16 +244,7 @@ pub fn run() -> AppResult<()> {
     unsafe { std::env::set_var("PATH", "/usr/sbin:/usr/bin:/sbin:/bin") };
     let mut requested = String::new();
     std::io::stdin().take(37).read_to_string(&mut requested)?;
-    if !requested.is_empty()
-        && (requested.len() != 36
-            || !requested.bytes().enumerate().all(|(i, byte)| {
-                if matches!(i, 8 | 13 | 18 | 23) {
-                    byte == b'-'
-                } else {
-                    byte.is_ascii_hexdigit()
-                }
-            }))
-    {
+    if !is_valid_activation_uuid(&requested) {
         return Err(AppError::Firewall("Invalid activation UUID".into()));
     }
     let lock = std::fs::OpenOptions::new()
@@ -274,6 +265,23 @@ pub fn run() -> AppResult<()> {
         return Ok(());
     }
     run_script(&build_firewall_script(&batches), false)
+}
+
+/// Whether piped stdin is an acceptable activation UUID for the privileged
+/// entry point: empty (refresh everything) or a 36-byte lowercase/uppercase
+/// hex UUID with dashes at 8/13/18/23. Anything else is rejected before any
+/// privileged work happens. Extracted pure so the trust boundary is unit
+/// testable without invoking the helper itself.
+fn is_valid_activation_uuid(requested: &str) -> bool {
+    requested.is_empty()
+        || (requested.len() == 36
+            && requested.bytes().enumerate().all(|(i, byte)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }))
 }
 
 fn tunnels(activating: Option<&str>) -> AppResult<Vec<WireguardTunnel>> {
@@ -350,6 +358,78 @@ mod tests {
                 "--process",
                 &std::process::id().to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn activation_uuid_gate_accepts_empty_and_valid_uuids_only() {
+        assert!(is_valid_activation_uuid(""));
+        assert!(is_valid_activation_uuid(
+            "123e4567-e89b-12d3-a456-426614174000"
+        ));
+        assert!(is_valid_activation_uuid(
+            "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        ));
+        // Wrong lengths: stdin is truncated at 37 bytes, so anything but
+        // empty-or-36 is malformed input, not a UUID.
+        assert!(!is_valid_activation_uuid(
+            "123e4567-e89b-12d3-a456-42661417400"
+        ));
+        assert!(!is_valid_activation_uuid(
+            "123e4567-e89b-12d3-a456-4266141740000"
+        ));
+        // Non-hex content and misplaced dashes.
+        assert!(!is_valid_activation_uuid(
+            "123e4567-e89b-12d3-a456-42661417400g"
+        ));
+        assert!(!is_valid_activation_uuid(
+            "123e4567_e89b-12d3-a456-426614174000"
+        ));
+        assert!(!is_valid_activation_uuid(
+            "-23e4567-e89b-12d3-a456-426614174000"
+        ));
+        assert!(!is_valid_activation_uuid(
+            "123e4567-e89b-12d3-a456-42661417400\n"
+        ));
+    }
+
+    #[test]
+    fn install_script_quotes_paths_and_targets_the_polkit_action() {
+        if std::process::Command::new("pkaction")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("Skipping install script test: 'pkaction' is not installed.");
+            return;
+        }
+        let script = install_script().expect("install script should render");
+        let executable = std::env::current_exe().expect("test binary has a path");
+        let raw_exe = executable.to_string_lossy().into_owned();
+        let quoted_exe = format!("'{raw_exe}'");
+        // The executable path must only ever appear single-quoted: the
+        // whole script runs as root via pkexec, so an unquoted path with
+        // spaces or metacharacters would be a command injection.
+        assert!(
+            script.contains(&format!("install -m 755 -- {quoted_exe} ")),
+            "executable must be quoted in the install step: {script}"
+        );
+        assert_eq!(
+            script.matches(raw_exe.as_str()).count(),
+            script.matches(quoted_exe.as_str()).count(),
+            "every occurrence of the executable path must be quoted: {script}"
+        );
+        assert!(
+            script.contains(&format!("{ACTION_ID}.policy")),
+            "script must target the dedicated policy file: {script}"
+        );
+        assert!(
+            script.contains(&format!("rm -f -- {LEGACY_POLICY_PATH}")),
+            "script must remove the legacy rules file: {script}"
+        );
+        assert!(
+            script.contains(&format!("pkaction --action-id {ACTION_ID}")),
+            "script must verify the action is registered: {script}"
         );
     }
 

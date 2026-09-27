@@ -65,3 +65,15 @@ pub enum AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policies_display_as_readable_names() {
+        assert_eq!(Policy::Lockdown.to_string(), "lockdown");
+        assert_eq!(Policy::KillSwitch.to_string(), "kill switch");
+        assert_eq!(Policy::SplitTunnel.to_string(), "split tunneling");
+    }
+}

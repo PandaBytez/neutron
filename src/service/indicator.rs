@@ -1043,6 +1043,82 @@ mod tests {
     }
 
     #[test]
+    fn status_notifier_properties_are_stable() {
+        // Panel hosts read these once at registration; a typo here hides or
+        // mislabels the tray icon with no error anywhere.
+        let item = make_sni(None, None);
+        assert_eq!(item.category(), "ApplicationStatus");
+        assert_eq!(item.id(), "neutron");
+        assert_eq!(item.title(), "Neutron");
+        assert_eq!(item.status(), "Active");
+        assert_eq!(item.icon_name(), "");
+    }
+
+    #[test]
+    fn tray_toggle_disconnects_while_connected() {
+        use crate::testing::profile;
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: Some("wg-us".to_string()),
+            ..Default::default()
+        }));
+        let client = MockNmClient::new(vec![profile("wg-us", "uuid-1", ProfileState::Active)]);
+        let menu = DBusMenu {
+            client: client.clone(),
+            state,
+        };
+
+        menu.event(2, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(client.calls(), vec!["disconnect".to_string()]);
+    }
+
+    #[test]
+    fn tray_ignores_non_click_events_and_unknown_ids() {
+        let state = Arc::new(Mutex::new(IndicatorSharedState::default()));
+        let client = MockNmClient::default();
+        let menu = DBusMenu {
+            client: client.clone(),
+            state,
+        };
+
+        // Hover/scroll chatter and stale ids must not touch NetworkManager.
+        menu.event(2, "hovered", zbus::zvariant::Value::from(0u32), 0);
+        menu.event(99, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert!(
+            client.calls().is_empty(),
+            "ignored events must not reach the client: {:?}",
+            client.calls()
+        );
+    }
+
+    #[test]
+    fn favorite_switch_failure_does_not_escape_the_menu() {
+        use crate::testing::profile;
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: None,
+            forwarded_port: None,
+            favorite_profiles: vec![("uuid-fav".to_string(), "Favorite 1".to_string())],
+            menu_revision: 1,
+            ..Default::default()
+        }));
+        let client = MockNmClient::with_failures(
+            vec![profile("Favorite 1", "uuid-fav", ProfileState::Inactive)],
+            &["uuid-fav"],
+        );
+        let menu = DBusMenu {
+            client: client.clone(),
+            state,
+        };
+
+        // The id->uuid map is populated by rendering the layout first.
+        let _ = menu.get_layout(0, -1, vec![]);
+
+        // The D-Bus handler returns (): a failed switch must be swallowed
+        // (and logged), never panic the tray.
+        menu.event(100, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(client.calls(), vec!["switch:uuid-fav".to_string()]);
+    }
+
+    #[test]
     fn indicator_lock_excludes_concurrent_instance() {
         let temp_dir = std::env::temp_dir().join(format!(
             "neutron-indicator-lock-{}",

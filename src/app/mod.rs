@@ -175,17 +175,34 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     cli: Cli,
 ) -> AppResult<()> {
     let path = config::default_config_path()?;
+    execute_with_path(client, cli, &path, std::path::Path::new("/proc"))
+}
+
+/// Dispatch one CLI invocation against an explicit config path and process root.
+///
+/// Split out so a test can drive a whole command against a temp config instead
+/// of the developer's real one. Both arguments are the point: every arm below has
+/// to route through a `_with_path` handler, because a handler that re-resolves
+/// `default_config_path()` writes the real settings the moment a test drives it,
+/// and `proc_root` is what `Restart` and `Reset` signal, so a test must never
+/// hand them the real `/proc`.
+fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
+    client: &C,
+    cli: Cli,
+    path: &std::path::Path,
+    proc_root: &std::path::Path,
+) -> AppResult<()> {
     match cli.command {
         None | Some(Commands::Tui) => crate::tui::run(client.clone()),
         Some(Commands::Indicator) => {
             crate::service::indicator::run_standalone_indicator(client.clone())
         }
         Some(Commands::Sync) => {
-            let app_cfg = config::load(&path)?;
+            let app_cfg = config::load(path)?;
             let report = sync::sync_profiles_dir(client, &app_cfg)?;
             // Imported profiles have no lockdown allow-rule yet, so the ruleset
             // has to be rebuilt before they can connect.
-            rebuild_lockdown_if_enabled(client, &path)?;
+            rebuild_lockdown_if_enabled(client, path)?;
             if !report.imported.is_empty() {
                 println!(
                     "Imported {} new profiles: {}",
@@ -205,7 +222,7 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             Ok(())
         }
         Some(Commands::List) => {
-            let app_cfg = config::load(&path)?;
+            let app_cfg = config::load(path)?;
             let profiles = client.list_wireguard_profiles()?;
             let rows = profile_list::build_rows(
                 &profiles,
@@ -220,25 +237,25 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         }
         Some(Commands::Connect { profile }) => {
             client.connect(&profile)?;
-            rebuild_lockdown_if_enabled(client, &path)
+            rebuild_lockdown_if_enabled(client, path)
         }
         Some(Commands::Disconnect) => {
             client.disconnect_active()?;
-            rebuild_lockdown_if_enabled(client, &path)
+            rebuild_lockdown_if_enabled(client, path)
         }
         Some(Commands::Switch { profile }) => {
             client.switch_to(&profile)?;
-            rebuild_lockdown_if_enabled(client, &path)
+            rebuild_lockdown_if_enabled(client, path)
         }
         Some(Commands::StartupRandom) => {
-            let app_cfg = config::load(&path)?;
+            let app_cfg = config::load(path)?;
             if !app_cfg.general.autoconnect_at_login {
-                let _ = service::set_autoconnect_at_login(client, &path, false);
+                let _ = service::set_autoconnect_at_login(client, path, false);
                 println!("Startup random skipped: auto-connect at login is disabled in config");
                 return Ok(());
             }
-            let res = service::run_startup_random(client);
-            let _ = rebuild_lockdown_if_enabled(client, &path);
+            let res = service::run_startup_random_with_path(client, path);
+            let _ = rebuild_lockdown_if_enabled(client, path);
             service::indicator::ensure_indicator_daemon_running();
             match res? {
                 service::StartupRandomResult::Connected(selected) => {
@@ -251,36 +268,43 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
             Ok(())
         }
         Some(Commands::Restart) => {
-            kill_other_neutron_processes(std::path::Path::new("/proc"));
+            kill_other_neutron_processes(proc_root);
             std::thread::sleep(std::time::Duration::from_millis(100));
             crate::tui::run(client.clone())
         }
-        Some(Commands::Eligible { command }) => handle_eligible_command(client, command),
-        Some(Commands::Favorite { command }) => handle_favorite_command(client, command),
-        Some(Commands::KillSwitch { command }) => handle_kill_switch_command(client, command),
-        Some(Commands::Lockdown { command }) => handle_lockdown_command(client, command),
-        Some(Commands::SplitTunnel { command }) => handle_split_tunnel_command(client, command),
-        Some(Commands::Qbit { command }) => handle_qbit_command(client, command),
+        Some(Commands::Eligible { command }) => {
+            handle_eligible_command_with_path(client, command, path)
+        }
+        Some(Commands::Favorite { command }) => {
+            handle_favorite_command_with_path(client, command, path)
+        }
+        Some(Commands::KillSwitch { command }) => {
+            handle_kill_switch_command_with_path(client, command, path)
+        }
+        Some(Commands::Lockdown { command }) => {
+            handle_lockdown_command_with_path(client, command, path)
+        }
+        Some(Commands::SplitTunnel { command }) => {
+            handle_split_tunnel_command_with_path(client, command, path)
+        }
+        Some(Commands::Qbit { command }) => handle_qbit_command_with_path(client, command, path),
         Some(Commands::Uninstall { purge }) => {
-            uninstall::handle_uninstall_command(client, &path, purge)
+            uninstall::handle_uninstall_command(client, path, purge)
         }
         Some(Commands::Reset { yes }) => {
             // A missing autostart directory means nothing was installed.
             let autostart_dir = service::autostart::dir().ok();
-            uninstall::handle_reset_command(
-                client,
-                &path,
-                autostart_dir.as_deref(),
-                std::path::Path::new("/proc"),
-                yes,
-            )
+            uninstall::handle_reset_command(client, path, autostart_dir.as_deref(), proc_root, yes)
         }
     }
 }
 
-fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -> AppResult<()> {
-    let path = config::default_config_path()?;
-    let app_cfg = config::load(&path)?;
+fn handle_eligible_command_with_path<C: NmClient>(
+    client: &C,
+    command: EligibleCommands,
+    path: &std::path::Path,
+) -> AppResult<()> {
+    let app_cfg = config::load(path)?;
     let profiles = client.list_wireguard_profiles()?;
 
     match command {
@@ -304,7 +328,7 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
             // "Add to eligible" clears any exclusion for the profile.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
             let mut changed = false;
-            config::update(&path, |cfg| {
+            config::update(path, |cfg| {
                 changed = eligibility::set_profile_eligible(
                     &mut cfg.excluded_profile_ids,
                     &profile_id,
@@ -321,7 +345,7 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
             // "Remove from eligible" excludes the profile from startup-random.
             let profile_id = resolve_profile_id(&profiles, &profile)?;
             let mut changed = false;
-            config::update(&path, |cfg| {
+            config::update(path, |cfg| {
                 changed = eligibility::set_profile_eligible(
                     &mut cfg.excluded_profile_ids,
                     &profile_id,
@@ -339,9 +363,12 @@ fn handle_eligible_command<C: NmClient>(client: &C, command: EligibleCommands) -
     Ok(())
 }
 
-fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -> AppResult<()> {
-    let path = config::default_config_path()?;
-    let app_cfg = config::load(&path)?;
+fn handle_favorite_command_with_path<C: NmClient>(
+    client: &C,
+    command: FavoriteCommands,
+    path: &std::path::Path,
+) -> AppResult<()> {
+    let app_cfg = config::load(path)?;
     let profiles = client.list_wireguard_profiles()?;
 
     match command {
@@ -355,7 +382,7 @@ fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -
         FavoriteCommands::Add { profile } => {
             let profile_id = resolve_profile_id(&profiles, &profile)?;
             let mut changed = false;
-            config::update(&path, |cfg| {
+            config::update(path, |cfg| {
                 changed = cfg.favorite_profile_ids.insert(profile_id.clone())
             })?;
             if changed {
@@ -367,7 +394,7 @@ fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -
         FavoriteCommands::Remove { profile } => {
             let profile_id = resolve_profile_id(&profiles, &profile)?;
             let mut changed = false;
-            config::update(&path, |cfg| {
+            config::update(path, |cfg| {
                 changed = cfg.favorite_profile_ids.remove(&profile_id)
             })?;
             if changed {
@@ -379,14 +406,6 @@ fn handle_favorite_command<C: NmClient>(client: &C, command: FavoriteCommands) -
     }
 
     Ok(())
-}
-
-fn handle_kill_switch_command<C: NmClient>(
-    client: &C,
-    command: KillSwitchCommands,
-) -> AppResult<()> {
-    let path = config::default_config_path()?;
-    handle_kill_switch_command_with_path(client, command, &path)
 }
 
 fn handle_kill_switch_command_with_path<C: NmClient>(
@@ -481,14 +500,6 @@ fn policy_save_error(policy: crate::error::Policy, source: AppError) -> AppError
     }
 }
 
-fn handle_lockdown_command<C: NmClient + FirewallClient>(
-    client: &C,
-    command: LockdownCommands,
-) -> AppResult<()> {
-    let path = config::default_config_path()?;
-    handle_lockdown_command_with_path(client, command, &path)
-}
-
 fn handle_lockdown_command_with_path<C: NmClient + FirewallClient>(
     client: &C,
     command: LockdownCommands,
@@ -577,14 +588,6 @@ pub fn set_global_lockdown<C: NmIntrospect + FirewallClient>(
     )
 }
 
-fn handle_split_tunnel_command<C: NmClient>(
-    client: &C,
-    command: SplitTunnelCommands,
-) -> AppResult<()> {
-    let path = config::default_config_path()?;
-    handle_split_tunnel_command_with_path(client, command, &path)
-}
-
 fn handle_split_tunnel_command_with_path<C: NmClient>(
     client: &C,
     command: SplitTunnelCommands,
@@ -655,11 +658,6 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
     }
 
     Ok(())
-}
-
-fn handle_qbit_command<C: NmClient>(client: &C, command: QbitCommands) -> AppResult<()> {
-    let path = config::default_config_path()?;
-    handle_qbit_command_with_path(client, command, &path)
 }
 
 fn handle_qbit_command_with_path<C: NmClient>(
@@ -1118,17 +1116,9 @@ mod tests {
     }
     use crate::error::AppError;
 
-    fn profile(name: &str, uuid: &str) -> WireguardProfile {
-        WireguardProfile {
-            name: name.to_string(),
-            uuid: uuid.to_string(),
-            state: crate::nm::ProfileState::Inactive,
-        }
-    }
-
     #[test]
     fn resolves_uuid_identifier_directly() {
-        let profiles = vec![profile("wg-us", "uuid-1")];
+        let profiles = vec![crate::testing::inactive("wg-us", "uuid-1")];
 
         let resolved = resolve_profile_id(&profiles, "uuid-1").expect("uuid should resolve");
 
@@ -1137,7 +1127,10 @@ mod tests {
 
     #[test]
     fn resolves_unique_name_to_uuid() {
-        let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-eu", "uuid-2")];
+        let profiles = vec![
+            crate::testing::inactive("wg-us", "uuid-1"),
+            crate::testing::inactive("wg-eu", "uuid-2"),
+        ];
 
         let resolved = resolve_profile_id(&profiles, "wg-eu").expect("name should resolve");
 
@@ -1146,7 +1139,10 @@ mod tests {
 
     #[test]
     fn returns_ambiguous_error_for_duplicate_names() {
-        let profiles = vec![profile("wg-us", "uuid-1"), profile("wg-us", "uuid-2")];
+        let profiles = vec![
+            crate::testing::inactive("wg-us", "uuid-1"),
+            crate::testing::inactive("wg-us", "uuid-2"),
+        ];
 
         let result = resolve_profile_id(&profiles, "wg-us");
 
@@ -1158,7 +1154,7 @@ mod tests {
 
     #[test]
     fn returns_not_found_for_missing_identifier() {
-        let profiles = vec![profile("wg-us", "uuid-1")];
+        let profiles = vec![crate::testing::inactive("wg-us", "uuid-1")];
 
         let result = resolve_profile_id(&profiles, "wg-eu");
 
@@ -1170,7 +1166,8 @@ mod tests {
         let cli = Cli {
             command: Some(Commands::List),
         };
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let result = execute(&client, cli);
         assert!(result.is_ok());
     }
@@ -1267,7 +1264,8 @@ mod tests {
 
     #[test]
     fn kill_switch_enable_applies_globally_and_persists() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path)
@@ -1281,7 +1279,8 @@ mod tests {
 
     #[test]
     fn kill_switch_disable_applies_globally_and_persists() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
@@ -1303,7 +1302,8 @@ mod tests {
 
     #[test]
     fn kill_switch_status_does_not_change_nm_or_config() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
@@ -1326,7 +1326,8 @@ mod tests {
 
     #[test]
     fn kill_switch_status_defaults_to_off_without_config() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         // No config file: status reads the default (off) instead of erroring,
@@ -1341,7 +1342,8 @@ mod tests {
     #[test]
     fn kill_switch_enable_does_not_persist_when_nm_fails() {
         let client =
-            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_kill_switch();
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")])
+                .fail_kill_switch();
         let path = crate::testing::temp_config_path("app");
 
         let result =
@@ -1365,7 +1367,8 @@ mod tests {
     #[test]
     fn kill_switch_disable_keeps_previous_state_when_nm_fails() {
         let client =
-            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_kill_switch();
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")])
+                .fail_kill_switch();
         let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
@@ -1394,7 +1397,8 @@ mod tests {
 
     #[test]
     fn kill_switch_enable_then_disable_round_trips_state() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         handle_kill_switch_command_with_path(&client, KillSwitchCommands::Enable, &path)
@@ -1422,7 +1426,8 @@ mod tests {
 
     #[test]
     fn lockdown_enable_applies_and_persists() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path)
@@ -1439,7 +1444,8 @@ mod tests {
         // A profile imported after lockdown was enabled has no allow-rule and
         // is blocked by the terminal DROP, so the ruleset has to be rebuilt
         // whenever the profile set changes.
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
@@ -1460,7 +1466,8 @@ mod tests {
     fn rebuild_lockdown_does_nothing_when_lockdown_is_off() {
         // Callers invoke this unconditionally after any profile change, so it
         // must not install a ruleset the user never asked for.
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
         config::save(&path, &config::AppConfig::default()).expect("config should save");
 
@@ -1472,7 +1479,8 @@ mod tests {
 
     #[test]
     fn lockdown_disable_applies_and_persists() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
@@ -1494,7 +1502,8 @@ mod tests {
 
     #[test]
     fn lockdown_status_does_not_change_firewall_or_config() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
@@ -1517,7 +1526,8 @@ mod tests {
 
     #[test]
     fn lockdown_status_defaults_to_off_without_config() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         // No config file: status reads the default (off) instead of erroring,
@@ -1532,7 +1542,8 @@ mod tests {
     #[test]
     fn lockdown_enable_does_not_persist_when_firewall_fails() {
         let client =
-            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_lockdown();
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")])
+                .fail_lockdown();
         let path = crate::testing::temp_config_path("app");
 
         let result = handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path);
@@ -1555,7 +1566,8 @@ mod tests {
     #[test]
     fn lockdown_disable_keeps_previous_state_when_firewall_fails() {
         let client =
-            crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]).fail_lockdown();
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")])
+                .fail_lockdown();
         let path = crate::testing::temp_config_path("app");
         config::save(
             &path,
@@ -1583,7 +1595,8 @@ mod tests {
 
     #[test]
     fn lockdown_enable_then_disable_round_trips_state() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         handle_lockdown_command_with_path(&client, LockdownCommands::Enable, &path)
@@ -1611,7 +1624,8 @@ mod tests {
 
     #[test]
     fn split_tunnel_commands_flow() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         // 1. Set mode to include
@@ -1670,7 +1684,8 @@ mod tests {
     fn qbit_enable_and_disable_persists() {
         use crate::config::PortForwardMode;
 
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         handle_qbit_command_with_path(&client, QbitCommands::Enable, &path)
@@ -1688,7 +1703,8 @@ mod tests {
 
     #[test]
     fn qbit_config_updates_settings() {
-        let client = crate::testing::MockNmClient::new(vec![profile("wg-us", "uuid-1")]);
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
         let path = crate::testing::temp_config_path("app");
 
         handle_qbit_command_with_path(
@@ -1712,5 +1728,291 @@ mod tests {
         assert!(loaded.qbittorrent.binds_tunnel_interface());
 
         crate::testing::remove_temp_config(&path);
+    }
+
+    fn cli(command: Commands) -> Cli {
+        Cli {
+            command: Some(command),
+        }
+    }
+
+    #[test]
+    fn execute_connect_switch_and_disconnect_drive_the_client() {
+        let path = crate::testing::temp_config_path("app");
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")])
+                .with_config_path(path.clone());
+
+        execute_with_path(
+            &client,
+            cli(Commands::Connect {
+                profile: "uuid-1".into(),
+            }),
+            &path,
+            &scratch_proc_root(),
+        )
+        .expect("connect should succeed");
+        assert_eq!(client.calls(), vec!["connect:uuid-1".to_string()]);
+        assert_eq!(client.active_uuids(), vec!["uuid-1".to_string()]);
+
+        execute_with_path(
+            &client,
+            cli(Commands::Switch {
+                profile: "uuid-1".into(),
+            }),
+            &path,
+            &scratch_proc_root(),
+        )
+        .expect("switch should succeed");
+        assert!(client.calls().contains(&"switch:uuid-1".to_string()));
+
+        execute_with_path(
+            &client,
+            cli(Commands::Disconnect),
+            &path,
+            &scratch_proc_root(),
+        )
+        .expect("disconnect should succeed");
+        assert!(client.calls().contains(&"disconnect".to_string()));
+        assert!(
+            client.active_uuids().is_empty(),
+            "disconnect must take the profile down"
+        );
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn execute_connect_failure_propagates_without_lockdown_rebuild() {
+        let path = crate::testing::temp_config_path("app");
+        let client = crate::testing::MockNmClient::with_failures(
+            vec![crate::testing::inactive("wg-us", "uuid-1")],
+            &["uuid-1"],
+        )
+        .with_config_path(path.clone());
+
+        let error = execute_with_path(
+            &client,
+            cli(Commands::Connect {
+                profile: "uuid-1".into(),
+            }),
+            &path,
+            &scratch_proc_root(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, crate::error::AppError::CommandFailed(_)),
+            "a failed connect must surface, not print success: {error}"
+        );
+        // The name claims the lockdown rebuild is skipped as well, so it has to be
+        // checked: a connect that failed must not have rewritten the ruleset.
+        assert!(
+            client.lockdown_calls().is_empty(),
+            "a failed connect must not rebuild the ruleset: {:?}",
+            client.lockdown_calls()
+        );
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn eligible_add_and_remove_flip_the_exclusion_set() {
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
+        let path = crate::testing::temp_config_path("app");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+
+        handle_eligible_command_with_path(
+            &client,
+            EligibleCommands::Remove {
+                profile: "uuid-1".into(),
+            },
+            &path,
+        )
+        .expect("remove should succeed");
+        assert!(
+            config::load(&path)
+                .expect("config should load")
+                .excluded_profile_ids
+                .contains("uuid-1")
+        );
+
+        handle_eligible_command_with_path(
+            &client,
+            EligibleCommands::Add {
+                profile: "wg-us".into(),
+            },
+            &path,
+        )
+        .expect("add should succeed");
+        assert!(
+            !config::load(&path)
+                .expect("config should load")
+                .excluded_profile_ids
+                .contains("uuid-1")
+        );
+
+        // An unknown profile is an error, not a silent no-op.
+        let error = handle_eligible_command_with_path(
+            &client,
+            EligibleCommands::Remove {
+                profile: "nope".into(),
+            },
+            &path,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, crate::error::AppError::ProfileNotFound(_)),
+            "unknown profile must be reported: {error}"
+        );
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn favorite_add_and_remove_flip_the_favorite_set() {
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
+        let path = crate::testing::temp_config_path("app");
+        config::save(&path, &config::AppConfig::default()).expect("config should save");
+
+        handle_favorite_command_with_path(
+            &client,
+            FavoriteCommands::Add {
+                profile: "uuid-1".into(),
+            },
+            &path,
+        )
+        .expect("add should succeed");
+        assert!(
+            config::load(&path)
+                .expect("config should load")
+                .favorite_profile_ids
+                .contains("uuid-1")
+        );
+
+        handle_favorite_command_with_path(
+            &client,
+            FavoriteCommands::Remove {
+                profile: "wg-us".into(),
+            },
+            &path,
+        )
+        .expect("remove should succeed");
+        assert!(
+            !config::load(&path)
+                .expect("config should load")
+                .favorite_profile_ids
+                .contains("uuid-1")
+        );
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn qbit_sync_without_an_active_profile_is_an_error() {
+        let client =
+            crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
+        let path = crate::testing::temp_config_path("app");
+
+        let error = handle_qbit_command_with_path(&client, QbitCommands::Sync, &path).unwrap_err();
+        assert!(
+            matches!(error, crate::error::AppError::NoActiveProfile),
+            "sync with nothing connected must fail: {error}"
+        );
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn qbit_sync_without_a_tunnel_address_is_an_error() {
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "wg-us",
+            "uuid-1",
+            crate::nm::ProfileState::Active,
+        )])
+        .without_tunnel_address();
+        let path = crate::testing::temp_config_path("app");
+
+        let error = handle_qbit_command_with_path(&client, QbitCommands::Sync, &path).unwrap_err();
+        assert!(
+            matches!(error, crate::error::AppError::PortForward(_)),
+            "sync with no tunnel address must fail: {error}"
+        );
+
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn qbit_sync_pushes_the_leased_port_to_the_webui() {
+        use std::net::UdpSocket;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        if !crate::testing::curl_available() {
+            eprintln!("Skipping qbit sync test: 'curl' is not installed in the environment.");
+            return;
+        }
+
+        // NAT-PMP gateway stub on the protocol port: the mock tunnel address
+        // below derives gateway 127.0.0.1 from it.
+        let responder = UdpSocket::bind(("127.0.0.1", 5351)).expect("bind mock NAT-PMP gateway");
+        responder
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = done.clone();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok((len, src)) = responder.recv_from(&mut buf)
+                    && len >= 12
+                {
+                    let mut reply = [0u8; 16];
+                    reply[1] = buf[1] + 128;
+                    reply[10..12].copy_from_slice(&48888u16.to_be_bytes());
+                    reply[12..16].copy_from_slice(&60u32.to_be_bytes());
+                    let _ = responder.send_to(&reply, src);
+                }
+            }
+        });
+
+        let webui = crate::testing::MockQBittorrentWebUi::start();
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "wg-us",
+            "uuid-1",
+            crate::nm::ProfileState::Active,
+        )])
+        .with_tunnel_address("127.0.0.7/32");
+        let path = crate::testing::temp_config_path("app");
+        config::save(
+            &path,
+            &config::AppConfig {
+                qbittorrent: config::QBittorrentConfig {
+                    url: webui.url(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("config should save");
+
+        handle_qbit_command_with_path(&client, QbitCommands::Sync, &path)
+            .expect("sync should succeed");
+        assert!(
+            webui.last_set_preferences().contains("48888"),
+            "the leased port must reach qBittorrent"
+        );
+
+        done.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+        crate::testing::remove_temp_config(&path);
+    }
+
+    /// An empty stand-in for `/proc`. The command seam signals processes, so a
+    /// test driving `restart` or `reset` must aim it at a scratch tree: the real
+    /// one ends in `kill(2)` on anything named `neutron`.
+    fn scratch_proc_root() -> std::path::PathBuf {
+        crate::testing::scratch_dir("proc-root")
     }
 }

@@ -209,6 +209,55 @@ mod tests {
     }
 
     #[test]
+    fn sync_reports_inbox_files_it_cannot_consume() {
+        use crate::testing::running_as_root;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Directory permissions do not stop root, so the removal failure
+        // below cannot be triggered deterministically as root.
+        if running_as_root() {
+            eprintln!(
+                "Skipping inbox-removal test: running as root ignores directory permissions."
+            );
+            return;
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "neutron-sync-undeletable-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let conf = temp_dir.join("stuck.conf");
+        fs::write(&conf, "[Interface]\nPrivateKey = abc\n").unwrap();
+        // The import itself succeeds (mock); consuming the inbox file fails.
+        fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let client = MockNmClient::default();
+        let config = AppConfig {
+            general: config::GeneralConfig {
+                profiles_dir: temp_dir.to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let report = sync_profiles_dir(&client, &config).unwrap();
+        assert_eq!(report.imported, vec!["stuck".to_string()]);
+        assert_eq!(report.errors.len(), 1);
+        assert!(
+            report.errors[0].contains("Failed to remove imported inbox file"),
+            "removal failure must be reported, not swallowed: {:?}",
+            report.errors
+        );
+        assert!(conf.exists(), "an unconsumed inbox file must be kept");
+
+        fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn ensure_app_dirs_creates_profiles_directory() {
         let temp_dir = std::env::temp_dir().join(format!(
             "neutron-ensure-dirs-test-{}",
