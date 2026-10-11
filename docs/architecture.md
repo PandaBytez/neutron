@@ -40,13 +40,14 @@ Neutron is designed with a strictly decoupled architecture where all networking,
 - Trait `NmClient` provides an abstract interface for listing, connecting, disconnecting, switching profiles, setting kill-switch properties, and applying split-tunneling routes.
 - `CliNmClient` interacts with NetworkManager via `nmcli` with a strict 30-second execution deadline.
 - Submodule `nm::split_tunnel` validates and normalizes CIDRs, resolves domain names to IP addresses, and formats `ipv4.routes` / `ipv6.routes` / `never-default` arguments.
-- Submodule `nm::kill_switch` configures kernel policy routing (`wireguard.ip4-auto-default-route`) and negative DNS priorities (`-1500`).
+- Submodule `nm::kill_switch` pins policy routing and negative DNS priorities (`-1500`), and rejects unsupported protection before activation. Protected DNS uses explicit NM-managed resolver host routes in main table 254 with automatic routed-DNS processing disabled. Activation/reapply verify kernel UDP/TCP DNS egress and attempt disconnection on failure. NetworkManager/nmcli 1.52+ and iproute2 are required.
 
 ### 2. `firewall/` — Always-On Lockdown Netfilter Engine
 - Trait `FirewallClient` manages permanent direct `OUTPUT` chain rules in `firewalld`.
 - Uses mangle OUTPUT allow-list rules and a final DROP before filter-table established accepts; see [Security & Kill Switch](security.md).
 - All rules are tagged with a unique comment (`neutron-lockdown`) ensuring surgical removal without modifying user-defined firewall rules.
 - Privilege escalation is consolidated into one `pkexec` shell batch, with permanent fail-closed guards during rebuilds.
+- The refresh-only helper requires fresh administrator authorization, verifies exact WireGuard interfaces, and serializes mutations with root-owned locks and bounded waits; see [Security](security.md).
 
 ### 3. `portforward/` — NAT-PMP Dynamic Port Leasing & App Integrations
 - Implements RFC 6886 NAT-PMP client directly over `std::net::UdpSocket`.
@@ -70,10 +71,9 @@ Neutron is designed with a strictly decoupled architecture where all networking,
 
 | Metric | GTK4 / Libadwaita (GUI)`UNRELEASED` | Pure Rust TUI (`ratatui`) | Background Daemon / CLI | Electron / Web Clients |
 | :--- |:-----------------------------------:| :---: | :---: | :---: |
-| **Binary Size** |   ~15–30 MB (or AppImage bundle)    | **~3–5 MB** (Static musl binary) | **~3 MB** | 150–250 MB |
+| **Binary Size** |   ~15–30 MB (unreleased comparison) | **~3–5 MB** (Static musl binary) | **~3 MB** | 150–250 MB |
 | **Active RAM (RSS)** |          **~70 – 110 MB**           | **~10 – 15 MB** | **~3 – 6 MB** | 250 – 450 MB |
 | **Idle CPU Usage** |             0.1% – 0.5%             | **0.0%** (sleeps on `epoll`) | **0.0%** | 0.5% – 2.0% |
 | **Startup Time** |             ~150–300 ms             | **< 10 ms** (instantaneous) | **< 2 ms** | 1.5 – 3.0 seconds |
-| **System Dependencies** |   GTK4, Libadwaita, Mesa/Wayland    | **Zero** (100% static musl) | **Zero** | Node, Chromium, X11/Wayland |
+| **System Dependencies** |   GTK4, Libadwaita, Mesa/Wayland    | NetworkManager/nmcli 1.52+, iproute2, system tools | NetworkManager/nmcli 1.52+, iproute2, system tools | Node, Chromium, X11/Wayland |
 | **Primary Environments** |     GNOME Desktop Workstations      | Servers, SSH, Hyprland, Sway, i3 | Automation, Cron, Systemd | Legacy Cross-Platform |
-| **Distribution Channels** |      AppImage, Distro Packages      | Homebrew, Cargo, AUR, Static Musl | Homebrew, System Package | Custom Installers |

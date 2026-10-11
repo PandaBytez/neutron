@@ -64,6 +64,9 @@ and polkit as an unprivileged user, including denial and missing-policy errors.
 Since the container has no desktop login session, a temporary test-only rule
 grants only the refresh action for the success case. Active/inactive desktop
 session classification still requires a real login session.
+That sandbox-only success rule is not the production policy: installed helper
+refreshes require fresh `auth_admin`, and headless denial fails closed. Current
+desktop authorization behavior must be verified separately after main checks.
 
 ## Safety model
 

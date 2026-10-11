@@ -41,18 +41,43 @@ nmcli connection modify <uuid> \
     wireguard.ip4-auto-default-route yes \
     wireguard.ip6-auto-default-route yes \
     ipv4.dns-priority -1500 \
-    ipv6.dns-priority -1500
+    ipv6.dns-priority -1500 \
+    ipv4.routed-dns no \
+    ipv6.routed-dns no
 ```
 
 ### Routing Invariants
 1. **Dedicated Table Routing**: NetworkManager places the tunnel default route into an isolated routing table guarded by an `fwmark` and a `suppress_prefixlength 0` rule.
 2. **Active-Connection Scope**: Routing protection depends on the active connection's routes and rules. Lockdown provides protection across disconnection and switching.
-3. **DNS Priority**: A negative DNS priority (`-1500`) gives the tunnel's DNS resolvers exclusive precedence over LAN/DHCP resolvers, eliminating DNS leaks to your local ISP.
+3. **DNS Policy**: Negative DNS priority (`-1500`) selects tunnel resolvers. Preparation requires explicit tunnel DNS covered by peer AllowedIPs, adds `~.` on supported families, and makes those families non-optional (`may-fail=no`). Protected profiles disable automatic DNS route processing (`ipv4.routed-dns=no`, `ipv6.routed-dns=no`) and append explicit NetworkManager-managed resolver `/32` and `/128` routes with metric 5 in the main table (`table=254`). These routes merge with the selected split routes, preserve default-route policy, and retain resolver transport through the tunnel even when the resolver is excluded.
+
+The command above shows only the base properties, not complete DNS preparation.
+Automatic `routed-dns=yes` processing was found in the sandbox to remove IPv6
+host routes during device reapply on NetworkManager 1.56; it is not a protection
+guarantee. Protected profiles use explicit routes instead.
 
 The setting is global and applies to saved profiles for their next activation.
 Automatic default-route handling is pinned independently of the DNS toggle;
-full-tunnel routing requires a peer allowing `0.0.0.0/0` or `::/0`. IPv6 policy
-is adjusted for profiles without IPv6. See [saved versus effective policy](implementation.md#saved-intent-and-effective-policy).
+full-tunnel routes still depend on peer AllowedIPs. Both the NetworkManager
+daemon and `nmcli` must be **1.52+**. Preparation verifies that both routed-DNS
+properties retained the selected value: `no` for kill-protected profiles, `yes`
+for unprotected profiles. Unsupported or discarded properties refuse activation.
+The `ip` tool from **iproute2** is also required for kernel egress verification.
+
+After protected activation and active-device route reapply, Neutron checks each
+resolver's actual kernel egress selection using JSON `ip -4/-6 route get` with
+`ipproto udp/tcp dport 53`. Each lookup must select the tunnel interface; checks
+allow a short retry window for asynchronous route commits. This is a kernel route
+check, not a DNS response or packet-delivery probe. A failed lookup, malformed
+result, or non-tunnel egress triggers `nmcli connection down` and an error;
+disconnection failure is reported too. Saved properties alone are not verification.
+
+With the kill switch enabled **without lockdown**, activation refuses an
+unsupported IPv4 or IPv6 family. With split mode disabled, peers must allow both
+`0.0.0.0/0` and `::/0`. An IPv4-only or partial tunnel is not silently IPv6-safe:
+use a suitable dual-stack profile or enable lockdown to block unsupported traffic.
+Explicit split bypasses remain intentional, not a promise of full-tunnel
+protection. See [saved versus effective policy](implementation.md#saved-intent-and-effective-policy).
 
 ---
 
@@ -80,6 +105,44 @@ Activation installs the target interface and connected DNS policy before bringin
 the tunnel up. DNS drops precede LAN allowances. An `ACCEPT` here finishes this
 table; it does not bypass other firewall policy.
 
+### Helper Authorization and Trust Boundary
+
+Every invocation of the root-owned refresh helper requires **fresh `auth_admin`**
+authorization. The action uses `allow_any=no`, and `auth_admin` for active and
+inactive sessions, not `yes` or `auth_admin_keep`. There is no password-free
+refresh grant. Automatic activation, switching, login selection, profile changes,
+and background firewall/DNS reconciliation may therefore prompt. Missing agents,
+headless denial, or rejected authorization fail closed; required pre-activation
+refresh failures stop activation, and existing firewall protection remains.
+
+Existing installations must run `neutron lockdown enable` and authenticate to
+upgrade the old helper and password-free action. Current source refuses the old
+grant, checking both action directories and the legacy rules file, including
+mixed policies and dangling links. A hardened action in one directory does not
+excuse an unsafe grant elsewhere. Authenticated `lockdown disable` rechecks under
+the root lock and revokes the helper and all known authorization files if they
+are not hardened; it preserves only hardened authorization. The refresh-only
+helper derives allowances from NetworkManager and accepts
+only an optional validated activation UUID, never caller-provided firewall rules.
+It cannot enable or disable lockdown.
+
+Interface allowances use exact names: 1-15 bytes of ASCII letters, digits, `_`,
+or `-`, with no `+` wildcard. Existing links must be verified kernel WireGuard
+devices, even if named `wg...`. An absent inactive/pending interface must begin
+with `wg` and have a suffix; an active interface may not be absent. Authenticated
+toggles recheck the link type after authorization and before writing rules.
+
+Helper installation copies the running executable through `/proc/<pid>/exe`,
+opens that pinned inode, verifies its device/inode identity, and copies from the
+open descriptor rather than trusting a replaceable executable pathname.
+
+Mutations take the legacy `/run/neutron-lockdown.lock` and then the private
+`/run/neutron-lockdown/lock`, preserving old inode coordination across upgrades.
+The private directory is root-owned `0700`, lock files are root-owned `0600`, and
+each lock acquisition is bounded to 10 seconds. Unsafe file types, owners, or
+links are rejected; lock files are not unlinked during teardown. This bounds lock
+contention, not the administrator authentication wait.
+
 ### Surgical Teardown Guarantee
 Every single rule installed by Lockdown carries a marker:
 `-m comment --comment neutron-lockdown`
@@ -92,22 +155,23 @@ When disabling Lockdown:
 
 ### Uninstalling Revokes Everything It Installed
 
-Enabling Lockdown also writes two root-owned files that no package owns, because
+Enabling Lockdown writes root-owned helper/action files that no package owns, because
 they must live outside the app directory:
 
 | Path | Purpose |
 | :--- | :--- |
-| `/usr/local/libexec/neutron-lockdown-helper` | Root-owned, refresh-only copy of the binary, so a rule refresh needs no password |
-| `/usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy` | Authorizes that copy, `allow_active=yes` |
+| `/usr/local/libexec/neutron-lockdown-helper` | Root-owned, refresh-only copy of the running binary |
+| `/usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy` | Requires fresh `auth_admin` for that copy; polkit 126+ location |
 
-Together they are the **password-free refresh grant**. Its lifetime is the
-*installation*, not the current lockdown state: `lockdown enable` installs it and
-`neutron uninstall` revokes it, while `lockdown disable` leaves it in place so a
-re-enable needs no second prompt — and so the emergency path that lifts the block
-stays limited to the one thing a locked-out user needs. Revocation sweeps both
-polkit action directories, so a downgrade from polkit 126+ cannot leave a live
-grant, then verifies from unprivileged `stat` that nothing survived; a leftover
-is reported rather than ignored.
+`lockdown enable` installs/updates the authenticated helper and migrates old
+grants. `lockdown disable` keeps only hardened authorization; otherwise it revokes
+the helper and every known grant. Reset and uninstall revoke them unconditionally.
+Re-enabling and helper refreshes still require authentication. Older polkit uses
+`/usr/share/polkit-1/actions`; the legacy rules file is
+`/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules`. Detection and revocation
+cover both action directories, the legacy file, and the helper, including dangling
+links. Revocation reloads polkit and reports surviving files rather than ignoring
+them.
 
 **Package managers cannot clean this up themselves**, so uninstall through the
 app:
@@ -119,7 +183,7 @@ neutron uninstall --purge      # also delete ~/.config/neutron
 
 `neutron uninstall` stops the tray daemon, drops the autostart entry, and then
 runs the removal command for the install it detects. The privileged work — lifting
-the rules *and* revoking the grant — is one batch, so it is at most one password
+the rules *and* removing the helper/action — is one batch, so it is at most one password
 prompt, and it is skipped entirely when the machine holds no Neutron-owned
 lockdown state. Homebrew's own `post_uninstall` hook cannot do this: it runs
 *after* the files are removed, with no way to authenticate.
@@ -144,6 +208,9 @@ sudo firewall-cmd --permanent --direct --get-all-rules | grep neutron-lockdown
 sudo firewall-cmd --reload
 sudo rm -f /usr/local/libexec/neutron-lockdown-helper \
   /usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy
+sudo rm -f /usr/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy \
+  /etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules
+# Reload/restart the polkit authority using your system's service manager.
 ```
 
 ### Rebuild Recovery

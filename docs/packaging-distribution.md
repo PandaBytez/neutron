@@ -1,101 +1,82 @@
-# Packaging & Universal Distribution
+# Installation & Releases
 
-Neutron is designed for easy distribution across all major Linux packaging ecosystems.
+Supported installation channels are Homebrew, Cargo, and static Linux binaries.
+Static linking removes dynamic library dependencies, not the requirement for
+NetworkManager, `nmcli`, and other system tools. Both the NetworkManager daemon
+and `nmcli` must be 1.52+ and retain the selected `ipv4.routed-dns` /
+`ipv6.routed-dns` values (`no` when kill-protected, otherwise `yes`). iproute2's
+`ip` is required to verify protected resolver UDP/TCP egress after activation
+and reapply; automatic routed-DNS processing alone is not a protection guarantee.
+Lockdown additionally requires firewalld and polkit; desktop integration needs
+the appropriate session services.
 
----
-
-## Packaging Channels Overview
-
-| Format | Target Platform | Dependencies | Standalone? | Build Command |
-| :---: | :--- | :--- | :---: | :--- |
-| **Homebrew** | Linux / Linuxbrew | Zero (Pure Rust TUI/CLI) | Yes | `brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron` |
-| **Static Musl** | Headless Servers, SSH | Zero (Static musl binary) | Yes | `cargo build --target x86_64-unknown-linux-musl` |
-| **Arch AUR** | Arch Linux, Manjaro | System dependencies | Native | `makepkg -si` |
-
-`cargo install` is also supported. `neutron uninstall` detects which of these
-installed the running binary and hands it to the matching package manager
-(`brew uninstall neutron` or `cargo uninstall neutron`) after revoking the
-firewall rules and root-owned helper that no package manager owns. Any other
-install shape -- AppImage, distro package -- is refused rather than guessed at,
-so remove it by hand; see
-[security.md](security.md#uninstalling-revokes-everything-it-installed).
-
-
----
-
-## 1. Homebrew Tap Formula (`Formula/neutron.rb`)
-
-Sample formula for custom tap (`brew tap pandabytez/tap`):
-
-```ruby
-class Neutron < Formula
-  desc "Fast WireGuard profile manager via NetworkManager"
-  homepage "https://github.com/PandaBytez/neutron"
-  url "https://github.com/PandaBytez/neutron/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "<checksum>"
-  license "GPL-3.0-or-later"
-
-  depends_on "rust" => :build
-  depends_on :linux
-
-  def install
-    system "cargo", "install", *std_cargo_args
-    bin.install_symlink "neutron" => "neutron-vpn"
-  end
-
-  test do
-    assert_match "Neutron", shell_output("#{bin}/neutron --help")
-  end
-end
-```
-
-### Tap Trust Verification (Modern Homebrew)
-
-Under Homebrew's tap trust model, non-official taps can be explicitly marked as trusted:
+## Homebrew
 
 ```bash
-# Trust the tap
-brew trust pandabytez/tap
-
-# Or trust specifically the neutron formula
-brew trust --formula pandabytez/tap/neutron
+brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron
 ```
 
----
+The formula is maintained in the sibling `homebrew-tap` repository by the release
+script, not by copying a sample formula from this documentation.
 
-## 2. Static Musl Target (Headless Servers / Homelabs)
+## Cargo
 
-Compile a 100% statically-linked executable with no dynamic shared library dependencies:
+Install the existing stable source tag:
 
 ```bash
-# Add musl target
+cargo install --locked --git https://github.com/PandaBytez/neutron.git --tag v0.2.0
+```
+
+To install fixes newer than that tag, select an explicitly reviewed revision:
+
+```bash
+cargo install --locked --git https://github.com/PandaBytez/neutron.git --rev "<reviewed-commit-sha>"
+```
+
+These pages describe current source. The existence of `v0.2.0` does not mean
+that tag includes later security fixes, nor that those fixes have been released
+through Homebrew or binary assets. Check the selected revision and release notes.
+
+## Static Binary
+
+Download the x86_64 archive and matching SHA256SUMS from the
+[release page](https://github.com/PandaBytez/neutron/releases), verify the archive
+checksum, then extract and install `neutron` on your executable search path.
+Use the asset names published for that release.
+
+Alternatively, build from a reviewed checkout:
+
+```bash
 rustup target add x86_64-unknown-linux-musl
-
-# Build static binary
-cargo build --release --target x86_64-unknown-linux-musl
+cargo build --locked --release --target x86_64-unknown-linux-musl
 ```
-The resulting binary (`target/x86_64-unknown-linux-musl/release/neutron`) runs on Alpine Linux, Debian, RHEL, Ubuntu, and any minimal Linux environment.
 
----
+The binary is `target/x86_64-unknown-linux-musl/release/neutron`. A headless
+installation does not bypass lockdown authentication: required helper refreshes
+may prompt and fail closed when authorization is unavailable.
 
-## 3. Arch Linux AUR Package (`PKGBUILD`)
+## Removal
 
-Sample `PKGBUILD` for Arch Linux:
+`neutron uninstall` recognizes Homebrew and Cargo installations, withdraws
+Neutron's policies and root-owned helper/action, and invokes the matching package
+manager. Settings remain unless `--purge` is supplied. Unknown installation
+shapes, including manually installed static binaries, are refused before changes.
+For a static installation, run `neutron reset` to withdraw policies before
+manually removing the binary; reset clears settings as well. See
+[security recovery](security.md#uninstalling-revokes-everything-it-installed)
+if the binary has already been removed.
 
-```bash
-pkgname=neutron-bin
-pkgver=0.1.0
-pkgrel=1
-pkgdesc="Fast WireGuard manager via NetworkManager"
-arch=('x86_64' 'aarch64')
-url="https://github.com/PandaBytez/neutron"
-license=('GPL-3.0-or-later')
-depends=('networkmanager')
-source_x86_64=("https://github.com/PandaBytez/neutron/releases/download/v${pkgver}/neutron-linux-amd64.tar.gz")
-sha256sums_x86_64=('SKIP')
+## Release Contract
 
-package() {
-    install -Dm755 neutron "${pkgdir}/usr/bin/neutron"
-    ln -s neutron "${pkgdir}/usr/bin/neutron-vpn"
-}
-```
+`./release.sh <tag> [notes-file]` is the only supported release entry point.
+It requires a clean checkout on `main` with `HEAD == main`, a clean sibling
+`homebrew-tap`, and the expected origin. It does not auto-commit dirty work;
+it commits only its own version bump when needed. Existing local or remote tags
+must peel to the release commit, and main, HEAD, and the tag are rechecked before
+the atomic main-and-tag push.
+
+The script accepts only a successful **main push** CI run whose source SHA
+matches the release commit. It verifies the immutable commit source archive,
+packages the CI-built static binary, publishes checksums, and updates the tap
+using that verified archive's URL and SHA256. Reruns verify existing assets
+instead of overwriting them. Do not publish releases or tap commits by hand.

@@ -79,7 +79,12 @@ Before enabling synchronization, ensure qBittorrent's Web User Interface is enab
 1. In qBittorrent, open **Tools** $\rightarrow$ **Options** $\rightarrow$ **Web UI** (or **Preferences** $\rightarrow$ **Web UI**).
 2. Check **"Web User Interface (Remote control)"** (default port: `8080`).
 3. *(Recommended)* Under **Authentication**, check **"Bypass authentication for clients on localhost"**.
-   - If localhost authentication bypass is not enabled, configure your WebUI username and password in Neutron via `neutron qbit config --username <user> --password <pass>`.
+   - If localhost authentication bypass is not enabled, configure credentials with
+     `neutron qbit config --username admin --password-stdin < /path/to/protected-password`.
+     Use an existing owner-only (`0600`) password file or a secret-manager pipe.
+     `--password` is unsupported; terminal stdin is rejected before reading,
+     not echoed. The first line is read, an empty line clears the password, and
+     EOF without a line is rejected. Do not put literal secrets in shell commands.
 
 ### Compatibility (Flatpak, Native, Containers)
 

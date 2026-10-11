@@ -66,12 +66,14 @@ Pressing **`t`** opens the side-by-side Split Tunneling manager:
 * **Subnets / CIDRs (Right Column):** Type an IPv4/IPv6 CIDR (e.g. `10.0.0.0/8` or `192.168.1.0/24`) and press `Enter`.
 * **Navigation:** `Tab` cycles between Mode, Domains, and Subnets. Arrow keys (`←`, `→`, `↑`, `↓`) navigate between panels and list items.
 * **Deletion:** Select any entry in the list and press `Del` or `x`.
-* **Automatic Non-Blocking Apply:** All changes apply and persist immediately in the background without freezing the UI.
+* **Non-Blocking Apply:** Changes are submitted in the background. Backend or save failures are reported; saved profile routing changes require reconnect.
+* **Concurrent Edits:** If the captured split-settings snapshot conflicts with another writer, saving is rejected. Reload current settings before resubmitting, rather than retrying a stale snapshot.
 * **Lockdown Notice:** If the Lockdown Firewall is active, a clear banner reminds you that all non-tunnel traffic is dropped when disconnected.
 
 Include mode is evaluated per address family: only a family with a nonempty
 destination list routes just those destinations through the tunnel. An empty
-family intentionally retains its full-tunnel default. See
+family retains default-route eligibility, which still requires a usable tunnel
+family and matching peer AllowedIPs. This does not protect unsupported IPv6. See
 [routing modes](split-tunneling.md#routing-modes).
 
 ---
@@ -165,6 +167,20 @@ neutron lockdown disable
 while waiting on authentication and firewalld. Piped output gets a plain
 `Enabling Lockdown...` line instead.
 
+Helper refreshes also require fresh `auth_admin`, not a password-free grant.
+Automatic connections, switching, login selection, and reconciliation may prompt;
+headless denial fails closed and a required pre-activation refresh failure stops
+activation. After upgrading an existing install, authenticate with
+`neutron lockdown enable` to replace its old grant. Disable retains only hardened
+authorization and revokes unsafe grants, including mixed actions and legacy rules.
+NetworkManager and `nmcli` 1.52+ and iproute2's `ip` are required. Protected DNS
+disables automatic routed-DNS processing and merges explicit resolver host routes
+in main table 254, even for exclusions. After activation/reapply, kernel UDP/TCP
+DNS egress is checked; failure attempts disconnection and returns an error.
+Without lockdown, kill protection refuses unsupported IP
+families and unsplit profiles lacking both `0.0.0.0/0` and `::/0` AllowedIPs.
+Explicit split bypasses remain intentional. See [security](security.md).
+
 ### Factory Reset
 
 ```bash
@@ -197,7 +213,7 @@ session, and Homebrew refuses to run as root. Neutron detects whether it was
 installed by Homebrew or `cargo install` and runs the matching removal. It stops
 the tray daemon, deletes the autostart entry, and -- in one privileged batch, and
 only if any lockdown state is present -- lifts the firewall rules and revokes the
-password-free refresh grant. Settings are kept unless `--purge` is given. An unrecognized install is refused without changing anything; see
+authenticated refresh helper and action. Settings are kept unless `--purge` is given. An unrecognized install is refused without changing anything; see
 [security.md](security.md#uninstalling-revokes-everything-it-installed).
 
 ### NAT-PMP & qBittorrent Dynamic Port Sync
@@ -219,7 +235,15 @@ neutron qbit disable   # forward
 
 # Configure WebUI connection parameters (--bind forces interface binding on/off)
 neutron qbit config --url http://127.0.0.1:8080
+
+# Read the first password line from an existing owner-only file (0600)
+neutron qbit config --username admin --password-stdin < /path/to/protected-password
 ```
+
+`--password` is not supported. `--password-stdin` rejects terminal input before
+reading so the password is not echoed. Use protected redirection or a secret
+manager pipe, not a literal secret in command arguments or shell history. An
+empty line clears the saved password; EOF without a line is rejected.
 
 In the TUI, use the Command Palette's qBittorrent sync action for a manual push.
 It runs in the background using a snapshot of the daemon's leased port and profile

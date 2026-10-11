@@ -44,10 +44,10 @@ lease renewal timers, and clipboard integration.
 Specification for the human-readable TOML configuration, managed profile drop directory (`profiles/`) auto-sync,
 built-in themes (Osaka Jade, Catppuccin, Nord, Gruvbox, Monochrome), and color customization.
 
-### 8. [Packaging & Universal Distribution](packaging-distribution.md)
+### 8. [Installation & Releases](packaging-distribution.md)
 
-Packaging guides and distribution models for Homebrew tap formulas, Arch Linux AUR, and static musl compilation for
-headless servers.
+Supported Homebrew, pinned Cargo, and static binary installations, system
+requirements, removal, and the verified release process.
 
 ### 9. [Implementation Notes](implementation.md)
 
@@ -67,5 +67,6 @@ Formatting, Clippy, host tests, and disposable NetworkManager/firewall sandbox t
   terminal drawing code.
 * **Apply-Before-Persist**: Network operations are executed first; persisted application configurations are only updated
   if the underlying network mutation succeeds.
-* **Fail-Safe Security**: Kill Switch and Lockdown teardowns are strictly surgical and guaranteed never to lock the user
-  out permanently.
+* **Fail-Closed Security**: Unsupported protection and denied required refreshes
+  are reported, not silently bypassed. Lockdown teardown is surgical but requires
+  authorization; interrupted rebuilds can block traffic until authenticated recovery.

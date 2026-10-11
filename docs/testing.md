@@ -15,7 +15,7 @@ cargo xtask reinstall -- --debug
 # Run default-feature unit and integration tests
 cargo test
 
-# Include the optional qBittorrent integration tests
+# Check all features (qBittorrent is built in, not an optional feature)
 cargo test --all-features
 ```
 
@@ -76,6 +76,10 @@ Never run `cargo test -- --ignored` directly on the host or set
 - Container reload checks do not establish persistence across an actual reboot.
 
 ## Build the Documentation
+
+Run documentation builds only after main-source verification. GitHub Pages pins
+mdBook **0.4.52** and verifies the downloaded asset's SHA256 before installing it.
+Use the same version locally for matching behavior.
 
 ```bash
 cargo docs

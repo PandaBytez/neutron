@@ -7,7 +7,7 @@ This folder contains an optional one-shot user service that runs the startup ran
 1. Build and install the binary:
 
    ```bash
-   cargo install --path . --root "$HOME/.local"
+    cargo install --locked --path . --root "$HOME/.local"
    ```
 
 2. Install the unit file:
@@ -28,5 +28,13 @@ This folder contains an optional one-shot user service that runs the startup ran
 
    ```bash
    systemctl --user start neutron-startup-random.service
-   journalctl --user -u neutron-startup-random.service -n 50 --no-pager
-   ```
+    journalctl --user -u neutron-startup-random.service -n 50 --no-pager
+    ```
+
+Both NetworkManager and `nmcli` must be 1.52+, and iproute2's `ip` is required
+for protected resolver UDP/TCP kernel egress verification. With lockdown enabled, every
+helper refresh requires fresh administrator authorization, including this
+automatic selector. A headless session without authorization fails closed;
+required pre-activation refresh failure stops activation, not firewall protection.
+Existing installs must authenticate with `neutron lockdown enable` after upgrading
+to replace the old helper grant. This service is not a password-free bypass.

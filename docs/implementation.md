@@ -33,6 +33,10 @@ unreadable notes produce an error rather than being silently overwritten.
 WireGuard private keys remain in NetworkManager storage. Optional qBittorrent
 WebUI credentials are application settings; they are passed to curl through
 stdin rather than command-line arguments.
+The CLI accepts `--password-stdin` only with piped or redirected input, not a
+terminal; `--password` is not supported. Use a protected file or secret-producing
+pipe, never an inline password in a shell command. Settings still store these
+credentials, so do not publish the configuration directory.
 
 ## Activation and Import
 
@@ -40,6 +44,29 @@ Activation requires successful configuration loading and routing/DNS policy
 preparation. Invalid split-tunnel targets, unresolved domains, or rejected
 NetworkManager modifications stop activation with an error. Imported profiles
 receive the same checked preparation.
+
+Preparation requires NetworkManager and `nmcli` 1.52+ and verifies retained
+routed-DNS properties (`no` for protected profiles, `yes` for unprotected ones).
+Kill-protected profiles disable automatic DNS route processing and merge explicit
+NM-managed resolver `/32` and `/128` routes in main table 254 with split routes,
+even exclusions, without replacing defaults. After activation and active-device
+reapply, iproute2's `ip` verifies the kernel's UDP/TCP port-53 egress for every
+resolver. Non-tunnel routes or verification errors attempt disconnection and
+return an error, including any teardown failure; this is not a packet probe.
+Kill protection without lockdown refuses unsupported IP
+families; unsplit profiles need both full-family AllowedIPs. Explicit split
+bypasses remain intentional. Disabled split mode clears stale split routes during
+activation, and changing to disabled applies cleanup before saving; protected
+resolver host routes are merged back, not removed with the split policy.
+
+When lockdown is enabled, activation performs authenticated helper refreshes
+before activation and during reconciliation afterward. Each helper invocation
+requires fresh `auth_admin`, including automatic/headless paths; authorization
+failure does not remove existing protection, and a required pre-activation
+refresh failure aborts activation. Upgrade old grants with an authenticated
+`neutron lockdown enable`. Detection covers both action directories and legacy
+rules; disable retains only hardened authorization and revokes unsafe grants
+under the root lock. See [helper security](security.md#helper-authorization-and-trust-boundary).
 
 Automatic handshake-failure teardown applies to fresh interfaces whose profiles
 have an endpoint and nonzero persistent keepalive, when verification is enabled.
@@ -80,6 +107,11 @@ policies `UNKNOWN` until a successful retry, even after a config refresh. CLI
 lockdown status explicitly reports saved intent rather than verified firewall
 state. Emergency disable attempts firewall removal even when saving is unavailable.
 
+Split-editor snapshot writes compare the captured original with current saved
+settings under policy coordination. A conflicting writer causes a reload-required
+error rather than overwriting its changes; reload before resubmitting TUI edits.
+Displayed errors escape terminal control characters and bidi controls.
+
 For permanent rebuild guards and recovery, see
 [Lockdown rebuild recovery](security.md#rebuild-recovery).
 
@@ -92,5 +124,5 @@ requested tunnel address aborts the request instead of falling back to another s
 
 The executable is named `neutron`. The musl target produces a statically linked
 binary; system tools and services such as NetworkManager are still required.
-Build instructions are in [Packaging & Distribution](packaging-distribution.md).
+Build instructions are in [Installation & Releases](packaging-distribution.md).
 Commands and test-tier boundaries are in [Testing & Quality Checks](testing.md).

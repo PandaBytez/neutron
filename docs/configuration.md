@@ -57,7 +57,8 @@ verify_tunnel_on_connect = true
 [global_split_tunnel]
 # Routing mode: "disabled", "include", or "exclude".
 # Include routes only listed destinations for each nonempty address family;
-# an empty family retains its full-tunnel default (including an empty list).
+# an empty family retains default-route eligibility, requiring a usable tunnel
+# family and matching peer AllowedIPs; it does not protect unsupported IPv6.
 mode = "include"
 
 # Custom IP subnets (CIDRs) or single host IPs
@@ -137,6 +138,11 @@ default; that value migrates to URL-derived binding. With the current marker
 `true`, an explicit `bind_interface = false` remains an override. Prefer
 `neutron qbit config --bind false` to editing migration metadata yourself.
 
+For passwords, use `neutron qbit config --username admin --password-stdin < /path/to/protected-password`
+with an existing owner-only (`0600`) file, or a secret-manager pipe. There is no
+`--password` option; terminal input is rejected before reading so it is not
+echoed. Credentials remain in owner-only settings and reach curl through stdin.
+
 ---
 
 ## Theming Engine
@@ -169,4 +175,6 @@ Neutron manages a dedicated profile drop directory at `~/.config/neutron/profile
    ```bash
    neutron sync
    ```
-4. **Git/Dotfiles Automation**: The entire `~/.config/neutron/` folder can be tracked in a private Git repository for instant syncing across multiple machines.
+4. **Secrets**: Do not track the entire configuration directory in Git or publish
+   it as dotfiles: settings may contain a qBittorrent password and pending profile
+   files may contain WireGuard keys.
