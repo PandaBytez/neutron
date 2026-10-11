@@ -43,24 +43,6 @@ fn normalize_autoconnect<C: NmPolicy>(client: &C) {
     }
 }
 
-fn lock_selector(path: &Path) -> AppResult<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".selector.lock");
-    let lock = options.open(Path::new(&lock_path))?;
-    lock.lock()?;
-    Ok(lock)
-}
-
 fn run_startup_random_with_selector<C, F>(
     client: &C,
     path: &Path,
@@ -70,7 +52,7 @@ where
     C: NmClient,
     F: FnMut(usize) -> usize,
 {
-    let _selector_lock = lock_selector(path)?;
+    let _selector_lock = config::lock_sidecar(path, ".selector.lock")?;
     let app_cfg = config::load(path)?;
 
     let profiles = client.list_wireguard_profiles()?;

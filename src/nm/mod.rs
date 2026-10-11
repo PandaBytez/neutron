@@ -1129,7 +1129,7 @@ fn verify_or_disconnect(
 }
 
 fn run_nmcli(args: &[&str]) -> AppResult<String> {
-    run_nmcli_with_timeout(args, NMCLI_TIMEOUT)
+    crate::process::run_with_timeout("nmcli", args, NMCLI_TIMEOUT)
 }
 
 /// Convenience wrapper around [`run_nmcli`] for dynamically built argument
@@ -1137,10 +1137,6 @@ fn run_nmcli(args: &[&str]) -> AppResult<String> {
 fn run_nmcli_owned(args: &[String]) -> AppResult<String> {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_nmcli(&arg_refs)
-}
-
-fn run_nmcli_with_timeout(args: &[&str], timeout: Duration) -> AppResult<String> {
-    crate::process::run_with_timeout("nmcli", args, timeout)
 }
 
 #[cfg(test)]

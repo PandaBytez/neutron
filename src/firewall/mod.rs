@@ -49,7 +49,7 @@
 //! script so they cannot break out of their argument position.
 
 use std::net::IpAddr;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 pub mod helper;
 
@@ -215,7 +215,7 @@ impl FirewallClient for crate::nm::CliNmClient {
 /// Querying the ruleset does not require root, so this deliberately does **not**
 /// go through `pkexec`: it never triggers a password prompt. That is what lets
 /// enable/disable read the current rules freely and confine privilege to the
-/// single batched write below (see [`crate::process::host_command`]).
+/// single batched write below (see [`run_script`]).
 fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
     read_marked_rules_with(family, table, FIREWALL_CMD)
 }
@@ -223,7 +223,7 @@ fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
 /// [`read_marked_rules`] against a named binary, so the "no firewalld here" case
 /// is reachable from a test without a machine that lacks firewalld.
 fn read_marked_rules_with(family: &str, table: &str, tool: &str) -> AppResult<String> {
-    let output = crate::process::host_command(tool)
+    let output = Command::new(tool)
         .args(direct_args("--get-rules", family, table))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -260,7 +260,7 @@ fn read_direct_all_rules(permanent: bool) -> AppResult<String> {
     if permanent {
         args.insert(0, "--permanent");
     }
-    let output = crate::process::host_command(FIREWALL_CMD)
+    let output = Command::new(FIREWALL_CMD)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -359,11 +359,11 @@ fn locked_script() -> String {
 
 fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
     let mut command = if authenticate {
-        let mut command = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")]);
-        command.arg("sh");
+        let mut command = Command::new("pkexec");
+        command.env("SHELL", "/bin/sh").arg("sh");
         command
     } else {
-        crate::process::host_command("/bin/sh")
+        Command::new("/bin/sh")
     };
     let output = command
         .arg("-c")
@@ -414,17 +414,7 @@ fn build_firewall_script(batches: &[Vec<String>]) -> String {
 /// metacharacter (`;`, `$`, `` ` ``, newline, …). This is the mechanism that
 /// lets [`build_firewall_script`] safely embed profile-derived strings.
 fn shell_quote(arg: &str) -> String {
-    let mut quoted = String::with_capacity(arg.len() + 2);
-    quoted.push('\'');
-    for ch in arg.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Permanent IPv4/IPv6 rules; runtime rules are updated separately without reload.
@@ -551,28 +541,13 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
     // When disconnected (no tunnels active), allow broad DNS so peer endpoints
     // can resolve before connecting. When a tunnel is active, DNS travels through
     // the tunnel interface (-o <iface> -j ACCEPT) without leaking outside.
-    if !any_active {
+    // Block external/LAN-bound DNS while connected so queries cannot leak to LAN resolvers.
+    let dns_target = if any_active { "DROP" } else { "ACCEPT" };
+    for protocol in ["udp", "tcp"] {
         batches.push(add_rule(
             family,
             1,
-            &["-p", "udp", "--dport", "53", "-j", "ACCEPT"],
-        ));
-        batches.push(add_rule(
-            family,
-            1,
-            &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
-        ));
-    } else {
-        // Block external/LAN-bound DNS while connected so queries cannot leak to LAN resolvers.
-        batches.push(add_rule(
-            family,
-            1,
-            &["-p", "udp", "--dport", "53", "-j", "DROP"],
-        ));
-        batches.push(add_rule(
-            family,
-            1,
-            &["-p", "tcp", "--dport", "53", "-j", "DROP"],
+            &["-p", protocol, "--dport", "53", "-j", dns_target],
         ));
     }
 
@@ -614,74 +589,26 @@ fn local_network_batches(family: &str) -> Vec<Vec<String>> {
 /// broadly.
 fn endpoint_rules(family: &str, endpoint: &Endpoint) -> Vec<Vec<String>> {
     let port = endpoint.port.to_string();
+    let rule = |ip: IpAddr, host: &str| {
+        matches!(
+            (ip, family),
+            (IpAddr::V4(_), "ipv4") | (IpAddr::V6(_), "ipv6")
+        )
+        .then(|| {
+            add_rule(
+                family,
+                1,
+                &["-p", "udp", "-d", host, "--dport", &port, "-j", "ACCEPT"],
+            )
+        })
+    };
     if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(_) if family == "ipv4" => {
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    endpoint.host.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                return vec![add_rule(family, 1, &rule)];
-            }
-            IpAddr::V6(_) if family == "ipv6" => {
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    endpoint.host.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                return vec![add_rule(family, 1, &rule)];
-            }
-            _ => return Vec::new(),
-        }
+        return rule(ip, &endpoint.host).into_iter().collect();
     }
-
-    let ips = crate::nm::split_tunnel::resolve_domain_ips(&endpoint.host);
-    let mut rules = Vec::new();
-    for ip in ips {
-        match ip {
-            IpAddr::V4(v4) if family == "ipv4" => {
-                let v4_str = v4.to_string();
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    v4_str.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                rules.push(add_rule(family, 1, &rule));
-            }
-            IpAddr::V6(v6) if family == "ipv6" => {
-                let v6_str = v6.to_string();
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    v6_str.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                rules.push(add_rule(family, 1, &rule));
-            }
-            _ => {}
-        }
-    }
-    rules
+    crate::nm::split_tunnel::resolve_domain_ips(&endpoint.host)
+        .into_iter()
+        .filter_map(|ip| rule(ip, &ip.to_string()))
+        .collect()
 }
 
 /// Build a permanent `--direct --add-rule <family> mangle OUTPUT <priority>

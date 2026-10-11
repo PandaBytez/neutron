@@ -10,8 +10,6 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::error::AppResult;
-#[cfg(test)]
-use crate::nm::NmLifecycle;
 use crate::nm::{NmClient, NmIntrospect};
 use crate::service::lease::QbitSyncStatus;
 
@@ -432,29 +430,24 @@ fn copy_to_clipboard(text: &str) {
         return;
     }
     use std::io::Write;
-    if let Ok(mut child) = std::process::Command::new("xclip")
-        .args(["-selection", "clipboard"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        if let Ok(status) = child.wait()
-            && status.success()
+    for (program, args) in [
+        ("xclip", ["-selection", "clipboard"]),
+        ("xsel", ["--clipboard", "--input"]),
+    ] {
+        if let Ok(mut child) = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
         {
-            return;
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait()
+                && status.success()
+            {
+                return;
+            }
         }
-    }
-    if let Ok(mut child) = std::process::Command::new("xsel")
-        .args(["--clipboard", "--input"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
     }
 }
 
@@ -842,16 +835,6 @@ impl LeaseTracker {
     }
 }
 
-/// The currently active WireGuard profile, if any.
-#[cfg(test)]
-fn active_profile<C: NmLifecycle>(client: &C) -> Option<crate::nm::WireguardProfile> {
-    client
-        .list_wireguard_profiles()
-        .ok()?
-        .into_iter()
-        .find(|profile| profile.is_active())
-}
-
 /// How often the tray re-reads NetworkManager. Each poll spawns `nmcli`, so this
 /// is deliberately slower than a UI refresh: the tray only has to notice a
 /// connection change within a second or two.
@@ -1009,7 +992,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nm::{ProfileState, WireguardProfile};
+    use crate::nm::ProfileState;
     use crate::testing::MockNmClient;
 
     fn make_sni(active_profile: Option<String>, port: Option<u16>) -> StatusNotifierItem {
@@ -1605,32 +1588,5 @@ mod tests {
 
         // Children should contain: toggle (2), separator (3), quit (4) (no port item)
         assert_eq!(children.len(), 3);
-    }
-
-    #[test]
-    fn active_profile_extracts_active_profile_from_client() {
-        let profiles = vec![
-            WireguardProfile {
-                name: "wg-1".to_string(),
-                uuid: "uuid-1".to_string(),
-                state: ProfileState::Inactive,
-            },
-            WireguardProfile {
-                name: "wg-2".to_string(),
-                uuid: "uuid-2".to_string(),
-                state: ProfileState::Active,
-            },
-        ];
-        let client = MockNmClient::new(profiles);
-        let active = active_profile(&client);
-        assert!(active.is_some());
-        assert_eq!(active.unwrap().name, "wg-2");
-
-        let client_none = MockNmClient::new(vec![WireguardProfile {
-            name: "wg-1".to_string(),
-            uuid: "uuid-1".to_string(),
-            state: ProfileState::Inactive,
-        }]);
-        assert!(active_profile(&client_none).is_none());
     }
 }

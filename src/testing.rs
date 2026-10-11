@@ -202,8 +202,6 @@ pub fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile 
 #[derive(Clone, Default)]
 pub struct MockNmClient {
     profiles: Vec<WireguardProfile>,
-    tunnels: Vec<WireguardTunnel>,
-    fail_list: bool,
     fail_list_count: Arc<AtomicUsize>,
     fail_ids: HashSet<String>,
     fail_kill_switch: bool,
@@ -225,7 +223,6 @@ pub struct MockNmClient {
     autoconnect_calls: Arc<Mutex<Vec<String>>>,
     lockdown_calls: Arc<Mutex<Vec<String>>>,
     split_tunnel_calls: Arc<Mutex<Vec<String>>>,
-    imported: Arc<Mutex<Vec<String>>>,
     extra_profiles: Arc<Mutex<Vec<WireguardProfile>>>,
     deleted: Arc<Mutex<HashSet<String>>>,
     /// Simulated NetworkManager profile settings, keyed by UUID then property.
@@ -264,12 +261,9 @@ impl MockNmClient {
         self
     }
 
-    /// The config this mock reads policies from: what a test injected, or -- like
-    /// the real client -- the user's own.
-    fn policy_config_path(&self) -> Option<PathBuf> {
-        self.config_path
-            .clone()
-            .or_else(|| crate::config::default_config_path().ok())
+    /// Only read policies from an explicitly injected fixture, never the host config.
+    fn policy_config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     /// The kill-switch and split-tunnel arguments the real client would pin on
@@ -390,14 +384,6 @@ impl MockNmClient {
         active.push(uuid.to_string());
     }
 
-    /// A mock whose `list_wireguard_profiles` fails, to exercise error paths.
-    pub fn failing_list() -> Self {
-        Self {
-            fail_list: true,
-            ..Self::default()
-        }
-    }
-
     /// A mock whose `list_wireguard_profiles` fails `count` times transiently.
     pub fn with_transient_list_failure(self, count: usize) -> Self {
         self.fail_list_count.store(count, Ordering::SeqCst);
@@ -511,12 +497,6 @@ impl MockNmClient {
         self
     }
 
-    /// Set the tunnels returned by `wireguard_tunnels`.
-    pub fn with_tunnels(mut self, tunnels: Vec<WireguardTunnel>) -> Self {
-        self.tunnels = tunnels;
-        self
-    }
-
     /// Every operation in invocation order, formatted as `connect:<id>`,
     /// `switch:<id>`, or `disconnect`.
     pub fn calls(&self) -> Vec<String> {
@@ -555,11 +535,6 @@ impl MockNmClient {
     /// `split-tunnel-all:<mode>:<v4_count>:<v6_count>`.
     pub fn split_tunnel_calls(&self) -> Vec<String> {
         snapshot(&self.split_tunnel_calls)
-    }
-
-    /// Paths passed to `import_wireguard_profile`, in invocation order.
-    pub fn imported_paths(&self) -> Vec<String> {
-        snapshot(&self.imported)
     }
 }
 
@@ -633,13 +608,12 @@ impl NmPolicy for MockNmClient {
 /// Lifecycle seam.
 impl NmLifecycle for MockNmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-        if self.fail_list
-            || self
-                .fail_list_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                    if c > 0 { Some(c - 1) } else { None }
-                })
-                .is_ok()
+        if self
+            .fail_list_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                if c > 0 { Some(c - 1) } else { None }
+            })
+            .is_ok()
         {
             return Err(AppError::CommandFailed("simulated".to_string()));
         }
@@ -681,8 +655,8 @@ impl NmLifecycle for MockNmClient {
         if let Some(config_path) = self.policy_config_path() {
             // Under the policy lock, as the real client does, so a concurrent
             // toggle cannot be read half-applied.
-            let _ = crate::config::coordinate_policy(&config_path, || {
-                self.apply_policy_args(profile_identifier, &config_path);
+            let _ = crate::config::coordinate_policy(config_path, || {
+                self.apply_policy_args(profile_identifier, config_path);
                 Ok(())
             });
         }
@@ -731,7 +705,7 @@ impl NmLifecycle for MockNmClient {
             true,
         ));
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(profile_identifier, &config_path);
+            self.apply_policy_args(profile_identifier, config_path);
         }
         if self.unhealthy {
             return Err(AppError::TunnelUnhealthy(format!(
@@ -743,7 +717,6 @@ impl NmLifecycle for MockNmClient {
     }
 
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
-        record(&self.imported, path.display().to_string());
         if self.fail_import {
             return Err(AppError::CommandFailed(format!(
                 "simulated import failure for {}",
@@ -774,7 +747,7 @@ impl NmLifecycle for MockNmClient {
         // When imported while global security settings are active, the new profile
         // immediately inherits kill switch and split-tunnel settings.
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(&uuid, &config_path);
+            self.apply_policy_args(&uuid, config_path);
         }
 
         Ok(format!("Imported {}", path.display()))
@@ -805,10 +778,7 @@ impl NmLifecycle for MockNmClient {
 /// Introspection seam.
 impl NmIntrospect for MockNmClient {
     fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
-        if self.fail_list {
-            return Err(AppError::CommandFailed("simulated".to_string()));
-        }
-        Ok(self.tunnels.clone())
+        Ok(Vec::new())
     }
 
     fn get_profile_diagnostics(
@@ -1087,4 +1057,17 @@ pub fn curl_available() -> bool {
         .arg("--version")
         .output()
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_policy_config_requires_explicit_injection() {
+        assert_eq!(MockNmClient::default().policy_config_path(), None);
+        let path = temp_toml_config_path("mock-policy");
+        let client = MockNmClient::default().with_config_path(path.clone());
+        assert_eq!(client.policy_config_path(), Some(path.as_path()));
+    }
 }

@@ -167,7 +167,7 @@ fn probe_cargo_list(root: &Path) -> Option<String> {
 }
 
 fn tool_on_path(program: &str) -> bool {
-    crate::process::host_command(program)
+    std::process::Command::new(program)
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

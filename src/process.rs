@@ -12,11 +12,6 @@ use std::time::{Duration, Instant};
 
 use crate::error::{AppError, AppResult};
 
-/// Build a [`Command`] for `program` to execute on the system.
-pub fn host_command(program: &str) -> Command {
-    Command::new(program)
-}
-
 /// Resolve the path or name of the currently running application binary,
 /// accounting for `$APPIMAGE`, `current_exe()`, and fallback.
 pub fn current_app_path() -> std::ffi::OsString {
@@ -27,13 +22,6 @@ pub fn current_app_path() -> std::ffi::OsString {
     } else {
         std::ffi::OsString::from("neutron")
     }
-}
-
-/// Like [`host_command`], but also sets environment variables on the process.
-pub fn host_command_with_env(program: &str, envs: &[(&str, &str)]) -> Command {
-    let mut command = Command::new(program);
-    command.envs(envs.iter().copied());
-    command
 }
 
 /// Render a failed command's exit status and stderr into one message. Falls back
@@ -58,7 +46,7 @@ pub fn format_command_error(
 /// Run `program` with `args`, returning its trimmed stdout, and killing it if it
 /// outlives `timeout`.
 pub fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> AppResult<String> {
-    let mut command = host_command(program);
+    let mut command = Command::new(program);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -183,34 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn host_command_creates_command_for_program() {
-        let command = host_command("nmcli");
-
-        assert_eq!(command.get_program(), "nmcli");
-        assert_eq!(command.get_args().count(), 0);
-    }
-
-    #[test]
     fn current_app_path_resolves_non_empty() {
         let path = current_app_path();
         assert!(!path.is_empty());
-    }
-
-    #[test]
-    fn host_command_with_env_sets_env_on_command() {
-        let command = host_command_with_env("pkexec", &[("SHELL", "/bin/sh")]);
-
-        assert_eq!(command.get_program(), "pkexec");
-        assert_eq!(command.get_args().count(), 0);
-        let envs: Vec<_> = command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_str().expect("env key should be valid UTF-8"),
-                    value.map(|value| value.to_str().expect("env value should be valid UTF-8")),
-                )
-            })
-            .collect();
-        assert_eq!(envs, [("SHELL", Some("/bin/sh"))]);
     }
 }

@@ -40,12 +40,13 @@ fn assert_every_profile_still_routes(client: &MockNmClient, context: &str) {
 }
 
 fn connected_client() -> (MockNmClient, std::path::PathBuf) {
+    let path = testing::temp_toml_config_path("active-policies");
+    config::save(&path, &AppConfig::default()).expect("config should save");
     let client = MockNmClient::new(vec![
         profile("wg-eu", "uuid-eu", ProfileState::Active),
         profile("wg-us", "uuid-us", ProfileState::Inactive),
-    ]);
-    let path = testing::temp_config_path("active-policies");
-    config::save(&path, &AppConfig::default()).expect("config should save");
+    ])
+    .with_config_path(path.clone());
     (client, path)
 }
 
@@ -291,17 +292,9 @@ fn switching_fails_when_active_profile_teardown_fails() {
     );
 }
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
-    let sandbox = std::env::temp_dir().join(format!(
-        "neutron-sync-lockdown-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let sandbox = testing::scratch_dir("sync-lockdown");
     let config_dir = sandbox.join("neutron");
     let profiles_dir = config_dir.join("profiles");
     std::fs::create_dir_all(&profiles_dir).unwrap();
@@ -319,7 +312,7 @@ fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
     };
     config::save(&config_path, &config).expect("config should save");
 
-    let client = MockNmClient::new(vec![]);
+    let client = MockNmClient::new(vec![]).with_config_path(config_path.clone());
     let report = neutron::app::sync::sync_profiles_dir(&client, &config).unwrap();
     assert_eq!(report.imported, vec!["test-sync".to_string()]);
     neutron::app::rebuild_lockdown_if_enabled(&client, &config_path).unwrap();
@@ -334,17 +327,7 @@ fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
 
 #[test]
 fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
-    let _env_lock = ENV_LOCK.lock().unwrap();
-    let sandbox = std::env::temp_dir().join(format!(
-        "neutron-import-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let config_dir = sandbox.join("neutron");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
+    let config_path = testing::temp_toml_config_path("import-policy");
 
     let config = AppConfig {
         kill_switch_enabled: true,
@@ -357,9 +340,7 @@ fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
     };
     config::save(&config_path, &config).expect("config should save");
 
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
-
-    let client = MockNmClient::new(vec![]);
+    let client = MockNmClient::new(vec![]).with_config_path(config_path.clone());
     client
         .import_wireguard_profile(std::path::Path::new("/tmp/wg-imported.conf"))
         .expect("import should succeed");
@@ -386,23 +367,12 @@ fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
         "importing must inherit active global split tunnel configuration"
     );
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-    let _ = std::fs::remove_dir_all(&sandbox);
+    testing::remove_temp_config(&config_path);
 }
 
 #[test]
 fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel() {
-    let _env_lock = ENV_LOCK.lock().unwrap();
-    let sandbox = std::env::temp_dir().join(format!(
-        "neutron-activate-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let config_dir = sandbox.join("neutron");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
+    let config_path = testing::temp_toml_config_path("activate-policy");
 
     let config = AppConfig {
         kill_switch_enabled: true,
@@ -415,9 +385,8 @@ fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel(
     };
     config::save(&config_path, &config).expect("config should save");
 
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
-
-    let client = MockNmClient::new(vec![profile("wg-raw", "uuid-raw", ProfileState::Inactive)]);
+    let client = MockNmClient::new(vec![profile("wg-raw", "uuid-raw", ProfileState::Inactive)])
+        .with_config_path(config_path.clone());
     client.connect("uuid-raw").expect("connect should succeed");
 
     assert_eq!(
@@ -431,8 +400,7 @@ fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel(
         "connecting must apply global split tunnel routing to profile"
     );
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-    let _ = std::fs::remove_dir_all(&sandbox);
+    testing::remove_temp_config(&config_path);
 }
 
 #[test]

@@ -204,26 +204,18 @@ impl CommandPaletteState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThemePickerState {
     pub selected_index: usize,
-    pub themes: Vec<(&'static str, &'static str)>,
 }
 
-impl Default for ThemePickerState {
-    fn default() -> Self {
-        Self {
-            selected_index: 0,
-            themes: vec![
-                ("nord", "Nord (Arctic Frost)"),
-                ("osaka-jade", "Osaka Jade"),
-                ("catppuccin-mocha", "Catppuccin Mocha"),
-                ("gruvbox", "Gruvbox Dark"),
-                ("monochrome", "Monochrome (High-Contrast)"),
-            ],
-        }
-    }
-}
+pub const THEMES: [(&str, &str); 5] = [
+    ("nord", "Nord (Arctic Frost)"),
+    ("osaka-jade", "Osaka Jade"),
+    ("catppuccin-mocha", "Catppuccin Mocha"),
+    ("gruvbox", "Gruvbox Dark"),
+    ("monochrome", "Monochrome (High-Contrast)"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitTunnelFocus {

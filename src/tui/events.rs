@@ -10,14 +10,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::eligibility;
-use crate::app::sync;
 use crate::config;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
-use crate::nm::{self, NmClient, ProfileDiagnostics};
+use crate::nm::{self, NmClient};
 use crate::tui::state::{
-    ActiveModal, CachedProfileInfo, CommandPaletteState, SplitTunnelFocus, ThemePickerState,
-    TuiState, wrap_next, wrap_prev,
+    ActiveModal, AsyncAction, AsyncActionResult, CachedProfileInfo, CommandPaletteState,
+    SplitTunnelFocus, THEMES, ThemePickerState, TuiState, wrap_next, wrap_prev,
 };
 
 /// The client capabilities every action needs. Named once so the bound does not
@@ -127,75 +126,48 @@ pub fn execute_action<C: ActionClient>(
                     &state.config.global_split_tunnel,
                 ));
         }
-        "toggle" => {
+        "toggle" | "switch" | "disconnect" => {
             if state.connecting.is_some() {
                 return Ok(());
             }
-            if let Some((uuid, name, is_active)) = state.selected_identity() {
-                if let Some(ref tx) = state.connect_tx {
-                    state.connecting = Some(crate::tui::state::ConnectingState {
-                        uuid: uuid.clone(),
-                        name: name.clone(),
-                        is_disconnect: is_active,
-                        started_at: std::time::Instant::now(),
-                    });
-                    let _ = tx.send((uuid, name, !is_active));
-                } else {
-                    if is_active {
-                        client.disconnect_active()?;
-                        state.set_status(format!("Disconnected '{name}'."));
-                    } else {
-                        client.switch_to(&uuid)?;
-                        state.set_status(format!("Connected '{name}'."));
-                    }
-                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
-                    reload_profiles(state, client)?;
-                }
-            }
-        }
-        "switch" => {
-            if state.connecting.is_some() {
-                return Ok(());
-            }
-            if let Some((uuid, name, is_active)) = state.selected_identity() {
-                if is_active {
+            let (uuid, name, is_disconnect) = if id == "disconnect" {
+                (
+                    String::new(),
+                    state
+                        .active_profile_name
+                        .clone()
+                        .unwrap_or_else(|| "profile".to_string()),
+                    true,
+                )
+            } else {
+                let Some(identity) = state.selected_identity() else {
+                    return Ok(());
+                };
+                if id == "switch" && identity.2 {
                     return Ok(());
                 }
-                if let Some(ref tx) = state.connect_tx {
-                    state.connecting = Some(crate::tui::state::ConnectingState {
-                        uuid: uuid.clone(),
-                        name: name.clone(),
-                        is_disconnect: false,
-                        started_at: std::time::Instant::now(),
-                    });
-                    let _ = tx.send((uuid, name, true));
-                } else {
-                    client.switch_to(&uuid)?;
-                    state.set_status(format!("Switched to '{name}'."));
-                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
-                    reload_profiles(state, client)?;
-                }
-            }
-        }
-        "disconnect" => {
-            if state.connecting.is_some() {
-                return Ok(());
-            }
-            let name = state
-                .active_profile_name
-                .clone()
-                .unwrap_or_else(|| "profile".to_string());
+                identity
+            };
             if let Some(ref tx) = state.connect_tx {
                 state.connecting = Some(crate::tui::state::ConnectingState {
-                    uuid: String::new(),
+                    uuid: uuid.clone(),
                     name: name.clone(),
-                    is_disconnect: true,
+                    is_disconnect,
                     started_at: std::time::Instant::now(),
                 });
-                let _ = tx.send((String::new(), name, false));
+                let _ = tx.send((uuid, name, !is_disconnect));
             } else {
-                client.disconnect_active()?;
-                state.set_status("Disconnected active profile.");
+                if is_disconnect {
+                    client.disconnect_active()?;
+                } else {
+                    client.switch_to(&uuid)?;
+                }
+                state.set_status(match id {
+                    "disconnect" => "Disconnected active profile.".to_string(),
+                    "switch" => format!("Switched to '{name}'."),
+                    _ if is_disconnect => format!("Disconnected '{name}'."),
+                    _ => format!("Connected '{name}'."),
+                });
                 let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                 reload_profiles(state, client)?;
             }
@@ -249,15 +221,9 @@ pub fn execute_action<C: ActionClient>(
                 ));
                 let _ = tx.send(crate::tui::state::AsyncAction::KillSwitch(enable));
             } else {
-                crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
-                state
-                    .uncertain_policies
-                    .remove(&crate::error::Policy::KillSwitch);
-                state.config.kill_switch_enabled = enable;
-                state.set_status(format!(
-                    "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
-                    enabled_verb(enable)
-                ));
+                let result =
+                    run_action(client, &state.config_path, AsyncAction::KillSwitch(enable));
+                finish_action(state, result)?;
             }
         }
         "lockdown" => {
@@ -289,13 +255,9 @@ pub fn execute_action<C: ActionClient>(
                 // No worker thread: this blocks the event loop, so the spinner
                 // cannot repaint. Marked anyway so the state cannot be left
                 // showing an action that already finished.
-                crate::app::set_global_lockdown(client, &state.config_path, enable)?;
+                let result = run_action(client, &state.config_path, AsyncAction::Lockdown(enable));
+                finish_action(state, result)?;
                 state.end_pending();
-                state
-                    .uncertain_policies
-                    .remove(&crate::error::Policy::Lockdown);
-                state.config.lockdown_enabled = enable;
-                state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
             }
         }
         "autoconnect" => {
@@ -307,9 +269,9 @@ pub fn execute_action<C: ActionClient>(
                 ));
                 let _ = tx.send(crate::tui::state::AsyncAction::Autoconnect(enable));
             } else {
-                crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
-                state.config.general.autoconnect_at_login = enable;
-                state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+                let result =
+                    run_action(client, &state.config_path, AsyncAction::Autoconnect(enable));
+                finish_action(state, result)?;
             }
         }
         "port_forwarding" => {
@@ -329,22 +291,9 @@ pub fn execute_action<C: ActionClient>(
                 state.set_status("Syncing profiles in background...");
                 let _ = tx.send(crate::tui::state::AsyncAction::Sync);
             } else {
-                let report = sync::sync_profiles_dir(client, &state.config)?;
-                // The profile set may have changed, so the lockdown allow-list is
-                // stale: a freshly imported profile has no rule and would be
-                // blocked by the terminal DROP.
-                crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
+                let report = sync_profiles(client, &state.config_path, &state.config)?;
                 reload_profiles(state, client)?;
-                if !report.errors.is_empty() {
-                    state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
-                } else if report.imported.is_empty() {
-                    state.set_status("Refreshed profiles.");
-                } else {
-                    state.set_status(format!(
-                        "Imported {} new profile(s).",
-                        report.imported.len()
-                    ));
-                }
+                finish_action(state, AsyncActionResult::Sync(Ok(report)))?;
             }
         }
         "qbit_sync" => {
@@ -414,6 +363,111 @@ pub fn enabled_verb(enabled: bool) -> &'static str {
     if enabled { "Enabled" } else { "Disabled" }
 }
 
+pub(crate) fn run_action<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    action: AsyncAction,
+) -> AsyncActionResult {
+    match action {
+        AsyncAction::KillSwitch(enable) => AsyncActionResult::KillSwitch {
+            enable,
+            result: crate::app::set_global_kill_switch(client, path, enable),
+        },
+        AsyncAction::Lockdown(enable) => AsyncActionResult::Lockdown {
+            enable,
+            result: crate::app::set_global_lockdown(client, path, enable),
+        },
+        AsyncAction::Autoconnect(enable) => AsyncActionResult::Autoconnect {
+            enable,
+            result: crate::service::set_autoconnect_at_login(client, path, enable),
+        },
+        AsyncAction::Sync => AsyncActionResult::Sync((|| {
+            let cfg = config::load(path)?;
+            sync_profiles(client, path, &cfg)
+        })()),
+        AsyncAction::Delete(uuid) => AsyncActionResult::Delete((|| {
+            client.delete_profile(&uuid)?;
+            crate::app::rebuild_lockdown_if_enabled(client, path)?;
+            Ok(uuid)
+        })()),
+        AsyncAction::ProbeQbitWebUi => AsyncActionResult::ProbeQbitWebUi(
+            config::load(path)
+                .map(|cfg| {
+                    crate::portforward::qbittorrent::QBittorrentClient::new(&cfg.qbittorrent)
+                        .with_timeout(std::time::Duration::from_secs(1))
+                        .reachable()
+                })
+                .unwrap_or(false),
+        ),
+    }
+}
+
+fn sync_profiles<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    cfg: &config::AppConfig,
+) -> AppResult<crate::app::sync::SyncReport> {
+    let report = crate::app::sync::sync_profiles_dir(client, cfg)?;
+    crate::app::rebuild_lockdown_if_enabled(client, path)?;
+    Ok(report)
+}
+
+/// Apply a successful reply, returning whether the profile list needs refreshing.
+/// Callers retain their own error propagation and refresh ordering.
+pub(crate) fn finish_action(state: &mut TuiState, result: AsyncActionResult) -> AppResult<bool> {
+    match result {
+        AsyncActionResult::KillSwitch { enable, result } => {
+            result?;
+            state
+                .uncertain_policies
+                .remove(&crate::error::Policy::KillSwitch);
+            state.config.kill_switch_enabled = enable;
+            state.set_status(format!(
+                "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
+                enabled_verb(enable)
+            ));
+        }
+        AsyncActionResult::Lockdown { enable, result } => {
+            result?;
+            state
+                .uncertain_policies
+                .remove(&crate::error::Policy::Lockdown);
+            state.config.lockdown_enabled = enable;
+            state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
+        }
+        AsyncActionResult::Autoconnect { enable, result } => {
+            result?;
+            state.config.general.autoconnect_at_login = enable;
+            state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+        }
+        AsyncActionResult::Sync(result) => {
+            let report = result?;
+            if !report.errors.is_empty() {
+                state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+            } else if report.imported.is_empty() {
+                state.set_status("Refreshed profiles.");
+            } else {
+                state.set_status(format!(
+                    "Imported {} new profile(s).",
+                    report.imported.len()
+                ));
+            }
+            return Ok(true);
+        }
+        AsyncActionResult::Delete(result) => {
+            result?;
+            state.set_status("Profile deleted.");
+            return Ok(true);
+        }
+        AsyncActionResult::ProbeQbitWebUi(reachable) => {
+            if matches!(state.modal, ActiveModal::PortForward(_)) {
+                state.qbit_webui_reachable = Some(reachable);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn handle_help_key(state: &mut TuiState, key: KeyEvent) {
     if matches!(
         key.code,
@@ -469,10 +523,10 @@ fn handle_theme_picker_key(state: &mut TuiState, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => state.modal = ActiveModal::None,
-        KeyCode::Up => tp.selected_index = wrap_prev(tp.selected_index, tp.themes.len()),
-        KeyCode::Down => tp.selected_index = wrap_next(tp.selected_index, tp.themes.len()),
+        KeyCode::Up => tp.selected_index = wrap_prev(tp.selected_index, THEMES.len()),
+        KeyCode::Down => tp.selected_index = wrap_next(tp.selected_index, THEMES.len()),
         KeyCode::Enter => {
-            let selected = tp.themes.get(tp.selected_index).copied();
+            let selected = THEMES.get(tp.selected_index).copied();
             state.modal = ActiveModal::None;
             if let Some((preset, label)) = selected {
                 match config::update(&state.config_path, |cfg| {
@@ -938,12 +992,7 @@ pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
         None => {
             if let Some(ref tx) = state.diag_tx {
                 let _ = tx.send((uuid.clone(), is_active));
-                CachedProfileInfo {
-                    diagnostics: ProfileDiagnostics::default(),
-                    tunnel_address: None,
-                    tunnel_dns: None,
-                    gateway: None,
-                }
+                CachedProfileInfo::default()
             } else {
                 let fetched = fetch_profile_info(client, &uuid, is_active);
                 state.profile_cache.insert(uuid, fetched.clone());
@@ -1197,7 +1246,60 @@ mod tests {
             client.calls()
         );
 
+        // The inline API keeps its distinct confirmations and active-switch no-op.
+        state.connecting = None;
+        state.connect_tx = None;
+        execute_action(&mut state, &client, "switch").unwrap();
+        assert!(client.calls().is_empty());
+        execute_action(&mut state, &client, "toggle").unwrap();
+        assert_eq!(state.status_message, "Disconnected 'wg-eu'.");
+        state.selected_index = state.rows.iter().position(|row| row.uuid == uuid).unwrap();
+        execute_action(&mut state, &client, "switch").unwrap();
+        assert_eq!(state.status_message, format!("Switched to '{name}'."));
+        execute_action(&mut state, &client, "disconnect").unwrap();
+        assert_eq!(state.status_message, "Disconnected active profile.");
+        execute_action(&mut state, &client, "toggle").unwrap();
+        assert_eq!(state.status_message, format!("Connected '{name}'."));
+
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dropped_action_channels_keep_their_existing_outcomes() {
+        let client = crate::testing::MockNmClient::default();
+        let mut state = TuiState::new(
+            crate::testing::temp_config_path("dropped-actions"),
+            config::AppConfig::default(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        state.action_tx = Some(tx);
+        for action in ["kill_switch", "autoconnect", "sync"] {
+            execute_action(&mut state, &client, action).unwrap();
+            assert!(!state.status_is_error);
+        }
+        execute_action(&mut state, &client, "lockdown").unwrap();
+        assert!(state.status_is_error);
+        assert!(state.pending.is_none());
+        assert!(state.status_message.contains("policy worker has stopped"));
+        handle_delete_key(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            "uuid",
+        )
+        .unwrap();
+        assert_eq!(state.status_message, "Deleting profile in background...");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        state.connect_tx = Some(tx);
+        execute_action(&mut state, &client, "disconnect").unwrap();
+        assert!(state.connecting.is_some());
+        assert!(
+            client.calls().is_empty(),
+            "a dropped send must not run inline"
+        );
     }
 
     #[test]
@@ -1272,14 +1374,7 @@ mod tests {
     #[test]
     fn sync_with_nothing_new_reports_a_refresh() {
         let client = crate::testing::MockNmClient::default();
-        let inbox = std::env::temp_dir().join(format!(
-            "neutron-sync-empty-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should move forward")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&inbox).expect("inbox should be created");
+        let inbox = crate::testing::scratch_dir("sync-empty");
         let path = crate::testing::temp_config_path("tui-sync-refresh");
         let mut app_cfg = crate::config::AppConfig::default();
         app_cfg.general.profiles_dir = inbox.to_string_lossy().to_string();
@@ -1308,14 +1403,7 @@ mod tests {
             return;
         }
         let client = crate::testing::MockNmClient::default();
-        let inbox = std::env::temp_dir().join(format!(
-            "neutron-sync-unreadable-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should move forward")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&inbox).expect("inbox should be created");
+        let inbox = crate::testing::scratch_dir("sync-unreadable");
         // Strip every permission: listing needs read, so 0o555 would still
         // list. (ensure_profiles_dir only chmods on creation, so this sticks.)
         std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o000))

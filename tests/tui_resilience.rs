@@ -151,13 +151,7 @@ fn a_failed_connection_leaves_no_profile_marked_active() {
 
 #[test]
 fn malformed_config_fails_cleanly_at_startup() {
-    let sandbox = std::env::temp_dir().join(format!(
-        "tui-malformed-config-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let sandbox = testing::scratch_dir("tui-malformed-config");
     let config_dir = sandbox.join("neutron");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.toml");

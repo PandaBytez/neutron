@@ -171,7 +171,7 @@ fn action_directory(version: &str) -> AppResult<&'static str> {
 }
 
 fn authorization_command() -> std::process::Command {
-    let mut command = crate::process::host_command("pkcheck");
+    let mut command = std::process::Command::new("pkcheck");
     // Unprivileged callers cannot supply --detail, even for their own process.
     // The dedicated action binds pkexec to the helper without caller details.
     command
@@ -215,7 +215,8 @@ pub(super) fn refresh(activating: Option<&str>) -> AppResult<()> {
              or repair authorization; existing protection remains in place."
         )));
     }
-    let mut child = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")])
+    let mut child = std::process::Command::new("pkexec")
+        .env("SHELL", "/bin/sh")
         .arg("--disable-internal-agent")
         .arg(std::fs::canonicalize(PATH)?)
         .stdin(Stdio::piped())

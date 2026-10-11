@@ -250,7 +250,7 @@ pub fn handle_uninstall_command<C: NmClient + FirewallClient>(
 fn remove_the_package(removal: &crate::install::Removal) -> AppResult<()> {
     // Unprivileged, no shell, inheriting the terminal so brew or cargo can
     // report or prompt itself.
-    let status = crate::process::host_command(removal.program)
+    let status = std::process::Command::new(removal.program)
         .args(&removal.args)
         .status()
         .map_err(|error| AppError::CommandFailed(format!("{}: {error}", removal.program)))?;
@@ -328,21 +328,10 @@ fn report_manual_unit(config_root: Option<&std::path::Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{
+        remove_temp_config as cleanup_test_config, scratch_dir, temp_config_path,
+    };
     use std::collections::BTreeSet;
-
-    /// The config path and the proc root are the two things the reset tests must
-    /// not take from the environment; `crate::testing` is their one home.
-    fn unique_test_config_path() -> std::path::PathBuf {
-        crate::testing::temp_config_path("app")
-    }
-
-    fn cleanup_test_config(path: &std::path::Path) {
-        crate::testing::remove_temp_config(path);
-    }
-
-    fn scratch_proc_root() -> std::path::PathBuf {
-        crate::testing::scratch_dir("proc-root")
-    }
 
     #[test]
     fn revoke_removes_only_neutrons_own_autostart_entry() {
@@ -407,7 +396,7 @@ mod tests {
         // already-purged config must not be what decides whether the machine
         // gets unblocked. Evidence, not intent.
         let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
 
         revoke_installed_state(&client, None).expect("revoke should succeed");
         remove_app_settings(&path, false).expect("settings should be kept");
@@ -424,7 +413,7 @@ mod tests {
         // The gate is what keeps a fresh install from prompting for a password to
         // delete three files that were never created.
         let client = crate::testing::MockNmClient::new(vec![]);
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
 
         revoke_installed_state(&client, None).expect("revoke should succeed");
         remove_app_settings(&path, true).expect("purge should succeed");
@@ -440,7 +429,7 @@ mod tests {
         // password to delete files that are not there and, on a machine where
         // something *is* still installed, would not be the thing that decides.
         let client = crate::testing::MockNmClient::new(vec![]);
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -468,7 +457,7 @@ mod tests {
         // block it. The setting is unreadable *and* the state is installed: the
         // evidence check is the only way to that teardown.
         let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
         std::fs::create_dir_all(path.parent().expect("config path has a parent"))
             .expect("config directory should be created");
         std::fs::write(&path, "this is not valid toml = = =").expect("corrupt config should write");
@@ -533,7 +522,7 @@ mod tests {
         let home = decoy_config_home("drop-outside");
         let path = home.join("neutron/config.toml");
         // A sibling of the app directory: the common `~/wg-configs` shape.
-        let sibling = unique_temp_root("drop-sibling").join("drop");
+        let sibling = scratch_dir("drop-sibling").join("drop");
         std::fs::create_dir_all(&sibling).expect("drop dir should be created");
         config::save(&path, &config_with_drop_dir(&sibling)).expect("config should save");
 
@@ -583,7 +572,7 @@ mod tests {
         // pin the behaviour rather than trusting it.
         let home = decoy_config_home("symlink");
         let path = home.join("neutron/config.toml");
-        let target = unique_temp_root("symlink-target").join("precious");
+        let target = scratch_dir("symlink-target").join("precious");
         std::fs::create_dir_all(&target).expect("target should be created");
         std::fs::write(target.join("keep.txt"), "keep").expect("file should be written");
         config::save(&path, &config::AppConfig::default()).expect("config should save");
@@ -673,7 +662,7 @@ mod tests {
     /// pre-rename directory, a foreign autostart entry, and the hand-installed
     /// systemd unit.
     fn decoy_config_home(label: &str) -> std::path::PathBuf {
-        let home = unique_temp_root(label);
+        let home = scratch_dir(label);
         for relative in [
             "neutron/config.toml.policy.lock",
             "neutron/profile-info.json",
@@ -726,13 +715,6 @@ mod tests {
         found
     }
 
-    fn unique_temp_root(label: &str) -> std::path::PathBuf {
-        crate::testing::temp_config_path(label)
-            .parent()
-            .expect("temp config path has a parent")
-            .to_path_buf()
-    }
-
     fn remove_temp_root(root: &std::path::Path) {
         let _ = std::fs::remove_dir_all(root);
     }
@@ -774,7 +756,7 @@ mod tests {
             &client,
             &path,
             Some(&autostart_dir),
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
             true,
         )
         .expect("reset should succeed");
@@ -827,7 +809,7 @@ mod tests {
             &client,
             &path,
             Some(&autostart_dir),
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
             true,
         )
         .expect("reset should succeed");
@@ -854,7 +836,7 @@ mod tests {
         .expect("config should save");
         let before = relative_paths(&home);
 
-        let error = handle_reset_command(&client, &path, None, &scratch_proc_root(), false)
+        let error = handle_reset_command(&client, &path, None, &scratch_dir("proc-root"), false)
             .expect_err("without a terminal, reset must not proceed");
 
         assert!(error.to_string().contains("--yes"), "{error}");

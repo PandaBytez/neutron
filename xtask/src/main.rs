@@ -85,10 +85,10 @@ fn detect_container_tool() -> Result<&'static str, String> {
 fn image_exists(tool: &str, image: &str) -> bool {
     let output = Command::new(tool).args(["image", "exists", image]).output();
 
-    if let Ok(out) = output {
-        if out.status.success() {
-            return true;
-        }
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        return true;
     }
 
     let inspect = Command::new(tool)
@@ -166,47 +166,31 @@ fn run_system_tests(root: &Path, args: &[String]) -> i32 {
         return 1;
     }
 
-    let mut test_args = vec![
-        "test".to_string(),
-        "--".to_string(),
-        "--ignored".to_string(),
-        "--test-threads=1".to_string(),
-    ];
+    run_in_container(root, &system_test_args(args))
+}
 
-    if args.iter().any(|a| a == "--nm") {
-        test_args = vec![
-            "test".to_string(),
-            "--test".to_string(),
-            "system_nm".to_string(),
-            "--".to_string(),
-            "--ignored".to_string(),
-            "--test-threads=1".to_string(),
-        ];
+fn system_test_args(args: &[String]) -> Vec<String> {
+    let target = if args.iter().any(|a| a == "--nm") {
+        Some("system_nm")
     } else if args.iter().any(|a| a == "--firewall") {
-        test_args = vec![
-            "test".to_string(),
-            "--test".to_string(),
-            "system_firewall".to_string(),
-            "--".to_string(),
-            "--ignored".to_string(),
-            "--test-threads=1".to_string(),
-        ];
+        Some("system_firewall")
     } else if args.iter().any(|a| a == "--uninstall") {
-        test_args = vec![
-            "test".to_string(),
-            "--test".to_string(),
-            "system_uninstall".to_string(),
-            "--".to_string(),
-            "--ignored".to_string(),
-            "--test-threads=1".to_string(),
-        ];
-    } else if let Some(idx) = args.iter().position(|a| a == "--filter") {
-        if let Some(pattern) = args.get(idx + 1) {
-            test_args.push(pattern.clone());
-        }
+        Some("system_uninstall")
+    } else {
+        None
+    };
+    let mut test_args = vec!["test".to_string()];
+    if let Some(target) = target {
+        test_args.extend(["--test".to_string(), target.to_string()]);
     }
-
-    run_in_container(root, &test_args)
+    test_args.extend(["--", "--ignored", "--test-threads=1"].map(String::from));
+    if target.is_none()
+        && let Some(idx) = args.iter().position(|a| a == "--filter")
+        && let Some(pattern) = args.get(idx + 1)
+    {
+        test_args.push(pattern.clone());
+    }
+    test_args
 }
 
 fn run_leak_tests(root: &Path, args: &[String]) -> i32 {
@@ -708,6 +692,35 @@ fn run_status(status: std::io::Result<ExitStatus>) -> i32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn system_test_selectors_keep_precedence_and_filter_only_without_a_target() {
+        for (input, expected) in [
+            (vec![], vec!["test"]),
+            (vec!["--filter"], vec!["test"]),
+            (vec!["--filter", "leak_"], vec!["test"]),
+            (
+                vec!["--uninstall", "--firewall", "--nm", "--filter", "leak_"],
+                vec!["test", "--test", "system_nm"],
+            ),
+            (
+                vec!["--uninstall", "--firewall", "--filter", "leak_"],
+                vec!["test", "--test", "system_firewall"],
+            ),
+            (
+                vec!["--uninstall", "--filter", "leak_"],
+                vec!["test", "--test", "system_uninstall"],
+            ),
+        ] {
+            let mut expected = expected;
+            expected.extend(["--", "--ignored", "--test-threads=1"]);
+            if input == ["--filter", "leak_"] {
+                expected.push("leak_");
+            }
+            let args: Vec<String> = input.into_iter().map(String::from).collect();
+            assert_eq!(system_test_args(&args), expected, "input: {args:?}");
+        }
+    }
+
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "neutron-xtask-{label}-{}",
@@ -864,7 +877,7 @@ mod tests {
                 .position(|arg| arg == IMAGE_NAME)
                 .expect("the image name is in the argument list");
 
-            for (index, arg) in args.iter().enumerate().skip(image + 1) {
+            for arg in args.iter().skip(image + 1) {
                 assert!(
                     !arg.starts_with('-'),
                     "runtime option {arg} must precede the image, not the command: {args:?}"

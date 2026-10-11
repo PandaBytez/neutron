@@ -184,8 +184,8 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
 /// of the developer's real one. Both arguments are the point: every arm below has
 /// to route through a `_with_path` handler, because a handler that re-resolves
 /// `default_config_path()` writes the real settings the moment a test drives it,
-/// and `proc_root` is what `Restart` and `Reset` signal, so a test must never
-/// hand them the real `/proc`.
+/// and `proc_root` is what `Restart`, `Reset`, and `Uninstall` signal, so a test
+/// must never hand them the real `/proc`.
 fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
     cli: Cli,
@@ -295,7 +295,7 @@ fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'stati
                 client,
                 path,
                 autostart_dir.as_deref(),
-                std::path::Path::new("/proc"),
+                proc_root,
                 purge,
             )
         }
@@ -584,13 +584,8 @@ pub fn set_global_lockdown<C: NmIntrospect + FirewallClient>(
         path,
         crate::error::Policy::Lockdown,
         || {
-            if enable {
-                let tunnels = client.wireguard_tunnels()?;
-                client.enable_lockdown(&tunnels)?;
-            } else {
-                client.disable_lockdown()?;
-            }
-            Ok(())
+            let tunnels = client.wireguard_tunnels()?;
+            client.enable_lockdown(&tunnels)
         },
         |cfg| cfg.lockdown_enabled = enable,
     )
@@ -1038,6 +1033,7 @@ fn resolve_profile_id(
 mod tests {
 
     use super::*;
+    use crate::testing::scratch_dir;
 
     #[test]
     fn automatic_rebuild_rechecks_disabled_intent_after_coordination() {
@@ -1171,13 +1167,17 @@ mod tests {
 
     #[test]
     fn cli_subcommand_routing() {
+        let path = crate::testing::temp_config_path("cli-routing");
+        let proc_root = scratch_dir("proc-root");
         let cli = Cli {
             command: Some(Commands::List),
         };
         let client =
             crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
-        let result = execute(&client, cli);
+        let result = execute_with_path(&client, cli, &path, &proc_root);
         assert!(result.is_ok());
+        crate::testing::remove_temp_config(&path);
+        let _ = std::fs::remove_dir_all(&proc_root);
     }
 
     #[test]
@@ -1757,7 +1757,7 @@ mod tests {
                 profile: "uuid-1".into(),
             }),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .expect("connect should succeed");
         assert_eq!(client.calls(), vec!["connect:uuid-1".to_string()]);
@@ -1769,7 +1769,7 @@ mod tests {
                 profile: "uuid-1".into(),
             }),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .expect("switch should succeed");
         assert!(client.calls().contains(&"switch:uuid-1".to_string()));
@@ -1778,7 +1778,7 @@ mod tests {
             &client,
             cli(Commands::Disconnect),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .expect("disconnect should succeed");
         assert!(client.calls().contains(&"disconnect".to_string()));
@@ -1805,7 +1805,7 @@ mod tests {
                 profile: "uuid-1".into(),
             }),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .unwrap_err();
         assert!(
@@ -2015,12 +2015,5 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         let _ = worker.join();
         crate::testing::remove_temp_config(&path);
-    }
-
-    /// An empty stand-in for `/proc`. The command seam signals processes, so a
-    /// test driving `restart` or `reset` must aim it at a scratch tree: the real
-    /// one ends in `kill(2)` on anything named `neutron`.
-    fn scratch_proc_root() -> std::path::PathBuf {
-        crate::testing::scratch_dir("proc-root")
     }
 }

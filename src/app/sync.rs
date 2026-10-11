@@ -118,18 +118,11 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
 mod tests {
     use super::*;
     use crate::nm::{ProfileState, WireguardProfile};
-    use crate::testing::MockNmClient;
+    use crate::testing::{MockNmClient, scratch_dir};
 
     #[test]
     fn sync_imports_new_conf_files_and_cleans_inbox() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "neutron-sync-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = scratch_dir("sync");
 
         let conf1 = temp_dir.join("profile1.conf");
         let conf2 = temp_dir.join("profile2.conf");
@@ -178,14 +171,7 @@ mod tests {
 
     #[test]
     fn sync_preserves_conf_files_on_import_failure() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "neutron-sync-fail-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = scratch_dir("sync-fail");
 
         let conf = temp_dir.join("broken.conf");
         fs::write(&conf, "invalid").unwrap();
@@ -221,14 +207,7 @@ mod tests {
             );
             return;
         }
-        let temp_dir = std::env::temp_dir().join(format!(
-            "neutron-sync-undeletable-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = scratch_dir("sync-undeletable");
         let conf = temp_dir.join("stuck.conf");
         fs::write(&conf, "[Interface]\nPrivateKey = abc\n").unwrap();
         // The import itself succeeds (mock); consuming the inbox file fails.
@@ -258,26 +237,22 @@ mod tests {
     }
 
     #[test]
-    fn ensure_app_dirs_creates_profiles_directory() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "neutron-ensure-dirs-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn ensure_profiles_dir_creates_private_directory_and_is_idempotent() {
+        let temp_dir = scratch_dir("ensure-dirs");
         let profiles = temp_dir.join("profiles");
-        let config = AppConfig {
-            general: config::GeneralConfig {
-                profiles_dir: profiles.to_string_lossy().to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
 
         assert!(!profiles.exists());
-        ensure_app_dirs(&config).unwrap();
+        ensure_profiles_dir(&profiles).unwrap();
+        ensure_profiles_dir(&profiles).unwrap();
         assert!(profiles.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&profiles).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

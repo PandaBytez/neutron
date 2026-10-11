@@ -428,7 +428,7 @@ fn read_profile_info(config_path: &Path) -> AppResult<Option<BTreeMap<String, St
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
-    let _lock = lock_config(path)?;
+    let _lock = lock_sidecar(path, ".lock")?;
     save_unlocked(path, config)
 }
 
@@ -451,34 +451,22 @@ pub fn coordinate_policy<R>(path: &Path, f: impl FnOnce() -> AppResult<R>) -> Ap
     let _mem_lock = mutex
         .lock()
         .map_err(|_| AppError::Config("policy coordination mutex poisoned".to_string()))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".policy.lock");
-    let lock = options.open(PathBuf::from(lock_path))?;
-    lock.lock()?;
+    let _lock = lock_sidecar(path, ".policy.lock")?;
     f()
 }
 
 /// Serialize narrow read-modify-write edits across threads and Neutron processes.
 /// Lock a stable sidecar, since atomic replacement changes the config's inode.
 pub fn update(path: &Path, edit: impl FnOnce(&mut AppConfig)) -> AppResult<AppConfig> {
-    let _lock = lock_config(path)?;
+    let _lock = lock_sidecar(path, ".lock")?;
     let mut config = load(path)?;
     edit(&mut config);
     save_unlocked(path, &config)?;
     Ok(config)
 }
 
-fn lock_config(path: &Path) -> AppResult<fs::File> {
+/// Hold a blocking lock on a stable sidecar until the returned file is dropped.
+pub(crate) fn lock_sidecar(path: &Path, suffix: &str) -> AppResult<fs::File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -490,7 +478,7 @@ fn lock_config(path: &Path) -> AppResult<fs::File> {
         options.mode(0o600);
     }
     let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".lock");
+    lock_path.push(suffix);
     let lock = options.open(PathBuf::from(lock_path))?;
     lock.lock()?;
     Ok(lock)

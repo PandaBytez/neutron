@@ -133,15 +133,6 @@ pub fn remove_last_known_good_domain_ips(domain: &str) {
     }
 }
 
-#[cfg(test)]
-pub fn clear_last_known_good_domain_ips() {
-    if let Ok(mut lock) = LAST_KNOWN_GOOD.lock()
-        && let Some(cache) = lock.as_mut()
-    {
-        cache.clear();
-    }
-}
-
 /// Normalize a domain name for storage and comparison, or `None` if it is not usable.
 pub fn normalize_domain(input: &str) -> Option<String> {
     let trimmed = input.trim().to_lowercase();

@@ -132,20 +132,13 @@ impl QBittorrentClient {
     pub fn app_version(&mut self) -> AppResult<String> {
         self.ensure_authenticated()?;
         let url = self.endpoint_url("api/v2/app/version");
-        let resp = self.http_get(&url)?;
+        let mut resp = self.http_get(&url)?;
 
         if resp.status == 403 {
             // Cookie might have expired; retry once after re-authenticating
             self.cookie = None;
             self.login()?;
-            let retry = self.http_get(&url)?;
-            if retry.status != 200 {
-                return Err(AppError::QBittorrent(format!(
-                    "failed to query qBittorrent version (HTTP {})",
-                    retry.status
-                )));
-            }
-            return Ok(retry.body.trim().to_string());
+            resp = self.http_get(&url)?;
         }
 
         if resp.status != 200 {
