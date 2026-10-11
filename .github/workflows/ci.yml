@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   rustfmt:
     name: Rustfmt
@@ -31,7 +34,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Lint (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: Test Suite
@@ -41,7 +44,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests (all features)
-        run: cargo test --all --all-features
+        run: cargo test --all --all-features --locked
+      - name: Release security checks (mock commands only)
+        run: bash tests/release_security.sh
 
   system-tests:
     name: System Tests (sandbox)
@@ -87,9 +92,10 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build release binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: neutron-linux-x86_64
           path: target/x86_64-unknown-linux-musl/release/neutron
+          if-no-files-found: error

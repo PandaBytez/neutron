@@ -234,7 +234,9 @@ fn build_docs(root: &Path, args: &[String]) -> i32 {
     let tool = match detect_container_tool() {
         Ok(t) => t,
         Err(err) => {
-            eprintln!("Error: {err}\nPlease install mdbook with: cargo install mdbook");
+            eprintln!(
+                "Error: {err}\nPlease install mdbook with: cargo install mdbook --version 0.4.52 --locked"
+            );
             return 1;
         }
     };
@@ -423,8 +425,8 @@ impl SettingsSnapshot {
 /// stale on purpose. A rule refresh runs that copy, not this build, so after
 /// changing firewall code run `neutron lockdown enable` once to refresh it.
 ///
-/// Extra arguments go straight to `cargo install`, so `--debug`, `--root DIR`,
-/// and `--locked` all work: `cargo xtask reinstall -- --debug`.
+/// Extra arguments go straight to `cargo install`, so `--debug` and `--root DIR`
+/// work: `cargo xtask reinstall -- --debug`. Dependencies are locked by default.
 /// What `cargo reinstall` does, printed for `-h` / `--help`.
 ///
 /// Handled here rather than forwarded: `cargo install --help` would print
@@ -433,7 +435,7 @@ impl SettingsSnapshot {
 const REINSTALL_USAGE: &str = "\
 cargo reinstall [-- <cargo install flags>]
 
-Rebuilds and installs Neutron, keeping your lockdown state and your settings.
+Rebuilds and installs Neutron with --locked, keeping your lockdown state and your settings.
 
   cargo reinstall                 release build, installed to $CARGO_HOME/bin
   cargo reinstall -- --debug      much faster rebuild for iterating
@@ -465,12 +467,7 @@ fn run_reinstall(root: &Path, args: &[String]) -> i32 {
         None => args,
     };
     let settings = SettingsSnapshot::capture_in(&config_home());
-    let mut command = Command::new("cargo");
-    command
-        .args(["install", "--path", ".", "--force"])
-        .args(forwarded)
-        .current_dir(root);
-    if run_status(command.status()) != 0 {
+    if run_status(reinstall_command(root, forwarded).status()) != 0 {
         eprintln!("Reinstall failed; nothing was changed.");
         return 1;
     }
@@ -517,6 +514,16 @@ fn run_reinstall(root: &Path, args: &[String]) -> i32 {
         "If you changed firewall code, run `neutron lockdown enable` once to refresh the helper copy."
     );
     0
+}
+
+fn reinstall_command(root: &Path, forwarded: &[String]) -> Command {
+    let mut command = Command::new("cargo");
+    command.args(["install", "--path", ".", "--force"]);
+    if !forwarded.iter().any(|arg| arg == "--locked") {
+        command.arg("--locked");
+    }
+    command.args(forwarded).current_dir(root);
+    command
 }
 
 /// The running Neutron processes, split by what this task may do to them.
@@ -691,6 +698,38 @@ fn run_status(status: std::io::Result<ExitStatus>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reinstall_locks_dependencies_and_preserves_user_flags_without_running_cargo() {
+        let flags = ["--debug", "--root", "/scratch/install", "--offline"].map(String::from);
+        let command = reinstall_command(Path::new("/scratch/project"), &flags);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "install",
+                "--path",
+                ".",
+                "--force",
+                "--locked",
+                "--debug",
+                "--root",
+                "/scratch/install",
+                "--offline"
+            ]
+        );
+        assert_eq!(
+            command.get_current_dir(),
+            Some(Path::new("/scratch/project"))
+        );
+        let explicit = ["--locked", "--debug"].map(String::from);
+        assert_eq!(
+            reinstall_command(Path::new("/scratch/project"), &explicit)
+                .get_args()
+                .filter(|arg| *arg == "--locked")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn system_test_selectors_keep_precedence_and_filter_only_without_a_target() {
