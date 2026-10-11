@@ -468,10 +468,20 @@ fn drain_action_results(
     rx: &std::sync::mpsc::Receiver<crate::tui::state::AsyncActionResult>,
     needs_profile_refresh: &mut bool,
 ) {
-    while let Ok(action_res) = rx.try_recv() {
-        // Every arm means the dispatched action reported back, so the spinner
-        // has done its job -- on success and on failure alike.
-        state.end_pending();
+    loop {
+        let action_res = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if state.pending.is_some() {
+                    state.end_pending();
+                    state.set_error(&crate::error::AppError::Config(
+                        "the action worker has stopped; restart Neutron and try again".into(),
+                    ));
+                }
+                break;
+            }
+        };
         // Only the failed flag is restored; unrelated, unsubmitted edits stay put.
         let flag: Option<fn(&mut config::AppConfig) -> &mut bool> = match &action_res {
             crate::tui::state::AsyncActionResult::KillSwitch { .. } => {
@@ -483,7 +493,10 @@ fn drain_action_results(
             crate::tui::state::AsyncActionResult::Autoconnect { .. } => {
                 Some(|cfg| &mut cfg.general.autoconnect_at_login)
             }
-            _ => None,
+            crate::tui::state::AsyncActionResult::Sync(_)
+            | crate::tui::state::AsyncActionResult::QbitSync(_)
+            | crate::tui::state::AsyncActionResult::Delete(_)
+            | crate::tui::state::AsyncActionResult::ProbeQbitWebUi(_) => None,
         };
         match events::finish_action(state, action_res) {
             Ok(refresh) => *needs_profile_refresh |= refresh,
@@ -914,6 +927,7 @@ mod tests {
         assert!(!state.config.kill_switch_enabled);
 
         // Lockdown + Autoconnect Ok paths record intent.
+        state.begin_pending("Enabling Lockdown Mode");
         tx.send(AsyncActionResult::Lockdown {
             enable: true,
             result: Ok(()),
@@ -927,6 +941,7 @@ mod tests {
         drain_action_results(&mut state, &rx, &mut needs_refresh);
         assert!(state.config.lockdown_enabled);
         assert!(state.config.general.autoconnect_at_login);
+        assert!(state.pending.is_none());
 
         // Sync report variants: errors toast, empty refreshes, imports count.
         tx.send(AsyncActionResult::Sync(Ok(crate::app::sync::SyncReport {
@@ -979,6 +994,61 @@ mod tests {
         drain_action_results(&mut state, &rx, &mut needs_refresh);
         assert!(state.status_is_error);
 
+        // Manual sync reports completion without changing the daemon's verdict.
+        needs_refresh = false;
+        state.lease = Some(crate::service::lease::LeaseState::default());
+        state.begin_pending("Synchronizing qBittorrent");
+        let started_at = state.pending.as_ref().unwrap().started_at;
+        for result in [
+            AsyncActionResult::ProbeQbitWebUi(true),
+            AsyncActionResult::Sync(Ok(crate::app::sync::SyncReport::default())),
+        ] {
+            tx.send(result).unwrap();
+            drain_action_results(&mut state, &rx, &mut needs_refresh);
+            assert_eq!(state.pending.as_ref().unwrap().started_at, started_at);
+            assert_eq!(
+                state.pending.as_ref().unwrap().label,
+                "Synchronizing qBittorrent"
+            );
+        }
+        needs_refresh = false;
+        tx.send(AsyncActionResult::QbitSync(Ok(
+            crate::portforward::qbittorrent::QBittorrentSyncReport {
+                previous_port: None,
+                new_port: 51820,
+                bound_interface: None,
+                app_version: None,
+            },
+        )))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(
+            state.status_message,
+            "qBittorrent: synchronized port 51820."
+        );
+        assert!(!state.status_is_error);
+        assert!(state.pending.is_none());
+        assert!(!needs_refresh);
+        assert_eq!(
+            state.qbit_sync(),
+            Some(crate::service::lease::QbitSyncStatus::Pending)
+        );
+
+        state.begin_pending("Synchronizing qBittorrent");
+        tx.send(AsyncActionResult::QbitSync(Err(
+            crate::error::AppError::CommandFailed("WebUI rejected sync".into()),
+        )))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+        assert!(state.status_message.contains("WebUI rejected sync"));
+        assert!(state.pending.is_none());
+        assert!(!needs_refresh);
+        assert_eq!(
+            state.qbit_sync(),
+            Some(crate::service::lease::QbitSyncStatus::Pending)
+        );
+
         // The WebUI probe verdict, and the two Err arms that reload intent from
         // disk. Without the first, the port-forward panel would wait forever for
         // a verdict that arrives and is thrown away.
@@ -1009,6 +1079,7 @@ mod tests {
         let boom = || Err(crate::error::AppError::CommandFailed("boom".into()));
 
         state.config.lockdown_enabled = true;
+        state.begin_pending("Enabling Lockdown Mode");
         tx.send(AsyncActionResult::Lockdown {
             enable: true,
             result: boom(),
@@ -1016,6 +1087,7 @@ mod tests {
         .unwrap();
         drain_action_results(&mut state, &rx, &mut needs_refresh);
         assert!(state.status_is_error, "a failed policy must toast");
+        assert!(state.pending.is_none());
         assert!(
             !state.config.lockdown_enabled,
             "and revert to the intent on disk, not to the attempt"
@@ -1033,6 +1105,13 @@ mod tests {
             !state.config.general.autoconnect_at_login,
             "and revert to the intent on disk, not to the attempt"
         );
+
+        state.begin_pending("Synchronizing qBittorrent");
+        drop(tx);
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.pending.is_none());
+        assert!(state.status_is_error);
+        assert!(state.status_message.contains("worker has stopped"));
 
         crate::testing::remove_temp_config(&path);
     }

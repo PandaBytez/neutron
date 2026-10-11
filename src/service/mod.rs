@@ -719,8 +719,11 @@ mod tests {
     #[test]
     fn failed_persistence_rolls_back_desktop_entry() {
         let client = MockNmClient::new(vec![]);
-        let bad_config_path = PathBuf::from("/nonexistent/directory/config.toml");
-        let autostart_dir = autostart_test_dir();
+        let scratch = crate::testing::scratch_dir("autostart-persistence-failure");
+        let blocker = scratch.join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        let bad_config_path = blocker.join("config.toml");
+        let autostart_dir = scratch.join("autostart");
 
         let res = set_autoconnect_at_login_in(&client, &bad_config_path, &autostart_dir, true);
         assert!(res.is_err(), "config update to bad path should fail");
@@ -728,8 +731,9 @@ mod tests {
             !autostart::is_installed_in(&autostart_dir),
             "entry must be uninstalled on persistence failure"
         );
+        assert_eq!(fs::read_to_string(&blocker).unwrap(), "not a directory");
 
-        let _ = std::fs::remove_dir_all(&autostart_dir);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// A throwaway autostart directory, so these tests never write into the

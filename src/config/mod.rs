@@ -255,6 +255,10 @@ pub struct QBittorrentConfig {
     /// WebUI on another host that must keep its own interface (`false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<bool>,
+    /// True for current tri-state binding overrides. Missing or false marks
+    /// legacy configs whose `bind_interface = false` was the v0.1.3 default.
+    #[serde(default)]
+    pub binding_overrides_migrated: bool,
 }
 
 fn default_qbittorrent_url() -> String {
@@ -322,6 +326,7 @@ impl Default for QBittorrentConfig {
             username: None,
             password: None,
             bind_interface: None,
+            binding_overrides_migrated: true,
         }
     }
 }
@@ -395,17 +400,14 @@ pub fn load(path: &Path) -> AppResult<AppConfig> {
             config.port_forwarding.mode = PortForwardMode::Forward;
         }
     }
-    // Same story, one field over: v0.1.3 wrote `bind_interface` unconditionally
-    // -- a plain `bool` with no `skip_serializing_if` -- so *every* existing
-    // config carries `bind_interface = false`. Read as the tri-state override
-    // that is a forced "never bind", which would switch the feature off for
-    // exactly the installs the URL-derived default exists for: a local qBittorrent
-    // would stop being bound to the tunnel and the forward would never arrive.
-    // An explicit `false` is therefore read for what it was -- the old default.
-    // `--bind true` still forces it on, and `--bind false` clears a force.
-    if config.qbittorrent.bind_interface == Some(false) {
+    // v0.1.3 always wrote the old boolean default. Migrate it once, then persist
+    // the marker so a new explicit false (including CLI --bind false) survives.
+    if !config.qbittorrent.binding_overrides_migrated
+        && config.qbittorrent.bind_interface == Some(false)
+    {
         config.qbittorrent.bind_interface = None;
     }
+    config.qbittorrent.binding_overrides_migrated = true;
     Ok(config)
 }
 
@@ -614,6 +616,41 @@ pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn documented_config_example_matches_the_current_schema() {
+        let docs = include_str!("../../docs/configuration.md");
+        let body = docs
+            .split_once("```toml\n")
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0;
+        let config: super::AppConfig = toml::from_str(body).expect("documented TOML should parse");
+        assert!(!config.kill_switch_enabled);
+        assert!(!config.lockdown_enabled);
+        assert_eq!(config.excluded_profile_ids.len(), 1);
+        assert_eq!(config.favorite_profile_ids.len(), 1);
+        assert_eq!(
+            config.global_split_tunnel.mode,
+            super::SplitTunnelMode::Include
+        );
+        assert_eq!(config.global_split_tunnel.cidrs.len(), 3);
+        assert_eq!(config.global_split_tunnel.domains.len(), 2);
+        assert_eq!(config.theme.active_border.as_deref(), Some("#88c0d0"));
+        assert_eq!(config.qbittorrent.bind_interface, Some(false));
+        assert!(config.qbittorrent.binding_overrides_migrated);
+        assert!(!config.qbittorrent.binds_tunnel_interface());
+        // False defaults alone would not detect an ignored or misplaced security key.
+        let mut sample: toml::Value = toml::from_str(body).unwrap();
+        for key in ["kill_switch_enabled", "lockdown_enabled"] {
+            *sample.get_mut(key).expect("documented root security key") =
+                toml::Value::Boolean(true);
+        }
+        let enabled: super::AppConfig = sample.try_into().unwrap();
+        assert!(enabled.kill_switch_enabled && enabled.lockdown_enabled);
+    }
+
     use super::*;
 
     #[test]
@@ -940,6 +977,65 @@ mod tests {
 
         assert!(loaded.qbittorrent.binds_tunnel_interface());
         cleanup(&path);
+    }
+
+    #[test]
+    fn an_explicit_false_roundtrips_and_survives_narrow_updates() {
+        for label in ["pf-explicit-false", "pf-explicit-false.json"] {
+            let path = unique_path(label);
+            let config = AppConfig {
+                qbittorrent: QBittorrentConfig {
+                    url: "http://localhost:8080".to_string(),
+                    bind_interface: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            save(&path, &config).expect("config should save");
+            let loaded = load(&path).expect("config should load");
+            assert_eq!(loaded.qbittorrent.bind_interface, Some(false));
+            assert!(!loaded.qbittorrent.binds_tunnel_interface());
+
+            update(&path, |cfg| cfg.qbittorrent.bind_interface = Some(true))
+                .expect("binding should be enabled");
+            // The CLI uses this same update path for --bind false.
+            update(&path, |cfg| cfg.qbittorrent.bind_interface = Some(false))
+                .expect("binding should be disabled");
+            update(&path, |cfg| cfg.theme.preset = "gruvbox".into())
+                .expect("unrelated setting should update");
+            let loaded = load(&path).expect("config should reload");
+            assert_eq!(loaded.qbittorrent.bind_interface, Some(false));
+            assert!(!loaded.qbittorrent.binds_tunnel_interface());
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn legacy_binding_default_migrates_before_an_explicit_false_update() {
+        for (label, body) in [
+            (
+                "pf-legacy-bind-marker",
+                "[qbittorrent]\nurl = \"http://localhost:8080\"\nbind_interface = false\nbinding_overrides_migrated = false\n",
+            ),
+            (
+                "pf-legacy-bind.json",
+                r#"{"qbittorrent":{"url":"http://localhost:8080","bind_interface":false}}"#,
+            ),
+        ] {
+            let path = unique_path(label);
+            fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+                .expect("fixture dir should be created");
+            fs::write(&path, body).expect("legacy fixture should write");
+            let loaded = load(&path).expect("legacy config should load");
+            assert_eq!(loaded.qbittorrent.bind_interface, None);
+            assert!(loaded.qbittorrent.binds_tunnel_interface());
+            update(&path, |cfg| cfg.qbittorrent.bind_interface = Some(false))
+                .expect("binding should be disabled");
+            let loaded = load(&path).expect("config should reload");
+            assert_eq!(loaded.qbittorrent.bind_interface, Some(false));
+            assert!(!loaded.qbittorrent.binds_tunnel_interface());
+            cleanup(&path);
+        }
     }
 
     #[test]

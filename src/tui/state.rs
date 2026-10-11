@@ -528,6 +528,11 @@ pub enum AsyncAction {
     Lockdown(bool),
     Autoconnect(bool),
     Sync,
+    QbitSync {
+        uuid: String,
+        port: u16,
+        config: crate::config::QBittorrentConfig,
+    },
     Delete(String),
     ProbeQbitWebUi,
 }
@@ -546,6 +551,7 @@ pub enum AsyncActionResult {
         result: crate::error::AppResult<()>,
     },
     Sync(crate::error::AppResult<crate::app::sync::SyncReport>),
+    QbitSync(crate::error::AppResult<crate::portforward::qbittorrent::QBittorrentSyncReport>),
     Delete(crate::error::AppResult<String>),
     ProbeQbitWebUi(bool),
 }

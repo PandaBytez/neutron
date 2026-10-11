@@ -6,9 +6,10 @@ Neutron provides **Global Split Tunneling**, allowing users to specify exact sub
 
 ## Routing Modes
 
-### 1. `Include` Mode (Route Only Listed Destinations via Tunnel)
-* **Behavior**: Default internet browsing bypasses the tunnel over your physical interface, while only specified subnets and domain IPs are routed securely through the WireGuard tunnel.
+### 1. `Include` Mode (Per-Family Destination Selection)
+* **Behavior**: For each address family with a nonempty list of configured CIDRs and resolved domain IPs, only listed destinations route through the tunnel; other destinations in that family use the physical default route. An empty family retains the full-tunnel default (`never-default = no`). This is intentional, tested behavior: an IPv4-only Include list does not make IPv6 bypass the tunnel, and an entirely empty list retains both defaults.
 * **NetworkManager Mechanism**:
+  With nonempty lists for both families:
   ```bash
   nmcli connection modify <uuid> \
       ipv4.never-default yes \
@@ -54,10 +55,14 @@ For domain entries (e.g., `internal.corp`, `service.local`):
 1. The domain is resolved via `std::net::ToSocketAddrs` to all associated IPv4 (`/32`) and IPv6 (`/128`) literals.
 2. Resolved IPs are merged with configured CIDRs before applying route arguments to NetworkManager.
 3. Resolution is performed in the background during connection or rule modification.
+4. Invalid CIDRs or domains without a successful or retained last-known-good
+   resolution prevent an enabled policy from being applied and saved, rather
+   than silently applying a partial list. Entries can be stored while the mode
+   is disabled; enabling it validates and resolves the list.
 
 ---
 
-## CLI & GUI Configuration
+## CLI & TUI Configuration
 
 ### CLI Commands
 ```bash
@@ -79,8 +84,7 @@ neutron split-tunnel remove-domain internal.corp
 neutron split-tunnel clear
 ```
 
-### GUI Dialog
-Available in the **Settings** section of the GUI main window:
-* Clean mode selector dropdown (`Disabled`, `Include`, `Exclude`).
-* Interactive list editors for CIDRs and Domain names with inline syntax validation.
-* Real-time subtitle updates reflecting active rules.
+### TUI Editor
+Press `t` in the TUI to edit the global mode, CIDRs, and domains. See the
+[usage guide](usage.md#interactive-split-tunneling-t) for editor controls and
+[configuration reference](configuration.md) for `[global_split_tunnel]` settings.

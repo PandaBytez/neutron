@@ -33,6 +33,16 @@ pub(crate) fn routes_for_checked(
     cidrs: &[String],
     domains: &[String],
 ) -> AppResult<(Vec<String>, Vec<String>)> {
+    routes_for_checked_with(mode, cidrs, domains, resolve_domain_ips)
+}
+
+/// Checked policy resolution with a caller-supplied resolver (no implicit DNS or cache).
+pub(crate) fn routes_for_checked_with(
+    mode: SplitTunnelMode,
+    cidrs: &[String],
+    domains: &[String],
+    mut resolve: impl FnMut(&str) -> Vec<IpAddr>,
+) -> AppResult<(Vec<String>, Vec<String>)> {
     if !mode.is_enabled() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -42,7 +52,7 @@ pub(crate) fn routes_for_checked(
         targets.push(normalized);
     }
     for domain in domains {
-        let ips = resolve_domain_ips(domain);
+        let ips = resolve(domain);
         if ips.is_empty() {
             return Err(AppError::Config(format!(
                 "could not resolve split-tunnel domain '{domain}'; policy was not applied"
@@ -61,6 +71,23 @@ static LAST_KNOWN_GOOD: Mutex<Option<HashMap<String, Vec<IpAddr>>>> = Mutex::new
 /// Retains last-known-good resolutions to avoid dropping split-tunnel routes
 /// on transient DNS failure (which would fail open in Include mode).
 pub fn resolve_domain_ips(domain: &str) -> Vec<IpAddr> {
+    resolve_domain_ips_with(domain, &LAST_KNOWN_GOOD, |host| {
+        let target = format!("{host}:0");
+        match target.to_socket_addrs() {
+            Ok(addrs) => addrs.map(|addr| addr.ip()).collect(),
+            Err(e) => {
+                tracing::warn!("failed to resolve domain '{domain}': {e}");
+                Vec::new()
+            }
+        }
+    })
+}
+
+fn resolve_domain_ips_with(
+    domain: &str,
+    cache: &Mutex<Option<HashMap<String, Vec<IpAddr>>>>,
+    resolve: impl FnOnce(&str) -> Vec<IpAddr>,
+) -> Vec<IpAddr> {
     let host = domain.trim().to_lowercase();
     if host.is_empty() {
         return Vec::new();
@@ -81,30 +108,21 @@ pub fn resolve_domain_ips(domain: &str) -> Vec<IpAddr> {
         }
         _ => {}
     }
-    let target = format!("{host}:0");
-    match target.to_socket_addrs() {
-        Ok(addrs) => {
-            let mut ips = Vec::new();
-            for addr in addrs {
-                let ip = addr.ip();
-                if !ips.contains(&ip) {
-                    ips.push(ip);
-                }
-            }
-            if !ips.is_empty() {
-                if let Ok(mut lock) = LAST_KNOWN_GOOD.lock() {
-                    lock.get_or_insert_with(HashMap::new)
-                        .insert(host.clone(), ips.clone());
-                }
-                return ips;
-            }
-        }
-        Err(e) => {
-            tracing::warn!("failed to resolve domain '{domain}': {e}");
+    let mut ips = Vec::new();
+    for ip in resolve(&host) {
+        if !ips.contains(&ip) {
+            ips.push(ip);
         }
     }
+    if !ips.is_empty() {
+        if let Ok(mut lock) = cache.lock() {
+            lock.get_or_insert_with(HashMap::new)
+                .insert(host.clone(), ips.clone());
+        }
+        return ips;
+    }
 
-    if let Ok(lock) = LAST_KNOWN_GOOD.lock()
+    if let Ok(lock) = cache.lock()
         && let Some(cache) = lock.as_ref()
         && let Some(cached) = cache.get(&host)
     {
@@ -113,24 +131,6 @@ pub fn resolve_domain_ips(domain: &str) -> Vec<IpAddr> {
     }
 
     Vec::new()
-}
-
-#[cfg(test)]
-pub fn set_last_known_good_domain_ips(domain: &str, ips: Vec<IpAddr>) {
-    let host = domain.trim().to_lowercase();
-    if let Ok(mut lock) = LAST_KNOWN_GOOD.lock() {
-        lock.get_or_insert_with(HashMap::new).insert(host, ips);
-    }
-}
-
-#[cfg(test)]
-pub fn remove_last_known_good_domain_ips(domain: &str) {
-    let host = domain.trim().to_lowercase();
-    if let Ok(mut lock) = LAST_KNOWN_GOOD.lock()
-        && let Some(cache) = lock.as_mut()
-    {
-        cache.remove(&host);
-    }
 }
 
 /// Normalize a domain name for storage and comparison, or `None` if it is not usable.
@@ -868,31 +868,38 @@ mod tests {
     fn last_known_good_resolution_retained_on_dns_failure() {
         let domain = "nonexistent.vpn.test";
         let fake_ip = "192.0.2.123".parse::<IpAddr>().unwrap();
-        remove_last_known_good_domain_ips(domain);
+        let cache = Mutex::new(None);
 
-        // Initially no cache: resolve fails and returns empty
-        assert!(resolve_domain_ips(domain).is_empty());
+        assert!(resolve_domain_ips_with(domain, &cache, |_| Vec::new()).is_empty());
 
-        // Prime last known good cache
-        set_last_known_good_domain_ips(domain, vec![fake_ip]);
+        assert_eq!(
+            resolve_domain_ips_with("  NONEXISTENT.VPN.TEST  ", &cache, |host| {
+                assert_eq!(host, domain);
+                vec![fake_ip, fake_ip]
+            }),
+            vec![fake_ip]
+        );
 
-        // When resolution fails, retained last-known-good IP is returned instead of empty
-        let ips = resolve_domain_ips(domain);
+        let ips = resolve_domain_ips_with(domain, &cache, |_| Vec::new());
         assert_eq!(ips, vec![fake_ip]);
 
-        // routes_for_checked uses the retained resolution and succeeds
-        let (v4, _) = routes_for_checked(SplitTunnelMode::Include, &[], &[domain.to_string()])
-            .expect("should use last-known-good resolution");
+        let (v4, _) = routes_for_checked_with(
+            SplitTunnelMode::Include,
+            &[],
+            &[domain.to_string()],
+            |host| resolve_domain_ips_with(host, &cache, |_| Vec::new()),
+        )
+        .expect("should use last-known-good resolution");
         assert_eq!(v4, vec!["192.0.2.123/32".to_string()]);
-
-        remove_last_known_good_domain_ips(domain);
     }
 
     #[test]
     fn routes_for_checked_rejects_unresolved_domain_without_cache() {
         let domain = "unresolvable-domain-1234567.invalid";
-        remove_last_known_good_domain_ips(domain);
-        let res = routes_for_checked(SplitTunnelMode::Include, &[], &[domain.to_string()]);
+        let res =
+            routes_for_checked_with(SplitTunnelMode::Include, &[], &[domain.to_string()], |_| {
+                Vec::new()
+            });
         assert!(res.is_err());
         let err = res.unwrap_err().to_string();
         assert!(err.contains("could not resolve split-tunnel domain"));

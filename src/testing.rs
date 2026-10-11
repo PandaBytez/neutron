@@ -21,6 +21,9 @@
 //! * the lease file under `$XDG_RUNTIME_DIR`, which is what a live daemon
 //!   publishes for the TUI.
 //!
+//! DNS is external state too: mock policy replay resolves only explicitly
+//! supplied fixture IPs, never the host resolver or production DNS cache.
+//!
 //! A test that genuinely needs the real thing is a *system* test: marked
 //! `#[ignore = "system test: requires the disposable sandbox"]` and gated on
 //! [`require_sandbox`].
@@ -238,6 +241,7 @@ pub struct MockNmClient {
     /// is its own interface, so they never compete for a device.
     active: Arc<Mutex<Vec<String>>>,
     config_path: Option<PathBuf>,
+    domain_ips: BTreeMap<String, Vec<std::net::IpAddr>>,
     sweep_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
 }
 
@@ -261,6 +265,12 @@ impl MockNmClient {
         self
     }
 
+    /// Supply deterministic DNS answers for policy replay; absent domains fail resolution.
+    pub fn with_domain_ips(mut self, domain: &str, ips: Vec<std::net::IpAddr>) -> Self {
+        self.domain_ips.insert(domain.trim().to_lowercase(), ips);
+        self
+    }
+
     /// Only read policies from an explicitly injected fixture, never the host config.
     fn policy_config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
@@ -273,19 +283,23 @@ impl MockNmClient {
     /// *when* they run. Three copies is three places for an injected path to be
     /// forgotten, which is how `switch_to` and `import_wireguard_profile` came to
     /// read the developer's real settings while `connect` honoured the temp one.
-    fn apply_policy_args(&self, identifier: &str, config_path: &Path) {
-        let Ok(app_cfg) = crate::config::load(config_path) else {
-            return;
-        };
+    fn apply_policy_args(&self, identifier: &str, config_path: &Path) -> AppResult<()> {
+        let app_cfg = crate::config::load(config_path)?;
         if app_cfg.kill_switch_enabled {
             self.apply_args(&crate::nm::kill_switch::set_args(identifier, true, true));
         }
         if app_cfg.global_split_tunnel.mode.is_enabled() {
-            let (v4, v6) = crate::nm::split_tunnel::routes_for(
+            let (v4, v6) = crate::nm::split_tunnel::routes_for_checked_with(
                 app_cfg.global_split_tunnel.mode,
                 &app_cfg.global_split_tunnel.cidrs,
                 &app_cfg.global_split_tunnel.domains,
-            );
+                |domain| {
+                    self.domain_ips
+                        .get(&domain.trim().to_lowercase())
+                        .cloned()
+                        .unwrap_or_default()
+                },
+            )?;
             self.apply_args(&crate::nm::split_tunnel::set_args(
                 identifier,
                 app_cfg.global_split_tunnel.mode,
@@ -293,6 +307,7 @@ impl MockNmClient {
                 &v6,
             ));
         }
+        Ok(())
     }
 
     pub fn with_sweep_barrier(self, barrier: Arc<std::sync::Barrier>) -> Self {
@@ -655,10 +670,9 @@ impl NmLifecycle for MockNmClient {
         if let Some(config_path) = self.policy_config_path() {
             // Under the policy lock, as the real client does, so a concurrent
             // toggle cannot be read half-applied.
-            let _ = crate::config::coordinate_policy(config_path, || {
-                self.apply_policy_args(profile_identifier, config_path);
-                Ok(())
-            });
+            crate::config::coordinate_policy(config_path, || {
+                self.apply_policy_args(profile_identifier, config_path)
+            })?;
         }
         if self.unhealthy {
             // As the real client does: the tunnel came up but carries no
@@ -705,7 +719,7 @@ impl NmLifecycle for MockNmClient {
             true,
         ));
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(profile_identifier, config_path);
+            self.apply_policy_args(profile_identifier, config_path)?;
         }
         if self.unhealthy {
             return Err(AppError::TunnelUnhealthy(format!(
@@ -747,7 +761,7 @@ impl NmLifecycle for MockNmClient {
         // When imported while global security settings are active, the new profile
         // immediately inherits kill switch and split-tunnel settings.
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(&uuid, config_path);
+            self.apply_policy_args(&uuid, config_path)?;
         }
 
         Ok(format!("Imported {}", path.display()))

@@ -326,6 +326,59 @@ fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
 }
 
 #[test]
+fn mock_policy_replay_uses_only_supplied_domain_ips_on_every_lifecycle_path() {
+    let scratch = testing::scratch_dir("mock-domain-policy");
+    let path = scratch.join("config.toml");
+    let config = AppConfig {
+        global_split_tunnel: SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            cidrs: vec!["10.1.2.3/8".into()],
+            domains: vec!["  FIXTURE.EXAMPLE  ".into()],
+        },
+        ..Default::default()
+    };
+    config::save(&path, &config).unwrap();
+    let client = MockNmClient::new(vec![testing::inactive("wg-fixture", "uuid-fixture")])
+        .with_config_path(path.clone())
+        .with_domain_ips(
+            "fixture.example",
+            vec![
+                "192.0.2.123".parse().unwrap(),
+                "2001:db8::123".parse().unwrap(),
+            ],
+        );
+    client.connect("uuid-fixture").unwrap();
+    client.switch_to("uuid-fixture").unwrap();
+    client
+        .import_wireguard_profile(&scratch.join("wg-imported.conf"))
+        .unwrap();
+    for uuid in ["uuid-fixture", "uuid-wg-imported"] {
+        assert_eq!(
+            client.setting(uuid, "ipv4.routes").as_deref(),
+            Some("10.0.0.0/8, 192.0.2.123/32")
+        );
+        assert_eq!(
+            client.setting(uuid, "ipv6.routes").as_deref(),
+            Some("2001:db8::123/128")
+        );
+    }
+
+    // A separate mock has no answers, even for the same domain and fixture path.
+    let unresolved = MockNmClient::new(vec![testing::inactive("wg-fixture", "uuid-fixture")])
+        .with_config_path(path);
+    assert!(unresolved.connect("uuid-fixture").is_err());
+    assert!(unresolved.switch_to("uuid-fixture").is_err());
+    assert!(
+        unresolved
+            .import_wireguard_profile(&scratch.join("wg-unresolved.conf"))
+            .is_err()
+    );
+    assert!(unresolved.active_uuids().is_empty());
+    assert!(unresolved.setting("uuid-fixture", "ipv4.routes").is_none());
+    std::fs::remove_dir_all(scratch).unwrap();
+}
+
+#[test]
 fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
     let config_path = testing::temp_toml_config_path("import-policy");
 

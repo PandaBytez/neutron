@@ -69,6 +69,11 @@ Pressing **`t`** opens the side-by-side Split Tunneling manager:
 * **Automatic Non-Blocking Apply:** All changes apply and persist immediately in the background without freezing the UI.
 * **Lockdown Notice:** If the Lockdown Firewall is active, a clear banner reminds you that all non-tunnel traffic is dropped when disconnected.
 
+Include mode is evaluated per address family: only a family with a nonempty
+destination list routes just those destinations through the tunnel. An empty
+family intentionally retains its full-tunnel default. See
+[routing modes](split-tunneling.md#routing-modes).
+
 ---
 
 ### Command Palette (`Ctrl+P` or `:`)
@@ -215,6 +220,15 @@ neutron qbit disable   # forward
 # Configure WebUI connection parameters (--bind forces interface binding on/off)
 neutron qbit config --url http://127.0.0.1:8080
 ```
+
+In the TUI, use the Command Palette's qBittorrent sync action for a manual push.
+It runs in the background using a snapshot of the daemon's leased port and profile
+UUID. A pending indicator remains until completion; success or failure appears in
+the status message without changing the daemon's automatic-sync badge verdict.
+Without an active published lease, the action reports that no port is available.
+
+For headless renewal and missing `XDG_RUNTIME_DIR` behavior, see the
+[port-forwarding lifecycle](port-forwarding.md#auto-renewal-lifecycle).
 
 ### System Tray AppIndicator & Background Daemon
 

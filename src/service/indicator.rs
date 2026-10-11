@@ -967,6 +967,7 @@ where
 
         // Republished every poll even when nothing changed: the timestamp is how
         // a reader tells a held lease from one left behind by a dead daemon.
+        // Only a live foreign owner stops renewal; publication I/O is best effort.
         if !crate::service::lease::publish(&lease.publication(active_uuid.clone())) {
             warn!("Lease publication rejected by active owner, exiting duplicate indicator.");
             return Ok(());

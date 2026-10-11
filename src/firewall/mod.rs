@@ -826,12 +826,12 @@ mod tests {
 
     #[test]
     fn disconnected_bootstrap_dns_and_connected_lan_dns_drop() {
-        let mut inactive = tunnel("wg0", &[("vpn.example.com", 51820)]);
+        let mut inactive = tunnel("wg0", &[("192.0.2.1", 51820)]);
         inactive.is_active = false;
         let disconnected = lockdown_enable_batches(&[inactive]);
         assert!(has_rule(&disconnected, &["--dport", "53", "-j", "ACCEPT"]));
 
-        let active = lockdown_enable_batches(&[tunnel("wg0", &[("vpn.example.com", 51820)])]);
+        let active = lockdown_enable_batches(&[tunnel("wg0", &[("192.0.2.1", 51820)])]);
         assert!(!has_rule(&active, &["--dport", "53", "-j", "ACCEPT"]));
         assert!(has_rule(&active, &["--dport", "53", "-j", "DROP"]));
     }
@@ -1143,10 +1143,7 @@ mod tests {
         // `--get-rules` echoes it back, parse it, and require the result to be
         // precisely that one rule's targeted removal — proving teardown only
         // ever touches what we added.
-        let tunnels = [tunnel(
-            "wg0",
-            &[("1.2.3.4", 51820), ("vpn.example.com", 1194)],
-        )];
+        let tunnels = [tunnel("wg0", &[("1.2.3.4", 51820), ("localhost", 1194)])];
         for add in lockdown_enable_batches(&tunnels) {
             if add == reload_batch() {
                 continue;

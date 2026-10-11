@@ -80,6 +80,9 @@ neutron restart
 
 ## 🌐 **[Documentation](https://pandabytez.github.io/neutron/)**
 
+See the [settings reference](docs/configuration.md) for the current `config.toml`
+schema, UUID-based profile lists, theme colors, and qBittorrent binding overrides.
+
 ---
 
 ## Building from Source

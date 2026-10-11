@@ -12,40 +12,52 @@ writes and owner-only permissions; deleting a profile removes its notes.
 
 ## Configuration File Schema
 
+This illustrative sample uses the current serialized `AppConfig` schema, not
+necessarily default values. Profile lists contain NetworkManager UUIDs, not
+profile names. Replace the example UUIDs and `.invalid` documentation domains
+before use; the sample is suitable for a parse-only check, not live DNS or routing.
+Optional values are omitted when unset.
+
 ```toml
 # ==============================================================================
 # Neutron Configuration (~/.config/neutron/config.toml)
 # ==============================================================================
 
-[general]
-# Directory monitored for WireGuard .conf files.
-# Dropping, copying, or git-cloning profiles here automatically imports them to NetworkManager.
-profiles_dir = "~/.config/neutron/profiles"
-
-# Automatically import new/updated .conf files from profiles_dir on launch
-auto_sync_profiles = true
-
-# Opt in to connecting a random eligible profile at login
-autoconnect_at_login = false
-
-# Default interface when launching `neutron` with no arguments: "tui" or "gui"
-default_ui = "tui"
-
-# ==============================================================================
-# Security & Routing Policies
-# ==============================================================================
-[security]
+# Root settings must precede all [tables].
 # NetworkManager policy routing (drops traffic if tunnel fails; exclusive DNS priority)
-kill_switch = false
+kill_switch_enabled = false
 
 # Always-on Netfilter firewall via firewalld (blocks non-tunnel traffic even when disconnected)
-lockdown = false
+lockdown_enabled = false
+
+# Every profile is eligible for startup-random selection unless its UUID is listed.
+excluded_profile_ids = ["11111111-1111-4111-8111-111111111111"]
+# Favorites pinned to tray quick actions, also keyed by UUID.
+favorite_profile_ids = ["22222222-2222-4222-8222-222222222222"]
+# Optional last random selection; maintained by the app.
+last_random_profile_id = "22222222-2222-4222-8222-222222222222"
+
+[general]
+# Drop directory for WireGuard .conf files; scanned during profile sync.
+profiles_dir = "~/.config/neutron/profiles"
+
+# Automatically import new/updated .conf files from profiles_dir on launch.
+auto_sync_profiles = true
+
+# Opt in to connecting a random eligible profile at login.
+autoconnect_at_login = false
+
+# Verify fresh tunnels with an endpoint and persistent keepalive.
+# Idle on-demand tunnels are exempt.
+verify_tunnel_on_connect = true
 
 # ==============================================================================
 # Global Split Tunneling
 # ==============================================================================
-[split_tunnel]
-# Routing mode: "disabled", "include" (route only listed), or "exclude" (bypass listed)
+[global_split_tunnel]
+# Routing mode: "disabled", "include", or "exclude".
+# Include routes only listed destinations for each nonempty address family;
+# an empty family retains its full-tunnel default (including an empty list).
 mode = "include"
 
 # Custom IP subnets (CIDRs) or single host IPs
@@ -57,32 +69,18 @@ cidrs = [
 
 # Domain names resolved dynamically at connection time
 domains = [
-    "internal.corp",
-    "homelab.local",
-]
-
-# ==============================================================================
-# Startup Random Profile Selection Pool
-# ==============================================================================
-[startup_pool]
-# List of profile names or UUIDs excluded from random selection (opt-out model)
-excluded_profiles = [
-    "backup-slow-server",
-    "emergency-profile",
+    "internal.example.invalid",
+    "homelab.example.invalid",
 ]
 
 # ==============================================================================
 # Terminal User Interface (TUI) & Theming
 # ==============================================================================
-[tui]
-# Telemetry polling rate in milliseconds (handshake, transfer counters)
-refresh_interval_ms = 1000
-
+[theme]
 # Built-in theme preset: "nord" (default), "osaka-jade", "catppuccin", "gruvbox", "monochrome"
-theme = "nord"
+preset = "nord"
 
 # Optional custom color overrides (accepts hex #rrggbb or standard color names)
-[tui.colors]
 active_border = "#88c0d0"
 status_connected = "#a3be8c"
 status_disconnected = "#bf616a"
@@ -97,7 +95,7 @@ transfer_tx = "#ebcb8b"
 # gateway and keep renewing it), or "forward-and-sync" (also push the leased
 # port to qBittorrent automatically). Switchable live from the TUI with `o`.
 # Off by default: the lease is renewed on a timer against the provider, so it
-# is only requested on request.
+# is only requested when enabled.
 mode = "disabled"
 
 # ==============================================================================
@@ -120,7 +118,24 @@ url = "http://127.0.0.1:8080"
 # machine reached at a container bridge address (true), or a WebUI on another host
 # that must keep its own interface (false).
 # bind_interface = true
+# This sample explicitly disables binding, even for the local URL above.
+# Omit this line to restore URL-derived binding.
+bind_interface = false
+
+# Current generated value; maintained internally by the app. Do not hand-edit.
+# Distinguishes current explicit overrides (including false) from legacy defaults.
+binding_overrides_migrated = true
 ```
+
+There is no saved `default_ui` or `[tui]` section: `neutron` starts the TUI,
+and theme colors are flat fields in `[theme]`. Security flags and profile UUID
+lists are root fields, not `[security]` or `[startup_pool]` tables.
+
+Neutron maintains `binding_overrides_migrated` on load/save. A missing or false
+marker identifies legacy settings where `bind_interface = false` was the old
+default; that value migrates to URL-derived binding. With the current marker
+`true`, an explicit `bind_interface = false` remains an override. Prefer
+`neutron qbit config --bind false` to editing migration metadata yourself.
 
 ---
 

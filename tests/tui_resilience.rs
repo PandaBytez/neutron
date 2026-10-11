@@ -245,6 +245,108 @@ fn transient_list_failure_retains_refresh_and_eventually_reloads() {
 }
 
 #[test]
+fn manual_qbit_sync_queues_the_lease_snapshot_and_survives_a_stopped_worker() {
+    use neutron::service::lease::LeaseState;
+    use neutron::tui::state::{ActiveModal, AsyncAction, CommandPaletteState};
+
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-qbit-async");
+    state.config.port_forwarding.mode = config::PortForwardMode::ForwardAndSync;
+    // An invalid IPv6 authority fails before network IO if a push is attempted.
+    state.config.qbittorrent.url = "http://[invalid".into();
+    state.config.qbittorrent.username = Some("snapshot-user".into());
+    let expected_config = state.config.qbittorrent.clone();
+    state.lease = Some(LeaseState {
+        profile_uuid: Some("uuid-lease".into()),
+        port: Some(51820),
+        ..Default::default()
+    });
+    state.active_profile_uuid = Some("uuid-not-the-lease".into());
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.action_tx = Some(tx);
+    state.modal = ActiveModal::CommandPalette(CommandPaletteState {
+        filter: "qBittorrent: Sync Forwarded Port Now".into(),
+        ..Default::default()
+    });
+
+    press(&mut state, &client, KeyCode::Enter).expect("queueing must not call the WebUI");
+    assert!(!state.status_is_error);
+    assert!(state.status_message.contains("in background"));
+    assert!(state.pending.is_some());
+    state.lease = None;
+    state.config.qbittorrent.username = None;
+    match rx.try_recv().expect("manual sync must reach the worker") {
+        AsyncAction::QbitSync { uuid, port, config } => {
+            assert_eq!(uuid, "uuid-lease");
+            assert_eq!(port, 51820);
+            assert_eq!(config, expected_config);
+        }
+        other => panic!("expected QbitSync task, got {other:?}"),
+    }
+    press(&mut state, &client, KeyCode::Char('q')).unwrap();
+    assert!(
+        state.should_quit,
+        "input must not wait for worker completion"
+    );
+
+    state.end_pending();
+    drop(rx);
+    state.lease = Some(LeaseState {
+        profile_uuid: Some("uuid-lease".into()),
+        port: Some(51820),
+        ..Default::default()
+    });
+    execute_action(&mut state, &client, "qbit_sync").unwrap();
+    assert!(state.status_is_error);
+    assert!(state.status_message.contains("worker has stopped"));
+    assert!(state.pending.is_none());
+
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn spinner_actions_do_not_overwrite_or_queue_overlapping_requests() {
+    use neutron::service::lease::LeaseState;
+    use neutron::tui::state::AsyncAction;
+
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-spinner-overlap");
+    state.lease = Some(LeaseState {
+        profile_uuid: Some("uuid-lease".into()),
+        port: Some(51820),
+        ..Default::default()
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.action_tx = Some(tx);
+
+    for first in ["lockdown", "qbit_sync"] {
+        execute_action(&mut state, &client, first).unwrap();
+        match (first, rx.try_recv().unwrap()) {
+            ("lockdown", AsyncAction::Lockdown(_))
+            | ("qbit_sync", AsyncAction::QbitSync { .. }) => {}
+            other => panic!("unexpected request: {other:?}"),
+        }
+        let pending = state.pending.as_ref().unwrap();
+        let label = pending.label.clone();
+        let started_at = pending.started_at;
+        let status = state.status_message.clone();
+        for overlapping in ["lockdown", "qbit_sync"] {
+            execute_action(&mut state, &client, overlapping).unwrap();
+            assert_eq!(state.pending.as_ref().unwrap().label, label);
+            assert_eq!(state.pending.as_ref().unwrap().started_at, started_at);
+            assert_eq!(state.status_message, status);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
+        state.end_pending();
+    }
+
+    testing::remove_temp_config(&path);
+}
+
+#[test]
 fn split_worker_failure_reconciles_modal_and_pending_state() {
     let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)]);
     let path = testing::temp_config_path("tui-split-reconcile");

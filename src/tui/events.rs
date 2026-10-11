@@ -227,6 +227,9 @@ pub fn execute_action<C: ActionClient>(
             }
         }
         "lockdown" => {
+            if state.pending.is_some() {
+                return Ok(());
+            }
             let enable = !state.config.lockdown_enabled;
             // Escalation blocks on a polkit prompt, so the wait is what the user
             // is watching. Animate it, and show elapsed time in case the prompt
@@ -257,7 +260,6 @@ pub fn execute_action<C: ActionClient>(
                 // showing an action that already finished.
                 let result = run_action(client, &state.config_path, AsyncAction::Lockdown(enable));
                 finish_action(state, result)?;
-                state.end_pending();
             }
         }
         "autoconnect" => {
@@ -297,14 +299,16 @@ pub fn execute_action<C: ActionClient>(
             }
         }
         "qbit_sync" => {
+            if state.pending.is_some() {
+                return Ok(());
+            }
             // Both halves come from the daemon's lease: the port is only
             // meaningful together with the tunnel it was obtained for, which is
             // also what decides the interface qBittorrent binds to.
             //
-            // Pushed straight away rather than by asking the daemon to do it,
-            // because the point of the action is an answer now. The badge keeps
-            // reporting the daemon's own verdict and converges on the next poll;
-            // the toast is what reports this push.
+            // The worker pushes this snapshot rather than asking the daemon to
+            // do it. The badge still reports the daemon's own verdict; the toast
+            // reports this manual push.
             let lease = state
                 .lease
                 .as_ref()
@@ -312,17 +316,24 @@ pub fn execute_action<C: ActionClient>(
 
             match lease {
                 Some((uuid, port)) => {
-                    match crate::app::qbittorrent::sync_port(
-                        client,
-                        &state.config.qbittorrent,
-                        &uuid,
+                    let action = AsyncAction::QbitSync {
+                        uuid,
                         port,
-                    ) {
-                        Ok(report) => state.set_status(format!(
-                            "qBittorrent: synchronized port {}.",
-                            report.new_port
-                        )),
-                        Err(error) => state.set_error(&error),
+                        config: state.config.qbittorrent.clone(),
+                    };
+                    if let Some(ref tx) = action_tx {
+                        state.begin_pending("Synchronizing qBittorrent");
+                        state.set_status("qBittorrent: synchronizing in background...");
+                        if tx.send(action).is_err() {
+                            state.end_pending();
+                            state.set_error(&crate::error::AppError::Config(
+                                "the action worker has stopped; restart Neutron and try again"
+                                    .into(),
+                            ));
+                        }
+                    } else {
+                        let result = run_action(client, &state.config_path, action);
+                        finish_action(state, result)?;
                     }
                 }
                 // Distinguished, because the three causes have three different
@@ -385,6 +396,9 @@ pub(crate) fn run_action<C: NmClient + FirewallClient>(
             let cfg = config::load(path)?;
             sync_profiles(client, path, &cfg)
         })()),
+        AsyncAction::QbitSync { uuid, port, config } => AsyncActionResult::QbitSync(
+            crate::app::qbittorrent::sync_port(client, &config, &uuid, port),
+        ),
         AsyncAction::Delete(uuid) => AsyncActionResult::Delete((|| {
             client.delete_profile(&uuid)?;
             crate::app::rebuild_lockdown_if_enabled(client, path)?;
@@ -428,6 +442,7 @@ pub(crate) fn finish_action(state: &mut TuiState, result: AsyncActionResult) -> 
             ));
         }
         AsyncActionResult::Lockdown { enable, result } => {
+            state.end_pending();
             result?;
             state
                 .uncertain_policies
@@ -458,6 +473,16 @@ pub(crate) fn finish_action(state: &mut TuiState, result: AsyncActionResult) -> 
             result?;
             state.set_status("Profile deleted.");
             return Ok(true);
+        }
+        AsyncActionResult::QbitSync(result) => {
+            state.end_pending();
+            match result {
+                Ok(report) => state.set_status(format!(
+                    "qBittorrent: synchronized port {}.",
+                    report.new_port
+                )),
+                Err(error) => state.set_error(&error),
+            }
         }
         AsyncActionResult::ProbeQbitWebUi(reachable) => {
             if matches!(state.modal, ActiveModal::PortForward(_)) {
@@ -1783,8 +1808,8 @@ mod tests {
             assert_eq!(st.focus, SplitTunnelFocus::DomainInput);
         }
 
-        // Type domain "example.com" and press Enter to auto-apply
-        for c in "example.com".chars() {
+        // Use the built-in loopback answer so applying the edit never uses DNS.
+        for c in "localhost".chars() {
             handle_key_event(
                 &mut state,
                 &client,
@@ -1799,12 +1824,12 @@ mod tests {
         )
         .unwrap();
         if let ActiveModal::SplitTunnel(ref st) = state.modal {
-            assert_eq!(st.domains, vec!["example.com".to_string()]);
+            assert_eq!(st.domains, vec!["localhost".to_string()]);
             assert_eq!(st.domain_input, "");
         }
         assert_eq!(
             state.config.global_split_tunnel.domains,
-            vec!["example.com".to_string()]
+            vec!["localhost".to_string()]
         );
 
         // Tab switches panel to CidrInput

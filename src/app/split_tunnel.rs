@@ -20,8 +20,26 @@ pub fn apply_and_persist_global_split_tunnel<C: NmPolicy>(
     path: &Path,
     st_cfg: &SplitTunnelConfig,
 ) -> AppResult<()> {
-    let (v4_routes, v6_routes) =
-        nm::split_tunnel::routes_for_checked(st_cfg.mode, &st_cfg.cidrs, &st_cfg.domains)?;
+    apply_and_persist_global_split_tunnel_with(
+        client,
+        path,
+        st_cfg,
+        nm::split_tunnel::resolve_domain_ips,
+    )
+}
+
+fn apply_and_persist_global_split_tunnel_with<C: NmPolicy>(
+    client: &C,
+    path: &Path,
+    st_cfg: &SplitTunnelConfig,
+    resolve: impl FnMut(&str) -> Vec<std::net::IpAddr>,
+) -> AppResult<()> {
+    let (v4_routes, v6_routes) = nm::split_tunnel::routes_for_checked_with(
+        st_cfg.mode,
+        &st_cfg.cidrs,
+        &st_cfg.domains,
+        resolve,
+    )?;
 
     crate::app::apply_and_save_policy(
         path,
@@ -356,9 +374,11 @@ mod tests {
             domains: vec!["unresolvable-test-domain-xyz.invalid".to_string()],
         };
 
-        let res = apply_and_persist_global_split_tunnel(&client, &path, &st_cfg);
+        let res =
+            apply_and_persist_global_split_tunnel_with(&client, &path, &st_cfg, |_| Vec::new());
         assert!(res.is_err());
         assert!(client.split_tunnel_calls().is_empty());
+        assert!(!path.exists(), "unresolved policy must not be persisted");
 
         testing::remove_temp_config(&path);
     }
