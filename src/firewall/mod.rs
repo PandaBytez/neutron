@@ -20,7 +20,7 @@
 //! Everything else is dropped, even before any VPN is connected and across
 //! reboots (the rules are made `--permanent`). Changing the system firewall
 //! requires privileges: explicit toggles authenticate through `pkexec`, while
-//! automatic refreshes use a root-owned, refresh-only helper; the `disable`
+//! refreshes also authenticate through a root-owned, refresh-only helper; the `disable`
 //! path always works to lift the block, so the user can never be permanently
 //! locked out.
 //!
@@ -102,8 +102,10 @@ pub trait FirewallClient {
     /// Install the lockdown ruleset, allowing the supplied tunnels' interfaces
     /// and endpoints through. Replaces any previous lockdown rules.
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()>;
-    /// Refresh an already enabled policy without interactive authorization.
+    /// Refresh an already enabled policy with administrator authentication.
     /// `activating` identifies the NM profile whose first traffic must be protected.
+    /// `Some(uuid)` fails if protection is absent or cannot be fully verified in
+    /// both address families and both scopes. Propagate this before connection up.
     fn refresh_lockdown(&self, activating: Option<&str>) -> AppResult<()>;
     /// Whether this machine currently holds any Neutron-owned lockdown state:
     /// tagged rules, the root-owned refresh helper, or its polkit action.
@@ -114,13 +116,14 @@ pub trait FirewallClient {
     /// machine whose config was lost or purged can still be firewalled.
     fn has_installed_lockdown_state(&self) -> AppResult<bool>;
     /// Remove the lockdown ruleset in one privileged batch, and revoke the
-    /// password-free refresh grant when `revoke_grant` is set. Idempotent: safe
+    /// refresh helper authorization when `revoke_grant` is set. Idempotent: safe
     /// to call when lockdown is not currently active.
     ///
     /// `revoke_grant` is the whole difference between the two callers. A plain
-    /// disable leaves the grant alone, because it belongs to the *installation*
+    /// disable leaves only hardened authorization alone; legacy grants are revoked.
+    /// Hardened authorization belongs to the *installation*
     /// rather than to the current lockdown state: it is installed on enable,
-    /// must survive a disable so a re-enable needs no second prompt, and is
+    /// survives a disable (refresh still cannot re-enable), and is
     /// revoked when the app goes away. An uninstall sets it, so rules and grant
     /// leave in a single `pkexec` batch -- one password prompt either way.
     fn teardown_lockdown(&self, revoke_grant: bool) -> AppResult<()>;
@@ -134,12 +137,14 @@ pub trait FirewallClient {
 
 impl FirewallClient for crate::nm::CliNmClient {
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()> {
+        validate_tunnel_interfaces(tunnels)?;
         // Everything that mutates the firewall runs in ONE privileged batch so
         // the user is prompted for a password at most once. Reads are
         // unprivileged and never prompt.
         //
         // Permanent fail-closed guards protect every intermediate rebuild state.
         let mut script = locked_script();
+        script.push_str(&interface_validation_script(tunnels));
         script.push_str(&helper::install_script()?);
         for permanent in [true, false] {
             let mut batches = lockdown_rebuild_batches(Vec::new(), tunnels);
@@ -178,6 +183,8 @@ impl FirewallClient for crate::nm::CliNmClient {
         script.push_str(&live_removal_script(false, false));
         if revoke_grant {
             script.push_str(&helper::uninstall_script());
+        } else {
+            script.push_str(&helper::revoke_unsafe_authorization_script());
         }
         run_script(&script, true)?;
 
@@ -196,12 +203,11 @@ impl FirewallClient for crate::nm::CliNmClient {
             }
         }
         // The install's other durable footprint: a root-owned helper binary and
-        // the polkit action that authorizes it. They grant password-free root
-        // execution, so report a survivor rather than leave a live grant behind.
-        if revoke_grant && helper::is_installed() {
+        // the polkit action that authorizes it. Report any surviving grant.
+        if helper::is_installed() && (revoke_grant || !helper::has_hardened_authorization()) {
             return Err(AppError::Firewall(format!(
                 "{} or its polkit action could not be deleted; remove them as root to \
-                 revoke password-free root execution",
+                  revoke helper authorization",
                 helper::PATH,
             )));
         }
@@ -354,7 +360,119 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
 }
 
 fn locked_script() -> String {
-    format!("set -e\nexec 9>{}\nflock -x 9\n", helper::LOCK_PATH)
+    let mut script = locked_script_for(helper::LOCK_PATH, 0, helper::LOCK_TIMEOUT.as_secs(), 9);
+    // Bridge upgrades: old helpers hold the legacy inode, new helpers take both
+    // in this order. Neither file is ever removed during teardown.
+    script.push_str(&format!(
+        "[ ! -L {dir} ]\n\
+         mkdir -m 700 -- {dir} 2>/dev/null || [ -d {dir} ]\n\
+         [ \"$(stat -Lc '%u' {dir})\" = 0 ]\n\
+         chmod 700 -- {dir}\n",
+        dir = helper::LOCK_DIR,
+    ));
+    script.push_str(&locked_script_for(
+        helper::PRIVATE_LOCK_PATH,
+        0,
+        helper::LOCK_TIMEOUT.as_secs(),
+        7,
+    ));
+    script
+}
+
+fn locked_script_for(path: &str, owner: u32, timeout: u64, fd: u8) -> String {
+    // Keep the old pathname/inode so already-running helpers still serialize.
+    // /run is root-owned; umask applies before the file's first exposure.
+    format!(
+        "set -e\numask 077\n\
+         [ ! -L {lock} ] || exit 1\n\
+         [ ! -e {lock} ] || [ -f {lock} ]\n\
+         exec {fd}>>{lock}\n\
+         [ \"$(stat -Lc '%u:%h' /proc/self/fd/{fd})\" = {owner}:1 ]\n\
+         chmod 600 /proc/self/fd/{fd}\n\
+         flock -x -w {timeout} {fd}\n",
+        lock = shell_quote(path),
+    )
+}
+
+/// Only exact interface names may become OUTPUT allowances. Existing links must
+/// be kernel WireGuard devices; absent links reserve the conventional wg prefix.
+fn validate_tunnel_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<()> {
+    validate_tunnel_interfaces_with(tunnels, |interface| {
+        let listing = crate::process::run_with_timeout(
+            "ip",
+            &["-json", "-details", "link", "show"],
+            helper::LOCK_TIMEOUT,
+        )?;
+        let links: serde_json::Value = serde_json::from_str(&listing)
+            .map_err(|error| AppError::Firewall(format!("Invalid link introspection: {error}")))?;
+        let links = links
+            .as_array()
+            .ok_or_else(|| AppError::Firewall("Invalid link introspection".into()))?;
+        Ok(links
+            .iter()
+            .find(|link| link["ifname"] == interface)
+            .map(|link| link["linkinfo"]["info_kind"] == "wireguard"))
+    })
+}
+
+fn validate_tunnel_interfaces_with(
+    tunnels: &[WireguardTunnel],
+    mut is_wireguard: impl FnMut(&str) -> AppResult<Option<bool>>,
+) -> AppResult<()> {
+    for tunnel in tunnels {
+        let Some(interface) = tunnel.interface.as_deref() else {
+            if tunnel.is_active {
+                return Err(AppError::Firewall(
+                    "Active WireGuard profile has no interface".into(),
+                ));
+            }
+            continue;
+        };
+        if interface.is_empty()
+            || interface.len() > 15
+            || !interface
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            return Err(AppError::Firewall(format!(
+                "Unsafe tunnel interface: {interface}"
+            )));
+        }
+        match is_wireguard(interface)? {
+            Some(true) => {}
+            None if !tunnel.is_active && interface.starts_with("wg") && interface.len() > 2 => {}
+            _ => {
+                return Err(AppError::Firewall(format!(
+                    "Interface {interface} is not WireGuard; absent interfaces must use a wg-prefixed name"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recheck after authentication, before any firewall writes. User-side checks
+/// alone leave a device-type race across the password prompt.
+fn interface_validation_script(tunnels: &[WireguardTunnel]) -> String {
+    let mut script = String::from("ip link show >/dev/null\n");
+    for tunnel in tunnels {
+        if let Some(interface) = &tunnel.interface {
+            let absent = if !tunnel.is_active && interface.starts_with("wg") && interface.len() > 2
+            {
+                ":"
+            } else {
+                "echo 'WireGuard interface disappeared' >&2; exit 1"
+            };
+            script.push_str(&format!(
+                "if ip link show dev {interface} >/dev/null 2>&1; then\n\
+                   wireguard_link=$(ip -details -oneline link show dev {interface} type wireguard)\n\
+                   [ -n \"$wireguard_link\" ] || {{ echo 'Interface is not WireGuard' >&2; exit 1; }}\n\
+                 else\n  {absent}\nfi\n",
+                interface = shell_quote(interface),
+            ));
+        }
+    }
+    script
 }
 
 fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
@@ -433,6 +551,13 @@ fn lockdown_rebuild_batches(
     removals: Vec<Vec<String>>,
     tunnels: &[WireguardTunnel],
 ) -> Vec<Vec<String>> {
+    lockdown_rebuild_batches_for(removals, &lockdown_enable_batches(tunnels))
+}
+
+fn lockdown_rebuild_batches_for(
+    removals: Vec<Vec<String>>,
+    desired: &[Vec<String>],
+) -> Vec<Vec<String>> {
     let guards: Vec<_> = FAMILIES
         .iter()
         .map(|family| add_rule(family, -1, &["-j", "DROP"]))
@@ -453,8 +578,7 @@ fn lockdown_rebuild_batches(
             .into_iter()
             .filter(|batch| !guard_removals.contains(batch)),
     );
-    let replacement = lockdown_enable_batches(tunnels);
-    batches.extend(replacement);
+    batches.extend_from_slice(desired);
     batches.extend(guard_removals);
     batches
 }
@@ -638,6 +762,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_lock_is_private_repairs_inode_and_has_bounded_wait() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::testing::scratch_dir("shell-firewall-lock");
+        let path = dir.join("lock");
+        let owner = std::fs::metadata(&dir).unwrap().uid();
+        let script = locked_script_for(path.to_str().unwrap(), owner, 1, 9);
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let file = std::fs::File::open(&path).unwrap();
+        let inode = file.metadata().unwrap().ino();
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        file.lock().unwrap();
+        let start = std::time::Instant::now();
+        assert!(
+            !Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        drop(file);
+        let symlink = dir.join("symlink");
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        let script = locked_script_for(symlink.to_str().unwrap(), owner, 1, 9);
+        assert!(
+            !Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interface_validation_rejects_hostile_inactive_profiles_and_physical_collisions() {
+        for name in ["eth0", "wg+", "+", "wg0;bad", "", "wg"] {
+            let mut pending = tunnel(name, &[]);
+            pending.is_active = false;
+            assert!(
+                validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).is_err(),
+                "{name}"
+            );
+        }
+        let mut pending = tunnel("wg-test", &[]);
+        pending.is_active = false;
+        assert!(validate_tunnel_interfaces_with(&[pending.clone()], |_| Ok(Some(false))).is_err());
+        assert!(validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).is_ok());
+        assert!(
+            validate_tunnel_interfaces_with(&[tunnel("eth0", &[])], |_| Ok(Some(false))).is_err()
+        );
+        assert!(
+            validate_tunnel_interfaces_with(&[tunnel("custom", &[])], |_| Ok(Some(true))).is_ok()
+        );
+    }
+
+    #[test]
+    fn authenticated_interface_recheck_rejects_physical_link_after_prompt() {
+        // A shell function is a local fake command, not host introspection.
+        let fake =
+            "ip() { case \"$*\" in *wireguard*) return 0;; *) printf '%s\\n' physical;; esac; }\n";
+        let script = format!(
+            "set -e\n{fake}{}",
+            interface_validation_script(&[tunnel("wg-test", &[])])
+        );
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not WireGuard"));
+    }
+
+    #[test]
     fn a_machine_without_firewall_cmd_reports_no_rules_rather_than_failing() {
         // The evidence check behind `neutron uninstall` and `neutron reset` asks
         // firewalld what is installed. On a machine that does not run it, the
@@ -698,7 +906,10 @@ mod tests {
     fn interrupted_rebuild_stays_closed_after_reload_and_recovers() {
         crate::testing::require_sandbox();
         let client = crate::nm::CliNmClient;
-        let tunnels = [tunnel("wg-old", &[])];
+        let tunnels = [WireguardTunnel {
+            is_active: false,
+            ..tunnel("wg-old", &[])
+        }];
         client.enable_lockdown(&tunnels).unwrap();
         let batches =
             lockdown_rebuild_batches(marked_removal_batches().unwrap(), &[tunnel("wg-new", &[])]);

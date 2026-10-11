@@ -22,6 +22,23 @@ use neutron::testing::require_sandbox;
 /// The marker Neutron stamps onto every rule it installs.
 const MARKER: &str = "neutron-lockdown";
 
+/// Helper tests must install the application, not this running test harness.
+fn enable_real_helper() {
+    require_sandbox();
+    assert!(
+        std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
+            .args(["lockdown", "enable"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        std::fs::read("/usr/local/libexec/neutron-lockdown-helper").unwrap(),
+        std::fs::read(env!("CARGO_BIN_EXE_neutron")).unwrap(),
+        "installed helper must be the real application"
+    );
+}
+
 /// Every direct rule currently installed, one per line.
 fn all_rules() -> String {
     let output = std::process::Command::new("firewall-cmd")
@@ -46,10 +63,30 @@ struct Lockdown;
 impl Drop for Lockdown {
     fn drop(&mut self) {
         let _ = CliNmClient.disable_lockdown();
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", "wg-test"])
+            .status();
     }
 }
 
 fn tunnel(interface: &str, host: &str, port: u16) -> WireguardTunnel {
+    require_sandbox();
+    // Real WireGuard links, not a trusted-looking name on a physical/veth link.
+    if !std::process::Command::new("ip")
+        .args(["link", "show", "dev", interface])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert!(
+            std::process::Command::new("ip")
+                .args(["link", "add", interface, "type", "wireguard"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     WireguardTunnel {
         interface: Some(interface.to_string()),
         endpoints: vec![Endpoint {
@@ -65,13 +102,7 @@ fn tunnel(interface: &str, host: &str, port: u16) -> WireguardTunnel {
 fn permanent_lockdown_refreshes_after_reload_without_reenabling_after_disable() {
     require_sandbox();
     let _guard = Lockdown;
-    assert!(
-        std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
-            .args(["lockdown", "enable"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    enable_real_helper();
     let saved = marked_rules();
     // firewalld reconstructs runtime from permanent configuration at boot.
     assert!(
@@ -91,11 +122,37 @@ fn permanent_lockdown_refreshes_after_reload_without_reenabling_after_disable() 
     for rule in &saved {
         assert!(runtime.lines().any(|line| line == rule), "{runtime}");
     }
+    // Losing one family in either scope must not be mistaken for a complete
+    // policy merely because the other family still has marked rules.
+    for permanent in [true, false] {
+        for rule in saved.iter().filter(|rule| rule.starts_with("ipv6 ")) {
+            let mut command = std::process::Command::new("firewall-cmd");
+            if permanent {
+                command.arg("--permanent");
+            }
+            assert!(
+                command
+                    .args(["--direct", "--remove-rule"])
+                    .args(rule.split_whitespace())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        CliNmClient.refresh_lockdown(None).unwrap();
+        assert_eq!(marked_rules(), saved);
+        let runtime = std::process::Command::new("firewall-cmd")
+            .args(["--direct", "--get-all-rules"])
+            .output()
+            .unwrap();
+        let runtime = String::from_utf8_lossy(&runtime.stdout);
+        for rule in &saved {
+            assert!(runtime.lines().any(|line| line == rule), "{runtime}");
+        }
+    }
     CliNmClient.disable_lockdown().unwrap();
     assert!(marked_rules().is_empty());
-    // A disable lifts the block but keeps the password-free grant: it belongs to
-    // the installation, so a re-enable needs no second prompt -- and, more to the
-    // point here, a refresh still cannot *enable* anything.
+    // Disable keeps the authenticated helper but refresh cannot enable anything.
     assert!(
         std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
         "a disable must not revoke the refresh grant"
@@ -105,11 +162,23 @@ fn permanent_lockdown_refreshes_after_reload_without_reenabling_after_disable() 
         marked_rules().is_empty(),
         "refresh must never enable lockdown"
     );
+    let error = CliNmClient
+        .refresh_lockdown(Some("123e4567-e89b-12d3-a456-426614174000"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("protection is absent") && error.contains("activation refused"),
+        "{error}"
+    );
+    assert!(
+        marked_rules().is_empty(),
+        "stale saved intent must not re-enable protection"
+    );
 }
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
-fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
+fn admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user() {
     require_sandbox();
     const ACTION: &str = "io.github.pandabytez.neutron.lockdown-refresh";
     const TEST_RULE: &str = "/etc/polkit-1/rules.d/00-neutron-test-refresh.rules";
@@ -122,19 +191,13 @@ fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
             "denied" | "missing" => {
                 let error = result.unwrap_err().to_string();
                 assert!(
-                    error.contains("Password-free lockdown refresh is unavailable"),
-                    "{error}"
-                );
-                assert!(error.contains("neutron lockdown enable"), "{error}");
-                assert!(
-                    error.contains(if mode == "denied" {
-                        "exit 1)"
+                    error.contains(if mode == "missing" {
+                        "Administrator-authenticated lockdown refresh is unavailable"
                     } else {
-                        "exit 127)"
+                        "exit "
                     }),
                     "{error}"
                 );
-                assert!(!error.contains("Only trusted callers"), "{error}");
             }
             _ => panic!("unexpected refresh test mode: {mode}"),
         }
@@ -155,7 +218,7 @@ fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
             .args([
                 "--ignored",
                 "--exact",
-                "password_free_refresh_uses_real_polkit_as_an_unprivileged_user",
+                "admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user",
                 "--nocapture",
             ])
             // Bypass the root-only firewall-test pkexec shim.
@@ -203,13 +266,7 @@ fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
 "#,
     )
     .unwrap();
-    assert!(
-        std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))
-            .args(["lockdown", "enable"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    enable_real_helper();
     assert!(!std::path::Path::new(legacy_rule).exists());
     let action_path = format!("/usr/local/share/polkit-1/actions/{ACTION}.policy");
     let policy = std::fs::read_to_string(&action_path).unwrap();
@@ -219,15 +276,41 @@ fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
         helper_path.display()
     )));
     assert!(policy.contains("<allow_any>no</allow_any>"));
-    assert!(policy.contains("<allow_inactive>no</allow_inactive>"));
-    assert!(policy.contains("<allow_active>yes</allow_active>"));
+    assert!(policy.contains("<allow_inactive>auth_admin</allow_inactive>"));
+    assert!(policy.contains("<allow_active>auth_admin</allow_active>"));
+    assert!(!policy.contains("auth_admin_keep"));
     let saved = marked_rules();
     wait_for_authorization(1);
     run_child("denied");
     assert_eq!(marked_rules(), saved);
+    // A forged, well-formed activation request from another user cannot change
+    // global DNS policy or add a personal profile's egress allowances.
+    let mut forged = std::process::Command::new("runuser")
+        .args([
+            "-u",
+            "nobody",
+            "--",
+            "/usr/bin/pkexec",
+            "--disable-internal-agent",
+        ])
+        .arg(&helper_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    forged
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"123e4567-e89b-12d3-a456-426614174000")
+        .unwrap();
+    assert!(!forged.wait_with_output().unwrap().status.success());
+    assert_eq!(marked_rules(), saved);
 
-    // There is no active logind session in this container. Grant only this
-    // action to the test user so both pkcheck and pkexec exercise real polkit.
+    // Simulate explicit administrator approval of this test invocation. This
+    // test-only rule is not the installed policy and grants no production access.
     std::fs::write(
         TEST_RULE,
         format!(
@@ -269,14 +352,12 @@ fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
     wait_for_authorization(127);
     run_child("missing");
 
-    // The grant's real lifetime: it survives a disable, and only the uninstall
-    // step revokes it. Both files live outside any package's file list, so
-    // nothing else can remove them.
+    // An installation missing its hardened policy is unsafe to retain on disable.
     CliNmClient.disable_lockdown().unwrap();
     assert!(marked_rules().is_empty());
     assert!(
-        std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
-        "a disable must leave the grant in place"
+        !std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists(),
+        "disable must revoke an installation without hardened authorization"
     );
     // An uninstall revokes the grant in the *same* batch as the rules, which is
     // one prompt and one lock rather than two privileged runs.
@@ -353,6 +434,7 @@ fn every_rule_lockdown_installs_carries_the_marker() {
 #[ignore = "system test: requires the disposable sandbox"]
 fn disabling_lockdown_removes_every_rule_it_installed() {
     require_sandbox();
+    let _guard = Lockdown;
 
     CliNmClient
         .enable_lockdown(&[tunnel("wg-test", "192.0.2.1", 51820)])
@@ -377,6 +459,7 @@ fn teardown_leaves_foreign_rules_untouched() {
     // Lockdown must never clear the chain wholesale: a user's own direct rules,
     // or another tool's, have to survive.
     require_sandbox();
+    let _guard = Lockdown;
 
     let foreign = [
         "--permanent",
@@ -629,6 +712,102 @@ fn disabling_lockdown_that_was_never_enabled_is_harmless() {
         .disable_lockdown()
         .expect("disabling an inactive lockdown must succeed");
     assert!(marked_rules().is_empty());
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn disable_revokes_legacy_and_mixed_authorization_and_detects_legacy_only_state() {
+    require_sandbox();
+    let _guard = Lockdown;
+    const LEGACY: &str = "/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules";
+    const OBSOLETE: &str =
+        "/usr/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy";
+    CliNmClient.teardown_lockdown(true).unwrap();
+    std::fs::write(LEGACY, "// legacy grant fixture\n").unwrap();
+    assert!(CliNmClient.has_installed_lockdown_state().unwrap());
+    assert!(
+        CliNmClient
+            .refresh_lockdown(None)
+            .unwrap_err()
+            .to_string()
+            .contains("upgrade the helper")
+    );
+    CliNmClient.disable_lockdown().unwrap();
+    assert!(!std::path::Path::new(LEGACY).exists());
+    enable_real_helper();
+    let saved = marked_rules();
+    std::fs::write(LEGACY, "// legacy grant fixture\n").unwrap();
+    assert!(CliNmClient.refresh_lockdown(None).is_err());
+    assert_eq!(marked_rules(), saved);
+    CliNmClient.disable_lockdown().unwrap();
+    assert!(!std::path::Path::new(LEGACY).exists());
+    assert!(!std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists());
+    enable_real_helper();
+    std::fs::write(
+        OBSOLETE,
+        "<defaults><allow_active>yes</allow_active></defaults>",
+    )
+    .unwrap();
+    assert!(CliNmClient.refresh_lockdown(None).is_err());
+    CliNmClient.disable_lockdown().unwrap();
+    assert!(!std::path::Path::new(OBSOLETE).exists());
+    assert!(!std::path::Path::new("/usr/local/libexec/neutron-lockdown-helper").exists());
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn hostile_inactive_interfaces_are_rejected_by_enable_and_root_refresh() {
+    require_sandbox();
+    let _guard = Lockdown;
+    enable_real_helper();
+    let saved = marked_rules();
+    struct Profile;
+    impl Drop for Profile {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("nmcli")
+                .args(["connection", "delete", "neutron-hostile-interface"])
+                .status();
+        }
+    }
+    for interface in ["eth0", "wg+"] {
+        let hostile = WireguardTunnel {
+            interface: Some(interface.into()),
+            is_active: false,
+            ..Default::default()
+        };
+        assert!(CliNmClient.enable_lockdown(&[hostile]).is_err());
+        assert_eq!(marked_rules(), saved);
+        let _profile = Profile;
+        assert!(
+            std::process::Command::new("nmcli")
+                .args([
+                    "connection",
+                    "add",
+                    "type",
+                    "wireguard",
+                    "ifname",
+                    interface,
+                    "con-name",
+                    "neutron-hostile-interface",
+                    "connection.autoconnect",
+                    "no",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let refresh = std::process::Command::new("/usr/local/libexec/neutron-lockdown-helper")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!refresh.status.success(), "{refresh:?}");
+        assert!(
+            String::from_utf8_lossy(&refresh.stderr).contains("interface")
+                || String::from_utf8_lossy(&refresh.stderr).contains("Interface"),
+            "{refresh:?}"
+        );
+        assert_eq!(marked_rules(), saved);
+    }
 }
 
 #[test]
