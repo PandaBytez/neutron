@@ -343,6 +343,16 @@ fn to_ranges(cidrs: &[String], want_v6: bool) -> Vec<(u128, u128)> {
         .collect()
 }
 
+pub(crate) fn address_in_routes(routes: &[String], address: IpAddr) -> bool {
+    let target = match address {
+        IpAddr::V4(ip) => u32::from(ip) as u128,
+        IpAddr::V6(ip) => u128::from(ip),
+    };
+    to_ranges(routes, address.is_ipv6())
+        .iter()
+        .any(|(start, end)| *start <= target && target <= *end)
+}
+
 /// Every address of one family *except* those in `excluded`, as CIDR strings.
 ///
 /// This is what makes Exclude mode actually exclude: the returned routes are
@@ -431,6 +441,10 @@ pub fn set_args(
         v4,
         "ipv6.routes".to_string(),
         v6,
+        "ipv4.routed-dns".to_string(),
+        "yes".to_string(),
+        "ipv6.routed-dns".to_string(),
+        "yes".to_string(),
     ]
 }
 

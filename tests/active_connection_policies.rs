@@ -22,6 +22,133 @@ const ROUTING_KEYS: [&str; 2] = [
     "wireguard.ip6-auto-default-route",
 ];
 
+#[test]
+fn activation_clears_stale_split_properties_even_when_saved_mode_is_disabled() {
+    let (client, path) = connected_client();
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Include, &["192.0.2.0/24".into()], &[])
+        .unwrap();
+    client.switch_to("uuid-us").unwrap();
+    for family in ["ipv4", "ipv6"] {
+        assert_eq!(
+            client
+                .setting("uuid-us", &format!("{family}.never-default"))
+                .as_deref(),
+            Some("no")
+        );
+        assert_eq!(
+            client
+                .setting("uuid-us", &format!("{family}.routes"))
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            client
+                .setting("uuid-us", &format!("{family}.routed-dns"))
+                .as_deref(),
+            Some("yes")
+        );
+    }
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn protected_activation_refuses_unsupported_families_partial_peers_and_dns() {
+    let path = testing::temp_toml_config_path("activation-security");
+    config::save(
+        &path,
+        &AppConfig {
+            kill_switch_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (key, value, warning) in [
+        ("ipv6.method", "disabled", "unsupported IP family"),
+        ("ipv4.method", "disabled", "unsupported IP family"),
+        (
+            "wireguard.peers",
+            "KEY allowed-ips=10.0.0.0/8;::/0",
+            "AllowedIPs",
+        ),
+        ("ipv4.dns", "", "explicit tunnel DNS"),
+    ] {
+        let client = MockNmClient::new(vec![testing::inactive("wg", "uuid")])
+            .with_config_path(path.clone())
+            .with_setting("uuid", key, value);
+        let error = client.connect("uuid").unwrap_err().to_string();
+        assert!(error.contains(warning), "{error}");
+        assert!(client.active_uuids().is_empty());
+        assert!(client.setting("uuid", "ipv4.routes").is_none());
+    }
+    let client =
+        MockNmClient::new(vec![testing::inactive("wg", "uuid")]).with_config_path(path.clone());
+    client.connect("uuid").unwrap();
+    assert_eq!(
+        client.setting("uuid", "ipv4.dns-search").as_deref(),
+        Some("~.")
+    );
+    assert_eq!(
+        client.setting("uuid", "ipv4.routed-dns").as_deref(),
+        Some("no")
+    );
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn protected_dns_host_routes_survive_split_replacement_and_disabled_mode() {
+    let path = testing::temp_toml_config_path("dns-host-routes");
+    config::save(
+        &path,
+        &AppConfig {
+            kill_switch_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let client = MockNmClient::new(vec![testing::inactive("wg", "uuid")])
+        .with_config_path(path.clone())
+        .with_setting("uuid", "ipv4.dns", "198.18.40.1")
+        .with_setting("uuid", "ipv6.dns", "fd00:40::1");
+    client.connect("uuid").unwrap();
+    for mode in [
+        SplitTunnelMode::Exclude,
+        SplitTunnelMode::Include,
+        SplitTunnelMode::Disabled,
+    ] {
+        let split = SplitTunnelConfig {
+            mode,
+            cidrs: vec!["198.18.40.0/24".into(), "fd00:40::/64".into()],
+            domains: vec![],
+        };
+        neutron::app::split_tunnel::apply_and_persist_global_split_tunnel(&client, &path, &split)
+            .unwrap();
+        assert!(
+            client
+                .setting("uuid", "ipv4.routes")
+                .unwrap()
+                .contains("198.18.40.1/32 0.0.0.0 5 table=254")
+        );
+        assert!(
+            client
+                .setting("uuid", "ipv6.routes")
+                .unwrap()
+                .contains("fd00:40::1/128 :: 5 table=254")
+        );
+        if mode == SplitTunnelMode::Disabled {
+            assert_eq!(
+                client.setting("uuid", "ipv4.never-default").as_deref(),
+                Some("no")
+            );
+            assert_eq!(
+                client.setting("uuid", "ipv6.never-default").as_deref(),
+                Some("no")
+            );
+        }
+    }
+    testing::remove_temp_config(&path);
+}
+
 /// Fail if any profile has been left in a state where NetworkManager would
 /// install no routes for it.
 fn assert_every_profile_still_routes(client: &MockNmClient, context: &str) {

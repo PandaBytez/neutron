@@ -271,6 +271,17 @@ impl MockNmClient {
         self
     }
 
+    /// Override an NM read in the fixture (methods, DNS and peer AllowedIPs).
+    pub fn with_setting(self, uuid: &str, key: &str, value: &str) -> Self {
+        self.settings
+            .lock()
+            .expect("mock mutex poisoned")
+            .entry(uuid.into())
+            .or_default()
+            .insert(key.into(), value.into());
+        self
+    }
+
     /// Only read policies from an explicitly injected fixture, never the host config.
     fn policy_config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
@@ -285,29 +296,49 @@ impl MockNmClient {
     /// read the developer's real settings while `connect` honoured the temp one.
     fn apply_policy_args(&self, identifier: &str, config_path: &Path) -> AppResult<()> {
         let app_cfg = crate::config::load(config_path)?;
-        if app_cfg.kill_switch_enabled {
-            self.apply_args(&crate::nm::kill_switch::set_args(identifier, true, true));
+        self.apply_policy_config(identifier, &app_cfg)
+    }
+
+    fn apply_policy_config(
+        &self,
+        identifier: &str,
+        app_cfg: &crate::config::AppConfig,
+    ) -> AppResult<()> {
+        crate::nm::prepare_profile_with(
+            identifier,
+            app_cfg,
+            &mut |args| self.policy_command(args),
+            |domain| {
+                self.domain_ips
+                    .get(&domain.trim().to_lowercase())
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        )
+    }
+
+    fn policy_command(&self, args: &[&str]) -> AppResult<String> {
+        match args {
+            ["-g", key, "connection", "show", uuid]
+            | ["--escape", "no", "-g", key, "connection", "show", uuid] => {
+                Ok(self.setting(uuid, key).unwrap_or_else(|| match *key {
+                    "ipv4.method" | "ipv6.method" => "manual".into(),
+                    "wireguard.peers" => "KEY allowed-ips=0.0.0.0/0;::/0".into(),
+                    "ipv4.dns" => "10.2.0.1".into(),
+                    "ipv6.dns" => String::new(),
+                    "ipv4.dns-priority" | "ipv6.dns-priority" => "0".into(),
+                    _ => panic!("unexpected NM read: {args:?}"),
+                }))
+            }
+            ["connection", "modify", ..] => {
+                if self.fail_kill_switch || self.fail_split_tunnel {
+                    return Err(AppError::CommandFailed("simulated policy rejection".into()));
+                }
+                self.apply_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                Ok(String::new())
+            }
+            _ => panic!("unexpected policy command: {args:?}"),
         }
-        if app_cfg.global_split_tunnel.mode.is_enabled() {
-            let (v4, v6) = crate::nm::split_tunnel::routes_for_checked_with(
-                app_cfg.global_split_tunnel.mode,
-                &app_cfg.global_split_tunnel.cidrs,
-                &app_cfg.global_split_tunnel.domains,
-                |domain| {
-                    self.domain_ips
-                        .get(&domain.trim().to_lowercase())
-                        .cloned()
-                        .unwrap_or_default()
-                },
-            )?;
-            self.apply_args(&crate::nm::split_tunnel::set_args(
-                identifier,
-                app_cfg.global_split_tunnel.mode,
-                &v4,
-                &v6,
-            ));
-        }
-        Ok(())
     }
 
     pub fn with_sweep_barrier(self, barrier: Arc<std::sync::Barrier>) -> Self {
@@ -329,7 +360,21 @@ impl MockNmClient {
         let mut settings = self.settings.lock().expect("mock mutex poisoned");
         let profile = settings.entry(uuid.clone()).or_default();
         for pair in rest.as_chunks::<2>().0 {
-            profile.insert(pair[0].clone(), pair[1].clone());
+            if let Some(key) = pair[0].strip_prefix('+') {
+                let value = profile.entry(key.into()).or_default();
+                if !value.split(", ").any(|entry| entry == pair[1]) {
+                    if !value.is_empty() {
+                        value.push_str(", ");
+                    }
+                    value.push_str(&pair[1]);
+                }
+            } else if let Some(key) = pair[0].strip_prefix('-') {
+                if profile.get(key) == Some(&pair[1]) {
+                    profile.insert(key.into(), String::new());
+                }
+            } else {
+                profile.insert(pair[0].clone(), pair[1].clone());
+            }
         }
     }
 
@@ -571,6 +616,18 @@ impl NmPolicy for MockNmClient {
             ));
         }
 
+        if enable {
+            let mut config = match self.policy_config_path() {
+                Some(path) => crate::config::load(path)?,
+                None => crate::config::AppConfig::default(),
+            };
+            config.kill_switch_enabled = true;
+            for uuid in self.uuids() {
+                self.apply_policy_config(&uuid, &config)?;
+            }
+            return Ok(());
+        }
+
         self.apply_to_all(|uuid| crate::nm::kill_switch::set_args(uuid, enable, true));
         Ok(())
     }
@@ -613,9 +670,17 @@ impl NmPolicy for MockNmClient {
             ));
         }
 
-        self.apply_to_all(|uuid| {
-            crate::nm::split_tunnel::set_args(uuid, mode, v4_routes, v6_routes)
-        });
+        let mut batches = Vec::new();
+        for uuid in self.uuids() {
+            let mut args = crate::nm::split_tunnel::set_args(&uuid, mode, v4_routes, v6_routes);
+            if crate::nm::profile_dns_protected(&uuid, &mut |args| self.policy_command(args))? {
+                let dns =
+                    crate::nm::checked_tunnel_dns(&uuid, &mut |args| self.policy_command(args))?;
+                args.extend(crate::nm::dns_host_route_args(&dns));
+            }
+            batches.push((uuid, args));
+        }
+        self.apply_to_all(|uuid| batches.iter().find(|(id, _)| id == uuid).unwrap().1.clone());
         Ok(())
     }
 }
@@ -663,16 +728,17 @@ impl NmLifecycle for MockNmClient {
 
         // Mirrors the real client: routing is pinned immediately before the
         // profile is brought up, along with active kill switch and split tunnel policies.
-        self.apply_args(&crate::nm::tunnel_routing::set_args(
-            profile_identifier,
-            true,
-        ));
         if let Some(config_path) = self.policy_config_path() {
             // Under the policy lock, as the real client does, so a concurrent
             // toggle cannot be read half-applied.
             crate::config::coordinate_policy(config_path, || {
                 self.apply_policy_args(profile_identifier, config_path)
             })?;
+        } else {
+            self.apply_args(&crate::nm::tunnel_routing::set_args(
+                profile_identifier,
+                true,
+            ));
         }
         if self.unhealthy {
             // As the real client does: the tunnel came up but carries no
@@ -714,12 +780,15 @@ impl NmLifecycle for MockNmClient {
                 "teardown failed and old profile is still active".to_string(),
             ));
         }
-        self.apply_args(&crate::nm::tunnel_routing::set_args(
-            profile_identifier,
-            true,
-        ));
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(profile_identifier, config_path)?;
+            crate::config::coordinate_policy(config_path, || {
+                self.apply_policy_args(profile_identifier, config_path)
+            })?;
+        } else {
+            self.apply_args(&crate::nm::tunnel_routing::set_args(
+                profile_identifier,
+                true,
+            ));
         }
         if self.unhealthy {
             return Err(AppError::TunnelUnhealthy(format!(
@@ -761,7 +830,9 @@ impl NmLifecycle for MockNmClient {
         // When imported while global security settings are active, the new profile
         // immediately inherits kill switch and split-tunnel settings.
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(&uuid, config_path)?;
+            crate::config::coordinate_policy(config_path, || {
+                self.apply_policy_args(&uuid, config_path)
+            })?;
         }
 
         Ok(format!("Imported {}", path.display()))

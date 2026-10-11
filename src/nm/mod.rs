@@ -317,7 +317,6 @@ impl NmLifecycle for CliNmClient {
             .ok_or_else(|| AppError::Config("import path is not valid UTF-8".to_string()))?;
 
         let config_path = crate::config::default_config_path()?;
-        let app_cfg = crate::config::load(&config_path)?;
         // The confirmation UUID identifies this import, even during concurrent
         // profile changes. Pin the locale because nmcli translates this message.
         let output = crate::process::run_with_timeout(
@@ -348,7 +347,10 @@ impl NmLifecycle for CliNmClient {
         {
             run_nmcli(&["connection", "down", uuid])?;
         }
-        prepare_profile(uuid, &app_cfg, &mut run_nmcli)?;
+        crate::config::coordinate_policy(&config_path, || {
+            let app_cfg = crate::config::load(&config_path)?;
+            prepare_profile(uuid, &app_cfg, &mut run_nmcli)
+        })?;
 
         let comments = extract_interface_comments(path);
         if !comments.is_empty() {
@@ -382,6 +384,15 @@ impl NmLifecycle for CliNmClient {
 impl NmPolicy for CliNmClient {
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
         let profiles = self.list_wireguard_profiles()?;
+        if enable {
+            let path = crate::config::default_config_path()?;
+            let mut config = crate::config::load(&path)?;
+            config.kill_switch_enabled = true;
+            for profile in &profiles {
+                prepare_profile(&profile.uuid, &config, &mut run_nmcli)?;
+            }
+            return Ok(());
+        }
         // NOTE: unlike `set_autoconnect_all` below, this still aborts on the
         // first failure, so later profiles keep their previous kill-switch
         // value while the caller sees a single error. Converting it to
@@ -407,7 +418,14 @@ impl NmPolicy for CliNmClient {
     ) -> AppResult<()> {
         let profiles = self.list_wireguard_profiles()?;
         let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
-        apply_to_every_profile(&profiles, batches, |args| run_nmcli_owned(args).map(|_| ()))
+        apply_to_every_profile(&profiles, batches, |args| {
+            let mut args = args.to_vec();
+            if profile_dns_protected(&args[2], &mut run_nmcli)? {
+                let dns = checked_tunnel_dns(&args[2], &mut run_nmcli)?;
+                args.extend(dns_host_route_args(&dns));
+            }
+            run_nmcli_owned(&args).map(|_| ())
+        })
     }
 
     fn reapply_active_routes(&self) -> AppResult<()> {
@@ -422,7 +440,19 @@ impl NmPolicy for CliNmClient {
                     profile.uuid
                 ))
             })?;
-            run_nmcli(&["device", "reapply", &interface])?;
+            let protected = profile_dns_protected(&profile.uuid, &mut run_nmcli)?;
+            let dns = if protected {
+                checked_tunnel_dns(&profile.uuid, &mut run_nmcli)?
+            } else {
+                Vec::new()
+            };
+            reapply_routes_with(
+                &profile.uuid,
+                &interface,
+                &dns,
+                &mut run_nmcli,
+                &mut |args| crate::process::run_with_timeout("ip", args, NMCLI_TIMEOUT),
+            )?;
         }
         Ok(())
     }
@@ -989,6 +1019,16 @@ fn activate(uuid: &str) -> AppResult<()> {
         let config = crate::config::load(&path)?;
         prepare_profile(uuid, &config, &mut run_nmcli)?;
         let settings = parse_peer_settings(&run_nmcli(&["connection", "show", uuid])?);
+        let protected_dns = if config.kill_switch_enabled {
+            let interface = settings.interface_name.clone().ok_or_else(|| {
+                AppError::Config(
+                    "activation refused: protected DNS needs a tunnel interface".into(),
+                )
+            })?;
+            Some((interface, checked_tunnel_dns(uuid, &mut run_nmcli)?))
+        } else {
+            None
+        };
         if config.lockdown_enabled {
             CliNmClient.refresh_lockdown(Some(uuid))?;
         }
@@ -997,7 +1037,15 @@ fn activate(uuid: &str) -> AppResult<()> {
             config.general.verify_tunnel_on_connect,
             settings,
             &mut run_nmcli,
-        );
+        )
+        .and_then(|()| {
+            if let Some((interface, dns)) = protected_dns {
+                verify_dns_or_disconnect(uuid, &interface, &dns, &mut run_nmcli, &mut |args| {
+                    crate::process::run_with_timeout("ip", args, NMCLI_TIMEOUT)
+                })?;
+            }
+            Ok(())
+        });
         if config.lockdown_enabled {
             let reconciliation = CliNmClient.refresh_lockdown(None);
             if result.is_ok() {
@@ -1009,30 +1057,264 @@ fn activate(uuid: &str) -> AppResult<()> {
 }
 
 /// Shared checked policy preparation for import and every activation path.
-fn prepare_profile(
+pub(crate) fn prepare_profile(
     uuid: &str,
     config: &crate::config::AppConfig,
     run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<()> {
+    prepare_profile_with(uuid, config, run, split_tunnel::resolve_domain_ips)
+}
+
+pub(crate) fn prepare_profile_with(
+    uuid: &str,
+    config: &crate::config::AppConfig,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+    resolve: impl FnMut(&str) -> Vec<std::net::IpAddr>,
 ) -> AppResult<()> {
     let method = run(&["-g", "ipv6.method", "connection", "show", uuid])?;
     let has_ipv6 = !matches!(method.trim(), "" | "--" | "disabled" | "ignore");
     // The kill-switch builder already pins routing in both toggle states.
     let mut args = kill_switch::set_args(uuid, config.kill_switch_enabled, has_ipv6);
     args.extend(autoconnect::set_args(uuid, false).into_iter().skip(3));
-    if config.global_split_tunnel.mode.is_enabled() {
-        let split = &config.global_split_tunnel;
-        let (v4, v6) = split_tunnel::routes_for_checked(split.mode, &split.cidrs, &split.domains)?;
-        args.extend(
-            split_tunnel::set_args(uuid, split.mode, &v4, &v6)
-                .into_iter()
-                .skip(3),
-        );
+    let split = &config.global_split_tunnel;
+    let (v4, v6) =
+        split_tunnel::routes_for_checked_with(split.mode, &split.cidrs, &split.domains, resolve)?;
+    args.extend(
+        split_tunnel::set_args(uuid, split.mode, &v4, &v6)
+            .into_iter()
+            .skip(3),
+    );
+    if config.kill_switch_enabled {
+        let v4_method = run(&["-g", "ipv4.method", "connection", "show", uuid])?;
+        let has_ipv4 = !matches!(v4_method.trim(), "" | "--" | "disabled" | "ignore");
+        let peers = run(&[
+            "--escape",
+            "no",
+            "-g",
+            "wireguard.peers",
+            "connection",
+            "show",
+            uuid,
+        ])?;
+        kill_switch::validate_protection(config, has_ipv4, has_ipv6, &peers)?;
+        args.extend(dns_host_route_args(&checked_tunnel_dns(uuid, run)?));
+        for (family, supported) in [("ipv4", has_ipv4), ("ipv6", has_ipv6)] {
+            if supported {
+                args.extend([format!("+{family}.dns-search"), "~.".into()]);
+                args.extend([format!("{family}.may-fail"), "no".into()]);
+            }
+        }
+    } else {
+        args.extend(["-ipv4.dns-search".into(), "~.".into()]);
+        args.extend(["-ipv6.dns-search".into(), "~.".into()]);
     }
     run(&args.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|error| {
         AppError::Config(format!(
-            "could not apply routing/DNS policy to {uuid}; activation refused: {error}"
+            "could not apply routing/DNS policy to {uuid}; activation refused \
+             (NetworkManager 1.52+ with ipv4/ipv6.routed-dns support is required): {error}"
         ))
     })?;
+    // A newer nmcli can talk to an older daemon. Do not trust a successful write
+    // until the daemon reports the selected DNS backend was actually saved.
+    for property in ["ipv4.routed-dns", "ipv6.routed-dns"] {
+        let value = run(&["-g", property, "connection", "show", uuid]).map_err(|error| {
+            AppError::Config(format!(
+                "activation refused: cannot verify {property}: {error}"
+            ))
+        })?;
+        let retained = if config.kill_switch_enabled {
+            matches!(value.trim(), "0" | "no" | "0 (no)")
+        } else {
+            matches!(value.trim(), "1" | "yes" | "1 (yes)")
+        };
+        if !retained {
+            let expected = if config.kill_switch_enabled {
+                "no"
+            } else {
+                "yes"
+            };
+            return Err(AppError::Config(format!(
+                "activation refused: NetworkManager did not retain {property}={expected}; \
+                 NetworkManager daemon and nmcli 1.52+ are required for DNS protection"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn profile_dns_protected(
+    uuid: &str,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<bool> {
+    for property in ["ipv4.dns-priority", "ipv6.dns-priority"] {
+        if run(&["-g", property, "connection", "show", uuid])?.trim() == "-1500" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn checked_tunnel_dns(
+    uuid: &str,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<Vec<std::net::IpAddr>> {
+    let peers = run(&[
+        "--escape",
+        "no",
+        "-g",
+        "wireguard.peers",
+        "connection",
+        "show",
+        uuid,
+    ])?;
+    let allowed = kill_switch::allowed_networks(&peers);
+    let mut servers = Vec::new();
+    for family in ["ipv4", "ipv6"] {
+        let method = run(&[
+            "-g",
+            &format!("{family}.method"),
+            "connection",
+            "show",
+            uuid,
+        ])?;
+        let supported = !matches!(method.trim(), "" | "--" | "disabled" | "ignore");
+        let dns = run(&[
+            "--escape",
+            "no",
+            "-g",
+            &format!("{family}.dns"),
+            "connection",
+            "show",
+            uuid,
+        ])?;
+        for server in dns
+            .split([',', ' ', '\n'])
+            .filter(|s| !s.is_empty() && *s != "--")
+        {
+            let ip = server.parse::<std::net::IpAddr>().map_err(|_| {
+                AppError::Config(format!(
+                    "activation refused: cannot validate tunnel DNS address {server}"
+                ))
+            })?;
+            if !supported
+                || ip.is_ipv4() != (family == "ipv4")
+                || !split_tunnel::address_in_routes(&allowed, ip)
+            {
+                return Err(AppError::Config(format!(
+                    "activation refused: DNS server {server} is not covered by tunnel peer AllowedIPs"
+                )));
+            }
+            if !servers.contains(&ip) {
+                servers.push(ip);
+            }
+        }
+    }
+    if servers.is_empty() {
+        return Err(AppError::Config(
+            "activation refused: kill protection requires explicit tunnel DNS servers".into(),
+        ));
+    }
+    Ok(servers)
+}
+
+pub(crate) fn dns_host_route_args(servers: &[std::net::IpAddr]) -> Vec<String> {
+    let mut args: Vec<String> = servers
+        .iter()
+        .flat_map(|ip| {
+            let (family, prefix) = if ip.is_ipv4() {
+                ("ipv4", 32)
+            } else {
+                ("ipv6", 128)
+            };
+            // Explicit main-table host routes also work when routed-dns cannot derive
+            // a gateway from the split complement or a global route-table override.
+            [
+                format!("+{family}.routes"),
+                format!(
+                    "{ip}/{prefix} {} 5 table=254",
+                    if ip.is_ipv4() { "0.0.0.0" } else { "::" }
+                ),
+            ]
+        })
+        .collect();
+    // NM 1.56's automatic DNS route processing removes IPv6 host routes during
+    // device reapply. Use only the explicit NM-managed routes for protection.
+    args.extend([
+        "ipv4.routed-dns".into(),
+        "no".into(),
+        "ipv6.routed-dns".into(),
+        "no".into(),
+    ]);
+    args
+}
+
+fn reapply_routes_with(
+    uuid: &str,
+    interface: &str,
+    servers: &[std::net::IpAddr],
+    run_nm: &mut impl FnMut(&[&str]) -> AppResult<String>,
+    run_ip: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<()> {
+    if let Err(error) = run_nm(&["device", "reapply", interface]) {
+        // Even a timeout can leave partially applied routes on a live device.
+        return Err(if servers.is_empty() {
+            error
+        } else {
+            disconnect_policy_error(uuid, error, run_nm)
+        });
+    }
+    verify_dns_or_disconnect(uuid, interface, servers, run_nm, run_ip)
+}
+
+fn disconnect_policy_error(
+    uuid: &str,
+    error: AppError,
+    run_nm: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppError {
+    let teardown = run_nm(&["connection", "down", uuid]);
+    AppError::Config(format!(
+        "DNS protection verification failed: {error}; tunnel teardown: {}",
+        match teardown {
+            Ok(_) => "disconnected".into(),
+            Err(error) => error.to_string(),
+        }
+    ))
+}
+
+fn verify_dns_or_disconnect(
+    uuid: &str,
+    interface: &str,
+    servers: &[std::net::IpAddr],
+    run_nm: &mut impl FnMut(&[&str]) -> AppResult<String>,
+    run_ip: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<()> {
+    let result = servers.iter().try_for_each(|ip| {
+        for protocol in ["udp", "tcp"] {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let output = run_ip(&[
+                    if ip.is_ipv4() { "-4" } else { "-6" }, "-j", "route", "get",
+                    &ip.to_string(), "ipproto", protocol, "dport", "53",
+                ])?;
+                let routes: Vec<serde_json::Value> = serde_json::from_str(&output)?;
+                if routes.len() == 1 && routes[0]["dev"].as_str() == Some(interface) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(AppError::Config(format!(
+                        "DNS protection failed: {protocol} resolver {ip} is not routed via {interface}; \
+                         activation refused; kernel route: {output}"
+                    )));
+                }
+                // device reapply acknowledges before the asynchronous IPv6 commit.
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        return Err(disconnect_policy_error(uuid, error, run_nm));
+    }
     Ok(())
 }
 
@@ -1144,6 +1426,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protected_reapply_failure_disconnects_and_reports_both_errors() {
+        let servers = ["198.18.40.1".parse().unwrap()];
+        for failure in ["reapply rejected", "reapply timed out"] {
+            for teardown_fails in [false, true] {
+                let mut calls = Vec::new();
+                let error = reapply_routes_with(
+                    "uuid",
+                    "wg-test",
+                    &servers,
+                    &mut |args| {
+                        calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                        match args {
+                            ["device", "reapply", "wg-test"] => {
+                                Err(AppError::CommandFailed(failure.into()))
+                            }
+                            ["connection", "down", "uuid"] if teardown_fails => {
+                                Err(AppError::CommandFailed("disconnect denied".into()))
+                            }
+                            ["connection", "down", "uuid"] => Ok(String::new()),
+                            _ => panic!("unexpected command: {args:?}"),
+                        }
+                    },
+                    &mut |_| panic!("failed reapply must disconnect before route probes"),
+                )
+                .unwrap_err()
+                .to_string();
+                assert_eq!(
+                    calls,
+                    [
+                        vec!["device", "reapply", "wg-test"],
+                        vec!["connection", "down", "uuid"]
+                    ]
+                );
+                assert!(error.contains(failure), "{error}");
+                assert!(
+                    error.contains(if teardown_fails {
+                        "disconnect denied"
+                    } else {
+                        "disconnected"
+                    }),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dns_verification_checks_both_transports_and_disconnects_on_probe_failure() {
+        let servers = [
+            "198.18.40.1".parse().unwrap(),
+            "fd00:40::1".parse().unwrap(),
+        ];
+        let mut probes = Vec::new();
+        verify_dns_or_disconnect(
+            "uuid",
+            "wg-test",
+            &servers,
+            &mut |_| panic!("valid routes must not disconnect"),
+            &mut |args| {
+                probes.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                Ok(r#"[{"dev":"wg-test"}]"#.into())
+            },
+        )
+        .unwrap();
+        assert_eq!(probes.len(), 4);
+        assert_eq!(
+            probes[0],
+            [
+                "-4",
+                "-j",
+                "route",
+                "get",
+                "198.18.40.1",
+                "ipproto",
+                "udp",
+                "dport",
+                "53"
+            ]
+        );
+        assert_eq!(
+            probes[3],
+            [
+                "-6",
+                "-j",
+                "route",
+                "get",
+                "fd00:40::1",
+                "ipproto",
+                "tcp",
+                "dport",
+                "53"
+            ]
+        );
+        let mut disconnected = false;
+        let error = verify_dns_or_disconnect(
+            "uuid",
+            "wg-test",
+            &servers,
+            &mut |args| {
+                assert_eq!(args, ["connection", "down", "uuid"]);
+                disconnected = true;
+                Ok(String::new())
+            },
+            &mut |_| Err(AppError::CommandFailed("ip probe failed".into())),
+        )
+        .unwrap_err();
+        assert!(disconnected);
+        assert!(
+            error
+                .to_string()
+                .contains("DNS protection verification failed")
+        );
+    }
+
+    #[test]
     fn failed_teardown_requires_positive_inactive_confirmation() {
         let failure = || Err(AppError::CommandFailed("down denied".into()));
         assert!(confirm_teardown(failure(), || Ok(false)).is_ok());
@@ -1247,6 +1644,41 @@ mod tests {
             let mut activated = false;
             activate_with("uuid-1", &path, &mut |args| match args {
                 ["-g", "ipv6.method", "connection", "show", "uuid-1"] => Ok("auto".into()),
+                ["-g", "ipv4.method", "connection", "show", "uuid-1"] => Ok("manual".into()),
+                [
+                    "--escape",
+                    "no",
+                    "-g",
+                    "wireguard.peers",
+                    "connection",
+                    "show",
+                    "uuid-1",
+                ] => Ok("KEY allowed-ips=0.0.0.0/0;::/0".into()),
+                [
+                    "--escape",
+                    "no",
+                    "-g",
+                    "ipv4.dns",
+                    "connection",
+                    "show",
+                    "uuid-1",
+                ] => Ok("10.0.0.1".into()),
+                [
+                    "--escape",
+                    "no",
+                    "-g",
+                    "ipv6.dns",
+                    "connection",
+                    "show",
+                    "uuid-1",
+                ] => Ok(String::new()),
+                [
+                    "-g",
+                    "ipv4.routed-dns" | "ipv6.routed-dns",
+                    "connection",
+                    "show",
+                    "uuid-1",
+                ] => Ok("0".into()),
                 ["connection", "modify", "uuid-1", settings @ ..] => {
                     for pair in [
                         ["connection.autoconnect", "no"],
@@ -1279,6 +1711,82 @@ mod tests {
             assert!(activated);
         }
         crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn activation_refuses_missing_dns_routing_support_before_up() {
+        let path = crate::testing::temp_toml_config_path("dns-support");
+        crate::config::save(&path, &crate::config::AppConfig::default()).unwrap();
+        for unsupported_readback in [false, true] {
+            let mut up = false;
+            let error = activate_with("uuid", &path, &mut |args| match args {
+                ["-g", "ipv6.method", "connection", "show", "uuid"] => Ok("manual".into()),
+                ["connection", "modify", "uuid", ..] if !unsupported_readback => Err(
+                    AppError::CommandFailed("unknown property routed-dns".into()),
+                ),
+                ["connection", "modify", "uuid", ..] => Ok(String::new()),
+                ["-g", "ipv4.routed-dns", "connection", "show", "uuid"] => {
+                    Ok("-1 (default)".into())
+                }
+                ["connection", "up", "uuid"] => {
+                    up = true;
+                    Ok(String::new())
+                }
+                _ => panic!("unexpected NM command {args:?}"),
+            })
+            .unwrap_err();
+            assert!(!up);
+            assert!(error.to_string().contains("activation refused"));
+        }
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn protected_partial_tunnel_refuses_dns_outside_peer_allowed_ips() {
+        let config = crate::config::AppConfig {
+            kill_switch_enabled: true,
+            global_split_tunnel: crate::config::SplitTunnelConfig {
+                mode: crate::config::SplitTunnelMode::Include,
+                cidrs: vec!["10.0.0.0/8".into()],
+                domains: vec![],
+            },
+            ..Default::default()
+        };
+        let error = prepare_profile_with(
+            "uuid",
+            &config,
+            &mut |args| match args {
+                [
+                    "-g",
+                    "ipv4.method" | "ipv6.method",
+                    "connection",
+                    "show",
+                    "uuid",
+                ] => Ok("manual".into()),
+                [
+                    "--escape",
+                    "no",
+                    "-g",
+                    "wireguard.peers",
+                    "connection",
+                    "show",
+                    "uuid",
+                ] => Ok("KEY allowed-ips=10.0.0.0/8;::/0".into()),
+                [
+                    "--escape",
+                    "no",
+                    "-g",
+                    "ipv4.dns",
+                    "connection",
+                    "show",
+                    "uuid",
+                ] => Ok("192.0.2.53".into()),
+                _ => panic!("DNS validation must precede modification: {args:?}"),
+            },
+            |_| panic!("no domain resolution expected"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("DNS server 192.0.2.53"));
     }
 
     fn profile(name: &str, uuid: &str) -> WireguardProfile {

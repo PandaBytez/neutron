@@ -15,9 +15,9 @@
 //! turning the kill switch off silently stopped the VPN routing anything: the
 //! profile connected, the UI reported "Connected", and traffic kept leaving over
 //! the physical interface with the real IP exposed. Routing is therefore not
-//! optional, and what this toggle actually controls is DNS: a negative priority
-//! gives the tunnel's resolvers exclusive use, so queries cannot leak to another
-//! connection's DNS servers.
+//! optional. This toggle selects exclusive DNS, routes resolvers via the tunnel,
+//! and refuses activation without both protected IP families unless lockdown
+//! blocks the unsupported traffic. Explicit split bypasses remain intentional.
 //!
 //! The kill switch is a *global* setting: the application applies these
 //! properties to every WireGuard profile at once (see
@@ -66,12 +66,73 @@ pub fn set_args(uuid: &str, enable: bool, has_ipv6: bool) -> Vec<String> {
         dns_priority.to_string(),
         "ipv6.dns-priority".to_string(),
         v6_priority.to_string(),
+        // DNS transport must stay on the tunnel even when its address is excluded.
+        "ipv4.routed-dns".to_string(),
+        "yes".to_string(),
+        "ipv6.routed-dns".to_string(),
+        "yes".to_string(),
     ]
+}
+
+/// Refuse claiming dual-family protection without a usable tunnel for both.
+/// Lockdown may instead block unsupported families; split bypasses are intentional.
+pub(crate) fn validate_protection(
+    config: &crate::config::AppConfig,
+    has_ipv4: bool,
+    has_ipv6: bool,
+    peers: &str,
+) -> crate::error::AppResult<()> {
+    if !config.kill_switch_enabled || config.lockdown_enabled {
+        return Ok(());
+    }
+    let allowed = allowed_networks(peers);
+    if !has_ipv4 || !has_ipv6 {
+        return Err(crate::error::AppError::Config(
+            "activation refused: kill switch cannot protect an unsupported IP family; \
+             use a dual-stack tunnel or enable lockdown to block cleartext IPv4/IPv6"
+                .into(),
+        ));
+    }
+    if !config.global_split_tunnel.mode.is_enabled()
+        && (!allowed.contains(&"0.0.0.0/0".to_string()) || !allowed.contains(&"::/0".to_string()))
+    {
+        return Err(crate::error::AppError::Config(
+            "activation refused: full-tunnel kill protection requires peer AllowedIPs \
+             0.0.0.0/0 and ::/0; enable lockdown for a partial tunnel"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn allowed_networks(peers: &str) -> Vec<String> {
+    peers
+        .split("allowed-ips")
+        .skip(1)
+        .flat_map(|part| {
+            part.trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+                .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+                .filter(|token| !token.is_empty())
+                .map(crate::nm::split_tunnel::parse_and_normalize_cidr)
+                .map_while(Result::ok)
+                .map(|(cidr, _)| cidr)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_defaults_are_read_with_spacing_and_both_address_families() {
+        for peers in [
+            "KEY allowed-ips=0.0.0.0/0;::/0 endpoint=192.0.2.1:51820",
+            "KEY allowed-ips = 0.0.0.0/0, ::/0 persistent-keepalive = 25",
+        ] {
+            assert_eq!(allowed_networks(peers), ["0.0.0.0/0", "::/0"]);
+        }
+    }
 
     #[test]
     fn enable_args_target_the_uuid_and_force_routing_on() {

@@ -34,6 +34,18 @@ fn apply_and_persist_global_split_tunnel_with<C: NmPolicy>(
     st_cfg: &SplitTunnelConfig,
     resolve: impl FnMut(&str) -> Vec<std::net::IpAddr>,
 ) -> AppResult<()> {
+    config::coordinate_policy(path, || {
+        apply_and_persist_uncoordinated(client, path, st_cfg, resolve)
+    })
+}
+
+// Call only while holding coordinate_policy: it is not a reentrant lock.
+fn apply_and_persist_uncoordinated<C: NmPolicy>(
+    client: &C,
+    path: &Path,
+    st_cfg: &SplitTunnelConfig,
+    resolve: impl FnMut(&str) -> Vec<std::net::IpAddr>,
+) -> AppResult<()> {
     let (v4_routes, v6_routes) = nm::split_tunnel::routes_for_checked_with(
         st_cfg.mode,
         &st_cfg.cidrs,
@@ -41,12 +53,19 @@ fn apply_and_persist_global_split_tunnel_with<C: NmPolicy>(
         resolve,
     )?;
 
-    crate::app::apply_and_save_policy(
-        path,
-        crate::error::Policy::SplitTunnel,
-        || client.apply_split_tunnel_all(st_cfg.mode, &v4_routes, &v6_routes),
-        |cfg| cfg.global_split_tunnel = st_cfg.clone(),
-    )
+    let policy = crate::error::Policy::SplitTunnel;
+    client
+        .apply_split_tunnel_all(st_cfg.mode, &v4_routes, &v6_routes)
+        .map_err(|source| {
+            super::policy_apply_error(
+                policy,
+                source,
+                "application failed and may be partial; effective state is unknown",
+            )
+        })?;
+    config::update(path, |cfg| cfg.global_split_tunnel = st_cfg.clone())
+        .map(|_| ())
+        .map_err(|source| super::policy_save_error(policy, source))
 }
 
 /// Re-resolve split-tunnel domains and reapply routing rules to NetworkManager if
@@ -76,16 +95,38 @@ pub fn apply_split_config<C: NmPolicy>(
     path: &Path,
     st_cfg: &SplitTunnelConfig,
 ) -> AppResult<()> {
-    if st_cfg.mode.is_enabled() {
-        return apply_and_persist_global_split_tunnel(client, path, st_cfg);
-    }
-    // ponytail: load-then-decide can race a concurrent writer; the sweep
-    // itself runs under coordinate_policy, so worst case is one redundant sweep.
-    let mode_changed = config::load(path)
-        .map(|c| c.global_split_tunnel.mode != st_cfg.mode)
-        .unwrap_or(true);
-    if mode_changed {
-        apply_and_persist_global_split_tunnel(client, path, st_cfg)
+    config::coordinate_policy(path, || {
+        let original = config::load(path)?.global_split_tunnel;
+        apply_split_config_uncoordinated(client, path, &original, st_cfg)
+    })
+}
+
+/// Replace an editor snapshot only if its captured original is still current.
+/// On conflict the caller must reload, not retry the stale whole configuration.
+pub fn apply_split_config_if_unchanged<C: NmPolicy>(
+    client: &C,
+    path: &Path,
+    original: &SplitTunnelConfig,
+    st_cfg: &SplitTunnelConfig,
+) -> AppResult<()> {
+    config::coordinate_policy(path, || {
+        if config::load(path)?.global_split_tunnel != *original {
+            return Err(AppError::Config(
+                "split-tunnel settings changed in another writer; reload before saving".into(),
+            ));
+        }
+        apply_split_config_uncoordinated(client, path, original, st_cfg)
+    })
+}
+
+fn apply_split_config_uncoordinated<C: NmPolicy>(
+    client: &C,
+    path: &Path,
+    original: &SplitTunnelConfig,
+    st_cfg: &SplitTunnelConfig,
+) -> AppResult<()> {
+    if st_cfg.mode.is_enabled() || original.mode != st_cfg.mode {
+        apply_and_persist_uncoordinated(client, path, st_cfg, nm::split_tunnel::resolve_domain_ips)
     } else {
         config::update(path, |c| c.global_split_tunnel = st_cfg.clone()).map(|_| ())
     }
@@ -102,12 +143,15 @@ where
     C: NmPolicy,
     F: FnOnce(&mut SplitTunnelConfig) -> AppResult<bool>,
 {
-    let mut st_cfg = config::load(path)?.global_split_tunnel;
-    let changed = edit(&mut st_cfg)?;
-    if changed {
-        apply_split_config(client, path, &st_cfg)?;
-    }
-    Ok((st_cfg, changed))
+    config::coordinate_policy(path, || {
+        let original = config::load(path)?.global_split_tunnel;
+        let mut st_cfg = original.clone();
+        let changed = edit(&mut st_cfg)?;
+        if changed {
+            apply_split_config_uncoordinated(client, path, &original, &st_cfg)?;
+        }
+        Ok((st_cfg, changed))
+    })
 }
 
 /// Set global split tunnel mode.
@@ -116,10 +160,11 @@ pub fn set_global_mode<C: NmPolicy>(
     path: &Path,
     mode: SplitTunnelMode,
 ) -> AppResult<SplitTunnelConfig> {
-    let mut st_cfg = config::load(path)?.global_split_tunnel;
-    st_cfg.mode = mode;
-    apply_split_config(client, path, &st_cfg)?;
-    Ok(st_cfg)
+    mutate_global(client, path, |st_cfg| {
+        st_cfg.mode = mode;
+        Ok(true)
+    })
+    .map(|(st_cfg, _)| st_cfg)
 }
 
 /// Add a CIDR or IP to the global split tunnel config.
@@ -198,7 +243,7 @@ pub fn remove_global_domain<C: NmPolicy>(
 
 /// Clear all global split tunneling rules and restore default full-tunneling.
 pub fn clear_global<C: NmPolicy>(client: &C, path: &Path) -> AppResult<()> {
-    apply_split_config(client, path, &SplitTunnelConfig::default())
+    apply_and_persist_global_split_tunnel(client, path, &SplitTunnelConfig::default())
 }
 
 /// Format the global split tunnel status for display in the CLI.
@@ -431,6 +476,47 @@ mod tests {
             "editing disabled split list must not call apply_split_tunnel_all"
         );
 
+        testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn clear_reconciles_disabled_intent_and_stale_editor_is_rejected() {
+        let path = testing::temp_config_path("st-clear-stale");
+        let client = MockNmClient::new(vec![test_profile()]);
+        let original = SplitTunnelConfig::default();
+        config::save(&path, &AppConfig::default()).unwrap();
+        clear_global(&client, &path).unwrap();
+        assert_eq!(client.split_tunnel_calls().len(), 1);
+        assert_eq!(
+            client.setting("uuid-st-1", "ipv4.never-default").as_deref(),
+            Some("no")
+        );
+        add_global_cidr(&client, &path, "10.0.0.0/8").unwrap();
+        assert!(apply_split_config_if_unchanged(&client, &path, &original, &original).is_err());
+        assert_eq!(
+            config::load(&path).unwrap().global_split_tunnel.cidrs,
+            ["10.0.0.0/8"]
+        );
+        testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn concurrent_disabled_list_edits_preserve_every_writer() {
+        let path = testing::temp_config_path("st-atomic-edit");
+        let client = MockNmClient::new(vec![test_profile()]);
+        config::save(&path, &AppConfig::default()).unwrap();
+        std::thread::scope(|scope| {
+            for i in 1..9 {
+                let (client, path) = (&client, &path);
+                scope
+                    .spawn(move || add_global_cidr(client, path, &format!("192.0.2.{i}")).unwrap());
+            }
+        });
+        assert_eq!(
+            config::load(&path).unwrap().global_split_tunnel.cidrs.len(),
+            8
+        );
+        assert!(client.split_tunnel_calls().is_empty());
         testing::remove_temp_config(&path);
     }
 }

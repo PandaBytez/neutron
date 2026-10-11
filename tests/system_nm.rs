@@ -59,7 +59,139 @@ impl Fixture {
             .args(["-g", key, "connection", "show", &self.uuid])
             .output()
             .expect("nmcli should run");
+        assert!(
+            output.status.success(),
+            "nmcli rejected {key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn protected_activation_refuses_ipv4_only_and_partial_dual_stack_profiles() {
+    require_sandbox();
+    let path = neutron::config::default_config_path().unwrap();
+    let original = neutron::config::load(&path).unwrap();
+    struct Restore(PathBuf, neutron::config::AppConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = neutron::config::save(&self.0, &self.1);
+        }
+    }
+    let _restore = Restore(path.clone(), original);
+    neutron::config::save(&path, &neutron::config::AppConfig::default()).unwrap();
+    let v4 = Fixture::import_config(
+        "v4refuse",
+        &sample_wireguard_config("10.253.38.2/32", "10.253.38.1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    let partial = Fixture::import_config(
+        "partial",
+        &sample_wireguard_config("10.253.39.2/32, fd00:39::2/128", "10.253.39.1")
+            .replace("0.0.0.0/0, ::/0", "10.253.39.0/24, ::/0")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    neutron::config::update(&path, |cfg| cfg.kill_switch_enabled = true).unwrap();
+    for (fixture, warning) in [(&v4, "unsupported IP family"), (&partial, "AllowedIPs")] {
+        let error = CliNmClient.connect(&fixture.uuid).unwrap_err().to_string();
+        assert!(error.contains(warning), "{error}");
+        assert!(
+            CliNmClient
+                .list_wireguard_profiles()
+                .unwrap()
+                .iter()
+                .any(|p| p.uuid == fixture.uuid && !p.is_active())
+        );
+    }
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn protected_activation_routes_excluded_dns_via_the_tunnel_in_both_families() {
+    require_sandbox();
+    let path = neutron::config::default_config_path().unwrap();
+    let original = neutron::config::load(&path).unwrap();
+    struct Restore(PathBuf, neutron::config::AppConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = neutron::config::save(&self.0, &self.1);
+        }
+    }
+    let _restore = Restore(path.clone(), original);
+    neutron::config::save(&path, &neutron::config::AppConfig::default()).unwrap();
+    let fixture = Fixture::import_config(
+        "dnsroute",
+        &sample_wireguard_config("10.253.40.2/32, fd00:40::2/128", "198.18.40.1, fd00:40::1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    // Out-of-band stale split state must not survive a Disabled activation.
+    let stale = neutron::nm::split_tunnel::set_args(
+        &fixture.uuid,
+        SplitTunnelMode::Include,
+        &["198.19.0.0/16".into()],
+        &[],
+    );
+    assert!(
+        std::process::Command::new("nmcli")
+            .args(stale)
+            .status()
+            .unwrap()
+            .success()
+    );
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    assert_eq!(fixture.get("ipv4.never-default"), "no");
+    assert_eq!(fixture.get("ipv4.routes"), "");
+    assert!(
+        std::process::Command::new("nmcli")
+            .args(["connection", "down", &fixture.uuid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    neutron::config::update(&path, |cfg| {
+        cfg.kill_switch_enabled = true;
+        cfg.global_split_tunnel.mode = SplitTunnelMode::Exclude;
+        cfg.global_split_tunnel.cidrs = vec!["198.18.40.0/24".into(), "fd00:40::/64".into()];
+    })
+    .unwrap();
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    let assert_dns_routes = || {
+        for (family, dns) in [("-4", "198.18.40.1"), ("-6", "fd00:40::1")] {
+            for protocol in ["udp", "tcp"] {
+                let output = std::process::Command::new("ip")
+                    .args([
+                        family, "route", "get", dns, "ipproto", protocol, "dport", "53",
+                    ])
+                    .output()
+                    .unwrap();
+                let route = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    route.contains(&format!("dev {}", fixture.name)),
+                    "DNS escaped tunnel: {route}"
+                );
+            }
+        }
+    };
+    assert_dns_routes();
+    // Refresh must merge the DNS exceptions back after replacing split routes.
+    neutron::config::update(&path, |cfg| {
+        cfg.global_split_tunnel.domains = vec!["198.18.41.1".into()];
+    })
+    .unwrap();
+    neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
+    assert_dns_routes();
+    for property in ["ipv4.routed-dns", "ipv6.routed-dns"] {
+        assert!(matches!(
+            fixture.get(property).as_str(),
+            "0" | "no" | "0 (no)"
+        ));
     }
 }
 
@@ -210,7 +342,23 @@ fn activation_prepares_connected_lockdown_before_first_traffic() {
     let config = sample_wireguard_config("10.253.37.2/32", "10.253.37.1")
         .replace("0.0.0.0/0, ::/0", "198.19.0.0/16")
         .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0");
-    let fixture = Fixture::import_config("locked", &config);
+    let mut fixture = Fixture::import_config("locked", &config);
+    let interface = fixture.name.replacen("ns", "wg", 1);
+    assert!(interface.len() <= 15);
+    assert!(
+        std::process::Command::new("nmcli")
+            .args([
+                "connection",
+                "modify",
+                &fixture.uuid,
+                "connection.interface-name",
+                &interface
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fixture.name = interface;
     // Install the actual application as the refresh helper, not this test binary.
     assert!(
         std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))

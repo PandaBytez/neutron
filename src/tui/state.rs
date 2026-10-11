@@ -513,7 +513,7 @@ pub struct TuiState {
     pub toast: Option<Toast>,
     pub connecting: Option<ConnectingState>,
     pub connect_tx: Option<std::sync::mpsc::Sender<(String, String, bool)>>,
-    pub split_tunnel_tx: Option<std::sync::mpsc::Sender<SplitTunnelConfig>>,
+    pub split_tunnel_tx: Option<std::sync::mpsc::Sender<(SplitTunnelConfig, SplitTunnelConfig)>>,
     pub pending_split: Option<SplitTunnelConfig>,
     pub profile_refresh_requested: bool,
     pub action_tx: Option<std::sync::mpsc::Sender<AsyncAction>>,
@@ -600,19 +600,38 @@ impl TuiState {
         client: &C,
         new_cfg: SplitTunnelConfig,
     ) -> crate::error::AppResult<()> {
-        self.config.global_split_tunnel = new_cfg.clone();
-        if let Some(ref tx) = self.split_tunnel_tx {
-            tx.send(new_cfg.clone()).map_err(|_| {
-                crate::error::AppError::Config("split policy worker stopped".into())
-            })?;
-            self.pending_split = Some(new_cfg);
-            Ok(())
+        let original = std::mem::replace(&mut self.config.global_split_tunnel, new_cfg.clone());
+        let result = if let Some(ref tx) = self.split_tunnel_tx {
+            tx.send((original, new_cfg.clone()))
+                .map_err(|_| crate::error::AppError::Config("split policy worker stopped".into()))
         } else {
-            crate::app::split_tunnel::apply_split_config(client, &self.config_path, &new_cfg)?;
+            crate::app::split_tunnel::apply_split_config_if_unchanged(
+                client,
+                &self.config_path,
+                &original,
+                &new_cfg,
+            )
+        };
+        if let Err(error) = &result {
+            self.pending_split = None;
+            self.set_error(error);
+            self.reload_split_tunnel();
+        } else if self.split_tunnel_tx.is_some() {
+            self.pending_split = Some(new_cfg);
+        } else {
             self.uncertain_policies
                 .remove(&crate::error::Policy::SplitTunnel);
             self.set_status("Split tunneling saved; reconnect to apply routing changes.");
-            Ok(())
+        }
+        result
+    }
+
+    fn reload_split_tunnel(&mut self) {
+        if let Ok(saved) = crate::config::load(&self.config_path) {
+            self.config.global_split_tunnel = saved.global_split_tunnel;
+        }
+        if let ActiveModal::SplitTunnel(ref mut modal) = self.modal {
+            *modal = SplitTunnelModalState::from_config(&self.config.global_split_tunnel);
         }
     }
 
@@ -642,9 +661,8 @@ impl TuiState {
             }
             Err(error) => {
                 self.set_error(&error);
-                if let Ok(saved) = crate::config::load(&self.config_path) {
-                    self.config.global_split_tunnel = saved.global_split_tunnel;
-                }
+                self.reload_split_tunnel();
+                return;
             }
         }
         if let ActiveModal::SplitTunnel(ref mut modal) = self.modal {
@@ -670,7 +688,7 @@ impl TuiState {
 
     /// Report a completed action in a toast notification.
     pub fn set_status(&mut self, message: impl Into<String>) {
-        let msg = message.into();
+        let msg = crate::process::terminal_safe(&message.into());
         self.status_message = msg.clone();
         self.status_is_error = false;
         self.toast = Some(Toast {
@@ -713,7 +731,7 @@ impl TuiState {
         if let crate::error::AppError::PolicyUpdate { policy, .. } = error {
             self.uncertain_policies.insert(*policy);
         }
-        let msg = error.to_string();
+        let msg = crate::process::terminal_safe(&error.to_string());
         self.status_message = msg.clone();
         self.status_is_error = true;
         self.toast = Some(Toast {

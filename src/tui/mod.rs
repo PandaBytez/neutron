@@ -154,8 +154,10 @@ where
         }
     });
 
-    let (split_tunnel_tx, split_tunnel_rx) =
-        std::sync::mpsc::channel::<crate::config::SplitTunnelConfig>();
+    let (split_tunnel_tx, split_tunnel_rx) = std::sync::mpsc::channel::<(
+        crate::config::SplitTunnelConfig,
+        crate::config::SplitTunnelConfig,
+    )>();
     let (st_res_tx, st_res_rx) =
         std::sync::mpsc::channel::<(crate::config::SplitTunnelConfig, AppResult<()>)>();
     state.split_tunnel_tx = Some(split_tunnel_tx);
@@ -163,14 +165,12 @@ where
     let client_for_st = client.clone();
     let config_path_for_st = state.config_path.clone();
     thread::spawn(move || {
-        while let Ok(mut cfg) = split_tunnel_rx.recv() {
-            // Coalesce rapid updates: drain to the latest config
-            while let Ok(newer_cfg) = split_tunnel_rx.try_recv() {
-                cfg = newer_cfg;
-            }
-            let res = crate::app::split_tunnel::apply_split_config(
+        // Keep every predecessor: dropping an intermediate edit breaks snapshot checks.
+        while let Ok((original, cfg)) = split_tunnel_rx.recv() {
+            let res = crate::app::split_tunnel::apply_split_config_if_unchanged(
                 &client_for_st,
                 &config_path_for_st,
+                &original,
                 &cfg,
             );
             let _ = st_res_tx.send((cfg, res));
@@ -260,7 +260,7 @@ fn run_event_loop<C, B>(
 ) -> AppResult<()>
 where
     C: NmClient + FirewallClient + Clone + Send + Sync + 'static,
-    B: ratatui::backend::Backend,
+    B: ratatui::backend::Backend<Error = std::io::Error>,
 {
     let mut last_seen_event = 0_u64;
     let mut needs_profile_refresh = initial_refresh_needed;
