@@ -16,6 +16,7 @@ use crate::config;
 use crate::error::{AppError, AppResult};
 use crate::firewall::FirewallClient;
 use crate::nm::NmClient;
+use crate::process::terminal_safe;
 use crate::service;
 
 /// `neutron reset`: factory reset, back to a first-run state.
@@ -93,7 +94,7 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
             "were not installed"
         }
     );
-    println!("  settings: {}", path.display());
+    println!("  settings: {}", terminal_safe(&path.display().to_string()));
     report_drop_dir(path.parent(), &config::resolve_profiles_dir(&before));
     if still_running > 0 {
         println!("  {still_running} daemon(s) did not exit; close them before logging in again.");
@@ -114,8 +115,9 @@ fn load_for_teardown(path: &std::path::Path) -> (config::AppConfig, bool) {
         Ok(cfg) => (cfg, true),
         Err(error) => {
             println!(
-                "Settings at {} could not be read ({error}); continuing from evidence on disk.",
-                path.display()
+                "Settings at {} could not be read ({}); continuing from evidence on disk.",
+                terminal_safe(&path.display().to_string()),
+                terminal_safe(&error.to_string())
             );
             (config::AppConfig::default(), false)
         }
@@ -157,7 +159,7 @@ fn report_drop_dir(config_root: Option<&std::path::Path>, drop_dir: &std::path::
     if !inside {
         println!(
             "Profile drop directory left in place: {}",
-            drop_dir.display()
+            terminal_safe(&drop_dir.display().to_string())
         );
     }
 }
@@ -282,7 +284,10 @@ fn remove_app_settings(
         return Ok(None);
     };
     if !purge {
-        println!("Settings kept at {}", parent.display());
+        println!(
+            "Settings kept at {}",
+            terminal_safe(&parent.display().to_string())
+        );
         return Ok(None);
     }
     // An absent or unreadable config records no drop directory, so there is
@@ -302,7 +307,7 @@ fn remove_app_settings(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    println!("Removed {}", parent.display());
+    println!("Removed {}", terminal_safe(&parent.display().to_string()));
     Ok((!profiles.as_os_str().is_empty() && !profiles.starts_with(parent)).then_some(profiles))
 }
 
@@ -319,8 +324,8 @@ fn report_manual_unit(config_root: Option<&std::path::Path>) {
         println!(
             "systemd user unit left in place: {}\n  \
              systemctl --user disable --now {UNIT} && rm {}",
-            unit.display(),
-            unit.display()
+            terminal_safe(&unit.display().to_string()),
+            terminal_safe(&unit.display().to_string())
         );
     }
 }

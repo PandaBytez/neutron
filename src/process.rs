@@ -12,6 +12,22 @@ use std::time::{Duration, Instant};
 
 use crate::error::{AppError, AppResult};
 
+/// Escape terminal controls in displayed data, without changing command arguments
+/// or ordinary Unicode text. Also escape line separators and bidi controls.
+pub fn terminal_safe(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control()
+            || matches!(ch, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            safe.extend(ch.escape_default());
+        } else {
+            safe.push(ch);
+        }
+    }
+    safe
+}
+
 /// Resolve the path or name of the currently running application binary,
 /// accounting for `$APPIMAGE`, `current_exe()`, and fallback.
 pub fn current_app_path() -> std::ffi::OsString {
@@ -37,9 +53,9 @@ pub fn format_command_error(
         .map(|code| code.to_string())
         .unwrap_or_else(|| "terminated by signal".to_string());
     if stderr.is_empty() {
-        format!("{prefix} (exit {code})")
+        format!("{} (exit {code})", terminal_safe(prefix))
     } else {
-        format!("{stderr} (exit {code})")
+        format!("{} (exit {code})", terminal_safe(stderr))
     }
 }
 
@@ -111,6 +127,19 @@ pub fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> AppR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_terminal_controls_are_inert_and_unicode_is_preserved() {
+        let hostile =
+            "\u{6771}\u{4eac} caf\u{e9}\x1b]52;c;payload\x07\r\n\t\x7f\u{9b}\u{2028}\u{202e}";
+        let safe = terminal_safe(hostile);
+        assert!(safe.starts_with("\u{6771}\u{4eac} caf\u{e9}\\u{1b}]52;c;payload"));
+        assert!(!safe.chars().any(char::is_control));
+        assert!(!safe.contains('\u{2028}'));
+        assert_eq!(terminal_safe(&safe), safe);
+        let status = Command::new("false").status().unwrap();
+        assert!(!format_command_error("failure", status, hostile).contains('\x1b'));
+    }
 
     #[cfg(unix)]
     #[test]

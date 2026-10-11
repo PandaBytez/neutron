@@ -13,6 +13,7 @@ use std::path::Path;
 use crate::config::{self, AppConfig};
 use crate::error::AppResult;
 use crate::nm::NmClient;
+use crate::process::terminal_safe;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncReport {
@@ -65,10 +66,10 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(err) => {
-            report.errors.push(format!(
+            report.errors.push(terminal_safe(&format!(
                 "Failed to read profiles directory {}: {err}",
                 dir.display()
-            ));
+            )));
             return Ok(report);
         }
     };
@@ -83,10 +84,10 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
                 .to_string();
 
             if existing_names.contains(&stem) {
-                report.errors.push(format!(
+                report.errors.push(terminal_safe(&format!(
                     "{}: a profile named '{stem}' already exists in NetworkManager; preserved to prevent data loss",
                     path.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                )));
                 report.skipped += 1;
                 continue;
             }
@@ -95,17 +96,17 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
                 Ok(_) => {
                     report.imported.push(stem);
                     if let Err(err) = fs::remove_file(&path) {
-                        report.errors.push(format!(
+                        report.errors.push(terminal_safe(&format!(
                             "Failed to remove imported inbox file {}: {err}",
                             path.display()
-                        ));
+                        )));
                     }
                 }
                 Err(err) => {
-                    report.errors.push(format!(
+                    report.errors.push(terminal_safe(&format!(
                         "{}: {err}",
                         path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
+                    )));
                 }
             }
         }
@@ -119,6 +120,26 @@ mod tests {
     use super::*;
     use crate::nm::{ProfileState, WireguardProfile};
     use crate::testing::{MockNmClient, scratch_dir};
+
+    #[test]
+    fn security_import_errors_escape_hostile_filenames() {
+        let dir = scratch_dir("hostile-inbox");
+        let file = dir.join("caf\u{e9}\x1b]52;c;payload\x07.conf");
+        fs::write(&file, "invalid").unwrap();
+        let config = AppConfig {
+            general: config::GeneralConfig {
+                profiles_dir: dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = sync_profiles_dir(&MockNmClient::default().fail_import(), &config).unwrap();
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("caf\u{e9}\\u{1b}]52;c;payload\\u{7}"));
+        assert!(!report.errors[0].chars().any(char::is_control));
+        assert!(file.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn sync_imports_new_conf_files_and_cleans_inbox() {

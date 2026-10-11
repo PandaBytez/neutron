@@ -10,6 +10,7 @@ use ratatui::widgets::{
 
 use crate::config::{PortForwardMode, SplitTunnelMode};
 use crate::nm::network_info::format_speed;
+use crate::process::terminal_safe;
 use crate::service::lease::QbitSyncStatus;
 use crate::tui::state::{
     ActiveModal, CommandPaletteState, PortForwardFocus, PortForwardModalState, SplitTunnelFocus,
@@ -151,7 +152,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         Span::styled("Status ", theme.title),
     ]);
 
-    let status_badge = Span::styled(status_text, status_style);
+    let status_badge = Span::styled(terminal_safe(&status_text), status_style);
 
     // Dedicated Forwarded Port field (clean text, with icon).
     //
@@ -212,7 +213,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     };
     let line2 = Line::from(vec![
         Span::styled(" Public IP: ", theme.label_dim),
-        Span::styled(pub_ip_text, theme.text_primary),
+        Span::styled(terminal_safe(&pub_ip_text), theme.text_primary),
     ]);
 
     // Line 3: DNS Resolver under Public IP + Port under/alongside DNS
@@ -223,7 +224,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         .unwrap_or("N/A");
     let mut line3 = vec![
         Span::styled(" DNS:       ", theme.label_dim),
-        Span::styled(dns_text, theme.accent),
+        Span::styled(terminal_safe(dns_text), theme.accent),
         Span::raw("  "),
         Span::styled(port_label, theme.label_dim),
         Span::styled(port_val, port_val_style),
@@ -394,7 +395,7 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
     let name_col_w = state
         .rows
         .iter()
-        .map(|r| r.name.chars().count())
+        .map(|r| terminal_safe(&r.name).chars().count())
         .max()
         .unwrap_or(16)
         .max(18);
@@ -447,13 +448,14 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
                 (" ", theme.label_dim)
             };
 
-            let name_len = row.name.chars().count();
+            let name = terminal_safe(&row.name);
+            let name_len = name.chars().count();
             let name_pad = name_col_w.saturating_sub(name_len);
 
             let spans = vec![
                 Span::styled(prefix, theme.accent),
                 Span::styled(icon, icon_style),
-                Span::styled(&row.name, name_style),
+                Span::styled(name, name_style),
                 Span::raw(" ".repeat(name_pad)),
                 Span::raw("   "),
                 Span::styled(fav_icon, fav_style),
@@ -516,8 +518,8 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         // Section: Overview
         lines.push(Line::from(vec![
             Span::styled("Profile:       ", theme.label_dim),
-            Span::styled(&row.name, theme.title),
-            Span::styled(format!("  ({})", row.uuid), theme.label_dim),
+            Span::styled(terminal_safe(&row.name), theme.title),
+            Span::styled(format!("  ({})", terminal_safe(&row.uuid)), theme.label_dim),
         ]));
 
         let (status_str, status_style) = if row.is_active {
@@ -564,7 +566,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
                     .unwrap_or_default();
                 lines.push(Line::from(vec![
                     Span::styled("Tunnel IP:     ", theme.label_dim),
-                    Span::styled(format!("{addr}{gw_str}"), theme.accent),
+                    Span::styled(terminal_safe(&format!("{addr}{gw_str}")), theme.accent),
                 ]));
             }
 
@@ -580,7 +582,10 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             lines.push(Line::from(vec![
                 Span::styled("DNS Resolver:  ", theme.label_dim),
                 Span::styled(
-                    format!("{dns} (configured DNS; live priority not verified)"),
+                    format!(
+                        "{} (configured DNS; live priority not verified)",
+                        terminal_safe(dns)
+                    ),
                     theme.text_secondary,
                 ),
             ]));
@@ -592,32 +597,35 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         if let Some(diag) = info.map(|i| &i.diagnostics) {
             lines.push(Line::from(vec![
                 Span::styled("Remote Peer:   ", theme.label_dim),
-                Span::styled(&diag.endpoint, theme.text_primary),
+                Span::styled(terminal_safe(&diag.endpoint), theme.text_primary),
             ]));
 
             lines.push(Line::from(vec![
                 Span::styled("Total Data:    ", theme.label_dim),
                 Span::styled(
-                    format!("↑ {}  ↓ {}", diag.transfer_tx, diag.transfer_rx),
+                    terminal_safe(&format!("↑ {}  ↓ {}", diag.transfer_tx, diag.transfer_rx)),
                     theme.accent,
                 ),
             ]));
 
             lines.push(Line::from(vec![
                 Span::styled("Handshake:     ", theme.label_dim),
-                Span::styled(&diag.latest_handshake, theme.text_secondary),
+                Span::styled(terminal_safe(&diag.latest_handshake), theme.text_secondary),
             ]));
 
             if diag.keepalive != "N/A" && !diag.keepalive.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled("Keepalive:     ", theme.label_dim),
-                    Span::styled(format!("{}s", diag.keepalive), theme.text_secondary),
+                    Span::styled(
+                        format!("{}s", terminal_safe(&diag.keepalive)),
+                        theme.text_secondary,
+                    ),
                 ]));
             }
 
             lines.push(Line::from(vec![
                 Span::styled("Allowed IPs:   ", theme.label_dim),
-                Span::styled(&diag.allowed_ips, theme.text_secondary),
+                Span::styled(terminal_safe(&diag.allowed_ips), theme.text_secondary),
             ]));
         }
 
@@ -625,7 +633,10 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
                 Span::styled("Config Info:   ", theme.label_dim),
-                Span::styled(custom.replace('\n', " | "), theme.text_secondary),
+                Span::styled(
+                    terminal_safe(&custom.replace('\n', " | ")),
+                    theme.text_secondary,
+                ),
             ]));
         }
 
@@ -805,6 +816,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn render_pending_toast(frame: &mut Frame, area: Rect, text: &str, state: &TuiState) {
+    let text = terminal_safe(text);
     let theme = &state.theme;
     let toast_rect = toast_frame(frame, area, toast_width(area, text.chars().count()), 3);
 
@@ -849,6 +861,7 @@ fn render_connecting_toast(
         "Waiting for WireGuard handshake..."
     };
 
+    let action_str = terminal_safe(&action_str);
     let max_len = (action_str.chars().count() + 2).max(sub_str.chars().count());
     let toast_rect = toast_frame(frame, area, toast_width(area, max_len), 4);
 
@@ -1003,7 +1016,7 @@ fn render_command_palette_modal(
     // Search bar
     let search_bar = Paragraph::new(Line::from(vec![
         Span::styled(" 🔍 > ", theme.accent),
-        Span::styled(&cp.filter, theme.title),
+        Span::styled(terminal_safe(&cp.filter), theme.title),
         Span::styled("█", theme.accent),
     ]))
     .block(
@@ -1276,7 +1289,7 @@ fn render_port_forward_modal(
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(chunks[1]);
     frame.render_widget(
-        Paragraph::new(pf.host.as_str()).block(
+        Paragraph::new(terminal_safe(&pf.host)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(host_style)
@@ -1285,7 +1298,7 @@ fn render_port_forward_modal(
         endpoint[0],
     );
     frame.render_widget(
-        Paragraph::new(pf.port.as_str()).block(
+        Paragraph::new(terminal_safe(&pf.port)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(port_style)
@@ -1492,7 +1505,7 @@ fn render_entry_column(
         theme.border
     };
     let input_widget = Paragraph::new(Line::from(vec![
-        Span::styled(params.input_value, theme.title),
+        Span::styled(terminal_safe(params.input_value), theme.title),
         Span::styled(if params.is_input_focused { "█" } else { "" }, theme.accent),
     ]))
     .block(
@@ -1530,7 +1543,7 @@ fn render_entry_column(
                         theme.accent,
                     ),
                     Span::styled(
-                        val,
+                        terminal_safe(val),
                         if is_sel {
                             theme.title
                         } else {
@@ -1565,7 +1578,7 @@ fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state:
         Line::raw(""),
         Line::from(vec![
             Span::raw("Are you sure you want to permanently delete '"),
-            Span::styled(name, theme.warning),
+            Span::styled(terminal_safe(name), theme.warning),
             Span::raw("' from NetworkManager?"),
         ]),
         Line::raw(""),

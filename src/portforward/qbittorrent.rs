@@ -57,7 +57,7 @@ impl QBittorrentSyncReport {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct QBittorrentClient {
     base_url: String,
     username: Option<String>,
@@ -65,6 +65,19 @@ pub struct QBittorrentClient {
     bind_interface: bool,
     cookie: Option<String>,
     timeout: Duration,
+}
+
+impl std::fmt::Debug for QBittorrentClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QBittorrentClient")
+            .field("base_url", &self.base_url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("cookie", &self.cookie.as_ref().map(|_| "<redacted>"))
+            .field("bind_interface", &self.bind_interface)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl QBittorrentClient {
@@ -165,7 +178,10 @@ impl QBittorrentClient {
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&resp.body).map_err(|err| {
-            AppError::QBittorrent(format!("invalid JSON from qBittorrent preferences: {err}"))
+            AppError::QBittorrent(format!(
+                "invalid JSON from qBittorrent preferences: {}",
+                AppError::from(err)
+            ))
         })?;
 
         let listen_port = parsed
@@ -433,11 +449,11 @@ fn parse_status_code(status_line: &str) -> AppResult<u16> {
     let _http_version = tokens.next();
     let code_str = tokens
         .next()
-        .ok_or_else(|| AppError::QBittorrent(format!("invalid status line: {status_line}")))?;
+        .ok_or_else(|| AppError::QBittorrent("invalid HTTP status line".into()))?;
 
     code_str
         .parse::<u16>()
-        .map_err(|_| AppError::QBittorrent(format!("invalid status code: {code_str}")))
+        .map_err(|_| AppError::QBittorrent("invalid HTTP status code".into()))
 }
 
 fn extract_cookie(headers: &[(String, String)], cookie_name: &str) -> Option<String> {
@@ -457,6 +473,21 @@ fn extract_cookie(headers: &[(String, String)], cookie_name: &str) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_webui_errors_and_debug_do_not_disclose_secrets() {
+        let error = parse_http_response("sentinel_password\x1b]52;c;payload\x07").unwrap_err();
+        assert!(!error.to_string().contains("sentinel_password"));
+        assert!(!format!("{error:?}").contains("sentinel_password"));
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            password: Some("sentinel_password".into()),
+            ..Default::default()
+        });
+        client.cookie = Some("sentinel_cookie".into());
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("sentinel_password"));
+        assert!(!debug.contains("sentinel_cookie"));
+    }
 
     #[test]
     fn format_curl_timeout_handles_subsecond_and_fractional_durations() {

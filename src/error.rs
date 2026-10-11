@@ -2,6 +2,8 @@ use std::io;
 
 use thiserror::Error;
 
+use crate::process::terminal_safe;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Policy {
     Lockdown,
@@ -30,38 +32,68 @@ pub enum AppError {
         #[source]
         source: Box<AppError>,
     },
-    #[error("command failed: {0}")]
+    #[error("command failed: {}", terminal_safe(.0))]
     CommandFailed(String),
-    #[error("firewall command failed: {0}")]
+    #[error("firewall command failed: {}", terminal_safe(.0))]
     Firewall(String),
-    #[error("failed to parse NetworkManager output: {0}")]
+    #[error("failed to parse NetworkManager output: {}", terminal_safe(.0))]
     NmParseFailed(String),
-    #[error("wireguard profile not found: {0}")]
+    #[error("wireguard profile not found: {}", terminal_safe(.0))]
     ProfileNotFound(String),
-    #[error("multiple wireguard profiles match name: {0}; use a unique profile name")]
+    #[error("multiple wireguard profiles match name: {}; use a unique profile name", terminal_safe(.0))]
     AmbiguousProfileName(String),
     #[error("no active wireguard profile found")]
     NoActiveProfile,
-    #[error("{0}")]
+    #[error("{}", terminal_safe(.0))]
     TunnelUnhealthy(String),
     #[error("no eligible profile found for random startup")]
     NoEligibleProfile,
-    #[error("{0}")]
+    #[error("{}", terminal_safe(.0))]
     Uninstall(String),
-    #[error("port forwarding failed: {0}")]
+    #[error("port forwarding failed: {}", terminal_safe(.0))]
     PortForward(String),
-    #[error("qbittorrent error: {0}")]
+    #[error("qbittorrent error: {}", terminal_safe(.0))]
     QBittorrent(String),
-    #[error("configuration error: {0}")]
+    #[error("configuration error: {}", terminal_safe(.0))]
     Config(String),
-    #[error("io error: {0}")]
+    #[error("io error: {}", terminal_safe(&.0.to_string()))]
     Io(#[from] io::Error),
-    #[error("json serialization error: {0}")]
-    SerdeJson(#[from] serde_json::Error),
-    #[error("toml deserialization error: {0}")]
-    TomlDe(#[from] toml::de::Error),
-    #[error("toml serialization error: {0}")]
+    #[error("json error: {}", terminal_safe(.0))]
+    SerdeJson(String),
+    #[error("toml deserialization error: {}", terminal_safe(.0))]
+    TomlDe(String),
+    #[error("toml serialization error: {}", terminal_safe(&.0.to_string()))]
     TomlSer(#[from] toml::ser::Error),
+}
+
+// Parser messages can contain values, keys, or entire credential-bearing lines.
+// Retain only category/location, never the original error or its source chain.
+impl From<serde_json::Error> for AppError {
+    fn from(error: serde_json::Error) -> Self {
+        let reason = match error.classify() {
+            serde_json::error::Category::Io => "input/output failure",
+            serde_json::error::Category::Syntax => "invalid JSON syntax",
+            serde_json::error::Category::Data => "invalid field type or value",
+            serde_json::error::Category::Eof => "unexpected end of input",
+        };
+        Self::SerdeJson(format!(
+            "{reason} at line {}, column {}",
+            error.line(),
+            error.column()
+        ))
+    }
+}
+
+impl From<toml::de::Error> for AppError {
+    fn from(error: toml::de::Error) -> Self {
+        let location = error
+            .span()
+            .map(|span| format!(" at bytes {}..{}", span.start, span.end))
+            .unwrap_or_default();
+        Self::TomlDe(format!(
+            "invalid TOML syntax, field type, or value{location}"
+        ))
+    }
 }
 
 pub type AppResult<T> = Result<T, AppError>;

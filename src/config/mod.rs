@@ -233,7 +233,7 @@ impl From<PortForwardConfigDe> for PortForwardConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QBittorrentConfig {
     /// Legacy sync toggle, deserialized only so pre-mode configs keep
     /// loading; the port-forward mode decides syncing now (see
@@ -259,6 +259,17 @@ pub struct QBittorrentConfig {
     /// legacy configs whose `bind_interface = false` was the v0.1.3 default.
     #[serde(default)]
     pub binding_overrides_migrated: bool,
+}
+
+impl std::fmt::Debug for QBittorrentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QBittorrentConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("bind_interface", &self.bind_interface)
+            .finish_non_exhaustive()
+    }
 }
 
 fn default_qbittorrent_url() -> String {
@@ -419,7 +430,11 @@ fn read_profile_info(config_path: &Path) -> AppResult<Option<BTreeMap<String, St
     let path = profile_info_path(config_path);
     match fs::read_to_string(&path) {
         Ok(data) => serde_json::from_str(&data).map(Some).map_err(|error| {
-            AppError::Config(format!("could not parse {}: {error}", path.display()))
+            AppError::Config(format!(
+                "could not parse {}: {}",
+                path.display(),
+                AppError::from(error)
+            ))
         }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(AppError::Config(format!(
@@ -616,6 +631,44 @@ pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_parse_errors_never_retain_password_source() {
+        use std::error::Error;
+        for (label, body) in [
+            (
+                "secret-syntax",
+                "[qbittorrent]\npassword = \"sentinel_password\" trailing\n",
+            ),
+            (
+                "secret-type",
+                "[qbittorrent]\npassword = [\"sentinel_password\"]\n",
+            ),
+            (
+                "secret-type.json",
+                r#"{"qbittorrent":{"password":["sentinel_password"]}}"#,
+            ),
+            (
+                "secret-enum.json",
+                r#"{"port_forwarding":{"mode":"sentinel_password"}}"#,
+            ),
+        ] {
+            let path = unique_path(label);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            let error = load(&path).unwrap_err();
+            assert!(!error.to_string().contains("sentinel_password"));
+            assert!(!format!("{error:?}").contains("sentinel_password"));
+            assert!(error.source().is_none());
+            assert!(error.to_string().contains("at "));
+            cleanup(&path);
+        }
+        let config = QBittorrentConfig {
+            password: Some("sentinel_password".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{config:?}").contains("sentinel_password"));
+    }
+
     #[test]
     fn documented_config_example_matches_the_current_schema() {
         let docs = include_str!("../../docs/configuration.md");
