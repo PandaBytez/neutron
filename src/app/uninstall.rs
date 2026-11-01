@@ -16,6 +16,7 @@ use crate::config;
 use crate::error::{AppError, AppResult};
 use crate::firewall::FirewallClient;
 use crate::nm::NmClient;
+use crate::process::terminal_safe;
 use crate::service;
 
 /// `neutron reset`: factory reset, back to a first-run state.
@@ -35,7 +36,7 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     proc_root: &std::path::Path,
     assume_yes: bool,
 ) -> AppResult<()> {
-    let (before, settings_readable) = load_for_teardown(path);
+    let (mut before, mut settings_readable) = load_for_teardown(path);
     if !assume_yes && !confirm_reset(&before)? {
         println!("Reset cancelled; nothing was changed.");
         return Ok(());
@@ -51,6 +52,13 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     // explaining why -- so the privileged, hard-to-reverse step gets the
     // opportunity to abort while the settings are still intact.
     let revoked_lockdown = revoke_installed_state(client, autostart_dir)?;
+    if let Some(backup) = config::recover_profile_info(path)? {
+        eprintln!(
+            "Corrupt profile notes preserved at {}",
+            terminal_safe(&backup.display().to_string())
+        );
+        (before, settings_readable) = load_for_teardown(path);
+    }
 
     // Withdraw the policies Neutron wrote into the NetworkManager profiles. Gated
     // on saved intent so a reset on a clean install does not sweep every profile
@@ -93,7 +101,7 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
             "were not installed"
         }
     );
-    println!("  settings: {}", path.display());
+    println!("  settings: {}", terminal_safe(&path.display().to_string()));
     report_drop_dir(path.parent(), &config::resolve_profiles_dir(&before));
     if still_running > 0 {
         println!("  {still_running} daemon(s) did not exit; close them before logging in again.");
@@ -114,8 +122,9 @@ fn load_for_teardown(path: &std::path::Path) -> (config::AppConfig, bool) {
         Ok(cfg) => (cfg, true),
         Err(error) => {
             println!(
-                "Settings at {} could not be read ({error}); continuing from evidence on disk.",
-                path.display()
+                "Settings at {} could not be read ({}); continuing from evidence on disk.",
+                terminal_safe(&path.display().to_string()),
+                terminal_safe(&error.to_string())
             );
             (config::AppConfig::default(), false)
         }
@@ -157,7 +166,7 @@ fn report_drop_dir(config_root: Option<&std::path::Path>, drop_dir: &std::path::
     if !inside {
         println!(
             "Profile drop directory left in place: {}",
-            drop_dir.display()
+            terminal_safe(&drop_dir.display().to_string())
         );
     }
 }
@@ -250,7 +259,7 @@ pub fn handle_uninstall_command<C: NmClient + FirewallClient>(
 fn remove_the_package(removal: &crate::install::Removal) -> AppResult<()> {
     // Unprivileged, no shell, inheriting the terminal so brew or cargo can
     // report or prompt itself.
-    let status = crate::process::host_command(removal.program)
+    let status = std::process::Command::new(removal.program)
         .args(&removal.args)
         .status()
         .map_err(|error| AppError::CommandFailed(format!("{}: {error}", removal.program)))?;
@@ -282,7 +291,10 @@ fn remove_app_settings(
         return Ok(None);
     };
     if !purge {
-        println!("Settings kept at {}", parent.display());
+        println!(
+            "Settings kept at {}",
+            terminal_safe(&parent.display().to_string())
+        );
         return Ok(None);
     }
     // An absent or unreadable config records no drop directory, so there is
@@ -302,7 +314,7 @@ fn remove_app_settings(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    println!("Removed {}", parent.display());
+    println!("Removed {}", terminal_safe(&parent.display().to_string()));
     Ok((!profiles.as_os_str().is_empty() && !profiles.starts_with(parent)).then_some(profiles))
 }
 
@@ -319,30 +331,63 @@ fn report_manual_unit(config_root: Option<&std::path::Path>) {
         println!(
             "systemd user unit left in place: {}\n  \
              systemctl --user disable --now {UNIT} && rm {}",
-            unit.display(),
-            unit.display()
+            terminal_safe(&unit.display().to_string()),
+            terminal_safe(&unit.display().to_string())
         );
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_quarantines_corrupt_notes_only_after_successful_firewall_teardown() {
+        let root = crate::testing::scratch_dir("reset-corrupt-notes");
+        let path = root.join("config.toml");
+        let mut cfg = config::AppConfig {
+            kill_switch_enabled: true,
+            lockdown_enabled: true,
+            ..Default::default()
+        };
+        cfg.global_split_tunnel.mode = config::SplitTunnelMode::Include;
+        cfg.global_split_tunnel.cidrs = vec!["10.0.0.0/8".into()];
+        cfg.qbittorrent.password = Some("sentinel".into());
+        config::save(&path, &cfg).unwrap();
+        std::fs::write(root.join("profile-info.json"), "broken notes").unwrap();
+        let failed = crate::testing::MockNmClient::default()
+            .with_installed_lockdown_state()
+            .fail_lockdown();
+        assert!(handle_reset_command(&failed, &path, None, &root.join("fake-proc"), true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("profile-info.json")).unwrap(),
+            "broken notes"
+        );
+        let client = crate::testing::MockNmClient::default().with_installed_lockdown_state();
+        handle_reset_command(&client, &path, None, &root.join("fake-proc"), true).unwrap();
+        let reset = config::load(&path).unwrap();
+        assert!(!reset.kill_switch_enabled && !reset.lockdown_enabled);
+        assert!(reset.qbittorrent.password.is_none());
+        assert_eq!(client.kill_switch_calls(), ["kill-switch-all:off"]);
+        assert_eq!(
+            client.split_tunnel_calls(),
+            ["split-tunnel-all:disabled:0:0"]
+        );
+        let backup = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().extension().is_some_and(|e| e == "corrupt"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.path()).unwrap(),
+            "broken notes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
+    use crate::testing::{
+        remove_temp_config as cleanup_test_config, scratch_dir, temp_config_path,
+    };
     use std::collections::BTreeSet;
-
-    /// The config path and the proc root are the two things the reset tests must
-    /// not take from the environment; `crate::testing` is their one home.
-    fn unique_test_config_path() -> std::path::PathBuf {
-        crate::testing::temp_config_path("app")
-    }
-
-    fn cleanup_test_config(path: &std::path::Path) {
-        crate::testing::remove_temp_config(path);
-    }
-
-    fn scratch_proc_root() -> std::path::PathBuf {
-        crate::testing::scratch_dir("proc-root")
-    }
 
     #[test]
     fn revoke_removes_only_neutrons_own_autostart_entry() {
@@ -407,7 +452,7 @@ mod tests {
         // already-purged config must not be what decides whether the machine
         // gets unblocked. Evidence, not intent.
         let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
 
         revoke_installed_state(&client, None).expect("revoke should succeed");
         remove_app_settings(&path, false).expect("settings should be kept");
@@ -424,7 +469,7 @@ mod tests {
         // The gate is what keeps a fresh install from prompting for a password to
         // delete three files that were never created.
         let client = crate::testing::MockNmClient::new(vec![]);
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
 
         revoke_installed_state(&client, None).expect("revoke should succeed");
         remove_app_settings(&path, true).expect("purge should succeed");
@@ -440,7 +485,7 @@ mod tests {
         // password to delete files that are not there and, on a machine where
         // something *is* still installed, would not be the thing that decides.
         let client = crate::testing::MockNmClient::new(vec![]);
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
         config::save(
             &path,
             &config::AppConfig {
@@ -468,7 +513,7 @@ mod tests {
         // block it. The setting is unreadable *and* the state is installed: the
         // evidence check is the only way to that teardown.
         let client = crate::testing::MockNmClient::new(vec![]).with_installed_lockdown_state();
-        let path = unique_test_config_path();
+        let path = temp_config_path("app");
         std::fs::create_dir_all(path.parent().expect("config path has a parent"))
             .expect("config directory should be created");
         std::fs::write(&path, "this is not valid toml = = =").expect("corrupt config should write");
@@ -533,7 +578,7 @@ mod tests {
         let home = decoy_config_home("drop-outside");
         let path = home.join("neutron/config.toml");
         // A sibling of the app directory: the common `~/wg-configs` shape.
-        let sibling = unique_temp_root("drop-sibling").join("drop");
+        let sibling = scratch_dir("drop-sibling").join("drop");
         std::fs::create_dir_all(&sibling).expect("drop dir should be created");
         config::save(&path, &config_with_drop_dir(&sibling)).expect("config should save");
 
@@ -583,7 +628,7 @@ mod tests {
         // pin the behaviour rather than trusting it.
         let home = decoy_config_home("symlink");
         let path = home.join("neutron/config.toml");
-        let target = unique_temp_root("symlink-target").join("precious");
+        let target = scratch_dir("symlink-target").join("precious");
         std::fs::create_dir_all(&target).expect("target should be created");
         std::fs::write(target.join("keep.txt"), "keep").expect("file should be written");
         config::save(&path, &config::AppConfig::default()).expect("config should save");
@@ -673,7 +718,7 @@ mod tests {
     /// pre-rename directory, a foreign autostart entry, and the hand-installed
     /// systemd unit.
     fn decoy_config_home(label: &str) -> std::path::PathBuf {
-        let home = unique_temp_root(label);
+        let home = scratch_dir(label);
         for relative in [
             "neutron/config.toml.policy.lock",
             "neutron/profile-info.json",
@@ -726,13 +771,6 @@ mod tests {
         found
     }
 
-    fn unique_temp_root(label: &str) -> std::path::PathBuf {
-        crate::testing::temp_config_path(label)
-            .parent()
-            .expect("temp config path has a parent")
-            .to_path_buf()
-    }
-
     fn remove_temp_root(root: &std::path::Path) {
         let _ = std::fs::remove_dir_all(root);
     }
@@ -774,7 +812,7 @@ mod tests {
             &client,
             &path,
             Some(&autostart_dir),
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
             true,
         )
         .expect("reset should succeed");
@@ -827,7 +865,7 @@ mod tests {
             &client,
             &path,
             Some(&autostart_dir),
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
             true,
         )
         .expect("reset should succeed");
@@ -854,7 +892,7 @@ mod tests {
         .expect("config should save");
         let before = relative_paths(&home);
 
-        let error = handle_reset_command(&client, &path, None, &scratch_proc_root(), false)
+        let error = handle_reset_command(&client, &path, None, &scratch_dir("proc-root"), false)
             .expect_err("without a terminal, reset must not proceed");
 
         assert!(error.to_string().contains("--yes"), "{error}");

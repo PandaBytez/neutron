@@ -9,12 +9,12 @@
 //! NetworkManager rejects, a dismissed privilege prompt. It belongs in the
 //! footer, not in an exit.
 
-use neutron::config::{self, AppConfig};
+use neutron::config::{self, AppConfig, SplitTunnelConfig, SplitTunnelMode};
 use neutron::error::AppError;
 use neutron::nm::ProfileState;
 use neutron::testing::{self, MockNmClient, profile};
 use neutron::tui::events::{execute_action, handle_key_event};
-use neutron::tui::state::TuiState;
+use neutron::tui::state::{ActiveModal, SplitTunnelModalState, TuiState};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -151,13 +151,7 @@ fn a_failed_connection_leaves_no_profile_marked_active() {
 
 #[test]
 fn malformed_config_fails_cleanly_at_startup() {
-    let sandbox = std::env::temp_dir().join(format!(
-        "tui-malformed-config-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let sandbox = testing::scratch_dir("tui-malformed-config");
     let config_dir = sandbox.join("neutron");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.toml");
@@ -251,6 +245,101 @@ fn transient_list_failure_retains_refresh_and_eventually_reloads() {
 }
 
 #[test]
+fn manual_qbit_sync_queues_the_lease_snapshot_and_survives_a_stopped_worker() {
+    use neutron::tui::state::{ActiveModal, AsyncAction, CommandPaletteState};
+
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-qbit-async");
+    state.config.port_forwarding.mode = config::PortForwardMode::ForwardAndSync;
+    // An invalid IPv6 authority fails before network IO if a push is attempted.
+    state.config.qbittorrent.url = "http://[invalid".into();
+    state.config.qbittorrent.username = Some("snapshot-user".into());
+    let expected_config = state.config.qbittorrent.clone();
+    state.lease = Some(testing::fresh_lease("uuid-lease", 51820));
+    state.active_profile_uuid = Some("uuid-lease".into());
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.action_tx = Some(tx);
+    state.modal = ActiveModal::CommandPalette(CommandPaletteState {
+        filter: "qBittorrent: Sync Forwarded Port Now".into(),
+        ..Default::default()
+    });
+
+    press(&mut state, &client, KeyCode::Enter).expect("queueing must not call the WebUI");
+    assert!(!state.status_is_error);
+    assert!(state.status_message.contains("in background"));
+    assert!(state.pending.is_some());
+    state.lease = None;
+    state.config.qbittorrent.username = None;
+    match rx.try_recv().expect("manual sync must reach the worker") {
+        AsyncAction::QbitSync {
+            uuid,
+            port,
+            config,
+            expires_at,
+        } => {
+            assert_eq!(uuid, "uuid-lease");
+            assert_eq!(port, 51820);
+            assert_eq!(config, expected_config);
+            assert!(expires_at > 0);
+        }
+        other => panic!("expected QbitSync task, got {other:?}"),
+    }
+    press(&mut state, &client, KeyCode::Char('q')).unwrap();
+    assert!(
+        state.should_quit,
+        "input must not wait for worker completion"
+    );
+
+    state.end_pending();
+    drop(rx);
+    state.lease = Some(testing::fresh_lease("uuid-lease", 51820));
+    execute_action(&mut state, &client, "qbit_sync").unwrap();
+    assert!(state.status_is_error);
+    assert!(state.status_message.contains("worker has stopped"));
+    assert!(state.pending.is_none());
+
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn spinner_actions_do_not_overwrite_or_queue_overlapping_requests() {
+    use neutron::tui::state::AsyncAction;
+
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-spinner-overlap");
+    state.lease = Some(testing::fresh_lease("uuid-lease", 51820));
+    state.active_profile_uuid = Some("uuid-lease".into());
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.action_tx = Some(tx);
+
+    for first in ["lockdown", "qbit_sync"] {
+        execute_action(&mut state, &client, first).unwrap();
+        match (first, rx.try_recv().unwrap()) {
+            ("lockdown", AsyncAction::Lockdown(_))
+            | ("qbit_sync", AsyncAction::QbitSync { .. }) => {}
+            other => panic!("unexpected request: {other:?}"),
+        }
+        let pending = state.pending.as_ref().unwrap();
+        let label = pending.label.clone();
+        let started_at = pending.started_at;
+        let status = state.status_message.clone();
+        for overlapping in ["lockdown", "qbit_sync"] {
+            execute_action(&mut state, &client, overlapping).unwrap();
+            assert_eq!(state.pending.as_ref().unwrap().label, label);
+            assert_eq!(state.pending.as_ref().unwrap().started_at, started_at);
+            assert_eq!(state.status_message, status);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
+        state.end_pending();
+    }
+
+    testing::remove_temp_config(&path);
+}
+
+#[test]
 fn split_worker_failure_reconciles_modal_and_pending_state() {
     let client = MockNmClient::new(vec![profile("wg-eu", "uuid-eu", ProfileState::Inactive)]);
     let path = testing::temp_config_path("tui-split-reconcile");
@@ -272,7 +361,8 @@ fn split_worker_failure_reconciles_modal_and_pending_state() {
     rejected_cfg.cidrs.push("192.168.1.0/24".to_string());
 
     state.apply_split_tunnel(&client, rejected_cfg).unwrap();
-    let pending = st_rx.recv().unwrap();
+    let (request_id, original, pending) = st_rx.recv().unwrap();
+    assert_eq!(original, config::SplitTunnelConfig::default());
     assert_eq!(pending.cidrs, vec!["192.168.1.0/24".to_string()]);
 
     // Background reload happens while modal is open - must preserve modal edit state
@@ -282,7 +372,11 @@ fn split_worker_failure_reconciles_modal_and_pending_state() {
         vec!["192.168.1.0/24".to_string()]
     );
 
-    state.finish_split(pending, Err(AppError::CommandFailed("rejected".into())));
+    state.finish_split(
+        request_id,
+        pending,
+        Err(AppError::CommandFailed("rejected".into())),
+    );
     assert!(state.pending_split.is_none());
     assert!(state.config.global_split_tunnel.cidrs.is_empty());
     if let neutron::tui::state::ActiveModal::SplitTunnel(modal) = &state.modal {
@@ -291,5 +385,225 @@ fn split_worker_failure_reconciles_modal_and_pending_state() {
         panic!("modal should remain open");
     }
 
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn stale_split_snapshot_reloads_without_overwriting_cli_exclusions() {
+    for queued in [false, true] {
+        let client = MockNmClient::default();
+        let (mut state, path) = state_for(&client, "tui-split-conflict");
+        execute_action(&mut state, &client, "split_tunnel").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        if queued {
+            state.split_tunnel_tx = Some(tx);
+        }
+        neutron::app::split_tunnel::set_global_mode(&client, &path, SplitTunnelMode::Exclude)
+            .unwrap();
+        let (persisted, _) =
+            neutron::app::split_tunnel::add_global_cidr(&client, &path, "192.0.2.0/24").unwrap();
+        assert_eq!(persisted.mode, SplitTunnelMode::Exclude);
+        config::update(&path, |cfg| {
+            cfg.excluded_profile_ids.insert("cli-excluded".into());
+        })
+        .unwrap();
+        neutron::tui::events::reload_profiles(&mut state, &client).unwrap();
+        assert_eq!(
+            state.config.global_split_tunnel,
+            SplitTunnelConfig::default()
+        );
+        let calls_before = client.split_tunnel_calls().len();
+
+        // Apply through keyboard dispatch, using the modal's stale snapshot.
+        if queued {
+            press(&mut state, &client, KeyCode::Enter).unwrap();
+            let (request_id, original, edited) = rx.try_recv().unwrap();
+            assert_eq!(original, SplitTunnelConfig::default());
+            let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
+                &client, &path, &original, &edited,
+            );
+            assert!(result.is_err());
+            state.finish_split(request_id, edited, result);
+        } else {
+            assert!(press(&mut state, &client, KeyCode::Enter).is_err());
+        }
+        assert!(state.status_is_error);
+        assert!(state.status_message.contains("changed in another writer"));
+        assert!(state.pending_split.is_none());
+        assert_eq!(state.config.global_split_tunnel, persisted);
+        assert_eq!(client.split_tunnel_calls().len(), calls_before);
+        assert_eq!(config::load(&path).unwrap().global_split_tunnel, persisted);
+        assert!(
+            config::load(&path)
+                .unwrap()
+                .excluded_profile_ids
+                .contains("cli-excluded")
+        );
+        assert_eq!(
+            state.modal,
+            ActiveModal::SplitTunnel(SplitTunnelModalState::from_config(&persisted),)
+        );
+        testing::remove_temp_config(&path);
+    }
+}
+
+#[test]
+fn rapid_split_edits_queue_each_predecessor_and_ignore_older_replies() {
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-split-chain");
+    let original = state.config.global_split_tunnel.clone();
+    let first = SplitTunnelConfig {
+        mode: SplitTunnelMode::Include,
+        cidrs: vec!["192.0.2.0/24".into()],
+        domains: Vec::new(),
+    };
+    let mut second = first.clone();
+    second.cidrs.push("198.51.100.0/24".into());
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.split_tunnel_tx = Some(tx);
+    state.apply_split_tunnel(&client, first.clone()).unwrap();
+    state.apply_split_tunnel(&client, second.clone()).unwrap();
+
+    for (base, edited) in [(original, first.clone()), (first, second.clone())] {
+        let (request_id, captured, requested) = rx.try_recv().unwrap();
+        assert_eq!(captured, base);
+        assert_eq!(requested, edited);
+        let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
+            &client, &path, &captured, &requested,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let older_reply = requested != second;
+        state.finish_split(request_id, requested, result);
+        assert_eq!(state.config.global_split_tunnel, second);
+        assert_eq!(state.pending_split.is_some(), older_reply);
+    }
+    assert!(state.pending_split.is_none());
+    assert_eq!(config::load(&path).unwrap().global_split_tunnel, second);
+    assert_eq!(client.split_tunnel_calls().len(), 2);
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn stopped_split_worker_reloads_persisted_settings_and_modal() {
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-split-stopped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.split_tunnel_tx = Some(tx);
+    let edited = SplitTunnelConfig {
+        cidrs: vec!["192.0.2.0/24".into()],
+        ..Default::default()
+    };
+    state.apply_split_tunnel(&client, edited.clone()).unwrap();
+    assert!(state.pending_split.is_some());
+    drop(rx);
+    state.modal = ActiveModal::SplitTunnel(SplitTunnelModalState::from_config(&edited));
+    assert!(state.apply_split_tunnel(&client, edited).is_err());
+    assert!(state.status_is_error);
+    assert!(state.pending_split.is_none());
+    assert_eq!(
+        state.config.global_split_tunnel,
+        SplitTunnelConfig::default()
+    );
+    assert_eq!(
+        state.modal,
+        ActiveModal::SplitTunnel(SplitTunnelModalState::from_config(
+            &SplitTunnelConfig::default()
+        ),)
+    );
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn returning_to_an_earlier_split_mode_keeps_newer_edits_pending() {
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-split-repeated-mode");
+    let first = SplitTunnelConfig {
+        mode: SplitTunnelMode::Include,
+        cidrs: vec!["192.0.2.0/24".into()],
+        domains: Vec::new(),
+    };
+    let second = SplitTunnelConfig {
+        mode: SplitTunnelMode::Exclude,
+        ..first.clone()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.split_tunnel_tx = Some(tx);
+    for config in [first.clone(), second, first.clone()] {
+        state.apply_split_tunnel(&client, config).unwrap();
+    }
+    let latest = state.pending_split;
+    for _ in 0..2 {
+        let (request_id, original, edited) = rx.recv().unwrap();
+        let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
+            &client, &path, &original, &edited,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        state.finish_split(request_id, edited, result);
+        assert_eq!(state.pending_split, latest);
+        assert_eq!(state.config.global_split_tunnel, first);
+    }
+    let mut final_edit = first.clone();
+    final_edit.cidrs.push("198.51.100.0/24".into());
+    state
+        .apply_split_tunnel(&client, final_edit.clone())
+        .unwrap();
+    for _ in 0..2 {
+        let (request_id, original, edited) = rx.recv().unwrap();
+        let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
+            &client, &path, &original, &edited,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        state.finish_split(request_id, edited, result);
+    }
+    assert!(state.pending_split.is_none());
+    assert_eq!(state.config.global_split_tunnel, final_edit);
+    assert_eq!(config::load(&path).unwrap().global_split_tunnel, final_edit);
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn terminal_controls_are_escaped_without_changing_unicode_or_backend_values() {
+    let hostile = "caf\u{e9}\x1b]52;c;payload\x07\r\n\u{202e}";
+    let client = MockNmClient::new(vec![profile(hostile, "uuid-raw", ProfileState::Inactive)]);
+    let (mut state, path) = state_for(&client, "tui-terminal-safe");
+    let safe = neutron::process::terminal_safe(hostile);
+    state.set_status(hostile);
+    assert_eq!(state.status_message, safe);
+    assert_eq!(state.active_toast().unwrap().message, safe);
+    state.set_error(&AppError::Config(hostile.into()));
+    assert!(state.status_message.contains(&safe));
+    assert!(!state.status_message.chars().any(char::is_control));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.connect_tx = Some(tx);
+    press(&mut state, &client, KeyCode::Char(' ')).unwrap();
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        ("uuid-raw".into(), hostile.into(), true)
+    );
+    assert_eq!(state.rows[0].name, hostile);
+    assert_eq!(state.connecting.as_ref().unwrap().name, hostile);
+    state.connecting = None;
+    state.toast = None;
+    let mut modal = SplitTunnelModalState::from_config(&SplitTunnelConfig::default());
+    modal.domain_input = hostile.into();
+    state.modal = ActiveModal::SplitTunnel(modal);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 45)).unwrap();
+    terminal
+        .draw(|frame| neutron::tui::ui::render(frame, &state))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+    assert!(
+        screen.contains("caf\u{e9}\\u{1b}]52;c;payload\\u{7}"),
+        "{screen}"
+    );
+    assert!(!screen.chars().any(char::is_control));
+    assert!(!screen.contains('\u{202e}'));
+    if let ActiveModal::SplitTunnel(modal) = &state.modal {
+        assert_eq!(modal.domain_input, hostile);
+    } else {
+        panic!("split modal must remain open");
+    }
     testing::remove_temp_config(&path);
 }

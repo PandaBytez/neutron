@@ -6,9 +6,10 @@ Neutron provides **Global Split Tunneling**, allowing users to specify exact sub
 
 ## Routing Modes
 
-### 1. `Include` Mode (Route Only Listed Destinations via Tunnel)
-* **Behavior**: Default internet browsing bypasses the tunnel over your physical interface, while only specified subnets and domain IPs are routed securely through the WireGuard tunnel.
+### 1. `Include` Mode (Per-Family Destination Selection)
+* **Behavior**: For each address family with a nonempty list of configured CIDRs and resolved domain IPs, only listed destinations route through the tunnel; other destinations in that family use the physical default route. An empty family retains default-route eligibility (`never-default = no`), not a guarantee of protection: it still needs a usable tunnel family and matching peer AllowedIPs. An IPv4-only Include list does not intentionally exclude IPv6, but cannot make an unsupported IPv6 family safe.
 * **NetworkManager Mechanism**:
+  With nonempty lists for both families:
   ```bash
   nmcli connection modify <uuid> \
       ipv4.never-default yes \
@@ -19,7 +20,7 @@ Neutron provides **Global Split Tunneling**, allowing users to specify exact sub
 * **Use Case**: Remote network access where corporate/homelab subnets must route through the WireGuard tunnel while streaming, gaming, and personal browsing remain on high-speed unthrottled physical internet.
 
 ### 2. `Exclude` Mode (Bypass Tunnel for Listed Destinations)
-* **Behavior**: All general traffic routes through the encrypted WireGuard tunnel, while specified subnets or domains bypass the tunnel directly to your local physical gateway.
+* **Behavior**: The complement of listed destinations routes through the tunnel where its IP families and peer AllowedIPs support it; listed destinations intentionally bypass to the physical gateway. This is not a guarantee for unsupported families.
 * **NetworkManager Mechanism**: `never-default = yes` with the **complement** of the listed destinations installed as tunnel routes.
 
   Adding an excluded range to `ipv4.routes` would route it *into* the tunnel — the opposite of excluding it. There is no "bypass route" to install, because every route on a WireGuard connection points at the WireGuard device. So Neutron inverts the selection instead: it computes every CIDR *except* the listed ones and routes those through the tunnel, leaving the excluded ranges to the physical default route.
@@ -36,7 +37,24 @@ Neutron provides **Global Split Tunneling**, allowing users to specify exact sub
 * **Use Case**: Privacy browsing with exclusions for local services, banking portals, or gaming servers that block remote tunnel endpoints.
 
 ### 3. `Disabled` Mode (Standard Full-Tunnel)
-* Restores `never-default = no` and clears all custom static routes.
+* Restores `never-default = no` and clears stale split routes, then merges the
+  explicit resolver host routes required by kill-protected profiles.
+
+Changing to disabled applies stale-route cleanup before saving. Every activation
+also clears stale split properties when the saved mode is disabled. Default-route
+eligibility alone does not establish full-family protection.
+
+Explicit Include/Exclude bypasses are intentional even with the kill switch.
+Without lockdown, kill protection still rejects unsupported IPv4/IPv6 families;
+unsplit protection requires both `0.0.0.0/0` and `::/0` peer AllowedIPs. Lockdown
+can block unsupported or bypass traffic rather than route it. Kill-protected DNS
+uses explicit NM-managed resolver `/32` and `/128` routes in main table 254,
+merged with split routes even for excluded resolvers without replacing defaults.
+Automatic routed-DNS processing is disabled for these profiles; `yes` remains
+selected for unprotected profiles and is not a protection guarantee. After
+activation/reapply, kernel UDP/TCP port-53 egress must select the tunnel or
+Neutron attempts disconnection and reports an error. NetworkManager/nmcli 1.52+
+and iproute2's `ip` verifier are required. See [security](security.md).
 
 ---
 
@@ -54,10 +72,14 @@ For domain entries (e.g., `internal.corp`, `service.local`):
 1. The domain is resolved via `std::net::ToSocketAddrs` to all associated IPv4 (`/32`) and IPv6 (`/128`) literals.
 2. Resolved IPs are merged with configured CIDRs before applying route arguments to NetworkManager.
 3. Resolution is performed in the background during connection or rule modification.
+4. Invalid CIDRs or domains without a successful or retained last-known-good
+   resolution prevent an enabled policy from being applied and saved, rather
+   than silently applying a partial list. Entries can be stored while the mode
+   is disabled; enabling it validates and resolves the list.
 
 ---
 
-## CLI & GUI Configuration
+## CLI & TUI Configuration
 
 ### CLI Commands
 ```bash
@@ -79,8 +101,10 @@ neutron split-tunnel remove-domain internal.corp
 neutron split-tunnel clear
 ```
 
-### GUI Dialog
-Available in the **Settings** section of the GUI main window:
-* Clean mode selector dropdown (`Disabled`, `Include`, `Exclude`).
-* Interactive list editors for CIDRs and Domain names with inline syntax validation.
-* Real-time subtitle updates reflecting active rules.
+### TUI Editor
+Press `t` in the TUI to edit the global mode, CIDRs, and domains. See the
+[usage guide](usage.md#interactive-split-tunneling-t) for editor controls and
+[configuration reference](configuration.md) for `[global_split_tunnel]` settings.
+Snapshot saves reject a conflicting writer's changes with a reload-required
+error. Reload current settings before resubmitting; do not overwrite from the
+stale editor snapshot.

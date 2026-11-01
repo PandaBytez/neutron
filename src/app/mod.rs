@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
 use crate::nm::{self, NmClient, NmIntrospect, NmPolicy, WireguardProfile};
+use crate::process::terminal_safe;
 use crate::service;
 
 #[derive(Debug, Parser)]
@@ -146,8 +147,11 @@ enum QbitCommands {
         url: Option<String>,
         #[arg(long, help = "WebUI username")]
         username: Option<String>,
-        #[arg(long, help = "WebUI password")]
-        password: Option<String>,
+        #[arg(
+            long,
+            help = "Read one WebUI password line from piped/redirected stdin; an empty line clears it"
+        )]
+        password_stdin: bool,
         #[arg(
             long,
             value_name = "BOOL",
@@ -166,7 +170,16 @@ pub fn run<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         let _ = sync::ensure_app_dirs(&app_cfg);
     }
 
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|error| {
+        let code = error.exit_code();
+        // Clap may quote hostile argv in diagnostics. Help contains only trusted text.
+        if error.use_stderr() {
+            eprintln!("{}", terminal_safe(&error.to_string()));
+        } else {
+            print!("{error}");
+        }
+        std::process::exit(code);
+    });
     execute(client, cli)
 }
 
@@ -184,8 +197,8 @@ fn execute<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
 /// of the developer's real one. Both arguments are the point: every arm below has
 /// to route through a `_with_path` handler, because a handler that re-resolves
 /// `default_config_path()` writes the real settings the moment a test drives it,
-/// and `proc_root` is what `Restart` and `Reset` signal, so a test must never
-/// hand them the real `/proc`.
+/// and `proc_root` is what `Restart`, `Reset`, and `Uninstall` signal, so a test
+/// must never hand them the real `/proc`.
 fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
     cli: Cli,
@@ -207,14 +220,17 @@ fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'stati
                 println!(
                     "Imported {} new profiles: {}",
                     report.imported.len(),
-                    report.imported.join(", ")
+                    terminal_safe(&report.imported.join(", "))
                 );
             }
             if report.skipped > 0 {
                 println!("Skipped {} already existing profiles.", report.skipped);
             }
             if !report.errors.is_empty() {
-                eprintln!("Errors during sync:\n{}", report.errors.join("\n"));
+                eprintln!("Errors during sync:");
+                for error in &report.errors {
+                    eprintln!("{}", terminal_safe(error));
+                }
             }
             if report.imported.is_empty() && report.errors.is_empty() {
                 println!("All profiles are up to date.");
@@ -231,7 +247,7 @@ fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'stati
                 &app_cfg.profile_custom_info,
             );
             for row in rows {
-                println!("{}", profile_list::format_cli_row(&row));
+                println!("{}", terminal_safe(&profile_list::format_cli_row(&row)));
             }
             Ok(())
         }
@@ -259,7 +275,7 @@ fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'stati
             service::indicator::ensure_indicator_daemon_running();
             match res? {
                 service::StartupRandomResult::Connected(selected) => {
-                    println!("Startup random connected: {selected}");
+                    println!("Startup random connected: {}", terminal_safe(&selected));
                 }
                 service::StartupRandomResult::SkippedAlreadyActive => {
                     println!("Startup random skipped: a WireGuard profile is already active");
@@ -295,7 +311,7 @@ fn execute_with_path<C: NmClient + FirewallClient + Clone + Send + Sync + 'stati
                 client,
                 path,
                 autostart_dir.as_deref(),
-                std::path::Path::new("/proc"),
+                proc_root,
                 purge,
             )
         }
@@ -325,9 +341,13 @@ fn handle_eligible_command_with_path<C: NmClient>(
                 println!("Profiles excluded from startup-random:");
                 for id in &app_cfg.excluded_profile_ids {
                     if let Some(profile) = profiles.iter().find(|profile| &profile.uuid == id) {
-                        println!("  {} ({})", profile.name, profile.uuid);
+                        println!(
+                            "  {} ({})",
+                            terminal_safe(&profile.name),
+                            terminal_safe(&profile.uuid)
+                        );
                     } else {
-                        println!("  <unknown> ({id})");
+                        println!("  <unknown> ({})", terminal_safe(id));
                     }
                 }
             }
@@ -343,6 +363,8 @@ fn handle_eligible_command_with_path<C: NmClient>(
                     true,
                 )
             })?;
+            let profile = terminal_safe(&profile);
+            let profile_id = terminal_safe(&profile_id);
             if changed {
                 println!("Profile is now eligible for startup-random: {profile} ({profile_id})");
             } else {
@@ -360,6 +382,8 @@ fn handle_eligible_command_with_path<C: NmClient>(
                     false,
                 )
             })?;
+            let profile = terminal_safe(&profile);
+            let profile_id = terminal_safe(&profile_id);
             if changed {
                 println!("Profile excluded from startup-random: {profile} ({profile_id})");
             } else {
@@ -384,7 +408,11 @@ fn handle_favorite_command_with_path<C: NmClient>(
             for profile in &profiles {
                 let is_fav = app_cfg.favorite_profile_ids.contains(&profile.uuid);
                 let mark = if is_fav { "★" } else { " " };
-                println!("{mark} {} ({})", profile.name, profile.uuid);
+                println!(
+                    "{mark} {} ({})",
+                    terminal_safe(&profile.name),
+                    terminal_safe(&profile.uuid)
+                );
             }
         }
         FavoriteCommands::Add { profile } => {
@@ -393,6 +421,8 @@ fn handle_favorite_command_with_path<C: NmClient>(
             config::update(path, |cfg| {
                 changed = cfg.favorite_profile_ids.insert(profile_id.clone())
             })?;
+            let profile = terminal_safe(&profile);
+            let profile_id = terminal_safe(&profile_id);
             if changed {
                 println!("Starred profile as favorite: {profile} ({profile_id})");
             } else {
@@ -405,6 +435,8 @@ fn handle_favorite_command_with_path<C: NmClient>(
             config::update(path, |cfg| {
                 changed = cfg.favorite_profile_ids.remove(&profile_id)
             })?;
+            let profile = terminal_safe(&profile);
+            let profile_id = terminal_safe(&profile_id);
             if changed {
                 println!("Removed profile from favorites: {profile} ({profile_id})");
             } else {
@@ -578,19 +610,18 @@ pub fn set_global_lockdown<C: NmIntrospect + FirewallClient>(
             disable()
         });
         // If coordination storage is unavailable, still permit emergency removal.
-        return if entered { result } else { disable() };
+        return if entered || matches!(&result, Err(AppError::PolicyBusy)) {
+            result
+        } else {
+            disable()
+        };
     }
     apply_and_save_policy(
         path,
         crate::error::Policy::Lockdown,
         || {
-            if enable {
-                let tunnels = client.wireguard_tunnels()?;
-                client.enable_lockdown(&tunnels)?;
-            } else {
-                client.disable_lockdown()?;
-            }
-            Ok(())
+            let tunnels = client.wireguard_tunnels()?;
+            client.enable_lockdown(&tunnels)
         },
         |cfg| cfg.lockdown_enabled = enable,
     )
@@ -605,7 +636,10 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
         SplitTunnelCommands::Status => {
             let app_cfg = config::load(path)?;
             let st_cfg = split_tunnel::get_global_split_tunnel(&app_cfg);
-            println!("{}", split_tunnel::format_global_status(&st_cfg));
+            println!(
+                "{}",
+                terminal_safe(&split_tunnel::format_global_status(&st_cfg))
+            );
         }
         SplitTunnelCommands::SetMode { mode } => {
             let mode = mode.parse::<config::SplitTunnelMode>()?;
@@ -614,6 +648,7 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
         }
         SplitTunnelCommands::AddCidr { cidr } => {
             let (st_cfg, changed) = split_tunnel::add_global_cidr(client, path, &cidr)?;
+            let cidr = terminal_safe(&cidr);
             if changed {
                 println!(
                     "Added CIDR '{}' to global split tunneling (mode: {}).",
@@ -628,6 +663,7 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
         }
         SplitTunnelCommands::RemoveCidr { cidr } => {
             let (_, changed) = split_tunnel::remove_global_cidr(client, path, &cidr)?;
+            let cidr = terminal_safe(&cidr);
             if changed {
                 println!("Removed CIDR '{}' from global split tunneling.", cidr);
             } else {
@@ -636,6 +672,7 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
         }
         SplitTunnelCommands::AddDomain { domain } => {
             let (st_cfg, changed) = split_tunnel::add_global_domain(client, path, &domain)?;
+            let domain = terminal_safe(&domain);
             if changed {
                 println!(
                     "Added domain '{}' to global split tunneling (mode: {}).",
@@ -650,6 +687,7 @@ fn handle_split_tunnel_command_with_path<C: NmClient>(
         }
         SplitTunnelCommands::RemoveDomain { domain } => {
             let (_, changed) = split_tunnel::remove_global_domain(client, path, &domain)?;
+            let domain = terminal_safe(&domain);
             if changed {
                 println!("Removed domain '{}' from global split tunneling.", domain);
             } else {
@@ -687,7 +725,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
                     "Disabled"
                 }
             );
-            println!("WebUI URL:         {}", qcfg.url);
+            println!("WebUI URL:         {}", terminal_safe(&qcfg.url));
             println!(
                 "Authentication:    {}",
                 if qcfg.username.is_some() {
@@ -709,7 +747,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
             let profiles = client.list_wireguard_profiles()?;
             let active = profiles.iter().find(|p| p.is_active());
             if let Some(profile) = active {
-                println!("Active WireGuard Tunnel: {}", profile.name);
+                println!("Active WireGuard Tunnel: {}", terminal_safe(&profile.name));
                 if let Some(addr) = client.tunnel_address(&profile.uuid) {
                     // Asked of the gateway rather than read from
                     // `service::lease`, unlike the TUI. A one-shot command owns
@@ -736,16 +774,16 @@ fn handle_qbit_command_with_path<C: NmClient>(
             let mut qbit_client = crate::portforward::qbittorrent::QBittorrentClient::new(qcfg);
             match qbit_client.app_version() {
                 Ok(ver) => {
-                    println!("Online (qBittorrent {ver})");
+                    println!("Online (qBittorrent {})", terminal_safe(&ver));
                     if let Ok(prefs) = qbit_client.get_preferences() {
                         println!("qBittorrent Listening Port:  {}", prefs.listen_port);
                         if let Some(iface) = prefs.current_network_interface {
-                            println!("qBittorrent Bound Interface: {iface}");
+                            println!("qBittorrent Bound Interface: {}", terminal_safe(&iface));
                         }
                     }
                 }
                 Err(err) => {
-                    println!("Offline / Error ({err})");
+                    println!("Offline / Error ({})", terminal_safe(&err.to_string()));
                     println!(
                         "Note: Ensure qBittorrent is running with Web UI enabled in Options -> Web UI."
                     );
@@ -758,14 +796,17 @@ fn handle_qbit_command_with_path<C: NmClient>(
                 crate::portforward::qbittorrent::QBittorrentClient::new(&app_cfg.qbittorrent);
             println!(
                 "Connecting to qBittorrent WebUI at {}...",
-                app_cfg.qbittorrent.url
+                terminal_safe(&app_cfg.qbittorrent.url)
             );
             let version = qbit_client.app_version()?;
             let prefs = qbit_client.get_preferences()?;
-            println!("Success! Connected to qBittorrent {version}.");
+            println!(
+                "Success! Connected to qBittorrent {}.",
+                terminal_safe(&version)
+            );
             println!("Current listening port: {}", prefs.listen_port);
             if let Some(iface) = prefs.current_network_interface {
-                println!("Current network interface: {iface}");
+                println!("Current network interface: {}", terminal_safe(&iface));
             }
         }
         QbitCommands::Sync => {
@@ -785,13 +826,26 @@ fn handle_qbit_command_with_path<C: NmClient>(
             // working with no daemon running. The request renews the existing
             // mapping rather than replacing it, so the port pushed here is the
             // one the daemon is already holding.
-            let port = crate::portforward::port_for_tunnel_address(&addr).ok_or_else(|| {
-                AppError::PortForward(
-                    "gateway did not return a forwarded port via NAT-PMP".to_string(),
-                )
-            })?;
+            let mapping =
+                crate::portforward::mapping_for_tunnel_address(&addr).ok_or_else(|| {
+                    AppError::PortForward(
+                        "gateway did not return a forwarded port via NAT-PMP".to_string(),
+                    )
+                })?;
 
-            let report = qbittorrent::sync_port(client, &app_cfg.qbittorrent, &active.uuid, port)?;
+            let expires_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| AppError::PortForward("system clock is before the Unix epoch".into()))?
+                .as_secs()
+                + u64::from(mapping.lifetime_secs);
+            let report = qbittorrent::sync_port(
+                client,
+                path,
+                &app_cfg.qbittorrent,
+                &active.uuid,
+                mapping.port,
+                Some(expires_at),
+            )?;
 
             println!("qBittorrent port synchronized successfully!");
             if let Some(prev) = report.previous_port {
@@ -800,7 +854,7 @@ fn handle_qbit_command_with_path<C: NmClient>(
                 println!("Port: {}", report.new_port);
             }
             if let Some(bound) = report.bound_interface {
-                println!("Bound to interface: {}", bound);
+                println!("Bound to interface: {}", terminal_safe(&bound));
             } else if report.went_unbound(app_cfg.qbittorrent.binds_tunnel_interface()) {
                 // Said out loud, because "synchronized successfully" is otherwise
                 // the whole story and the forward still will not arrive.
@@ -824,9 +878,18 @@ fn handle_qbit_command_with_path<C: NmClient>(
         QbitCommands::Config {
             url,
             username,
-            password,
+            password_stdin,
             bind,
         } => {
+            use std::io::IsTerminal;
+            let password = if password_stdin {
+                if std::io::stdin().is_terminal() {
+                    return Err(AppError::Config("--password-stdin requires piped or redirected input so the password is not echoed; use the TUI for interactive entry".into()));
+                }
+                Some(read_password_line(std::io::stdin().lock())?)
+            } else {
+                None
+            };
             let app_cfg = config::update(path, |app_cfg| {
                 if let Some(u) = url {
                     app_cfg.qbittorrent.url = u;
@@ -846,10 +909,13 @@ fn handle_qbit_command_with_path<C: NmClient>(
                 }
             })?;
             println!("qBittorrent configuration updated.");
-            println!("URL:            {}", app_cfg.qbittorrent.url);
+            println!(
+                "URL:            {}",
+                terminal_safe(&app_cfg.qbittorrent.url)
+            );
             println!(
                 "Username:       {}",
-                app_cfg.qbittorrent.username.as_deref().unwrap_or("<none>")
+                terminal_safe(app_cfg.qbittorrent.username.as_deref().unwrap_or("<none>"))
             );
             println!(
                 "Bind Interface: {}",
@@ -865,6 +931,22 @@ fn handle_qbit_command_with_path<C: NmClient>(
     }
 
     Ok(())
+}
+
+fn read_password_line(mut reader: impl std::io::BufRead) -> AppResult<String> {
+    let mut password = String::new();
+    if reader.read_line(&mut password)? == 0 {
+        return Err(AppError::Config(
+            "no password line on stdin; provide an empty line to clear the password".into(),
+        ));
+    }
+    if password.ends_with('\n') {
+        password.pop();
+        if password.ends_with('\r') {
+            password.pop();
+        }
+    }
+    Ok(password)
 }
 
 /// Rebuild the lockdown ruleset from the current profile set, if lockdown is on.
@@ -942,6 +1024,27 @@ pub fn stop_daemons(proc_root: &std::path::Path, wait: std::time::Duration) -> u
         let _ = (proc_root, wait);
         0
     }
+}
+
+/// Whether any running tray daemon under `proc_root` was started from a
+/// different or since-replaced executable than the current process.
+#[cfg(unix)]
+pub fn has_stale_daemon(proc_root: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let self_exe = proc_root.join(format!("{}/exe", std::process::id()));
+    let self_link = std::fs::read_link(&self_exe).ok();
+    let self_ino = std::fs::metadata(&self_exe)
+        .ok()
+        .map(|m| (m.dev(), m.ino()));
+    neutron_processes_in(proc_root, std::process::id())
+        .into_iter()
+        .filter(|found| found.is_daemon)
+        .any(|found| {
+            let exe = proc_root.join(format!("{}/exe", found.pid));
+            let link = std::fs::read_link(&exe).ok();
+            let ino = std::fs::metadata(&exe).ok().map(|m| (m.dev(), m.ino()));
+            link != self_link || ino != self_ino
+        })
 }
 
 /// The other Neutron processes under `proc_root`, and which of them are the
@@ -1038,6 +1141,46 @@ fn resolve_profile_id(
 mod tests {
 
     use super::*;
+    use crate::testing::scratch_dir;
+
+    #[test]
+    fn security_password_input_is_not_an_argv_value_or_echoed() {
+        let cli = Cli::try_parse_from(["neutron", "qbit", "config", "--password-stdin"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Qbit {
+                command: QbitCommands::Config {
+                    password_stdin: true,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "neutron",
+                "qbit",
+                "config",
+                "--password",
+                "sentinel_password"
+            ])
+            .is_err()
+        );
+        // A reader owned by the test, never global stdin or a terminal.
+        let password =
+            read_password_line(std::io::Cursor::new(b"  sentinel_password  \r\nignored\n"))
+                .unwrap();
+        assert_eq!(password, "  sentinel_password  ");
+        assert_eq!(read_password_line(std::io::Cursor::new(b"\n")).unwrap(), "");
+        assert!(read_password_line(std::io::Cursor::new(b"")).is_err());
+        let path = crate::testing::temp_config_path("password-input");
+        let saved = config::update(&path, |cfg| cfg.qbittorrent.password = Some(password)).unwrap();
+        assert_eq!(
+            config::load(&path).unwrap().qbittorrent.password,
+            saved.qbittorrent.password
+        );
+        assert!(!format!("{saved:?}").contains("sentinel_password"));
+        crate::testing::remove_temp_config(&path);
+    }
 
     #[test]
     fn automatic_rebuild_rechecks_disabled_intent_after_coordination() {
@@ -1171,13 +1314,17 @@ mod tests {
 
     #[test]
     fn cli_subcommand_routing() {
+        let path = crate::testing::temp_config_path("cli-routing");
+        let proc_root = scratch_dir("proc-root");
         let cli = Cli {
             command: Some(Commands::List),
         };
         let client =
             crate::testing::MockNmClient::new(vec![crate::testing::inactive("wg-us", "uuid-1")]);
-        let result = execute(&client, cli);
+        let result = execute_with_path(&client, cli, &path, &proc_root);
         assert!(result.is_ok());
+        crate::testing::remove_temp_config(&path);
+        let _ = std::fs::remove_dir_all(&proc_root);
     }
 
     #[test]
@@ -1720,7 +1867,7 @@ mod tests {
             QbitCommands::Config {
                 url: Some("http://192.168.1.100:8080".to_string()),
                 username: Some("myuser".to_string()),
-                password: Some("mypass".to_string()),
+                password_stdin: false,
                 bind: Some(true),
             },
             &path,
@@ -1730,7 +1877,7 @@ mod tests {
         let loaded = config::load(&path).expect("config should load");
         assert_eq!(loaded.qbittorrent.url, "http://192.168.1.100:8080");
         assert_eq!(loaded.qbittorrent.username.as_deref(), Some("myuser"));
-        assert_eq!(loaded.qbittorrent.password.as_deref(), Some("mypass"));
+        assert_eq!(loaded.qbittorrent.password, None);
         // Forced, so a WebUI at an address the URL cannot place on this machine
         // still binds.
         assert!(loaded.qbittorrent.binds_tunnel_interface());
@@ -1757,7 +1904,7 @@ mod tests {
                 profile: "uuid-1".into(),
             }),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .expect("connect should succeed");
         assert_eq!(client.calls(), vec!["connect:uuid-1".to_string()]);
@@ -1769,7 +1916,7 @@ mod tests {
                 profile: "uuid-1".into(),
             }),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .expect("switch should succeed");
         assert!(client.calls().contains(&"switch:uuid-1".to_string()));
@@ -1778,7 +1925,7 @@ mod tests {
             &client,
             cli(Commands::Disconnect),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .expect("disconnect should succeed");
         assert!(client.calls().contains(&"disconnect".to_string()));
@@ -1805,7 +1952,7 @@ mod tests {
                 profile: "uuid-1".into(),
             }),
             &path,
-            &scratch_proc_root(),
+            &scratch_dir("proc-root"),
         )
         .unwrap_err();
         assert!(
@@ -2015,12 +2162,5 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         let _ = worker.join();
         crate::testing::remove_temp_config(&path);
-    }
-
-    /// An empty stand-in for `/proc`. The command seam signals processes, so a
-    /// test driving `restart` or `reset` must aim it at a scratch tree: the real
-    /// one ends in `kill(2)` on anything named `neutron`.
-    fn scratch_proc_root() -> std::path::PathBuf {
-        crate::testing::scratch_dir("proc-root")
     }
 }

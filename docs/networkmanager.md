@@ -2,6 +2,21 @@
 
 Neutron relies on **NetworkManager** as the source of truth for all WireGuard network configurations.
 
+The NetworkManager daemon and `nmcli` must both be **1.52+** with
+`ipv4.routed-dns` and `ipv6.routed-dns` support. Checked preparation reads back
+both selected values: `no` for kill-protected profiles, `yes` for unprotected
+profiles. Failure or a discarded value refuses activation. A newer CLI alone
+is not sufficient; `routed-dns=yes` alone is not a DNS protection guarantee.
+
+Kill-protected profiles disable automatic DNS route processing and append
+explicit NM-managed resolver `/32` and `/128` routes (metric 5, main table 254).
+These merge with split routes without replacing defaults, including resolver
+addresses explicitly excluded from ordinary tunnel traffic. After activation
+and active-device reapply, iproute2's `ip` performs JSON kernel route lookups for
+each resolver's UDP and TCP port-53 egress. The selected device must be the
+tunnel. Verification failure attempts disconnection and returns an error,
+including any teardown failure; this checks routes, not DNS packet delivery.
+
 ---
 
 ## Why NetworkManager?
@@ -29,6 +44,9 @@ The output is parsed into `WireguardProfile` structs with active/inactive states
 NetworkManager command helpers use `process::run_with_timeout` with a **30-second deadline** (`NMCLI_TIMEOUT`). The long-lived `nmcli monitor` process is managed separately.
 * Standard output and standard error pipes are drained concurrently on separate worker threads to prevent pipe buffer deadlocks.
 * If a command exceeds the deadline, the child process is terminated and an explicit `AppError::CommandFailed` error is returned. Failed commands surface their exit status.
+* Displayed errors and untrusted output escape control characters, line separators,
+  and bidirectional controls so profile names or command stderr cannot inject
+  terminal control sequences. Command arguments themselves are not rewritten.
 
 ### 3. Error Aggregation (`apply_to_every_profile`)
 Autoconnect normalization processes every profile and aggregates failures. Other policy sweeps can stop on a failure and leave mixed profile settings; callers report that possible partial state. See [Implementation Notes](implementation.md#saved-intent-and-effective-policy).

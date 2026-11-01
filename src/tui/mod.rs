@@ -124,67 +124,7 @@ where
             let _ = action_res_tx.send(crate::tui::state::AsyncActionResult::Sync(Err(error)));
         }
         while let Ok(action) = action_rx.recv() {
-            let res = match action {
-                crate::tui::state::AsyncAction::KillSwitch(enable) => {
-                    let r = crate::app::set_global_kill_switch(
-                        &client_for_action,
-                        &config_path_for_action,
-                        enable,
-                    );
-                    crate::tui::state::AsyncActionResult::KillSwitch { enable, result: r }
-                }
-                crate::tui::state::AsyncAction::Lockdown(enable) => {
-                    let r = crate::app::set_global_lockdown(
-                        &client_for_action,
-                        &config_path_for_action,
-                        enable,
-                    );
-                    crate::tui::state::AsyncActionResult::Lockdown { enable, result: r }
-                }
-                crate::tui::state::AsyncAction::Autoconnect(enable) => {
-                    let r = crate::service::set_autoconnect_at_login(
-                        &client_for_action,
-                        &config_path_for_action,
-                        enable,
-                    );
-                    crate::tui::state::AsyncActionResult::Autoconnect { enable, result: r }
-                }
-                crate::tui::state::AsyncAction::Sync => {
-                    let r = (|| {
-                        let cfg = crate::config::load(&config_path_for_action)?;
-                        let report = crate::app::sync::sync_profiles_dir(&client_for_action, &cfg)?;
-                        crate::app::rebuild_lockdown_if_enabled(
-                            &client_for_action,
-                            &config_path_for_action,
-                        )?;
-                        Ok(report)
-                    })();
-                    crate::tui::state::AsyncActionResult::Sync(r)
-                }
-                crate::tui::state::AsyncAction::Delete(uuid) => {
-                    let r = (|| {
-                        client_for_action.delete_profile(&uuid)?;
-                        crate::app::rebuild_lockdown_if_enabled(
-                            &client_for_action,
-                            &config_path_for_action,
-                        )?;
-                        Ok(uuid)
-                    })();
-                    crate::tui::state::AsyncActionResult::Delete(r)
-                }
-                crate::tui::state::AsyncAction::ProbeQbitWebUi => {
-                    let reachable = crate::config::load(&config_path_for_action)
-                        .map(|cfg| {
-                            crate::portforward::qbittorrent::QBittorrentClient::new(
-                                &cfg.qbittorrent,
-                            )
-                            .with_timeout(std::time::Duration::from_secs(1))
-                            .reachable()
-                        })
-                        .unwrap_or(false);
-                    crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable)
-                }
-            };
+            let res = events::run_action(&client_for_action, &config_path_for_action, action);
             let _ = action_res_tx.send(res);
         }
     });
@@ -214,26 +154,27 @@ where
         }
     });
 
-    let (split_tunnel_tx, split_tunnel_rx) =
-        std::sync::mpsc::channel::<crate::config::SplitTunnelConfig>();
+    let (split_tunnel_tx, split_tunnel_rx) = std::sync::mpsc::channel::<(
+        u64,
+        crate::config::SplitTunnelConfig,
+        crate::config::SplitTunnelConfig,
+    )>();
     let (st_res_tx, st_res_rx) =
-        std::sync::mpsc::channel::<(crate::config::SplitTunnelConfig, AppResult<()>)>();
+        std::sync::mpsc::channel::<(u64, crate::config::SplitTunnelConfig, AppResult<()>)>();
     state.split_tunnel_tx = Some(split_tunnel_tx);
 
     let client_for_st = client.clone();
     let config_path_for_st = state.config_path.clone();
     thread::spawn(move || {
-        while let Ok(mut cfg) = split_tunnel_rx.recv() {
-            // Coalesce rapid updates: drain to the latest config
-            while let Ok(newer_cfg) = split_tunnel_rx.try_recv() {
-                cfg = newer_cfg;
-            }
-            let res = crate::app::split_tunnel::apply_split_config(
+        // Keep every predecessor: dropping an intermediate edit breaks snapshot checks.
+        while let Ok((request_id, original, cfg)) = split_tunnel_rx.recv() {
+            let res = crate::app::split_tunnel::apply_split_config_if_unchanged(
                 &client_for_st,
                 &config_path_for_st,
+                &original,
                 &cfg,
             );
-            let _ = st_res_tx.send((cfg, res));
+            let _ = st_res_tx.send((request_id, cfg, res));
         }
     });
 
@@ -313,14 +254,14 @@ fn run_event_loop<C, B>(
     lat_rx: &std::sync::mpsc::Receiver<u32>,
     cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
     conn_res_rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
-    st_res_rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
+    st_res_rx: &std::sync::mpsc::Receiver<(u64, crate::config::SplitTunnelConfig, AppResult<()>)>,
     action_res_rx: &std::sync::mpsc::Receiver<crate::tui::state::AsyncActionResult>,
     monitor_events: &Arc<AtomicU64>,
     initial_refresh_needed: bool,
 ) -> AppResult<()>
 where
     C: NmClient + FirewallClient + Clone + Send + Sync + 'static,
-    B: ratatui::backend::Backend,
+    B: ratatui::backend::Backend<Error = std::io::Error>,
 {
     let mut last_seen_event = 0_u64;
     let mut needs_profile_refresh = initial_refresh_needed;
@@ -344,6 +285,7 @@ where
 
         // Drain any background profile cache updates
         drain_profile_cache(&mut *state, cache_rx);
+        state.dispatch_diagnostics();
 
         // Drain any incoming background connection/disconnection results
         drain_connection_results(
@@ -370,8 +312,8 @@ where
             events::refresh_qbit_webui_probe(state);
 
             if let Some((uuid, _, true)) = state.selected_identity() {
-                if let Some(ref tx) = state.diag_tx {
-                    let _ = tx.send((uuid, true));
+                if state.diag_tx.is_some() {
+                    state.request_diagnostics(uuid, true);
                 } else {
                     state.profile_cache.remove(&uuid);
                     events::update_diagnostics(state, client);
@@ -476,6 +418,7 @@ fn drain_profile_cache(
     rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
 ) {
     while let Ok((uuid, info)) = rx.try_recv() {
+        state.diag_in_flight = false;
         let matches_sel = state
             .selected_identity()
             .map(|(u, _, _)| u == uuid)
@@ -516,10 +459,10 @@ fn drain_connection_results(
 
 fn drain_split_results(
     state: &mut TuiState,
-    rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
+    rx: &std::sync::mpsc::Receiver<(u64, crate::config::SplitTunnelConfig, AppResult<()>)>,
 ) {
-    while let Ok((applied_cfg, res)) = rx.try_recv() {
-        state.finish_split(applied_cfg, res);
+    while let Ok((request_id, applied_cfg, res)) = rx.try_recv() {
+        state.finish_split(request_id, applied_cfg, res);
     }
 }
 
@@ -528,86 +471,44 @@ fn drain_action_results(
     rx: &std::sync::mpsc::Receiver<crate::tui::state::AsyncActionResult>,
     needs_profile_refresh: &mut bool,
 ) {
-    while let Ok(action_res) = rx.try_recv() {
-        // Every arm means the dispatched action reported back, so the spinner
-        // has done its job -- on success and on failure alike.
-        state.end_pending();
-        match action_res {
-            crate::tui::state::AsyncActionResult::KillSwitch { enable, result } => match result {
-                Ok(()) => {
-                    state
-                        .uncertain_policies
-                        .remove(&crate::error::Policy::KillSwitch);
-                    state.config.kill_switch_enabled = enable;
-                    state.set_status(format!(
-                        "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
-                        events::enabled_verb(enable)
+    loop {
+        let action_res = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if state.pending.is_some() {
+                    state.end_pending();
+                    state.set_error(&crate::error::AppError::Config(
+                        "the action worker has stopped; restart Neutron and try again".into(),
                     ));
                 }
-                Err(err) => {
-                    state.set_error(&err);
-                    if let Ok(persisted) = crate::config::load(&state.config_path) {
-                        state.config.kill_switch_enabled = persisted.kill_switch_enabled;
-                    }
-                }
-            },
-            crate::tui::state::AsyncActionResult::Lockdown { enable, result } => match result {
-                Ok(()) => {
-                    state
-                        .uncertain_policies
-                        .remove(&crate::error::Policy::Lockdown);
-                    state.config.lockdown_enabled = enable;
-                    state.set_status(format!("{} Lockdown Mode.", events::enabled_verb(enable)));
-                }
-                Err(err) => {
-                    state.set_error(&err);
-                    if let Ok(persisted) = crate::config::load(&state.config_path) {
-                        state.config.lockdown_enabled = persisted.lockdown_enabled;
-                    }
-                }
-            },
-            crate::tui::state::AsyncActionResult::Autoconnect { enable, result } => match result {
-                Ok(()) => {
-                    state.config.general.autoconnect_at_login = enable;
-                    state.set_status(format!(
-                        "{} Auto Connect at Login.",
-                        events::enabled_verb(enable)
-                    ));
-                }
-                Err(err) => {
-                    state.set_error(&err);
-                    if let Ok(persisted) = crate::config::load(&state.config_path) {
-                        state.config.general.autoconnect_at_login =
-                            persisted.general.autoconnect_at_login;
-                    }
-                }
-            },
-            crate::tui::state::AsyncActionResult::Sync(result) => match result {
-                Ok(report) => {
-                    *needs_profile_refresh = true;
-                    if !report.errors.is_empty() {
-                        state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
-                    } else if report.imported.is_empty() {
-                        state.set_status("Refreshed profiles.");
-                    } else {
-                        state.set_status(format!(
-                            "Imported {} new profile(s).",
-                            report.imported.len()
-                        ));
-                    }
-                }
-                Err(err) => state.set_error(&err),
-            },
-            crate::tui::state::AsyncActionResult::Delete(result) => match result {
-                Ok(_) => {
-                    state.set_status("Profile deleted.");
-                    *needs_profile_refresh = true;
-                }
-                Err(err) => state.set_error(&err),
-            },
-            crate::tui::state::AsyncActionResult::ProbeQbitWebUi(reachable) => {
-                if matches!(state.modal, crate::tui::state::ActiveModal::PortForward(_)) {
-                    state.qbit_webui_reachable = Some(reachable);
+                break;
+            }
+        };
+        // Only the failed flag is restored; unrelated, unsubmitted edits stay put.
+        let flag: Option<fn(&mut config::AppConfig) -> &mut bool> = match &action_res {
+            crate::tui::state::AsyncActionResult::KillSwitch { .. } => {
+                Some(|cfg| &mut cfg.kill_switch_enabled)
+            }
+            crate::tui::state::AsyncActionResult::Lockdown { .. } => {
+                Some(|cfg| &mut cfg.lockdown_enabled)
+            }
+            crate::tui::state::AsyncActionResult::Autoconnect { .. } => {
+                Some(|cfg| &mut cfg.general.autoconnect_at_login)
+            }
+            crate::tui::state::AsyncActionResult::Sync(_)
+            | crate::tui::state::AsyncActionResult::QbitSync(_)
+            | crate::tui::state::AsyncActionResult::Delete(_)
+            | crate::tui::state::AsyncActionResult::ProbeQbitWebUi(_) => None,
+        };
+        match events::finish_action(state, action_res) {
+            Ok(refresh) => *needs_profile_refresh |= refresh,
+            Err(err) => {
+                state.set_error(&err);
+                if let Some(flag) = flag
+                    && let Ok(mut persisted) = crate::config::load(&state.config_path)
+                {
+                    *flag(&mut state.config) = *flag(&mut persisted);
                 }
             }
         }
@@ -984,7 +885,8 @@ mod tests {
             cidrs: vec!["10.0.0.0/8".to_string()],
             domains: Vec::new(),
         };
-        tx.send((applied.clone(), Ok(()))).unwrap();
+        state.pending_split = Some(1);
+        tx.send((1, applied.clone(), Ok(()))).unwrap();
         drain_split_results(&mut state, &rx);
         assert!(state.pending_split.is_none());
         assert_eq!(state.config.global_split_tunnel, applied);
@@ -1029,6 +931,7 @@ mod tests {
         assert!(!state.config.kill_switch_enabled);
 
         // Lockdown + Autoconnect Ok paths record intent.
+        state.begin_pending("Enabling Lockdown Mode");
         tx.send(AsyncActionResult::Lockdown {
             enable: true,
             result: Ok(()),
@@ -1042,6 +945,7 @@ mod tests {
         drain_action_results(&mut state, &rx, &mut needs_refresh);
         assert!(state.config.lockdown_enabled);
         assert!(state.config.general.autoconnect_at_login);
+        assert!(state.pending.is_none());
 
         // Sync report variants: errors toast, empty refreshes, imports count.
         tx.send(AsyncActionResult::Sync(Ok(crate::app::sync::SyncReport {
@@ -1094,6 +998,61 @@ mod tests {
         drain_action_results(&mut state, &rx, &mut needs_refresh);
         assert!(state.status_is_error);
 
+        // Manual sync reports completion without changing the daemon's verdict.
+        needs_refresh = false;
+        state.lease = Some(crate::service::lease::LeaseState::default());
+        state.begin_pending("Synchronizing qBittorrent");
+        let started_at = state.pending.as_ref().unwrap().started_at;
+        for result in [
+            AsyncActionResult::ProbeQbitWebUi(true),
+            AsyncActionResult::Sync(Ok(crate::app::sync::SyncReport::default())),
+        ] {
+            tx.send(result).unwrap();
+            drain_action_results(&mut state, &rx, &mut needs_refresh);
+            assert_eq!(state.pending.as_ref().unwrap().started_at, started_at);
+            assert_eq!(
+                state.pending.as_ref().unwrap().label,
+                "Synchronizing qBittorrent"
+            );
+        }
+        needs_refresh = false;
+        tx.send(AsyncActionResult::QbitSync(Ok(
+            crate::portforward::qbittorrent::QBittorrentSyncReport {
+                previous_port: None,
+                new_port: 51820,
+                bound_interface: None,
+                app_version: None,
+            },
+        )))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert_eq!(
+            state.status_message,
+            "qBittorrent: synchronized port 51820."
+        );
+        assert!(!state.status_is_error);
+        assert!(state.pending.is_none());
+        assert!(!needs_refresh);
+        assert_eq!(
+            state.qbit_sync(),
+            Some(crate::service::lease::QbitSyncStatus::Pending)
+        );
+
+        state.begin_pending("Synchronizing qBittorrent");
+        tx.send(AsyncActionResult::QbitSync(Err(
+            crate::error::AppError::CommandFailed("WebUI rejected sync".into()),
+        )))
+        .unwrap();
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.status_is_error);
+        assert!(state.status_message.contains("WebUI rejected sync"));
+        assert!(state.pending.is_none());
+        assert!(!needs_refresh);
+        assert_eq!(
+            state.qbit_sync(),
+            Some(crate::service::lease::QbitSyncStatus::Pending)
+        );
+
         // The WebUI probe verdict, and the two Err arms that reload intent from
         // disk. Without the first, the port-forward panel would wait forever for
         // a verdict that arrives and is thrown away.
@@ -1124,6 +1083,7 @@ mod tests {
         let boom = || Err(crate::error::AppError::CommandFailed("boom".into()));
 
         state.config.lockdown_enabled = true;
+        state.begin_pending("Enabling Lockdown Mode");
         tx.send(AsyncActionResult::Lockdown {
             enable: true,
             result: boom(),
@@ -1131,6 +1091,7 @@ mod tests {
         .unwrap();
         drain_action_results(&mut state, &rx, &mut needs_refresh);
         assert!(state.status_is_error, "a failed policy must toast");
+        assert!(state.pending.is_none());
         assert!(
             !state.config.lockdown_enabled,
             "and revert to the intent on disk, not to the attempt"
@@ -1148,6 +1109,13 @@ mod tests {
             !state.config.general.autoconnect_at_login,
             "and revert to the intent on disk, not to the attempt"
         );
+
+        state.begin_pending("Synchronizing qBittorrent");
+        drop(tx);
+        drain_action_results(&mut state, &rx, &mut needs_refresh);
+        assert!(state.pending.is_none());
+        assert!(state.status_is_error);
+        assert!(state.status_message.contains("worker has stopped"));
 
         crate::testing::remove_temp_config(&path);
     }

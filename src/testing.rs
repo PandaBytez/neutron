@@ -21,6 +21,9 @@
 //! * the lease file under `$XDG_RUNTIME_DIR`, which is what a live daemon
 //!   publishes for the TUI.
 //!
+//! DNS is external state too: mock policy replay resolves only explicitly
+//! supplied fixture IPs, never the host resolver or production DNS cache.
+//!
 //! A test that genuinely needs the real thing is a *system* test: marked
 //! `#[ignore = "system test: requires the disposable sandbox"]` and gated on
 //! [`require_sandbox`].
@@ -188,6 +191,22 @@ pub fn inactive(name: &str, uuid: &str) -> WireguardProfile {
     profile(name, uuid, ProfileState::Inactive)
 }
 
+/// A live, unexpired lease fixture. Never writes the production publication file.
+pub fn fresh_lease(uuid: &str, port: u16) -> crate::service::lease::LeaseState {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("fixture clock")
+        .as_secs();
+    crate::service::lease::LeaseState {
+        profile_uuid: Some(uuid.into()),
+        port: Some(port),
+        updated_at: now,
+        publisher_pid: std::process::id(),
+        expires_at: Some(now + 60),
+        ..Default::default()
+    }
+}
+
 pub fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile {
     WireguardProfile {
         name: name.to_string(),
@@ -202,8 +221,6 @@ pub fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile 
 #[derive(Clone, Default)]
 pub struct MockNmClient {
     profiles: Vec<WireguardProfile>,
-    tunnels: Vec<WireguardTunnel>,
-    fail_list: bool,
     fail_list_count: Arc<AtomicUsize>,
     fail_ids: HashSet<String>,
     fail_kill_switch: bool,
@@ -225,7 +242,6 @@ pub struct MockNmClient {
     autoconnect_calls: Arc<Mutex<Vec<String>>>,
     lockdown_calls: Arc<Mutex<Vec<String>>>,
     split_tunnel_calls: Arc<Mutex<Vec<String>>>,
-    imported: Arc<Mutex<Vec<String>>>,
     extra_profiles: Arc<Mutex<Vec<WireguardProfile>>>,
     deleted: Arc<Mutex<HashSet<String>>>,
     /// Simulated NetworkManager profile settings, keyed by UUID then property.
@@ -241,6 +257,7 @@ pub struct MockNmClient {
     /// is its own interface, so they never compete for a device.
     active: Arc<Mutex<Vec<String>>>,
     config_path: Option<PathBuf>,
+    domain_ips: BTreeMap<String, Vec<std::net::IpAddr>>,
     sweep_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
 }
 
@@ -264,12 +281,26 @@ impl MockNmClient {
         self
     }
 
-    /// The config this mock reads policies from: what a test injected, or -- like
-    /// the real client -- the user's own.
-    fn policy_config_path(&self) -> Option<PathBuf> {
-        self.config_path
-            .clone()
-            .or_else(|| crate::config::default_config_path().ok())
+    /// Supply deterministic DNS answers for policy replay; absent domains fail resolution.
+    pub fn with_domain_ips(mut self, domain: &str, ips: Vec<std::net::IpAddr>) -> Self {
+        self.domain_ips.insert(domain.trim().to_lowercase(), ips);
+        self
+    }
+
+    /// Override an NM read in the fixture (methods, DNS and peer AllowedIPs).
+    pub fn with_setting(self, uuid: &str, key: &str, value: &str) -> Self {
+        self.settings
+            .lock()
+            .expect("mock mutex poisoned")
+            .entry(uuid.into())
+            .or_default()
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Only read policies from an explicitly injected fixture, never the host config.
+    fn policy_config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     /// The kill-switch and split-tunnel arguments the real client would pin on
@@ -279,25 +310,50 @@ impl MockNmClient {
     /// *when* they run. Three copies is three places for an injected path to be
     /// forgotten, which is how `switch_to` and `import_wireguard_profile` came to
     /// read the developer's real settings while `connect` honoured the temp one.
-    fn apply_policy_args(&self, identifier: &str, config_path: &Path) {
-        let Ok(app_cfg) = crate::config::load(config_path) else {
-            return;
-        };
-        if app_cfg.kill_switch_enabled {
-            self.apply_args(&crate::nm::kill_switch::set_args(identifier, true, true));
-        }
-        if app_cfg.global_split_tunnel.mode.is_enabled() {
-            let (v4, v6) = crate::nm::split_tunnel::routes_for(
-                app_cfg.global_split_tunnel.mode,
-                &app_cfg.global_split_tunnel.cidrs,
-                &app_cfg.global_split_tunnel.domains,
-            );
-            self.apply_args(&crate::nm::split_tunnel::set_args(
-                identifier,
-                app_cfg.global_split_tunnel.mode,
-                &v4,
-                &v6,
-            ));
+    fn apply_policy_args(&self, identifier: &str, config_path: &Path) -> AppResult<()> {
+        let app_cfg = crate::config::load(config_path)?;
+        self.apply_policy_config(identifier, &app_cfg)
+    }
+
+    fn apply_policy_config(
+        &self,
+        identifier: &str,
+        app_cfg: &crate::config::AppConfig,
+    ) -> AppResult<()> {
+        crate::nm::prepare_profile_with(
+            identifier,
+            app_cfg,
+            &mut |args| self.policy_command(args),
+            |domain| {
+                self.domain_ips
+                    .get(&domain.trim().to_lowercase())
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        )
+    }
+
+    fn policy_command(&self, args: &[&str]) -> AppResult<String> {
+        match args {
+            ["-g", key, "connection", "show", uuid]
+            | ["--escape", "no", "-g", key, "connection", "show", uuid] => {
+                Ok(self.setting(uuid, key).unwrap_or_else(|| match *key {
+                    "ipv4.method" | "ipv6.method" => "manual".into(),
+                    "wireguard.peers" => "KEY allowed-ips=0.0.0.0/0;::/0".into(),
+                    "ipv4.dns" => "10.2.0.1".into(),
+                    "ipv6.dns" => String::new(),
+                    "ipv4.dns-priority" | "ipv6.dns-priority" => "0".into(),
+                    _ => panic!("unexpected NM read: {args:?}"),
+                }))
+            }
+            ["connection", "modify", ..] => {
+                if self.fail_kill_switch || self.fail_split_tunnel {
+                    return Err(AppError::CommandFailed("simulated policy rejection".into()));
+                }
+                self.apply_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                Ok(String::new())
+            }
+            _ => panic!("unexpected policy command: {args:?}"),
         }
     }
 
@@ -320,7 +376,21 @@ impl MockNmClient {
         let mut settings = self.settings.lock().expect("mock mutex poisoned");
         let profile = settings.entry(uuid.clone()).or_default();
         for pair in rest.as_chunks::<2>().0 {
-            profile.insert(pair[0].clone(), pair[1].clone());
+            if let Some(key) = pair[0].strip_prefix('+') {
+                let value = profile.entry(key.into()).or_default();
+                if !value.split(", ").any(|entry| entry == pair[1]) {
+                    if !value.is_empty() {
+                        value.push_str(", ");
+                    }
+                    value.push_str(&pair[1]);
+                }
+            } else if let Some(key) = pair[0].strip_prefix('-') {
+                if profile.get(key) == Some(&pair[1]) {
+                    profile.insert(key.into(), String::new());
+                }
+            } else {
+                profile.insert(pair[0].clone(), pair[1].clone());
+            }
         }
     }
 
@@ -388,14 +458,6 @@ impl MockNmClient {
         let mut active = self.active.lock().expect("mock mutex poisoned");
         active.clear();
         active.push(uuid.to_string());
-    }
-
-    /// A mock whose `list_wireguard_profiles` fails, to exercise error paths.
-    pub fn failing_list() -> Self {
-        Self {
-            fail_list: true,
-            ..Self::default()
-        }
     }
 
     /// A mock whose `list_wireguard_profiles` fails `count` times transiently.
@@ -511,12 +573,6 @@ impl MockNmClient {
         self
     }
 
-    /// Set the tunnels returned by `wireguard_tunnels`.
-    pub fn with_tunnels(mut self, tunnels: Vec<WireguardTunnel>) -> Self {
-        self.tunnels = tunnels;
-        self
-    }
-
     /// Every operation in invocation order, formatted as `connect:<id>`,
     /// `switch:<id>`, or `disconnect`.
     pub fn calls(&self) -> Vec<String> {
@@ -556,11 +612,6 @@ impl MockNmClient {
     pub fn split_tunnel_calls(&self) -> Vec<String> {
         snapshot(&self.split_tunnel_calls)
     }
-
-    /// Paths passed to `import_wireguard_profile`, in invocation order.
-    pub fn imported_paths(&self) -> Vec<String> {
-        snapshot(&self.imported)
-    }
 }
 
 impl NmPolicy for MockNmClient {
@@ -581,7 +632,37 @@ impl NmPolicy for MockNmClient {
             ));
         }
 
-        self.apply_to_all(|uuid| crate::nm::kill_switch::set_args(uuid, enable, true));
+        let mut config = match self.policy_config_path() {
+            Some(path) => crate::config::load(path).unwrap_or_default(),
+            None => crate::config::AppConfig::default(),
+        };
+        config.kill_switch_enabled = enable;
+        let active_uuids = self.active_uuids();
+        for uuid in self.uuids() {
+            match self.apply_policy_config(&uuid, &config) {
+                Ok(()) => {}
+                Err(_) if !active_uuids.contains(&uuid) => {
+                    let has_ipv6 = self
+                        .setting(&uuid, "ipv6.method")
+                        .is_none_or(|m| !matches!(m.trim(), "" | "--" | "disabled" | "ignore"));
+                    let mut args = crate::nm::kill_switch::set_args(&uuid, enable, has_ipv6);
+                    if !enable {
+                        args.extend([
+                            "-ipv4.dns-search".into(),
+                            "~.".into(),
+                            "-ipv6.dns-search".into(),
+                            "~.".into(),
+                            "ipv4.may-fail".into(),
+                            "yes".into(),
+                            "ipv6.may-fail".into(),
+                            "yes".into(),
+                        ]);
+                    }
+                    self.apply_args(&args);
+                }
+                Err(err) => return Err(err),
+            }
+        }
         Ok(())
     }
 
@@ -623,9 +704,17 @@ impl NmPolicy for MockNmClient {
             ));
         }
 
-        self.apply_to_all(|uuid| {
-            crate::nm::split_tunnel::set_args(uuid, mode, v4_routes, v6_routes)
-        });
+        let mut batches = Vec::new();
+        for uuid in self.uuids() {
+            let mut args = crate::nm::split_tunnel::set_args(&uuid, mode, v4_routes, v6_routes);
+            if crate::nm::profile_dns_protected(&uuid, &mut |args| self.policy_command(args))? {
+                let dns =
+                    crate::nm::checked_tunnel_dns(&uuid, &mut |args| self.policy_command(args))?;
+                args.extend(crate::nm::dns_host_route_args(&dns));
+            }
+            batches.push((uuid, args));
+        }
+        self.apply_to_all(|uuid| batches.iter().find(|(id, _)| id == uuid).unwrap().1.clone());
         Ok(())
     }
 }
@@ -633,15 +722,18 @@ impl NmPolicy for MockNmClient {
 /// Lifecycle seam.
 impl NmLifecycle for MockNmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-        if self.fail_list
-            || self
+        loop {
+            let count = self.fail_list_count.load(Ordering::SeqCst);
+            if count == 0 {
+                break;
+            }
+            if self
                 .fail_list_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                    if c > 0 { Some(c - 1) } else { None }
-                })
+                .compare_exchange(count, count - 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
-        {
-            return Err(AppError::CommandFailed("simulated".to_string()));
+            {
+                return Err(AppError::CommandFailed("simulated".to_string()));
+            }
         }
         let active = self.active_uuids();
         let deleted = self.deleted.lock().expect("mock mutex poisoned");
@@ -674,17 +766,34 @@ impl NmLifecycle for MockNmClient {
 
         // Mirrors the real client: routing is pinned immediately before the
         // profile is brought up, along with active kill switch and split tunnel policies.
-        self.apply_args(&crate::nm::tunnel_routing::set_args(
-            profile_identifier,
-            true,
-        ));
         if let Some(config_path) = self.policy_config_path() {
             // Under the policy lock, as the real client does, so a concurrent
             // toggle cannot be read half-applied.
-            let _ = crate::config::coordinate_policy(&config_path, || {
-                self.apply_policy_args(profile_identifier, &config_path);
+            crate::config::coordinate_policy(config_path, || {
+                crate::nm::refuse_parallel_connect(
+                    &self.list_wireguard_profiles()?,
+                    profile_identifier,
+                    false,
+                )?;
+                self.apply_policy_args(profile_identifier, config_path)?;
+                if !self.unhealthy {
+                    self.add_active(profile_identifier);
+                }
                 Ok(())
-            });
+            })?;
+        } else {
+            crate::nm::refuse_parallel_connect(
+                &self.list_wireguard_profiles()?,
+                profile_identifier,
+                false,
+            )?;
+            self.apply_args(&crate::nm::tunnel_routing::set_args(
+                profile_identifier,
+                true,
+            ));
+            if !self.unhealthy {
+                self.add_active(profile_identifier);
+            }
         }
         if self.unhealthy {
             // As the real client does: the tunnel came up but carries no
@@ -693,7 +802,6 @@ impl NmLifecycle for MockNmClient {
                 "{profile_identifier}: connected but no traffic is passing"
             )));
         }
-        self.add_active(profile_identifier);
         record(&self.connected, profile_identifier.to_string());
         Ok(())
     }
@@ -726,24 +834,32 @@ impl NmLifecycle for MockNmClient {
                 "teardown failed and old profile is still active".to_string(),
             ));
         }
-        self.apply_args(&crate::nm::tunnel_routing::set_args(
-            profile_identifier,
-            true,
-        ));
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(profile_identifier, &config_path);
+            crate::config::coordinate_policy(config_path, || {
+                self.apply_policy_args(profile_identifier, config_path)?;
+                if !self.unhealthy {
+                    self.replace_active(profile_identifier);
+                }
+                Ok(())
+            })?;
+        } else {
+            self.apply_args(&crate::nm::tunnel_routing::set_args(
+                profile_identifier,
+                true,
+            ));
+            if !self.unhealthy {
+                self.replace_active(profile_identifier);
+            }
         }
         if self.unhealthy {
             return Err(AppError::TunnelUnhealthy(format!(
                 "{profile_identifier}: connected but no traffic is passing"
             )));
         }
-        self.replace_active(profile_identifier);
         Ok(())
     }
 
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
-        record(&self.imported, path.display().to_string());
         if self.fail_import {
             return Err(AppError::CommandFailed(format!(
                 "simulated import failure for {}",
@@ -774,7 +890,9 @@ impl NmLifecycle for MockNmClient {
         // When imported while global security settings are active, the new profile
         // immediately inherits kill switch and split-tunnel settings.
         if let Some(config_path) = self.policy_config_path() {
-            self.apply_policy_args(&uuid, &config_path);
+            crate::config::coordinate_policy(config_path, || {
+                self.apply_policy_args(&uuid, config_path)
+            })?;
         }
 
         Ok(format!("Imported {}", path.display()))
@@ -805,10 +923,7 @@ impl NmLifecycle for MockNmClient {
 /// Introspection seam.
 impl NmIntrospect for MockNmClient {
     fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
-        if self.fail_list {
-            return Err(AppError::CommandFailed("simulated".to_string()));
-        }
-        Ok(self.tunnels.clone())
+        Ok(Vec::new())
     }
 
     fn get_profile_diagnostics(
@@ -1087,4 +1202,17 @@ pub fn curl_available() -> bool {
         .arg("--version")
         .output()
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_policy_config_requires_explicit_injection() {
+        assert_eq!(MockNmClient::default().policy_config_path(), None);
+        let path = temp_toml_config_path("mock-policy");
+        let client = MockNmClient::default().with_config_path(path.clone());
+        assert_eq!(client.policy_config_path(), Some(path.as_path()));
+    }
 }

@@ -37,28 +37,10 @@ pub fn run_startup_random_with_path<C: NmClient>(
 ///
 /// Best-effort: failures are logged, since callers must still work on a system
 /// where the flag could not be cleared.
-fn normalize_autoconnect<C: NmPolicy>(client: &C) {
-    if let Err(error) = client.set_autoconnect_all(false) {
+fn normalize_autoconnect<C: NmPolicy>(client: &C, path: &Path) {
+    if let Err(error) = config::coordinate_policy(path, || client.set_autoconnect_all(false)) {
         warn!("failed to disable NetworkManager autoconnect: {error}");
     }
-}
-
-fn lock_selector(path: &Path) -> AppResult<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".selector.lock");
-    let lock = options.open(Path::new(&lock_path))?;
-    lock.lock()?;
-    Ok(lock)
 }
 
 fn run_startup_random_with_selector<C, F>(
@@ -70,14 +52,14 @@ where
     C: NmClient,
     F: FnMut(usize) -> usize,
 {
-    let _selector_lock = lock_selector(path)?;
+    let _selector_lock = config::lock_sidecar(path, ".selector.lock")?;
     let app_cfg = config::load(path)?;
 
     let profiles = client.list_wireguard_profiles()?;
 
     // Re-applied on every run so profiles imported out-of-band (via GNOME or
     // `nmcli`, which default autoconnect to on) cannot bring themselves up.
-    normalize_autoconnect(client);
+    normalize_autoconnect(client, path);
 
     let active_profiles: Vec<_> = profiles.iter().filter(|p| p.is_active()).collect();
 
@@ -119,6 +101,7 @@ where
         }
 
         match client.connect(&selected.uuid) {
+            Err(AppError::AlreadyActive) => return Ok(StartupRandomResult::SkippedAlreadyActive),
             Ok(()) => {
                 if let Err(error) = config::update(path, |cfg| {
                     cfg.last_random_profile_id = Some(selected.uuid.clone());
@@ -220,29 +203,65 @@ fn set_autoconnect_at_login_in<C: NmPolicy>(
     autostart_dir: &Path,
     enable: bool,
 ) -> AppResult<()> {
-    // NetworkManager must never activate a profile by itself in either state:
-    // the app is the only thing allowed to decide which tunnel is up.
-    client.set_autoconnect_all(false)?;
+    config::coordinate_policy(path, || {
+        // NetworkManager must never activate a profile by itself in either state:
+        // the app is the only thing allowed to decide which tunnel is up.
+        client.set_autoconnect_all(false)?;
 
-    if enable {
-        autostart::install_in(autostart_dir)?;
-    } else {
-        autostart::uninstall_in(autostart_dir)?;
-    }
-
-    if let Err(err) = config::update(path, |cfg| cfg.general.autoconnect_at_login = enable) {
         if enable {
-            let _ = autostart::uninstall_in(autostart_dir);
+            autostart::install_in(autostart_dir)?;
         } else {
-            let _ = autostart::install_in(autostart_dir);
+            autostart::uninstall_in(autostart_dir)?;
         }
-        return Err(err);
-    }
-    Ok(())
+
+        if let Err(err) = config::update(path, |cfg| cfg.general.autoconnect_at_login = enable) {
+            if enable {
+                let _ = autostart::uninstall_in(autostart_dir);
+            } else {
+                let _ = autostart::install_in(autostart_dir);
+            }
+            return Err(err);
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autoconnect_changes_wait_for_the_activation_policy_lock() {
+        let path = crate::testing::temp_config_path("autoconnect-coordination");
+        config::save(&path, &config::AppConfig::default()).unwrap();
+        let dir = crate::testing::scratch_dir("autostart-coordination");
+        let client = crate::testing::MockNmClient::default();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = config::coordinate_policy(&path, || {
+                let worker = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    done_tx
+                        .send(set_autoconnect_at_login_in(&client, &path, &dir, true))
+                        .unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_millis(30))
+                        .is_err()
+                );
+                assert!(client.autoconnect_calls().is_empty());
+                Ok(worker)
+            })
+            .unwrap();
+            worker.join().unwrap();
+        });
+        done_rx.recv().unwrap().unwrap();
+        assert_eq!(client.autoconnect_calls(), ["autoconnect-all:off"]);
+        crate::testing::remove_temp_config(&path);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
@@ -737,8 +756,11 @@ mod tests {
     #[test]
     fn failed_persistence_rolls_back_desktop_entry() {
         let client = MockNmClient::new(vec![]);
-        let bad_config_path = PathBuf::from("/nonexistent/directory/config.toml");
-        let autostart_dir = autostart_test_dir();
+        let scratch = crate::testing::scratch_dir("autostart-persistence-failure");
+        let blocker = scratch.join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        let bad_config_path = blocker.join("config.toml");
+        let autostart_dir = scratch.join("autostart");
 
         let res = set_autoconnect_at_login_in(&client, &bad_config_path, &autostart_dir, true);
         assert!(res.is_err(), "config update to bad path should fail");
@@ -746,8 +768,9 @@ mod tests {
             !autostart::is_installed_in(&autostart_dir),
             "entry must be uninstalled on persistence failure"
         );
+        assert_eq!(fs::read_to_string(&blocker).unwrap(), "not a directory");
 
-        let _ = std::fs::remove_dir_all(&autostart_dir);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// A throwaway autostart directory, so these tests never write into the

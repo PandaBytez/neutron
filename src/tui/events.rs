@@ -10,14 +10,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::eligibility;
-use crate::app::sync;
 use crate::config;
 use crate::error::AppResult;
 use crate::firewall::FirewallClient;
-use crate::nm::{self, NmClient, ProfileDiagnostics};
+use crate::nm::{self, NmClient};
 use crate::tui::state::{
-    ActiveModal, CachedProfileInfo, CommandPaletteState, SplitTunnelFocus, ThemePickerState,
-    TuiState, wrap_next, wrap_prev,
+    ActiveModal, AsyncAction, AsyncActionResult, CachedProfileInfo, CommandPaletteState,
+    SplitTunnelFocus, THEMES, ThemePickerState, TuiState, wrap_next, wrap_prev,
 };
 
 /// The client capabilities every action needs. Named once so the bound does not
@@ -127,75 +126,48 @@ pub fn execute_action<C: ActionClient>(
                     &state.config.global_split_tunnel,
                 ));
         }
-        "toggle" => {
+        "toggle" | "switch" | "disconnect" => {
             if state.connecting.is_some() {
                 return Ok(());
             }
-            if let Some((uuid, name, is_active)) = state.selected_identity() {
-                if let Some(ref tx) = state.connect_tx {
-                    state.connecting = Some(crate::tui::state::ConnectingState {
-                        uuid: uuid.clone(),
-                        name: name.clone(),
-                        is_disconnect: is_active,
-                        started_at: std::time::Instant::now(),
-                    });
-                    let _ = tx.send((uuid, name, !is_active));
-                } else {
-                    if is_active {
-                        client.disconnect_active()?;
-                        state.set_status(format!("Disconnected '{name}'."));
-                    } else {
-                        client.switch_to(&uuid)?;
-                        state.set_status(format!("Connected '{name}'."));
-                    }
-                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
-                    reload_profiles(state, client)?;
-                }
-            }
-        }
-        "switch" => {
-            if state.connecting.is_some() {
-                return Ok(());
-            }
-            if let Some((uuid, name, is_active)) = state.selected_identity() {
-                if is_active {
+            let (uuid, name, is_disconnect) = if id == "disconnect" {
+                (
+                    String::new(),
+                    state
+                        .active_profile_name
+                        .clone()
+                        .unwrap_or_else(|| "profile".to_string()),
+                    true,
+                )
+            } else {
+                let Some(identity) = state.selected_identity() else {
+                    return Ok(());
+                };
+                if id == "switch" && identity.2 {
                     return Ok(());
                 }
-                if let Some(ref tx) = state.connect_tx {
-                    state.connecting = Some(crate::tui::state::ConnectingState {
-                        uuid: uuid.clone(),
-                        name: name.clone(),
-                        is_disconnect: false,
-                        started_at: std::time::Instant::now(),
-                    });
-                    let _ = tx.send((uuid, name, true));
-                } else {
-                    client.switch_to(&uuid)?;
-                    state.set_status(format!("Switched to '{name}'."));
-                    let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
-                    reload_profiles(state, client)?;
-                }
-            }
-        }
-        "disconnect" => {
-            if state.connecting.is_some() {
-                return Ok(());
-            }
-            let name = state
-                .active_profile_name
-                .clone()
-                .unwrap_or_else(|| "profile".to_string());
+                identity
+            };
             if let Some(ref tx) = state.connect_tx {
                 state.connecting = Some(crate::tui::state::ConnectingState {
-                    uuid: String::new(),
+                    uuid: uuid.clone(),
                     name: name.clone(),
-                    is_disconnect: true,
+                    is_disconnect,
                     started_at: std::time::Instant::now(),
                 });
-                let _ = tx.send((String::new(), name, false));
+                let _ = tx.send((uuid, name, !is_disconnect));
             } else {
-                client.disconnect_active()?;
-                state.set_status("Disconnected active profile.");
+                if is_disconnect {
+                    client.disconnect_active()?;
+                } else {
+                    client.switch_to(&uuid)?;
+                }
+                state.set_status(match id {
+                    "disconnect" => "Disconnected active profile.".to_string(),
+                    "switch" => format!("Switched to '{name}'."),
+                    _ if is_disconnect => format!("Disconnected '{name}'."),
+                    _ => format!("Connected '{name}'."),
+                });
                 let _ = crate::app::rebuild_lockdown_if_enabled(client, &state.config_path);
                 reload_profiles(state, client)?;
             }
@@ -249,18 +221,15 @@ pub fn execute_action<C: ActionClient>(
                 ));
                 let _ = tx.send(crate::tui::state::AsyncAction::KillSwitch(enable));
             } else {
-                crate::app::set_global_kill_switch(client, &state.config_path, enable)?;
-                state
-                    .uncertain_policies
-                    .remove(&crate::error::Policy::KillSwitch);
-                state.config.kill_switch_enabled = enable;
-                state.set_status(format!(
-                    "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
-                    enabled_verb(enable)
-                ));
+                let result =
+                    run_action(client, &state.config_path, AsyncAction::KillSwitch(enable));
+                finish_action(state, result)?;
             }
         }
         "lockdown" => {
+            if state.pending.is_some() {
+                return Ok(());
+            }
             let enable = !state.config.lockdown_enabled;
             // Escalation blocks on a polkit prompt, so the wait is what the user
             // is watching. Animate it, and show elapsed time in case the prompt
@@ -289,13 +258,8 @@ pub fn execute_action<C: ActionClient>(
                 // No worker thread: this blocks the event loop, so the spinner
                 // cannot repaint. Marked anyway so the state cannot be left
                 // showing an action that already finished.
-                crate::app::set_global_lockdown(client, &state.config_path, enable)?;
-                state.end_pending();
-                state
-                    .uncertain_policies
-                    .remove(&crate::error::Policy::Lockdown);
-                state.config.lockdown_enabled = enable;
-                state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
+                let result = run_action(client, &state.config_path, AsyncAction::Lockdown(enable));
+                finish_action(state, result)?;
             }
         }
         "autoconnect" => {
@@ -307,9 +271,9 @@ pub fn execute_action<C: ActionClient>(
                 ));
                 let _ = tx.send(crate::tui::state::AsyncAction::Autoconnect(enable));
             } else {
-                crate::service::set_autoconnect_at_login(client, &state.config_path, enable)?;
-                state.config.general.autoconnect_at_login = enable;
-                state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+                let result =
+                    run_action(client, &state.config_path, AsyncAction::Autoconnect(enable));
+                finish_action(state, result)?;
             }
         }
         "port_forwarding" => {
@@ -329,51 +293,51 @@ pub fn execute_action<C: ActionClient>(
                 state.set_status("Syncing profiles in background...");
                 let _ = tx.send(crate::tui::state::AsyncAction::Sync);
             } else {
-                let report = sync::sync_profiles_dir(client, &state.config)?;
-                // The profile set may have changed, so the lockdown allow-list is
-                // stale: a freshly imported profile has no rule and would be
-                // blocked by the terminal DROP.
-                crate::app::rebuild_lockdown_if_enabled(client, &state.config_path)?;
+                let report = sync_profiles(client, &state.config_path, &state.config)?;
                 reload_profiles(state, client)?;
-                if !report.errors.is_empty() {
-                    state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
-                } else if report.imported.is_empty() {
-                    state.set_status("Refreshed profiles.");
-                } else {
-                    state.set_status(format!(
-                        "Imported {} new profile(s).",
-                        report.imported.len()
-                    ));
-                }
+                finish_action(state, AsyncActionResult::Sync(Ok(report)))?;
             }
         }
         "qbit_sync" => {
+            if state.pending.is_some() {
+                return Ok(());
+            }
             // Both halves come from the daemon's lease: the port is only
             // meaningful together with the tunnel it was obtained for, which is
             // also what decides the interface qBittorrent binds to.
             //
-            // Pushed straight away rather than by asking the daemon to do it,
-            // because the point of the action is an answer now. The badge keeps
-            // reporting the daemon's own verdict and converges on the next poll;
-            // the toast is what reports this push.
-            let lease = state
-                .lease
-                .as_ref()
-                .and_then(|lease| Some((lease.profile_uuid.clone()?, lease.port?)));
+            // The worker pushes this snapshot rather than asking the daemon to
+            // do it. The badge still reports the daemon's own verdict; the toast
+            // reports this manual push.
+            let lease = state.lease.as_ref().and_then(|lease| {
+                Some((
+                    lease.profile_uuid.clone()?,
+                    state.forwarded_port()?,
+                    lease.expires_at?,
+                ))
+            });
 
             match lease {
-                Some((uuid, port)) => {
-                    match crate::app::qbittorrent::sync_port(
-                        client,
-                        &state.config.qbittorrent,
-                        &uuid,
+                Some((uuid, port, expires_at)) => {
+                    let action = AsyncAction::QbitSync {
+                        uuid,
                         port,
-                    ) {
-                        Ok(report) => state.set_status(format!(
-                            "qBittorrent: synchronized port {}.",
-                            report.new_port
-                        )),
-                        Err(error) => state.set_error(&error),
+                        config: state.config.qbittorrent.clone(),
+                        expires_at,
+                    };
+                    if let Some(ref tx) = action_tx {
+                        state.begin_pending("Synchronizing qBittorrent");
+                        state.set_status("qBittorrent: synchronizing in background...");
+                        if tx.send(action).is_err() {
+                            state.end_pending();
+                            state.set_error(&crate::error::AppError::Config(
+                                "the action worker has stopped; restart Neutron and try again"
+                                    .into(),
+                            ));
+                        }
+                    } else {
+                        let result = run_action(client, &state.config_path, action);
+                        finish_action(state, result)?;
                     }
                 }
                 // Distinguished, because the three causes have three different
@@ -412,6 +376,136 @@ pub fn execute_action<C: ActionClient>(
 
 pub fn enabled_verb(enabled: bool) -> &'static str {
     if enabled { "Enabled" } else { "Disabled" }
+}
+
+pub(crate) fn run_action<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    action: AsyncAction,
+) -> AsyncActionResult {
+    match action {
+        AsyncAction::KillSwitch(enable) => AsyncActionResult::KillSwitch {
+            enable,
+            result: crate::app::set_global_kill_switch(client, path, enable),
+        },
+        AsyncAction::Lockdown(enable) => AsyncActionResult::Lockdown {
+            enable,
+            result: crate::app::set_global_lockdown(client, path, enable),
+        },
+        AsyncAction::Autoconnect(enable) => AsyncActionResult::Autoconnect {
+            enable,
+            result: crate::service::set_autoconnect_at_login(client, path, enable),
+        },
+        AsyncAction::Sync => AsyncActionResult::Sync((|| {
+            let cfg = config::load(path)?;
+            sync_profiles(client, path, &cfg)
+        })()),
+        AsyncAction::QbitSync {
+            uuid,
+            port,
+            config,
+            expires_at,
+        } => AsyncActionResult::QbitSync(crate::app::qbittorrent::sync_port(
+            client,
+            path,
+            &config,
+            &uuid,
+            port,
+            Some(expires_at),
+        )),
+        AsyncAction::Delete(uuid) => AsyncActionResult::Delete((|| {
+            client.delete_profile(&uuid)?;
+            crate::app::rebuild_lockdown_if_enabled(client, path)?;
+            Ok(uuid)
+        })()),
+        AsyncAction::ProbeQbitWebUi => AsyncActionResult::ProbeQbitWebUi(
+            config::load(path)
+                .map(|cfg| {
+                    crate::portforward::qbittorrent::QBittorrentClient::new(&cfg.qbittorrent)
+                        .with_timeout(std::time::Duration::from_secs(1))
+                        .reachable()
+                })
+                .unwrap_or(false),
+        ),
+    }
+}
+
+fn sync_profiles<C: NmClient + FirewallClient>(
+    client: &C,
+    path: &std::path::Path,
+    cfg: &config::AppConfig,
+) -> AppResult<crate::app::sync::SyncReport> {
+    let report = crate::app::sync::sync_profiles_dir(client, cfg)?;
+    crate::app::rebuild_lockdown_if_enabled(client, path)?;
+    Ok(report)
+}
+
+/// Apply a successful reply, returning whether the profile list needs refreshing.
+/// Callers retain their own error propagation and refresh ordering.
+pub(crate) fn finish_action(state: &mut TuiState, result: AsyncActionResult) -> AppResult<bool> {
+    match result {
+        AsyncActionResult::KillSwitch { enable, result } => {
+            result?;
+            state
+                .uncertain_policies
+                .remove(&crate::error::Policy::KillSwitch);
+            state.config.kill_switch_enabled = enable;
+            state.set_status(format!(
+                "{} saved Kill Switch policy; reconnect to apply routing/DNS changes.",
+                enabled_verb(enable)
+            ));
+        }
+        AsyncActionResult::Lockdown { enable, result } => {
+            state.end_pending();
+            result?;
+            state
+                .uncertain_policies
+                .remove(&crate::error::Policy::Lockdown);
+            state.config.lockdown_enabled = enable;
+            state.set_status(format!("{} Lockdown Mode.", enabled_verb(enable)));
+        }
+        AsyncActionResult::Autoconnect { enable, result } => {
+            result?;
+            state.config.general.autoconnect_at_login = enable;
+            state.set_status(format!("{} Auto Connect at Login.", enabled_verb(enable)));
+        }
+        AsyncActionResult::Sync(result) => {
+            let report = result?;
+            if !report.errors.is_empty() {
+                state.set_error(&crate::error::AppError::Config(report.errors.join("; ")));
+            } else if report.imported.is_empty() {
+                state.set_status("Refreshed profiles.");
+            } else {
+                state.set_status(format!(
+                    "Imported {} new profile(s).",
+                    report.imported.len()
+                ));
+            }
+            return Ok(true);
+        }
+        AsyncActionResult::Delete(result) => {
+            result?;
+            state.set_status("Profile deleted.");
+            return Ok(true);
+        }
+        AsyncActionResult::QbitSync(result) => {
+            state.end_pending();
+            match result {
+                Ok(report) => state.set_status(format!(
+                    "qBittorrent: synchronized port {}.",
+                    report.new_port
+                )),
+                Err(error) => state.set_error(&error),
+            }
+        }
+        AsyncActionResult::ProbeQbitWebUi(reachable) => {
+            state.qbit_probe_in_flight = false;
+            if matches!(state.modal, ActiveModal::PortForward(_)) {
+                state.qbit_webui_reachable = Some(reachable);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn handle_help_key(state: &mut TuiState, key: KeyEvent) {
@@ -469,10 +563,10 @@ fn handle_theme_picker_key(state: &mut TuiState, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => state.modal = ActiveModal::None,
-        KeyCode::Up => tp.selected_index = wrap_prev(tp.selected_index, tp.themes.len()),
-        KeyCode::Down => tp.selected_index = wrap_next(tp.selected_index, tp.themes.len()),
+        KeyCode::Up => tp.selected_index = wrap_prev(tp.selected_index, THEMES.len()),
+        KeyCode::Down => tp.selected_index = wrap_next(tp.selected_index, THEMES.len()),
         KeyCode::Enter => {
-            let selected = tp.themes.get(tp.selected_index).copied();
+            let selected = THEMES.get(tp.selected_index).copied();
             state.modal = ActiveModal::None;
             if let Some((preset, label)) = selected {
                 match config::update(&state.config_path, |cfg| {
@@ -643,8 +737,8 @@ fn handle_port_forward_key<C: ActionClient>(
             crate::tui::state::PortForwardFocus::Host | crate::tui::state::PortForwardFocus::Port
         );
         match key.code {
-            KeyCode::Esc if typing && field_nonempty(modal) => clear_focused_field(modal),
-            KeyCode::Esc | KeyCode::Char('q') => close_modal = true,
+            KeyCode::Esc => close_modal = true,
+            KeyCode::Char('q') if !typing => close_modal = true,
             KeyCode::Tab | KeyCode::Down => next_focus(modal),
             KeyCode::BackTab | KeyCode::Up => prev_focus(modal),
             KeyCode::Left if !typing => modal.move_left(),
@@ -655,6 +749,8 @@ fn handle_port_forward_key<C: ActionClient>(
                 // saying the WebUI is down would be a lie.
                 if mode == PortForwardMode::ForwardAndSync
                     && state.qbit_webui_reachable == Some(false)
+                    && modal.webui_url(&state.config.qbittorrent.url)
+                        == state.config.qbittorrent.url
                 {
                     blocked = true;
                 } else {
@@ -676,10 +772,7 @@ fn handle_port_forward_key<C: ActionClient>(
     }
 
     if url_changed {
-        persist_webui_url(state)?;
         state.qbit_webui_reachable = None;
-        state.qbit_webui_checked_at = None;
-        refresh_qbit_webui_probe(state);
     }
 
     if blocked {
@@ -689,12 +782,34 @@ fn handle_port_forward_key<C: ActionClient>(
     }
 
     if let Some(mode) = commit {
+        let ActiveModal::PortForward(ref modal) = state.modal else {
+            return Ok(());
+        };
+        let host = modal.host.trim();
+        let valid_host = if host.starts_with('[') && host.ends_with(']') {
+            host[1..host.len() - 1]
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok()
+        } else {
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        };
+        if !valid_host || !modal.port.trim().parse::<u16>().is_ok_and(|port| port != 0) {
+            return Err(crate::error::AppError::Config(
+                "enter a valid WebUI host and port (1-65535); settings were not saved".into(),
+            ));
+        }
+        let url = modal.webui_url(&state.config.qbittorrent.url);
         // Persisted before the reload below, which re-reads the config from
         // disk into `state.config` and would otherwise revert the choice.
         config::update(&state.config_path, |cfg| {
             cfg.port_forwarding.mode = mode;
+            cfg.qbittorrent.url = url.clone();
         })?;
         state.config.port_forwarding.mode = mode;
+        state.config.qbittorrent.url = url;
         let summary = match mode {
             PortForwardMode::Disabled => "Disabled NAT-PMP Port Forwarding.",
             PortForwardMode::Forward => "Enabled NAT-PMP Port Forwarding.",
@@ -717,22 +832,6 @@ fn handle_port_forward_key<C: ActionClient>(
     }
 
     Ok(())
-}
-
-fn field_nonempty(modal: &crate::tui::state::PortForwardModalState) -> bool {
-    match modal.focus {
-        crate::tui::state::PortForwardFocus::Host => !modal.host.is_empty(),
-        crate::tui::state::PortForwardFocus::Port => !modal.port.is_empty(),
-        crate::tui::state::PortForwardFocus::Mode => false,
-    }
-}
-
-fn clear_focused_field(modal: &mut crate::tui::state::PortForwardModalState) {
-    match modal.focus {
-        crate::tui::state::PortForwardFocus::Host => modal.host.clear(),
-        crate::tui::state::PortForwardFocus::Port => modal.port.clear(),
-        crate::tui::state::PortForwardFocus::Mode => {}
-    }
 }
 
 fn pop_focused_field(modal: &mut crate::tui::state::PortForwardModalState) {
@@ -773,45 +872,34 @@ fn prev_focus(modal: &mut crate::tui::state::PortForwardModalState) {
     };
 }
 
-fn persist_webui_url(state: &mut TuiState) -> AppResult<()> {
-    let ActiveModal::PortForward(ref modal) = state.modal else {
-        return Ok(());
-    };
-    let url = modal.webui_url(&state.config.qbittorrent.url);
-    if url == state.config.qbittorrent.url {
-        return Ok(());
-    }
-    config::update(&state.config_path, |cfg| cfg.qbittorrent.url = url.clone())?;
-    state.config.qbittorrent.url = url;
-    Ok(())
-}
-
 const QBIT_WEBUI_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Probe the WebUI while the port-forward panel is open, then again every 5s.
 ///
-/// A probe still inside that window is left alone. One that never answered
-/// is sent again, so a dropped send cannot leave Auto-Sync looking unchecked
-/// for the rest of the session. Closing the panel clears both.
+/// Keep at most one probe in flight, including when an action worker is busy.
 pub fn refresh_qbit_webui_probe(state: &mut TuiState) {
     if !matches!(state.modal, ActiveModal::PortForward(_)) {
         state.qbit_webui_reachable = None;
         state.qbit_webui_checked_at = None;
         return;
     }
-    let in_flight = state.qbit_webui_reachable.is_none() && state.qbit_webui_checked_at.is_some();
     let due = state
         .qbit_webui_checked_at
         .is_none_or(|at| at.elapsed() >= QBIT_WEBUI_REFRESH);
-    if !due {
+    if !due || state.qbit_probe_in_flight {
         return;
     }
-    if !in_flight {
-        state.qbit_webui_reachable = None;
-        state.qbit_webui_checked_at = Some(std::time::Instant::now());
-    }
     if let Some(ref tx) = state.action_tx {
-        let _ = tx.send(crate::tui::state::AsyncAction::ProbeQbitWebUi);
+        if tx
+            .send(crate::tui::state::AsyncAction::ProbeQbitWebUi)
+            .is_ok()
+        {
+            state.qbit_probe_in_flight = true;
+            state.qbit_webui_reachable = None;
+            state.qbit_webui_checked_at = Some(std::time::Instant::now());
+        } else {
+            state.qbit_webui_checked_at = None;
+        }
     }
 }
 
@@ -936,14 +1024,9 @@ pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
     let info = match state.profile_cache.get(&uuid) {
         Some(cached) => cached.clone(),
         None => {
-            if let Some(ref tx) = state.diag_tx {
-                let _ = tx.send((uuid.clone(), is_active));
-                CachedProfileInfo {
-                    diagnostics: ProfileDiagnostics::default(),
-                    tunnel_address: None,
-                    tunnel_dns: None,
-                    gateway: None,
-                }
+            if state.diag_tx.is_some() {
+                state.request_diagnostics(uuid.clone(), is_active);
+                CachedProfileInfo::default()
             } else {
                 let fetched = fetch_profile_info(client, &uuid, is_active);
                 state.profile_cache.insert(uuid, fetched.clone());
@@ -957,6 +1040,93 @@ pub fn update_diagnostics<C: NmClient>(state: &mut TuiState, client: &C) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn webui_drafts_are_saved_only_on_confirmation_and_text_shortcuts_are_literal() {
+        let path = crate::testing::temp_config_path("webui-draft");
+        let client = crate::testing::MockNmClient::default();
+        let mut cfg = config::AppConfig::default();
+        cfg.qbittorrent.url = "http://server.example.com:8080".into();
+        config::save(&path, &cfg).unwrap();
+        let mut state = TuiState::new(path.clone(), cfg);
+        execute_action(&mut state, &client, "port_forwarding").unwrap();
+        for code in [KeyCode::Tab, KeyCode::Backspace, KeyCode::Char('q')] {
+            handle_key_event(&mut state, &client, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+        }
+        assert!(matches!(state.modal, ActiveModal::PortForward(_)));
+        assert_eq!(
+            config::load(&path).unwrap().qbittorrent.url,
+            "http://server.example.com:8080"
+        );
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            config::load(&path).unwrap().qbittorrent.url,
+            "http://server.example.com:8080"
+        );
+        execute_action(&mut state, &client, "port_forwarding").unwrap();
+        for code in [
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::Tab,
+            KeyCode::Enter,
+        ] {
+            handle_key_event(&mut state, &client, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+        }
+        assert_eq!(
+            config::load(&path).unwrap().qbittorrent.url,
+            "http://server.example.co:8080"
+        );
+        execute_action(&mut state, &client, "port_forwarding").unwrap();
+        if let ActiveModal::PortForward(modal) = &mut state.modal {
+            modal.port = "65536".into();
+        }
+        assert!(
+            handle_key_event(
+                &mut state,
+                &client,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            config::load(&path).unwrap().qbittorrent.url,
+            "http://server.example.co:8080"
+        );
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn unanswered_webui_probes_never_queue_duplicates_and_failed_dispatch_can_retry() {
+        let mut state = TuiState::new(std::path::PathBuf::new(), config::AppConfig::default());
+        state.modal =
+            ActiveModal::PortForward(crate::tui::state::PortForwardModalState::from_config(
+                &state.config.port_forwarding,
+                &state.config.qbittorrent.url,
+            ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.action_tx = Some(tx);
+        refresh_qbit_webui_probe(&mut state);
+        assert!(matches!(rx.recv().unwrap(), AsyncAction::ProbeQbitWebUi));
+        state.qbit_webui_checked_at = Some(std::time::Instant::now() - QBIT_WEBUI_REFRESH);
+        for _ in 0..100 {
+            refresh_qbit_webui_probe(&mut state);
+        }
+        assert!(rx.try_recv().is_err());
+        finish_action(&mut state, AsyncActionResult::ProbeQbitWebUi(true)).unwrap();
+        refresh_qbit_webui_probe(&mut state);
+        assert!(matches!(rx.recv().unwrap(), AsyncAction::ProbeQbitWebUi));
+        state.qbit_probe_in_flight = false;
+        state.qbit_webui_checked_at = None;
+        drop(rx);
+        refresh_qbit_webui_probe(&mut state);
+        assert!(!state.qbit_probe_in_flight && state.qbit_webui_checked_at.is_none());
+    }
+
     use super::*;
     use crate::config::SplitTunnelMode;
     use crate::tui::state::CommandPaletteState;
@@ -1197,7 +1367,60 @@ mod tests {
             client.calls()
         );
 
+        // The inline API keeps its distinct confirmations and active-switch no-op.
+        state.connecting = None;
+        state.connect_tx = None;
+        execute_action(&mut state, &client, "switch").unwrap();
+        assert!(client.calls().is_empty());
+        execute_action(&mut state, &client, "toggle").unwrap();
+        assert_eq!(state.status_message, "Disconnected 'wg-eu'.");
+        state.selected_index = state.rows.iter().position(|row| row.uuid == uuid).unwrap();
+        execute_action(&mut state, &client, "switch").unwrap();
+        assert_eq!(state.status_message, format!("Switched to '{name}'."));
+        execute_action(&mut state, &client, "disconnect").unwrap();
+        assert_eq!(state.status_message, "Disconnected active profile.");
+        execute_action(&mut state, &client, "toggle").unwrap();
+        assert_eq!(state.status_message, format!("Connected '{name}'."));
+
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dropped_action_channels_keep_their_existing_outcomes() {
+        let client = crate::testing::MockNmClient::default();
+        let mut state = TuiState::new(
+            crate::testing::temp_config_path("dropped-actions"),
+            config::AppConfig::default(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        state.action_tx = Some(tx);
+        for action in ["kill_switch", "autoconnect", "sync"] {
+            execute_action(&mut state, &client, action).unwrap();
+            assert!(!state.status_is_error);
+        }
+        execute_action(&mut state, &client, "lockdown").unwrap();
+        assert!(state.status_is_error);
+        assert!(state.pending.is_none());
+        assert!(state.status_message.contains("policy worker has stopped"));
+        handle_delete_key(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            "uuid",
+        )
+        .unwrap();
+        assert_eq!(state.status_message, "Deleting profile in background...");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        state.connect_tx = Some(tx);
+        execute_action(&mut state, &client, "disconnect").unwrap();
+        assert!(state.connecting.is_some());
+        assert!(
+            client.calls().is_empty(),
+            "a dropped send must not run inline"
+        );
     }
 
     #[test]
@@ -1272,14 +1495,7 @@ mod tests {
     #[test]
     fn sync_with_nothing_new_reports_a_refresh() {
         let client = crate::testing::MockNmClient::default();
-        let inbox = std::env::temp_dir().join(format!(
-            "neutron-sync-empty-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should move forward")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&inbox).expect("inbox should be created");
+        let inbox = crate::testing::scratch_dir("sync-empty");
         let path = crate::testing::temp_config_path("tui-sync-refresh");
         let mut app_cfg = crate::config::AppConfig::default();
         app_cfg.general.profiles_dir = inbox.to_string_lossy().to_string();
@@ -1308,14 +1524,7 @@ mod tests {
             return;
         }
         let client = crate::testing::MockNmClient::default();
-        let inbox = std::env::temp_dir().join(format!(
-            "neutron-sync-unreadable-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should move forward")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&inbox).expect("inbox should be created");
+        let inbox = crate::testing::scratch_dir("sync-unreadable");
         // Strip every permission: listing needs read, so 0o555 would still
         // list. (ensure_profiles_dir only chmods on creation, so this sticks.)
         std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o000))
@@ -1332,9 +1541,7 @@ mod tests {
             "an unreadable inbox must raise an error toast, not a confirmation"
         );
         assert!(
-            state
-                .status_message
-                .contains("Failed to read profiles directory"),
+            state.status_message.contains("profiles directory"),
             "the toast must say what failed: {}",
             state.status_message
         );
@@ -1695,8 +1902,8 @@ mod tests {
             assert_eq!(st.focus, SplitTunnelFocus::DomainInput);
         }
 
-        // Type domain "example.com" and press Enter to auto-apply
-        for c in "example.com".chars() {
+        // Use the built-in loopback answer so applying the edit never uses DNS.
+        for c in "localhost".chars() {
             handle_key_event(
                 &mut state,
                 &client,
@@ -1711,12 +1918,12 @@ mod tests {
         )
         .unwrap();
         if let ActiveModal::SplitTunnel(ref st) = state.modal {
-            assert_eq!(st.domains, vec!["example.com".to_string()]);
+            assert_eq!(st.domains, vec!["localhost".to_string()]);
             assert_eq!(st.domain_input, "");
         }
         assert_eq!(
             state.config.global_split_tunnel.domains,
-            vec!["example.com".to_string()]
+            vec!["localhost".to_string()]
         );
 
         // Tab switches panel to CidrInput
@@ -1816,13 +2023,17 @@ mod qbittorrent_tests {
         crate::config::save(&path, &config).expect("config should save");
 
         let mut state = TuiState::new(path, config);
-        state.lease = Some(LeaseState {
-            port: Some(51820),
-            profile_uuid: Some("uuid-eu".to_string()),
-            ..Default::default()
-        });
+        state.lease = Some(crate::testing::fresh_lease("uuid-eu", 51820));
+        state.active_profile_uuid = Some("uuid-eu".into());
 
-        (state, MockNmClient::default())
+        (
+            state,
+            MockNmClient::new(vec![crate::testing::profile(
+                "wg-eu",
+                "uuid-eu",
+                crate::nm::ProfileState::Active,
+            )]),
+        )
     }
 
     #[test]

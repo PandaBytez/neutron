@@ -25,7 +25,7 @@ NAT-PMP (Port Mapping Protocol) allows clients behind a NAT gateway to request d
        │     Assigned Port: 51423                  │
        │     Lifetime: 60 seconds                  │
        │                                           │
-       │  3. Auto-Renew Loop (Every 45 seconds)    │
+       │  3. Auto-Renew Loop (30s for this lease)  │
        │──────────────────────────────────────────>│
        │     Repeats mapping request before expiry │
        │                                           │
@@ -56,9 +56,26 @@ mode = "forward-and-sync"
 Legacy configs with the old `enabled` flags keep loading: `[port_forwarding] enabled = true` becomes `forward`, and additionally `[qbittorrent] enabled = true` becomes `forward-and-sync`.
 
 1. **Lease Grant**: Upon receiving a success packet, the granted port number is stored in memory and displayed in the UI banner.
-2. **Periodic Renewal Timer**: A background timer runs at `RENEW_INTERVAL` (every 45 seconds) to refresh the lease with the gateway.
+2. **Periodic Renewal Timer**: Renewal becomes due after `min(granted lifetime / 2, 45 seconds)`, checked by the background loop. A 60-second lease is due after 30 seconds, not always 45 seconds.
 3. **Profile Switch / Disconnect Cleanup**: When switching profiles or disconnecting, the active port is cleared immediately to prevent displaying stale mappings.
-4. **Clipboard Integration**: A 1-click button in the GUI copies the forwarded port to the system clipboard for easy pasting into BitTorrent or game servers.
+4. **Clipboard Integration**: The tray's Copy Forwarded Port action copies the port for pasting into BitTorrent or game servers.
+
+On connect or switch, the daemon requests a lease on its next poll. If the tunnel
+address or gateway is not ready, it makes up to two retries, two seconds after
+each failed attempt, before backing off to 45 seconds between failures. Once a
+port is acquired, configured qBittorrent sync runs in the same poll.
+
+The publication carries the mapping's expiry separately from the daemon heartbeat.
+A fresh heartbeat cannot extend an expired mapping. The TUI accepts a port only for
+the active profile's UUID; old publications without expiry remain recognizable as
+daemon heartbeats but do not supply a usable port. Sync rechecks the active tunnel
+under the lifecycle policy lock and rejects expired queued mappings before writing.
+
+The daemon publishes its lease under `$XDG_RUNTIME_DIR/neutron/lease.json` for
+the TUI to read. On a headless system without `XDG_RUNTIME_DIR`, it still renews
+the lease and performs configured automatic qBittorrent sync, but warns that
+lease publication is unavailable. There is no fallback to shared `/tmp` storage;
+the TUI cannot display or manually sync an unpublished lease.
 
 ---
 
@@ -73,7 +90,12 @@ Before enabling synchronization, ensure qBittorrent's Web User Interface is enab
 1. In qBittorrent, open **Tools** $\rightarrow$ **Options** $\rightarrow$ **Web UI** (or **Preferences** $\rightarrow$ **Web UI**).
 2. Check **"Web User Interface (Remote control)"** (default port: `8080`).
 3. *(Recommended)* Under **Authentication**, check **"Bypass authentication for clients on localhost"**.
-   - If localhost authentication bypass is not enabled, configure your WebUI username and password in Neutron via `neutron qbit config --username <user> --password <pass>`.
+   - If localhost authentication bypass is not enabled, configure credentials with
+     `neutron qbit config --username admin --password-stdin < /path/to/protected-password`.
+     Use an existing owner-only (`0600`) password file or a secret-manager pipe.
+     `--password` is unsupported; terminal stdin is rejected before reading,
+     not echoed. The first line is read, an empty line clears the password, and
+     EOF without a line is rejected. Do not put literal secrets in shell commands.
 
 ### Compatibility (Flatpak, Native, Containers)
 
@@ -101,6 +123,14 @@ neutron qbit disable   # forward: lease only, port forwarding stays on
 neutron qbit config --url http://127.0.0.1:8080
 ```
 
+The TUI Command Palette also offers manual qBittorrent sync. It runs in a
+background worker with a pending indicator, then reports success or failure in
+the status message. It uses the published port/profile snapshot and does not
+overwrite the daemon's automatic-sync badge verdict.
+
+Host/port edits remain local drafts until confirmation. Escape cancels them, and
+the confirmed port must be within 1–65535. Only one WebUI probe is queued at a time.
+
 ### Interface Binding
 
 A forwarded port only arrives on the tunnel's interface, so a **local** qBittorrent (any `127.0.0.1`/`localhost`/`[::1]` WebUI URL, native, Flatpak or container) is bound to it along with the port — no setting to turn on. A WebUI on **another host** is left on whatever interface it already uses, since it has no tunnel device to bind.
@@ -114,3 +144,9 @@ neutron qbit config --url http://172.17.0.1:8080 --bind true
 # A WebUI on another host that must keep its own interface: do not bind.
 neutron qbit config --url http://192.168.1.50:8080 --bind false
 ```
+
+Current settings persist an internal `binding_overrides_migrated = true` marker
+in `[qbittorrent]`. Neutron maintains it so an explicit `bind_interface = false`
+survives reloads, while a legacy false default with a missing/false marker
+migrates to URL-derived binding. Use the CLI to set overrides rather than
+hand-editing the marker; see the [settings sample](configuration.md).

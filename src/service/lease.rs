@@ -90,9 +90,18 @@ pub struct LeaseState {
     /// parses, and zero is read as "unknown" rather than as a dead process.
     #[serde(default)]
     pub publisher_pid: u32,
+    /// Mapping deadline, independent of publication heartbeat. Missing legacy deadlines fail closed.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 impl LeaseState {
+    pub fn usable_port(&self) -> Option<u16> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        (now < self.expires_at?)
+            .then_some(self.port?)
+            .filter(|port| *port != 0)
+    }
     /// Whether this was published recently enough to still describe reality.
     ///
     /// Bounded on both sides. Too old means the lease has expired at the gateway;
@@ -172,11 +181,20 @@ pub fn path() -> Option<PathBuf> {
 ///
 /// Best effort and infallible: this runs on every daemon poll, and failing to
 /// tell the TUI about a lease must never take down the loop that renews it.
+/// Returns `false` only when a live foreign owner requires the renewer to stand
+/// down; `true` means keep renewing, not necessarily that the write succeeded.
 pub fn publish(state: &LeaseState) -> bool {
-    let Some(path) = path() else {
-        return false;
+    publish_with_path(path().as_deref(), state)
+}
+
+fn publish_with_path(path: Option<&std::path::Path>, state: &LeaseState) -> bool {
+    let Some(path) = path else {
+        tracing::warn!(
+            "Lease publication unavailable: XDG_RUNTIME_DIR is not set; continuing lease renewal"
+        );
+        return true;
     };
-    publish_to(&path, state)
+    publish_to(path, state)
 }
 
 /// The lease the daemon currently holds, or `None` when it is not publishing
@@ -200,6 +218,8 @@ pub fn live_owner() -> Option<u32> {
 /// Stands down when a *live* daemon other than this process already owns the
 /// file, so several daemons cannot take turns overwriting each other and leave
 /// the TUI watching the port flap.
+/// As with [`publish`], `false` means a live foreign owner, while publication
+/// errors are logged and return `true` so the renewal timer keeps running.
 ///
 /// Split out from [`publish`] so the round trip can be exercised against a
 /// temporary file. A test that wrote to [`path`] would clobber the lease of a
@@ -219,19 +239,31 @@ pub fn publish_to(path: &std::path::Path, state: &LeaseState) -> bool {
         ..state.clone()
     };
 
-    if let Ok(body) = serde_json::to_string(&stamped) {
-        // Atomic, because the TUI reads this file while the daemon rewrites it.
-        let _ = crate::config::write_atomically(path, &body);
-        true
-    } else {
-        false
+    match serde_json::to_string(&stamped) {
+        Ok(body) => {
+            // Atomic, because the TUI reads this file while the daemon rewrites it.
+            if let Err(error) = crate::config::write_atomically(path, &body) {
+                tracing::warn!(
+                    path = %path.display(), %error,
+                    "Lease publication failed; continuing lease renewal"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Lease serialization failed; continuing lease renewal");
+        }
     }
+    true
 }
 
 /// [`read`] from an explicit path.
 pub fn read_from(path: &std::path::Path) -> Option<LeaseState> {
     let body = std::fs::read_to_string(path).ok()?;
-    let state: LeaseState = serde_json::from_str(&body).ok()?;
+    let mut state: LeaseState = serde_json::from_str(&body).ok()?;
+    if state.usable_port().is_none() {
+        state.port = None;
+        state.qbit_sync = QbitSyncStatus::Pending;
+    }
     (state.is_fresh() && state.is_publisher_alive()).then_some(state)
 }
 
@@ -246,6 +278,21 @@ pub fn live_owner_of(path: &std::path::Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fresh_heartbeat_does_not_extend_mapping_expiry_or_validate_legacy_ports() {
+        let path = temp_lease_path("expired-mapping");
+        let mut state = held_at(now_secs());
+        for expires_at in [Some(now_secs() - 1), None] {
+            state.expires_at = expires_at;
+            assert!(publish_to(&path, &state));
+            let read = read_from(&path).unwrap();
+            assert!(read.port.is_none());
+            assert_eq!(live_owner_of(&path), Some(std::process::id()));
+            assert_eq!(read.qbit_sync, QbitSyncStatus::Pending);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     use super::*;
 
     fn now_secs() -> u64 {
@@ -262,12 +309,20 @@ mod tests {
             qbit_sync: QbitSyncStatus::Synchronized,
             updated_at,
             publisher_pid: std::process::id(),
+            expires_at: Some(now_secs() + STALE_AFTER.as_secs()),
         }
     }
 
     fn temp_lease_path(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_nanos();
         std::env::temp_dir()
-            .join(format!("neutron-lease-test-{label}-{}", now_secs()))
+            .join(format!(
+                "neutron-lease-test-{label}-{}-{stamp}",
+                std::process::id()
+            ))
             .join("lease.json")
     }
 
@@ -333,6 +388,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("path has a parent"));
+    }
+
+    #[test]
+    fn unavailable_publication_keeps_the_renewer_running() {
+        // Inject the missing runtime path without changing the process environment.
+        for _ in 0..2 {
+            assert!(publish_with_path(None, &held_at(0)));
+        }
+    }
+
+    #[test]
+    fn failed_publication_keeps_running_and_retries_after_recovery() {
+        let path = temp_lease_path("write-failure");
+        let parent = path.parent().expect("path has a parent");
+        // A file in place of the parent fails even when the tests run as root.
+        std::fs::write(parent, "not a directory").expect("write blocker");
+
+        for _ in 0..2 {
+            assert!(publish_to(&path, &held_at(0)));
+            assert!(read_from(&path).is_none());
+        }
+
+        std::fs::remove_file(parent).expect("remove blocker");
+        assert!(publish_to(&path, &held_at(0)));
+        assert_eq!(live_owner_of(&path), Some(std::process::id()));
+
+        std::fs::remove_dir_all(parent).expect("remove temp directory");
     }
 
     #[test]
@@ -405,13 +487,13 @@ mod tests {
             },
         );
 
-        publish_to(
+        assert!(!publish_to(
             &path,
             &LeaseState {
                 port: Some(9999),
                 ..held_at(0)
             },
-        );
+        ));
 
         assert_eq!(
             live_owner_of(&path),
@@ -464,6 +546,24 @@ mod tests {
         assert_eq!(live_owner_of(&path), Some(std::process::id()));
 
         let _ = std::fs::remove_dir_all(path.parent().expect("path has a parent"));
+    }
+
+    #[test]
+    fn a_stale_lease_from_a_live_process_does_not_stop_publication() {
+        let path = temp_lease_path("stale-owner");
+        write_raw(
+            &path,
+            &LeaseState {
+                publisher_pid: OTHER_LIVE_PID,
+                ..held_at(now_secs() - STALE_AFTER.as_secs() - 1)
+            },
+        );
+
+        assert!(publish_to(&path, &held_at(0)));
+        assert_eq!(live_owner_of(&path), Some(std::process::id()));
+
+        std::fs::remove_dir_all(path.parent().expect("path has a parent"))
+            .expect("remove temp directory");
     }
 
     #[test]

@@ -20,7 +20,7 @@
 //! Everything else is dropped, even before any VPN is connected and across
 //! reboots (the rules are made `--permanent`). Changing the system firewall
 //! requires privileges: explicit toggles authenticate through `pkexec`, while
-//! automatic refreshes use a root-owned, refresh-only helper; the `disable`
+//! refreshes in an active local session use a root-owned, refresh-only helper; the `disable`
 //! path always works to lift the block, so the user can never be permanently
 //! locked out.
 //!
@@ -49,7 +49,7 @@
 //! script so they cannot break out of their argument position.
 
 use std::net::IpAddr;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 pub mod helper;
 
@@ -63,6 +63,8 @@ const FIREWALL_CMD: &str = "firewall-cmd";
 /// among any other firewall rules and can be removed surgically at teardown
 /// without disturbing the user's own direct rules.
 const LOCKDOWN_MARKER: &str = "neutron-lockdown";
+// A device-local tag prevents a permanent name allowance matching a later physical link.
+const TUNNEL_GROUP: &str = "1313166676";
 
 /// The iptables `comment` match that stamps [`LOCKDOWN_MARKER`] onto a rule.
 const MARKER_ARGS: [&str; 4] = ["-m", "comment", "--comment", LOCKDOWN_MARKER];
@@ -102,8 +104,10 @@ pub trait FirewallClient {
     /// Install the lockdown ruleset, allowing the supplied tunnels' interfaces
     /// and endpoints through. Replaces any previous lockdown rules.
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()>;
-    /// Refresh an already enabled policy without interactive authorization.
+    /// Refresh an already enabled policy without enabling or disabling lockdown.
     /// `activating` identifies the NM profile whose first traffic must be protected.
+    /// `Some(uuid)` fails if protection is absent or cannot be fully verified in
+    /// both address families and both scopes. Propagate this before connection up.
     fn refresh_lockdown(&self, activating: Option<&str>) -> AppResult<()>;
     /// Whether this machine currently holds any Neutron-owned lockdown state:
     /// tagged rules, the root-owned refresh helper, or its polkit action.
@@ -114,13 +118,14 @@ pub trait FirewallClient {
     /// machine whose config was lost or purged can still be firewalled.
     fn has_installed_lockdown_state(&self) -> AppResult<bool>;
     /// Remove the lockdown ruleset in one privileged batch, and revoke the
-    /// password-free refresh grant when `revoke_grant` is set. Idempotent: safe
+    /// refresh helper authorization when `revoke_grant` is set. Idempotent: safe
     /// to call when lockdown is not currently active.
     ///
     /// `revoke_grant` is the whole difference between the two callers. A plain
-    /// disable leaves the grant alone, because it belongs to the *installation*
+    /// disable leaves only hardened authorization alone; legacy grants are revoked.
+    /// Hardened authorization belongs to the *installation*
     /// rather than to the current lockdown state: it is installed on enable,
-    /// must survive a disable so a re-enable needs no second prompt, and is
+    /// survives a disable (refresh still cannot re-enable), and is
     /// revoked when the app goes away. An uninstall sets it, so rules and grant
     /// leave in a single `pkexec` batch -- one password prompt either way.
     fn teardown_lockdown(&self, revoke_grant: bool) -> AppResult<()>;
@@ -134,25 +139,15 @@ pub trait FirewallClient {
 
 impl FirewallClient for crate::nm::CliNmClient {
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()> {
-        // Everything that mutates the firewall runs in ONE privileged batch so
-        // the user is prompted for a password at most once. Reads are
-        // unprivileged and never prompt.
-        //
-        // Permanent fail-closed guards protect every intermediate rebuild state.
-        let mut script = locked_script();
-        script.push_str(&helper::install_script()?);
-        for permanent in [true, false] {
-            let mut batches = lockdown_rebuild_batches(Vec::new(), tunnels);
-            if !permanent {
-                for batch in &mut batches {
-                    batch.remove(0);
-                }
-            }
-            script.push_str(&build_firewall_script(&batches[..2]));
-            script.push_str(&live_removal_script(permanent, true));
-            script.push_str(&build_firewall_script(&batches[2..]));
+        let tunnels = validate_tunnel_interfaces(tunnels)?;
+        let script = lockdown_enable_script(&tunnels, &helper::install_script()?);
+        run_script(&script, true)?;
+        if tunnels.iter().any(|t| !t.is_active) {
+            std::thread::spawn(|| {
+                let _ = helper::refresh(None);
+            });
         }
-        run_script(&script, true)
+        Ok(())
     }
 
     fn refresh_lockdown(&self, activating: Option<&str>) -> AppResult<()> {
@@ -176,8 +171,16 @@ impl FirewallClient for crate::nm::CliNmClient {
         let mut script = locked_script();
         script.push_str(&live_removal_script(true, false));
         script.push_str(&live_removal_script(false, false));
+        script.push_str(&format!(
+            "ip -o link show group {TUNNEL_GROUP} | \
+             awk -F ': ' '{{print $2}}' | cut -d '@' -f 1 | while IFS= read -r interface; do\n\
+               ip link set dev \"$interface\" group 0\n\
+             done\n"
+        ));
         if revoke_grant {
             script.push_str(&helper::uninstall_script());
+        } else {
+            script.push_str(&helper::revoke_unsafe_authorization_script());
         }
         run_script(&script, true)?;
 
@@ -196,12 +199,11 @@ impl FirewallClient for crate::nm::CliNmClient {
             }
         }
         // The install's other durable footprint: a root-owned helper binary and
-        // the polkit action that authorizes it. They grant password-free root
-        // execution, so report a survivor rather than leave a live grant behind.
-        if revoke_grant && helper::is_installed() {
+        // the polkit action that authorizes it. Report any surviving grant.
+        if helper::is_installed() && (revoke_grant || !helper::has_hardened_authorization()) {
             return Err(AppError::Firewall(format!(
                 "{} or its polkit action could not be deleted; remove them as root to \
-                 revoke password-free root execution",
+                  revoke helper authorization",
                 helper::PATH,
             )));
         }
@@ -215,7 +217,7 @@ impl FirewallClient for crate::nm::CliNmClient {
 /// Querying the ruleset does not require root, so this deliberately does **not**
 /// go through `pkexec`: it never triggers a password prompt. That is what lets
 /// enable/disable read the current rules freely and confine privilege to the
-/// single batched write below (see [`crate::process::host_command`]).
+/// single batched write below (see [`run_script`]).
 fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
     read_marked_rules_with(family, table, FIREWALL_CMD)
 }
@@ -223,7 +225,7 @@ fn read_marked_rules(family: &str, table: &str) -> AppResult<String> {
 /// [`read_marked_rules`] against a named binary, so the "no firewalld here" case
 /// is reachable from a test without a machine that lacks firewalld.
 fn read_marked_rules_with(family: &str, table: &str, tool: &str) -> AppResult<String> {
-    let output = crate::process::host_command(tool)
+    let output = Command::new(tool)
         .args(direct_args("--get-rules", family, table))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -254,47 +256,56 @@ fn read_marked_rules_with(family: &str, table: &str, tool: &str) -> AppResult<St
     }))
 }
 
-/// Read direct rules across all tables and chains.
-fn read_direct_all_rules(permanent: bool) -> AppResult<String> {
-    let mut args = vec!["--direct", "--get-all-rules"];
-    if permanent {
-        args.insert(0, "--permanent");
-    }
-    let output = crate::process::host_command(FIREWALL_CMD)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+/// Read rule arguments natively, without starting the Python firewall-cmd frontend.
+fn read_rule_batches(permanent: bool) -> AppResult<Vec<Vec<String>>> {
+    let connection = zbus::blocking::Connection::system()
         .map_err(|error| AppError::Firewall(error.to_string()))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-
-    Err(AppError::Firewall(
-        String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    ))
-}
-
-fn runtime_removal_batches() -> AppResult<Vec<Vec<String>>> {
-    Ok(read_direct_all_rules(false)?
-        .lines()
-        .filter(|line| line_is_marked(line))
-        .filter_map(|line| {
-            let parts: Vec<_> = line.split_whitespace().collect();
-            if parts.len() < 5
-                || !FAMILIES.contains(&parts[0])
-                || !MANAGED_TABLES.contains(&parts[1])
-                || parts[2] != "OUTPUT"
+    let (path, interface) = if permanent {
+        (
+            "/org/fedoraproject/FirewallD1/config",
+            "org.fedoraproject.FirewallD1.config.direct",
+        )
+    } else {
+        (
+            "/org/fedoraproject/FirewallD1",
+            "org.fedoraproject.FirewallD1.direct",
+        )
+    };
+    let proxy =
+        zbus::blocking::Proxy::new(&connection, "org.fedoraproject.FirewallD1", path, interface)
+            .map_err(|error| AppError::Firewall(error.to_string()))?;
+    let rules: Vec<(String, String, String, i32, Vec<String>)> = proxy
+        .call("getAllRules", &())
+        .map_err(|error| AppError::Firewall(error.to_string()))?;
+    Ok(rules
+        .into_iter()
+        .filter_map(|(family, table, chain, priority, args)| {
+            if !FAMILIES.contains(&family.as_str())
+                || !MANAGED_TABLES.contains(&table.as_str())
+                || chain != "OUTPUT"
+                || !args.iter().any(|arg| arg == LOCKDOWN_MARKER)
             {
                 return None;
             }
-            let mut batch = vec!["--direct".into(), "--remove-rule".into()];
-            batch.extend(parts.into_iter().map(str::to_string));
+            let mut batch = vec![
+                "--direct".into(),
+                "--remove-rule".into(),
+                family,
+                table,
+                chain,
+                priority.to_string(),
+            ];
+            if permanent {
+                batch.insert(0, "--permanent".into());
+            }
+            batch.extend(args);
             Some(batch)
         })
         .collect())
+}
+
+fn runtime_removal_batches() -> AppResult<Vec<Vec<String>>> {
+    read_rule_batches(false)
 }
 
 /// Enumerate under the root lock, not before a potentially long password prompt.
@@ -307,7 +318,8 @@ fn live_removal_script(permanent: bool, keep_guards: bool) -> String {
         ":"
     };
     format!(
-        "rules=$(firewall-cmd {scope} --direct --get-all-rules)\n\
+        "{rule_function}\n\
+         rules=$(firewall-cmd {scope} --direct --get-all-rules)\n\
          set -f\n\
          printf '%s\\n' \"$rules\" | while IFS= read -r rule; do\n\
            set -- $rule\n\
@@ -320,9 +332,10 @@ fn live_removal_script(permanent: bool, keep_guards: bool) -> String {
            marked=false\n\
            for arg do [ \"$arg\" != '{LOCKDOWN_MARKER}' ] || marked=true; done\n\
            if [ \"$marked\" = true ]; then\n\
-             firewall-cmd {scope} --direct --remove-rule \"$@\"\n\
+              firewall_rule {scope} --direct --remove-rule \"$@\"\n\
            fi\n\
-         done\n"
+         done\n",
+        rule_function = firewall_rule_function()
     )
 }
 
@@ -354,16 +367,186 @@ fn run_privileged_batches(batches: &[Vec<String>]) -> AppResult<()> {
 }
 
 fn locked_script() -> String {
-    format!("set -e\nexec 9>{}\nflock -x 9\n", helper::LOCK_PATH)
+    let mut script = locked_script_for(helper::LOCK_PATH, 0, helper::LOCK_TIMEOUT.as_secs(), 9);
+    // Bridge upgrades: old helpers hold the legacy inode, new helpers take both
+    // in this order. Neither file is ever removed during teardown.
+    script.push_str(&format!(
+        "[ ! -L {dir} ]\n\
+         mkdir -m 700 -- {dir} 2>/dev/null || [ -d {dir} ]\n\
+         [ \"$(stat -Lc '%u' {dir})\" = 0 ]\n\
+         chmod 700 -- {dir}\n",
+        dir = helper::LOCK_DIR,
+    ));
+    script.push_str(&locked_script_for(
+        helper::PRIVATE_LOCK_PATH,
+        0,
+        helper::LOCK_TIMEOUT.as_secs(),
+        7,
+    ));
+    script
+}
+
+fn lockdown_enable_script(tunnels: &[WireguardTunnel], installation: &str) -> String {
+    let active: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
+    let mut script = locked_script();
+    script.push_str(&interface_validation_script(tunnels));
+    script.push_str(installation);
+    // A snapshot taken before authentication can be invalid by the time these locks are held.
+    for permanent in [true, false] {
+        let mut batches = lockdown_rebuild_batches(Vec::new(), &active);
+        if !permanent {
+            for batch in &mut batches {
+                batch.remove(0);
+            }
+        }
+        script.push_str(&build_firewall_script(&batches[..2]));
+        script.push_str(&live_removal_script(permanent, true));
+        script.push_str(&build_firewall_script(&batches[2..]));
+    }
+    script.push_str(&retire_tag_guards_script());
+    script
+}
+
+fn locked_script_for(path: &str, owner: u32, timeout: u64, fd: u8) -> String {
+    // Keep the old pathname/inode so already-running helpers still serialize.
+    // /run is root-owned; umask applies before the file's first exposure.
+    format!(
+        "set -e\numask 077\n\
+         [ ! -L {lock} ] || exit 1\n\
+         [ ! -e {lock} ] || [ -f {lock} ]\n\
+         exec {fd}>>{lock}\n\
+         [ \"$(stat -Lc '%u:%h' /proc/self/fd/{fd})\" = {owner}:1 ]\n\
+         chmod 600 /proc/self/fd/{fd}\n\
+         flock -x -w {timeout} {fd}\n",
+        lock = shell_quote(path),
+    )
+}
+
+/// Only exact interface names may become OUTPUT allowances. Existing links must
+/// be kernel WireGuard devices; absent links are allowed for inactive profiles.
+fn validate_tunnel_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<Vec<WireguardTunnel>> {
+    let listing = crate::process::run_with_timeout(
+        "ip",
+        &["-json", "-details", "link", "show"],
+        helper::LOCK_TIMEOUT,
+    )?;
+    let links: serde_json::Value = serde_json::from_str(&listing)
+        .map_err(|error| AppError::Firewall(format!("Invalid link introspection: {error}")))?;
+    let links = links
+        .as_array()
+        .ok_or_else(|| AppError::Firewall("Invalid link introspection".into()))?;
+    validate_tunnel_interfaces_with(tunnels, |interface| {
+        Ok(links
+            .iter()
+            .find(|link| link["ifname"] == interface)
+            .map(|link| link["linkinfo"]["info_kind"] == "wireguard"))
+    })
+}
+
+fn validate_tunnel_interfaces_with(
+    tunnels: &[WireguardTunnel],
+    mut is_wireguard: impl FnMut(&str) -> AppResult<Option<bool>>,
+) -> AppResult<Vec<WireguardTunnel>> {
+    let mut tunnels = tunnels.to_vec();
+    for tunnel in &mut tunnels {
+        let Some(interface) = tunnel.interface.as_deref() else {
+            if tunnel.is_active {
+                return Err(AppError::Firewall(
+                    "Active WireGuard profile has no interface".into(),
+                ));
+            }
+            continue;
+        };
+        if interface.is_empty()
+            || interface.len() > 15
+            || !interface
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            return Err(AppError::Firewall(format!(
+                "Unsafe tunnel interface: {interface}"
+            )));
+        }
+        match is_wireguard(interface)? {
+            Some(true) => {}
+            None if !tunnel.is_active => tunnel.interface = None,
+            _ => {
+                return Err(AppError::Firewall(format!(
+                    "Interface {interface} is not WireGuard"
+                )));
+            }
+        }
+    }
+    Ok(tunnels)
+}
+
+/// Recheck after authentication, before any firewall writes. User-side checks
+/// alone leave a device-type race across the password prompt.
+fn interface_validation_script(tunnels: &[WireguardTunnel]) -> String {
+    let mut script = String::from("tagged=false\nip link show >/dev/null\n");
+    let guards: Vec<_> = FAMILIES
+        .iter()
+        .flat_map(|family| {
+            let permanent = add_rule(family, -1, &["-j", "DROP"]);
+            let mut runtime = permanent.clone();
+            runtime.remove(0);
+            [permanent, runtime]
+        })
+        .collect();
+    let guard_script = build_firewall_script(&guards);
+    for tunnel in tunnels {
+        if let Some(interface) = &tunnel.interface {
+            let absent = if !tunnel.is_active {
+                ":"
+            } else {
+                "echo 'WireGuard interface disappeared' >&2; exit 1"
+            };
+            script.push_str(&format!(
+                "if ip link show dev {interface} >/dev/null 2>&1; then\n\
+                   wireguard_link=$(ip -details -oneline link show dev {interface} type wireguard)\n\
+                    [ -n \"$wireguard_link\" ] || {{ echo 'Interface is not WireGuard' >&2; exit 1; }}\n\
+                    group=$(ip -o link show dev {interface} | awk '{{for (i=1;i<NF;i++) if ($i == \"group\") print $(i+1)}}')\n\
+                    case \"$group\" in\n\
+                      default|0)\n\
+                        if [ \"$tagged\" = false ]; then\n{guard_script}tagged=true\nfi\n\
+                        ip link set dev {interface} group {TUNNEL_GROUP}\n\
+                        wireguard_link=$(ip -details -oneline link show dev {interface} type wireguard)\n\
+                        [ -n \"$wireguard_link\" ] || {{ echo 'Interface changed while tagging; protection remains guarded' >&2; exit 1; }};;\n\
+                      {TUNNEL_GROUP}) :;;\n\
+                      *) echo 'WireGuard interface has a foreign device group; left unchanged' >&2; exit 1;;\n\
+                    esac\n\
+                  else\n  {absent}\nfi\n",
+                interface = shell_quote(interface),
+            ));
+        }
+    }
+    script
+}
+
+fn retire_tag_guards_script() -> String {
+    let removals: Vec<_> = FAMILIES
+        .iter()
+        .flat_map(|family| {
+            let mut permanent = add_rule(family, -1, &["-j", "DROP"]);
+            permanent[2] = "--remove-rule".into();
+            let mut runtime = permanent.clone();
+            runtime.remove(0);
+            [permanent, runtime]
+        })
+        .collect();
+    format!(
+        "if [ \"$tagged\" = true ]; then\n{}fi\n",
+        build_firewall_script(&removals)
+    )
 }
 
 fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
     let mut command = if authenticate {
-        let mut command = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")]);
-        command.arg("sh");
+        let mut command = Command::new("pkexec");
+        command.env("SHELL", "/bin/sh").arg("sh");
         command
     } else {
-        crate::process::host_command("/bin/sh")
+        Command::new("/bin/sh")
     };
     let output = command
         .arg("-c")
@@ -387,7 +570,7 @@ fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
     )))
 }
 
-/// Render `firewall-cmd` argument batches into a single `/bin/sh` script that
+/// Render direct-rule argument batches into a single `/bin/sh` script that
 /// runs each in order and aborts on the first failure (`set -e`). Rebuild guards
 /// keep partially applied permanent rules fail-closed.
 ///
@@ -397,8 +580,11 @@ fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
 /// commands into one `sh -c` safe against command injection.
 fn build_firewall_script(batches: &[Vec<String>]) -> String {
     let mut script = String::from("set -e\n");
+    if !batches.is_empty() {
+        script.push_str(firewall_rule_function());
+    }
     for batch in batches {
-        script.push_str(FIREWALL_CMD);
+        script.push_str("firewall_rule");
         for arg in batch {
             script.push(' ');
             script.push_str(&shell_quote(arg));
@@ -408,23 +594,50 @@ fn build_firewall_script(batches: &[Vec<String>]) -> String {
     script
 }
 
+// dbus-send is already required by helper installation and avoids Python startup per rule.
+fn firewall_rule_function() -> &'static str {
+    r#"firewall_rule() {
+  for arg do
+    case "$arg" in *,*) firewall-cmd "$@"; return;; esac
+  done
+  path=/org/fedoraproject/FirewallD1
+  interface=org.fedoraproject.FirewallD1.direct
+  if [ "$1" = --permanent ]; then
+    path=/org/fedoraproject/FirewallD1/config
+    interface=org.fedoraproject.FirewallD1.config.direct
+    shift
+  fi
+  if [ "$1" != --direct ]; then firewall-cmd "$@"; return; fi
+  shift
+  case "$1" in
+    --add-rule) method=addRule;;
+    --remove-rule) method=removeRule;;
+    *) echo 'Unsupported direct firewall operation' >&2; return 1;;
+  esac
+  shift
+  family=$1 table=$2 chain=$3 priority=$4
+  shift 4
+  rule_args=$(IFS=,; printf %s "$*")
+  if reply=$(dbus-send --system --print-reply --dest=org.fedoraproject.FirewallD1 "$path" "$interface.$method" \
+      "string:$family" "string:$table" "string:$chain" "int32:$priority" "array:string:$rule_args" 2>&1); then
+    return 0
+  fi
+  case "$method:$reply" in
+    'addRule:Error org.fedoraproject.FirewallD1.Exception: ALREADY_ENABLED:'*|'removeRule:Error org.fedoraproject.FirewallD1.Exception: NOT_ENABLED:'*) return 0;;
+  esac
+  printf '%s\n' "$reply" >&2
+  return 1
+}
+"#
+}
+
 /// POSIX-safe single-quote escaping: wrap `arg` in single quotes, rewriting any
 /// embedded single quote as `'\''`. The result is one shell word whose literal
 /// value is exactly `arg`, immune to word-splitting and to every shell
 /// metacharacter (`;`, `$`, `` ` ``, newline, …). This is the mechanism that
 /// lets [`build_firewall_script`] safely embed profile-derived strings.
 fn shell_quote(arg: &str) -> String {
-    let mut quoted = String::with_capacity(arg.len() + 2);
-    quoted.push('\'');
-    for ch in arg.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Permanent IPv4/IPv6 rules; runtime rules are updated separately without reload.
@@ -442,6 +655,13 @@ fn lockdown_enable_batches(tunnels: &[WireguardTunnel]) -> Vec<Vec<String>> {
 fn lockdown_rebuild_batches(
     removals: Vec<Vec<String>>,
     tunnels: &[WireguardTunnel],
+) -> Vec<Vec<String>> {
+    lockdown_rebuild_batches_for(removals, &lockdown_enable_batches(tunnels))
+}
+
+fn lockdown_rebuild_batches_for(
+    removals: Vec<Vec<String>>,
+    desired: &[Vec<String>],
 ) -> Vec<Vec<String>> {
     let guards: Vec<_> = FAMILIES
         .iter()
@@ -463,8 +683,7 @@ fn lockdown_rebuild_batches(
             .into_iter()
             .filter(|batch| !guard_removals.contains(batch)),
     );
-    let replacement = lockdown_enable_batches(tunnels);
-    batches.extend(replacement);
+    batches.extend_from_slice(desired);
     batches.extend(guard_removals);
     batches
 }
@@ -473,6 +692,9 @@ fn lockdown_rebuild_batches(
 /// teardown safety check so we never leave the user locked out. The read is
 /// unprivileged, so this check costs no password prompt.
 fn family_has_marked_rule(family: &str) -> AppResult<bool> {
+    if let Ok(rules) = read_rule_batches(true) {
+        return Ok(rules.iter().any(|batch| batch[3] == family));
+    }
     for table in MANAGED_TABLES {
         if read_marked_rules(family, table)?
             .lines()
@@ -500,22 +722,13 @@ fn direct_args(verb: &str, family: &str, table: &str) -> Vec<String> {
 
 /// Removal batches for every Neutron-tagged rule across all families.
 fn marked_removal_batches() -> AppResult<Vec<Vec<String>>> {
-    let mut batches = Vec::new();
-    for family in FAMILIES {
-        for table in MANAGED_TABLES {
-            batches.extend(parse_marked_removals(
-                family,
-                table,
-                &read_marked_rules(family, table)?,
-            ));
-        }
-    }
-    Ok(batches)
+    read_rule_batches(true)
 }
 
 /// Parse `--get-rules` output (a newline-separated list of `<priority> <args>`)
 /// into a `--remove-rule` batch for each Neutron-tagged rule. Untagged (foreign)
 /// rules are skipped so user-defined direct rules are preserved.
+#[cfg(test)]
 fn parse_marked_removals(family: &str, table: &str, listing: &str) -> Vec<Vec<String>> {
     listing
         .lines()
@@ -540,39 +753,36 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
     let mut batches = vec![add_rule(family, 0, &["-o", "lo", "-j", "ACCEPT"])];
 
     let any_active = tunnels.iter().any(|t| t.is_active);
-    // Permit first traffic on configured tunnel interfaces before activation
-    // completes. The DNS exception below still depends on connection state.
+    // Only callers' verified, existing WireGuard links may get an allowance.
     for tunnel in tunnels {
         if let Some(interface) = &tunnel.interface {
-            batches.push(add_rule(family, 0, &["-o", interface, "-j", "ACCEPT"]));
+            batches.push(add_rule(
+                family,
+                0,
+                &[
+                    "-o",
+                    interface,
+                    "-m",
+                    "devgroup",
+                    "--dst-group",
+                    TUNNEL_GROUP,
+                    "-j",
+                    "ACCEPT",
+                ],
+            ));
         }
     }
 
     // When disconnected (no tunnels active), allow broad DNS so peer endpoints
     // can resolve before connecting. When a tunnel is active, DNS travels through
     // the tunnel interface (-o <iface> -j ACCEPT) without leaking outside.
-    if !any_active {
+    // Block external/LAN-bound DNS while connected so queries cannot leak to LAN resolvers.
+    let dns_target = if any_active { "DROP" } else { "ACCEPT" };
+    for protocol in ["udp", "tcp"] {
         batches.push(add_rule(
             family,
             1,
-            &["-p", "udp", "--dport", "53", "-j", "ACCEPT"],
-        ));
-        batches.push(add_rule(
-            family,
-            1,
-            &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
-        ));
-    } else {
-        // Block external/LAN-bound DNS while connected so queries cannot leak to LAN resolvers.
-        batches.push(add_rule(
-            family,
-            1,
-            &["-p", "udp", "--dport", "53", "-j", "DROP"],
-        ));
-        batches.push(add_rule(
-            family,
-            1,
-            &["-p", "tcp", "--dport", "53", "-j", "DROP"],
+            &["-p", protocol, "--dport", "53", "-j", dns_target],
         ));
     }
 
@@ -602,7 +812,7 @@ fn local_network_batches(family: &str) -> Vec<Vec<String>> {
     };
     networks
         .iter()
-        .map(|network| add_rule(family, 1, &["-d", network, "-j", "ACCEPT"]))
+        .map(|network| add_rule(family, 2, &["-d", network, "-j", "ACCEPT"]))
         .collect()
 }
 
@@ -614,74 +824,26 @@ fn local_network_batches(family: &str) -> Vec<Vec<String>> {
 /// broadly.
 fn endpoint_rules(family: &str, endpoint: &Endpoint) -> Vec<Vec<String>> {
     let port = endpoint.port.to_string();
+    let rule = |ip: IpAddr, host: &str| {
+        matches!(
+            (ip, family),
+            (IpAddr::V4(_), "ipv4") | (IpAddr::V6(_), "ipv6")
+        )
+        .then(|| {
+            add_rule(
+                family,
+                0,
+                &["-p", "udp", "-d", host, "--dport", &port, "-j", "ACCEPT"],
+            )
+        })
+    };
     if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(_) if family == "ipv4" => {
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    endpoint.host.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                return vec![add_rule(family, 1, &rule)];
-            }
-            IpAddr::V6(_) if family == "ipv6" => {
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    endpoint.host.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                return vec![add_rule(family, 1, &rule)];
-            }
-            _ => return Vec::new(),
-        }
+        return rule(ip, &endpoint.host).into_iter().collect();
     }
-
-    let ips = crate::nm::split_tunnel::resolve_domain_ips(&endpoint.host);
-    let mut rules = Vec::new();
-    for ip in ips {
-        match ip {
-            IpAddr::V4(v4) if family == "ipv4" => {
-                let v4_str = v4.to_string();
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    v4_str.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                rules.push(add_rule(family, 1, &rule));
-            }
-            IpAddr::V6(v6) if family == "ipv6" => {
-                let v6_str = v6.to_string();
-                let rule = [
-                    "-p",
-                    "udp",
-                    "-d",
-                    v6_str.as_str(),
-                    "--dport",
-                    port.as_str(),
-                    "-j",
-                    "ACCEPT",
-                ];
-                rules.push(add_rule(family, 1, &rule));
-            }
-            _ => {}
-        }
-    }
-    rules
+    crate::nm::split_tunnel::resolve_domain_ips(&endpoint.host)
+        .into_iter()
+        .filter_map(|ip| rule(ip, &ip.to_string()))
+        .collect()
 }
 
 /// Build a permanent `--direct --add-rule <family> mangle OUTPUT <priority>
@@ -708,7 +870,269 @@ fn reload_batch() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enable_rebuilds_empty_post_authorization_state_in_both_scopes() {
+        let dir = crate::testing::scratch_dir("enable-live-state");
+        let fake = format!(
+            "ip() {{ :; }}\n\
+             firewall-cmd() {{ :; }}\n\
+             dbus-send() {{ printf '%s\\n' \"$*\" >> {}; }}\n",
+            shell_quote(dir.join("calls").to_str().unwrap()),
+        );
+        let script = lockdown_enable_script(&[], ":\n");
+        // Only injected commands run; the production lock prefix is tested separately.
+        let body = script.strip_prefix(&locked_script()).unwrap();
+        // Bash permits hyphens in the mock command functions; dash does not.
+        let output = Command::new("/bin/bash")
+            .args(["-c", &format!("set -e\n{fake}{body}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        for interface in [
+            "org.fedoraproject.FirewallD1.direct.addRule",
+            "org.fedoraproject.FirewallD1.config.direct.addRule",
+        ] {
+            for family in FAMILIES {
+                assert!(
+                    calls.lines().any(|line| {
+                        line.contains(interface)
+                            && line.contains(&format!("string:{family}"))
+                            && line.contains("int32:10")
+                            && line.contains("neutron-lockdown,-j,DROP")
+                    }),
+                    "missing {family} default drop: {calls}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_bus_writes_ignore_only_their_exact_idempotent_errors() {
+        let fake = "dbus-send() { printf '%s\\n' \"$ERROR\" >&2; return 1; }\n";
+        for (verb, error, succeeds) in [
+            (
+                "--add-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: ALREADY_ENABLED: rule exists",
+                true,
+            ),
+            (
+                "--remove-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: NOT_ENABLED: rule absent",
+                true,
+            ),
+            (
+                "--add-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: COMMAND_FAILED: ALREADY_ENABLED interface failed",
+                false,
+            ),
+            (
+                "--add-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: NOT_ENABLED: wrong operation",
+                false,
+            ),
+            (
+                "--remove-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: ALREADY_ENABLED: wrong operation",
+                false,
+            ),
+        ] {
+            let script = format!(
+                "set -e\n{fake}{}firewall_rule --direct {verb} ipv4 mangle OUTPUT 0 -o lo -j ACCEPT\n",
+                firewall_rule_function()
+            );
+            let output = Command::new("/bin/bash")
+                .args(["-c", &script])
+                .env("ERROR", error)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), succeeds, "{verb}: {error}");
+        }
+    }
+
+    #[test]
+    fn absent_interface_names_never_become_firewall_allowances() {
+        for name in ["enp9s0", "wg-pending"] {
+            let mut pending = tunnel(name, &[("192.0.2.1", 51820)]);
+            pending.is_active = false;
+            let validated = validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).unwrap();
+            assert!(validated[0].interface.is_none());
+            let rules = lockdown_enable_batches(&validated);
+            assert!(!rules.iter().any(|b| b.iter().any(|s| s == name)));
+            assert!(has_rule(
+                &rules,
+                &["-d", "192.0.2.1", "--dport", "51820", "ACCEPT"]
+            ));
+        }
+    }
+
+    #[test]
+    fn port_53_peer_allowance_precedes_connected_dns_drop() {
+        let rules = lockdown_family_batches("ipv4", &[tunnel("wg0", &[("203.0.113.2", 53)])]);
+        let peer = rules
+            .iter()
+            .find(|b| b.iter().any(|s| s == "203.0.113.2"))
+            .unwrap();
+        let dns = rules
+            .iter()
+            .find(|b| {
+                b.windows(2).any(|p| p == ["--dport", "53"])
+                    && b.last().is_some_and(|s| s == "DROP")
+            })
+            .unwrap();
+        assert!(peer[6].parse::<i32>().unwrap() < dns[6].parse::<i32>().unwrap());
+    }
+
+    #[test]
+    fn interface_allowances_require_the_device_local_tag() {
+        let rules = lockdown_enable_batches(&[tunnel("wg0", &[])]);
+        for rule in rules
+            .iter()
+            .filter(|b| b.windows(2).any(|p| p == ["-o", "wg0"]))
+        {
+            assert!(rule.windows(2).any(|p| p == ["--dst-group", TUNNEL_GROUP]));
+        }
+        let script = interface_validation_script(&[tunnel("wg0", &[])]);
+        assert!(script.contains("foreign device group"));
+        assert!(script.find("--add-rule").unwrap() < script.find("ip link set dev").unwrap());
+        assert!(script.contains("Interface changed while tagging"));
+    }
+
+    #[test]
+    fn a_device_replaced_while_tagging_keeps_the_guards_and_foreign_groups_are_untouched() {
+        let dir = crate::testing::scratch_dir("tagging-race");
+        let fake = format!(
+            r#"
+ip() {{
+    case "$*" in
+      *'type wireguard'*) [ -e {dir}/tagged ] || printf verified;;
+      *'link set dev'*) touch {dir}/tagged;;
+      *'-o link show dev'*) printf '3: wg-race: group %s\n' "$GROUP";;
+    esac
+}}
+dbus-send() {{ printf '%s\n' "$*" >> {dir}/calls; }}
+"#,
+            dir = shell_quote(dir.to_str().unwrap())
+        );
+        let script = format!(
+            "set -e\n{fake}{}{}",
+            interface_validation_script(&[tunnel("wg-race", &[])]),
+            retire_tag_guards_script()
+        );
+        for group in ["123", "default"] {
+            let output = Command::new("/bin/bash")
+                .args(["-c", &script])
+                .env("GROUP", group)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            if group == "123" {
+                assert!(!dir.join("tagged").exists() && !dir.join("calls").exists());
+            } else {
+                let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                assert_eq!(calls.lines().count(), 4);
+                assert!(
+                    calls
+                        .lines()
+                        .all(|line| line.contains(".addRule") && line.contains("-j,DROP"))
+                );
+                assert!(!calls.contains(".removeRule"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
+
+    #[test]
+    fn shell_lock_is_private_repairs_inode_and_has_bounded_wait() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::testing::scratch_dir("shell-firewall-lock");
+        let path = dir.join("lock");
+        let owner = std::fs::metadata(&dir).unwrap().uid();
+        let script = locked_script_for(path.to_str().unwrap(), owner, 1, 9);
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let file = std::fs::File::open(&path).unwrap();
+        let inode = file.metadata().unwrap().ino();
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        file.lock().unwrap();
+        let start = std::time::Instant::now();
+        assert!(
+            !Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        drop(file);
+        let symlink = dir.join("symlink");
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        let script = locked_script_for(symlink.to_str().unwrap(), owner, 1, 9);
+        assert!(
+            !Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interface_validation_rejects_hostile_inactive_profiles_and_physical_collisions() {
+        for name in ["wg+", "+", "wg0;bad", "", "too-long-ifname-1"] {
+            let mut pending = tunnel(name, &[]);
+            pending.is_active = false;
+            assert!(
+                validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).is_err(),
+                "{name}"
+            );
+        }
+        for name in ["wg-test", "proton0", "wg"] {
+            let mut pending = tunnel(name, &[]);
+            pending.is_active = false;
+            assert!(
+                validate_tunnel_interfaces_with(&[pending.clone()], |_| Ok(Some(false))).is_err()
+            );
+            assert!(validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).is_ok());
+        }
+        assert!(
+            validate_tunnel_interfaces_with(&[tunnel("eth0", &[])], |_| Ok(Some(false))).is_err()
+        );
+        assert!(validate_tunnel_interfaces_with(&[tunnel("wg-test", &[])], |_| Ok(None)).is_err());
+        assert!(
+            validate_tunnel_interfaces_with(&[tunnel("custom", &[])], |_| Ok(Some(true))).is_ok()
+        );
+    }
+
+    #[test]
+    fn authenticated_interface_recheck_rejects_physical_link_after_prompt() {
+        // A shell function is a local fake command, not host introspection.
+        let fake =
+            "ip() { case \"$*\" in *wireguard*) return 0;; *) printf '%s\\n' physical;; esac; }\n";
+        let script = format!(
+            "set -e\n{fake}{}",
+            interface_validation_script(&[tunnel("wg-test", &[])])
+        );
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not WireGuard"));
+    }
 
     #[test]
     fn a_machine_without_firewall_cmd_reports_no_rules_rather_than_failing() {
@@ -771,7 +1195,10 @@ mod tests {
     fn interrupted_rebuild_stays_closed_after_reload_and_recovers() {
         crate::testing::require_sandbox();
         let client = crate::nm::CliNmClient;
-        let tunnels = [tunnel("wg-old", &[])];
+        let tunnels = [WireguardTunnel {
+            is_active: false,
+            ..tunnel("wg-old", &[])
+        }];
         client.enable_lockdown(&tunnels).unwrap();
         let batches =
             lockdown_rebuild_batches(marked_removal_batches().unwrap(), &[tunnel("wg-new", &[])]);
@@ -899,12 +1326,12 @@ mod tests {
 
     #[test]
     fn disconnected_bootstrap_dns_and_connected_lan_dns_drop() {
-        let mut inactive = tunnel("wg0", &[("vpn.example.com", 51820)]);
+        let mut inactive = tunnel("wg0", &[("192.0.2.1", 51820)]);
         inactive.is_active = false;
         let disconnected = lockdown_enable_batches(&[inactive]);
         assert!(has_rule(&disconnected, &["--dport", "53", "-j", "ACCEPT"]));
 
-        let active = lockdown_enable_batches(&[tunnel("wg0", &[("vpn.example.com", 51820)])]);
+        let active = lockdown_enable_batches(&[tunnel("wg0", &[("192.0.2.1", 51820)])]);
         assert!(!has_rule(&active, &["--dport", "53", "-j", "ACCEPT"]));
         assert!(has_rule(&active, &["--dport", "53", "-j", "DROP"]));
     }
@@ -1121,7 +1548,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    !script.contains("--permanent"),
+                    script.contains("rules=$(firewall-cmd  --direct --get-all-rules)"),
                     "runtime teardown must not touch permanent rules: {script}"
                 );
             }
@@ -1165,7 +1592,7 @@ mod tests {
             "guards must be kept on rebuild"
         );
         assert!(
-            !live_removal_script(true, false).contains("$4"),
+            !live_removal_script(true, false).contains("[ \"$4\" != -1 ] || continue"),
             "guards must be removed on disable"
         );
     }
@@ -1216,10 +1643,7 @@ mod tests {
         // `--get-rules` echoes it back, parse it, and require the result to be
         // precisely that one rule's targeted removal — proving teardown only
         // ever touches what we added.
-        let tunnels = [tunnel(
-            "wg0",
-            &[("1.2.3.4", 51820), ("vpn.example.com", 1194)],
-        )];
+        let tunnels = [tunnel("wg0", &[("1.2.3.4", 51820), ("localhost", 1194)])];
         for add in lockdown_enable_batches(&tunnels) {
             if add == reload_batch() {
                 continue;
@@ -1266,8 +1690,8 @@ mod tests {
         // `set -e` stops subsequent commands after a failure.
         assert!(script.starts_with("set -e\n"));
         // One `firewall-cmd` line per batch, each argument single-quoted.
-        assert!(script.contains("\nfirewall-cmd '--reload'\n"));
-        assert!(script.contains("\nfirewall-cmd '-o' 'wg0'\n"));
+        assert!(script.contains("\nfirewall_rule '--reload'\n"));
+        assert!(script.contains("\nfirewall_rule '-o' 'wg0'\n"));
     }
 
     #[test]
@@ -1287,8 +1711,8 @@ mod tests {
         // the value is emitted as the inert `'\''` sequence, so it can never
         // close the quote early and start a new command.
         assert_eq!(
-            script,
-            "set -e\nfirewall-cmd '-o' 'wg0'\\''; reboot; echo '\\''' '-j' 'ACCEPT'\n"
+            script.lines().last().unwrap(),
+            "firewall_rule '-o' 'wg0'\\''; reboot; echo '\\''' '-j' 'ACCEPT'"
         );
     }
 

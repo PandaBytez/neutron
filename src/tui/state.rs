@@ -204,26 +204,18 @@ impl CommandPaletteState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThemePickerState {
     pub selected_index: usize,
-    pub themes: Vec<(&'static str, &'static str)>,
 }
 
-impl Default for ThemePickerState {
-    fn default() -> Self {
-        Self {
-            selected_index: 0,
-            themes: vec![
-                ("nord", "Nord (Arctic Frost)"),
-                ("osaka-jade", "Osaka Jade"),
-                ("catppuccin-mocha", "Catppuccin Mocha"),
-                ("gruvbox", "Gruvbox Dark"),
-                ("monochrome", "Monochrome (High-Contrast)"),
-            ],
-        }
-    }
-}
+pub const THEMES: [(&str, &str); 5] = [
+    ("nord", "Nord (Arctic Frost)"),
+    ("osaka-jade", "Osaka Jade"),
+    ("catppuccin-mocha", "Catppuccin Mocha"),
+    ("gruvbox", "Gruvbox Dark"),
+    ("monochrome", "Monochrome (High-Contrast)"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitTunnelFocus {
@@ -521,11 +513,16 @@ pub struct TuiState {
     pub toast: Option<Toast>,
     pub connecting: Option<ConnectingState>,
     pub connect_tx: Option<std::sync::mpsc::Sender<(String, String, bool)>>,
-    pub split_tunnel_tx: Option<std::sync::mpsc::Sender<SplitTunnelConfig>>,
-    pub pending_split: Option<SplitTunnelConfig>,
+    pub split_tunnel_tx:
+        Option<std::sync::mpsc::Sender<(u64, SplitTunnelConfig, SplitTunnelConfig)>>,
+    pub pending_split: Option<u64>,
+    split_request_id: u64,
     pub profile_refresh_requested: bool,
     pub action_tx: Option<std::sync::mpsc::Sender<AsyncAction>>,
     pub diag_tx: Option<std::sync::mpsc::Sender<(String, bool)>>,
+    pub diag_in_flight: bool,
+    pub diag_requested: Option<(String, bool)>,
+    pub qbit_probe_in_flight: bool,
     pub modal: ActiveModal,
     pub should_quit: bool,
 }
@@ -536,6 +533,12 @@ pub enum AsyncAction {
     Lockdown(bool),
     Autoconnect(bool),
     Sync,
+    QbitSync {
+        uuid: String,
+        port: u16,
+        config: crate::config::QBittorrentConfig,
+        expires_at: u64,
+    },
     Delete(String),
     ProbeQbitWebUi,
 }
@@ -554,11 +557,26 @@ pub enum AsyncActionResult {
         result: crate::error::AppResult<()>,
     },
     Sync(crate::error::AppResult<crate::app::sync::SyncReport>),
+    QbitSync(crate::error::AppResult<crate::portforward::qbittorrent::QBittorrentSyncReport>),
     Delete(crate::error::AppResult<String>),
     ProbeQbitWebUi(bool),
 }
 
 impl TuiState {
+    pub fn request_diagnostics(&mut self, uuid: String, active: bool) {
+        self.diag_requested = Some((uuid, active));
+        self.dispatch_diagnostics();
+    }
+
+    pub fn dispatch_diagnostics(&mut self) {
+        if !self.diag_in_flight
+            && let Some(request) = self.diag_requested.take()
+            && let Some(tx) = &self.diag_tx
+        {
+            self.diag_in_flight = tx.send(request).is_ok();
+        }
+    }
+
     pub fn new(config_path: PathBuf, config: AppConfig) -> Self {
         let theme = Theme::from_config(&config.theme);
         Self {
@@ -589,9 +607,13 @@ impl TuiState {
             connect_tx: None,
             split_tunnel_tx: None,
             pending_split: None,
+            split_request_id: 0,
             profile_refresh_requested: false,
             action_tx: None,
             diag_tx: None,
+            diag_in_flight: false,
+            diag_requested: None,
+            qbit_probe_in_flight: false,
             modal: ActiveModal::None,
             should_quit: false,
         }
@@ -602,32 +624,53 @@ impl TuiState {
         client: &C,
         new_cfg: SplitTunnelConfig,
     ) -> crate::error::AppResult<()> {
-        self.config.global_split_tunnel = new_cfg.clone();
-        if let Some(ref tx) = self.split_tunnel_tx {
-            tx.send(new_cfg.clone()).map_err(|_| {
-                crate::error::AppError::Config("split policy worker stopped".into())
-            })?;
-            self.pending_split = Some(new_cfg);
-            Ok(())
+        self.split_request_id = self.split_request_id.checked_add(1).ok_or_else(|| {
+            crate::error::AppError::Config(
+                "split request counter exhausted; restart Neutron".into(),
+            )
+        })?;
+        let original = std::mem::replace(&mut self.config.global_split_tunnel, new_cfg.clone());
+        let result = if let Some(ref tx) = self.split_tunnel_tx {
+            tx.send((self.split_request_id, original, new_cfg.clone()))
+                .map_err(|_| crate::error::AppError::Config("split policy worker stopped".into()))
         } else {
-            crate::app::split_tunnel::apply_split_config(client, &self.config_path, &new_cfg)?;
+            crate::app::split_tunnel::apply_split_config_if_unchanged(
+                client,
+                &self.config_path,
+                &original,
+                &new_cfg,
+            )
+        };
+        if let Err(error) = &result {
+            self.pending_split = None;
+            self.set_error(error);
+            self.reload_split_tunnel();
+        } else if self.split_tunnel_tx.is_some() {
+            self.pending_split = Some(self.split_request_id);
+        } else {
             self.uncertain_policies
                 .remove(&crate::error::Policy::SplitTunnel);
             self.set_status("Split tunneling saved; reconnect to apply routing changes.");
-            Ok(())
+        }
+        result
+    }
+
+    fn reload_split_tunnel(&mut self) {
+        if let Ok(saved) = crate::config::load(&self.config_path) {
+            self.config.global_split_tunnel = saved.global_split_tunnel;
+        }
+        if let ActiveModal::SplitTunnel(ref mut modal) = self.modal {
+            *modal = SplitTunnelModalState::from_config(&self.config.global_split_tunnel);
         }
     }
 
     pub fn finish_split(
         &mut self,
+        request_id: u64,
         applied: SplitTunnelConfig,
         result: crate::error::AppResult<()>,
     ) {
-        if self
-            .pending_split
-            .as_ref()
-            .is_some_and(|pending| pending != &applied)
-        {
+        if self.pending_split != Some(request_id) {
             // An older reply must not replace a newer edit still queued.
             if let Err(error) = result {
                 self.set_error(&error);
@@ -644,9 +687,8 @@ impl TuiState {
             }
             Err(error) => {
                 self.set_error(&error);
-                if let Ok(saved) = crate::config::load(&self.config_path) {
-                    self.config.global_split_tunnel = saved.global_split_tunnel;
-                }
+                self.reload_split_tunnel();
+                return;
             }
         }
         if let ActiveModal::SplitTunnel(ref mut modal) = self.modal {
@@ -672,7 +714,7 @@ impl TuiState {
 
     /// Report a completed action in a toast notification.
     pub fn set_status(&mut self, message: impl Into<String>) {
-        let msg = message.into();
+        let msg = crate::process::terminal_safe(&message.into());
         self.status_message = msg.clone();
         self.status_is_error = false;
         self.toast = Some(Toast {
@@ -715,7 +757,7 @@ impl TuiState {
         if let crate::error::AppError::PolicyUpdate { policy, .. } = error {
             self.uncertain_policies.insert(*policy);
         }
-        let msg = error.to_string();
+        let msg = crate::process::terminal_safe(&error.to_string());
         self.status_message = msg.clone();
         self.status_is_error = true;
         self.toast = Some(Toast {
@@ -739,13 +781,22 @@ impl TuiState {
     /// the same thing to a reader, since an unpublished lease is not being
     /// renewed and so is not a port anyone can rely on.
     pub fn forwarded_port(&self) -> Option<u16> {
-        self.lease.as_ref()?.port
+        let lease = self.lease.as_ref()?;
+        if lease.profile_uuid.as_ref()? != self.active_profile_uuid.as_ref()? {
+            return None;
+        }
+        lease.usable_port()
     }
 
     /// What the daemon's last push to qBittorrent came to, or `None` when it is
     /// not publishing a lease to have pushed.
     pub fn qbit_sync(&self) -> Option<QbitSyncStatus> {
-        Some(self.lease.as_ref()?.qbit_sync)
+        let lease = self.lease.as_ref()?;
+        Some(if self.forwarded_port().is_some() {
+            lease.qbit_sync
+        } else {
+            QbitSyncStatus::Pending
+        })
     }
 
     pub fn selected_row(&self) -> Option<&ProfileListRow> {
@@ -762,6 +813,41 @@ impl TuiState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_keep_one_in_flight_and_only_the_latest_pending_selection() {
+        let mut state = TuiState::new(PathBuf::new(), AppConfig::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.diag_tx = Some(tx);
+        state.request_diagnostics("first".into(), false);
+        assert_eq!(rx.recv().unwrap().0, "first");
+        for index in 0..100 {
+            state.request_diagnostics(format!("pending-{index}"), true);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.diag_requested.as_ref().unwrap().0, "pending-99");
+        state.diag_in_flight = false;
+        state.dispatch_diagnostics();
+        assert_eq!(rx.recv().unwrap().0, "pending-99");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn foreign_or_expired_leases_never_supply_the_active_tunnels_port_or_sync_verdict() {
+        let mut state = TuiState::new(PathBuf::new(), AppConfig::default());
+        state.active_profile_uuid = Some("B".into());
+        let mut lease = crate::testing::fresh_lease("A", 51820);
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+        state.lease = Some(lease.clone());
+        assert!(state.forwarded_port().is_none());
+        assert_eq!(state.qbit_sync(), Some(QbitSyncStatus::Pending));
+        state.active_profile_uuid = Some("A".into());
+        assert_eq!(state.forwarded_port(), Some(51820));
+        lease.expires_at = Some(0);
+        state.lease = Some(lease);
+        assert!(state.forwarded_port().is_none());
+        assert_eq!(state.qbit_sync(), Some(QbitSyncStatus::Pending));
+    }
+
     use super::*;
 
     #[test]
@@ -953,19 +1039,20 @@ mod tests {
             mode: SplitTunnelMode::Exclude,
             ..Default::default()
         };
-        state.pending_split = Some(pending.clone());
+        state.pending_split = Some(2);
 
         // Stale failure: the error surfaces, but the newer pending edit stays.
         state.finish_split(
+            1,
             stale,
             Err(crate::error::AppError::Config("stale boom".into())),
         );
         assert!(state.status_is_error);
-        assert_eq!(state.pending_split, Some(pending.clone()));
+        assert_eq!(state.pending_split, Some(2));
 
         // Stale success: silently dropped, pending edit and status untouched.
-        state.finish_split(SplitTunnelConfig::default(), Ok(()));
-        assert_eq!(state.pending_split, Some(pending.clone()));
+        state.finish_split(1, SplitTunnelConfig::default(), Ok(()));
+        assert_eq!(state.pending_split, Some(2));
         assert!(state.status_is_error);
         assert!(state.status_message.contains("stale boom"));
 
@@ -973,7 +1060,7 @@ mod tests {
         state.modal = ActiveModal::SplitTunnel(SplitTunnelModalState::from_config(
             &SplitTunnelConfig::default(),
         ));
-        state.finish_split(pending.clone(), Ok(()));
+        state.finish_split(2, pending.clone(), Ok(()));
         assert!(state.pending_split.is_none());
         assert_eq!(state.config.global_split_tunnel, pending);
         assert_eq!(
@@ -987,7 +1074,9 @@ mod tests {
         }
 
         // Fresh failure: error surfaces and config reverts to what is on disk.
+        state.pending_split = Some(3);
         state.finish_split(
+            3,
             pending,
             Err(crate::error::AppError::Config("fresh boom".into())),
         );

@@ -42,7 +42,27 @@ Install via [Homebrew](https://brew.sh/) (including tap trust so background auto
 brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron
 ```
 
-*(Or via Cargo: `cargo install --git https://github.com/PandaBytez/neutron.git`)*
+Or install the existing stable source tag with Cargo:
+
+```bash
+cargo install --locked --git https://github.com/PandaBytez/neutron.git --tag v0.2.0
+```
+
+For fixes newer than that tag, use `--rev <reviewed-commit-sha>` instead of
+`--tag v0.2.0`. This documentation describes current source behavior, not a
+promise that the stable tag or published packages contain every fix. Homebrew,
+Cargo, and [static release binaries](https://github.com/PandaBytez/neutron/releases)
+are the supported installation channels.
+
+The NetworkManager daemon and `nmcli` must both be **1.52+** with
+`ipv4.routed-dns` / `ipv6.routed-dns` support, and iproute2's `ip` is required.
+Protected profiles select `routed-dns=no` and merge explicit NM-managed resolver
+`/32` / `/128` routes in main table 254, including split-excluded resolvers,
+without replacing defaults. Unprotected profiles select `yes`; that property
+alone is not a protection guarantee. After protected activation/reapply, kernel
+UDP/TCP DNS egress must select the tunnel or Neutron attempts disconnection and
+reports an error. Static linking does not remove
+the need for system tools and services; lockdown also needs firewalld and polkit.
 
 ### 2. Import Profiles
 
@@ -76,9 +96,14 @@ Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles wit
 neutron restart
 ```
 
+> **Note (GNOME):** To display the system tray icon on GNOME, install and enable the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension (`gnome-shell-extension-appindicator`).
+
 ---
 
 ## 🌐 **[Documentation](https://pandabytez.github.io/neutron/)**
+
+See the [settings reference](docs/configuration.md) for the current `config.toml`
+schema, UUID-based profile lists, theme colors, and qBittorrent binding overrides.
 
 ---
 
@@ -106,9 +131,9 @@ Most maintenance is a cargo alias, so nothing needs installing first:
 | `cargo docs` | Build this documentation |
 
 `cargo reinstall` is the one to reach for while working on the app: it runs
-`cargo install --path . --force` and touches nothing privileged, so you do not
-disable lockdown and re-authenticate on every rebuild. It verifies your settings
-came through unchanged and restores them if anything touches them.
+`cargo install --locked --path . --force` and touches nothing privileged, so you do not
+disable lockdown and re-authenticate on every rebuild. Settings are left alone:
+concurrent edits and deletions are never overwritten by a snapshot rollback.
 
 Two caveats it deliberately does not hide: the root-owned refresh helper is a
 *copy* of the binary taken when lockdown was enabled, so after changing firewall
@@ -120,6 +145,10 @@ Podman — see [testing](docs/testing.md).
 Auto-connect is **off by default**. Press **`a`** in the TUI to enable it and install the desktop autostart entry,
 which connects an eligible WireGuard profile at login.
 
+An ordinary `neutron connect` refuses to add a second active WireGuard tunnel;
+use `neutron switch <profile>` to replace one. Startup selection also rechecks
+under the activation lock so a concurrent manual connection wins.
+
 For headless servers without an XDG desktop environment, an optional user service is provided in [`systemd/`](systemd/).
 
 ### Lockdown across reboots
@@ -130,13 +159,21 @@ authentication. Enabling also installs a root-owned refresh helper and a dedicat
 polkit action so an active local session can refresh tunnel/DNS allowances
 without another password prompt. The helper cannot turn lockdown on or off.
 
-After upgrading (including from 0.1.2), run `neutron lockdown enable` once from an
-active local session to install/update the helper and its authorization. This
-replaces the old authorization check that polkit rejected for non-root users.
-Existing protection stays in place if an automatic refresh cannot be authorized.
+After upgrading an existing installation, run `neutron lockdown enable` once from an
+active local session to install/update the helper and its authorization. Current source
+refuses unsafe or legacy grants, checking both action directories and legacy rules.
+Authenticated disable revokes unsafe helper authorization; enable migrates it.
+Headless operation or denied authorization fails closed: required pre-activation
+refresh failure stops activation and existing firewall protection stays in place.
 Enabling lockdown also enables firewalld at boot on systemd systems. Polkit 126+
 uses `/usr/local/share/polkit-1/actions`, supporting immutable `/usr`; older
 versions require a writable `/usr/share/polkit-1/actions`.
+
+Without lockdown, the kill switch refuses profiles with an unsupported IPv4 or
+IPv6 family. Unsplit protection requires peer AllowedIPs `0.0.0.0/0` **and**
+`::/0`, plus explicit tunnel DNS servers covered by AllowedIPs. It does not
+silently make an IPv4-only profile IPv6-safe. Explicit split-tunnel bypasses are
+intentional; lockdown can block traffic that the tunnel cannot carry.
 
 ### Resetting to factory defaults
 
@@ -156,7 +193,7 @@ machine firewalled with no configuration explaining why.
 
 Run `neutron uninstall` as your normal user. It stops the tray daemon, then — in
 a single privileged batch, so at most one password prompt — lifts lockdown if any
-of its state is actually present, revokes the password-free refresh grant (the
+of its state is actually present, removes the password-free refresh grant (the
 root-owned helper and its polkit action), and removes the autostart entry. It then
 hands the binary to whichever package manager installed it: `brew uninstall
 neutron` for a Homebrew install, `cargo uninstall neutron` for a `cargo install`.
@@ -165,18 +202,20 @@ An install that never enabled lockdown prompts for nothing at all.
 Those root-owned files live outside the package's own file list, and no packaging
 hook can remove them: Homebrew's `post_uninstall` runs *after* the files are gone,
 with no way to authenticate. So the teardown has to happen while the binary still
-exists — which is why it is a subcommand rather than a package script. The grant
-is revoked here rather than by `neutron lockdown disable`, so turning lockdown
-off and back on again does not cost a second password prompt.
+exists — which is why it is a subcommand rather than a package script. The helper
+and all known actions/legacy rules are removed here. `neutron lockdown disable`
+retains only hardened authorization and revokes unsafe grants; leaving a hardened
+helper installed lets turning lockdown off and back on avoid extra prompts.
 
 `~/.config/neutron` is **kept** (eligibility pool, favorites, settings) so a
 reinstall finds it intact; add `--purge` to delete it too, which is also how the
 stored qBittorrent password goes away. A drop directory configured *outside* it
 is always left alone, since it holds your own files.
 
-An install Neutron does not recognize — an AppImage, a distro package — is
-refused with an explanation and **nothing is changed**, rather than guessing a
-package manager. If the package is already gone and rules were left behind, see
+An install Neutron does not recognize, including a manually installed static
+binary, is refused with an explanation and **nothing is changed**, rather than
+guessing a package manager. For a static install, run `neutron reset` before
+manually removing the binary. If the binary is already gone and rules remain, see
 [the manual recovery steps](docs/security.md#uninstalling-revokes-everything-it-installed).
 
 ---

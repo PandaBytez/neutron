@@ -57,7 +57,7 @@ impl QBittorrentSyncReport {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct QBittorrentClient {
     base_url: String,
     username: Option<String>,
@@ -65,6 +65,19 @@ pub struct QBittorrentClient {
     bind_interface: bool,
     cookie: Option<String>,
     timeout: Duration,
+}
+
+impl std::fmt::Debug for QBittorrentClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QBittorrentClient")
+            .field("base_url", &self.base_url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("cookie", &self.cookie.as_ref().map(|_| "<redacted>"))
+            .field("bind_interface", &self.bind_interface)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl QBittorrentClient {
@@ -132,20 +145,13 @@ impl QBittorrentClient {
     pub fn app_version(&mut self) -> AppResult<String> {
         self.ensure_authenticated()?;
         let url = self.endpoint_url("api/v2/app/version");
-        let resp = self.http_get(&url)?;
+        let mut resp = self.http_get(&url)?;
 
         if resp.status == 403 {
             // Cookie might have expired; retry once after re-authenticating
             self.cookie = None;
             self.login()?;
-            let retry = self.http_get(&url)?;
-            if retry.status != 200 {
-                return Err(AppError::QBittorrent(format!(
-                    "failed to query qBittorrent version (HTTP {})",
-                    retry.status
-                )));
-            }
-            return Ok(retry.body.trim().to_string());
+            resp = self.http_get(&url)?;
         }
 
         if resp.status != 200 {
@@ -172,7 +178,10 @@ impl QBittorrentClient {
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&resp.body).map_err(|err| {
-            AppError::QBittorrent(format!("invalid JSON from qBittorrent preferences: {err}"))
+            AppError::QBittorrent(format!(
+                "invalid JSON from qBittorrent preferences: {}",
+                AppError::from(err)
+            ))
         })?;
 
         let listen_port = parsed
@@ -229,10 +238,14 @@ impl QBittorrentClient {
         &mut self,
         port: u16,
         interface_name: Option<&str>,
+        expires_at: Option<u64>,
     ) -> AppResult<QBittorrentSyncReport> {
+        ensure_live_mapping(expires_at)?;
         let version = self.app_version().ok();
         let current_prefs = self.get_preferences().ok();
         let previous_port = current_prefs.as_ref().map(|p| p.listen_port);
+
+        ensure_live_mapping(expires_at)?;
 
         self.set_listen_port(port, interface_name)?;
 
@@ -285,6 +298,19 @@ impl QBittorrentClient {
             self.cookie.as_deref(),
         )?)
     }
+}
+
+fn ensure_live_mapping(expires_at: Option<u64>) -> AppResult<()> {
+    if expires_at.is_some_and(|expiry| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(true, |now| now.as_secs() >= expiry)
+    }) {
+        return Err(AppError::QBittorrent(
+            "forwarded port lease expired; sync refused".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn request_config(
@@ -440,11 +466,11 @@ fn parse_status_code(status_line: &str) -> AppResult<u16> {
     let _http_version = tokens.next();
     let code_str = tokens
         .next()
-        .ok_or_else(|| AppError::QBittorrent(format!("invalid status line: {status_line}")))?;
+        .ok_or_else(|| AppError::QBittorrent("invalid HTTP status line".into()))?;
 
     code_str
         .parse::<u16>()
-        .map_err(|_| AppError::QBittorrent(format!("invalid status code: {code_str}")))
+        .map_err(|_| AppError::QBittorrent("invalid HTTP status code".into()))
 }
 
 fn extract_cookie(headers: &[(String, String)], cookie_name: &str) -> Option<String> {
@@ -463,7 +489,37 @@ fn extract_cookie(headers: &[(String, String)], cookie_name: &str) -> Option<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expired_mapping_is_rejected_before_any_webui_request() {
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            url: "http://[invalid".into(),
+            ..Default::default()
+        });
+        assert!(
+            client
+                .sync_port(51820, Some("wg0"), Some(0))
+                .unwrap_err()
+                .to_string()
+                .contains("lease expired")
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn security_webui_errors_and_debug_do_not_disclose_secrets() {
+        let error = parse_http_response("sentinel_password\x1b]52;c;payload\x07").unwrap_err();
+        assert!(!error.to_string().contains("sentinel_password"));
+        assert!(!format!("{error:?}").contains("sentinel_password"));
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            password: Some("sentinel_password".into()),
+            ..Default::default()
+        });
+        client.cookie = Some("sentinel_cookie".into());
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("sentinel_password"));
+        assert!(!debug.contains("sentinel_cookie"));
+    }
 
     #[test]
     fn format_curl_timeout_handles_subsecond_and_fractional_durations() {
@@ -685,7 +741,7 @@ mod tests {
         );
 
         let synced = client
-            .sync_port(55432, Some("wg0"))
+            .sync_port(55432, Some("wg0"), None)
             .expect("sync should succeed");
         assert_eq!(
             synced.previous_port,
@@ -704,7 +760,7 @@ mod tests {
         for interface in [None, Some(""), Some(" ")] {
             let mut client = QBittorrentClient::new(&base(false));
             let report = client
-                .sync_port(55433, interface)
+                .sync_port(55433, interface, None)
                 .expect("port-only sync should succeed");
             assert_eq!(report.bound_interface, None);
             let pushed = server.last_set_preferences();

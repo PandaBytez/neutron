@@ -10,10 +10,11 @@ use ratatui::widgets::{
 
 use crate::config::{PortForwardMode, SplitTunnelMode};
 use crate::nm::network_info::format_speed;
+use crate::process::terminal_safe;
 use crate::service::lease::QbitSyncStatus;
 use crate::tui::state::{
     ActiveModal, CommandPaletteState, PortForwardFocus, PortForwardModalState, SplitTunnelFocus,
-    SplitTunnelModalState, ThemePickerState, TuiState,
+    SplitTunnelModalState, THEMES, ThemePickerState, TuiState,
 };
 pub const MIN_WIDTH: u16 = 120;
 pub const MIN_HEIGHT: u16 = 30;
@@ -121,8 +122,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     // Status pill (clean profile name)
     let (status_text, status_style) = if let Some(ref conn) = state.connecting {
         let elapsed = conn.started_at.elapsed();
-        const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let spinner = SPINNER_FRAMES[(elapsed.as_millis() / 80) as usize % SPINNER_FRAMES.len()];
+        let spinner = crate::spinner::spinner_frame(elapsed);
         if conn.is_disconnect {
             (
                 format!(" Disconnecting: {} {spinner} ", conn.name),
@@ -152,7 +152,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         Span::styled("Status ", theme.title),
     ]);
 
-    let status_badge = Span::styled(status_text, status_style);
+    let status_badge = Span::styled(terminal_safe(&status_text), status_style);
 
     // Dedicated Forwarded Port field (clean text, with icon).
     //
@@ -213,7 +213,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     };
     let line2 = Line::from(vec![
         Span::styled(" Public IP: ", theme.label_dim),
-        Span::styled(pub_ip_text, theme.text_primary),
+        Span::styled(terminal_safe(&pub_ip_text), theme.text_primary),
     ]);
 
     // Line 3: DNS Resolver under Public IP + Port under/alongside DNS
@@ -224,7 +224,7 @@ fn render_status_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         .unwrap_or("N/A");
     let mut line3 = vec![
         Span::styled(" DNS:       ", theme.label_dim),
-        Span::styled(dns_text, theme.accent),
+        Span::styled(terminal_safe(dns_text), theme.accent),
         Span::raw("  "),
         Span::styled(port_label, theme.label_dim),
         Span::styled(port_val, port_val_style),
@@ -395,7 +395,7 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
     let name_col_w = state
         .rows
         .iter()
-        .map(|r| r.name.chars().count())
+        .map(|r| terminal_safe(&r.name).chars().count())
         .max()
         .unwrap_or(16)
         .max(18);
@@ -448,13 +448,14 @@ fn render_profile_list(frame: &mut Frame, area: Rect, state: &TuiState) {
                 (" ", theme.label_dim)
             };
 
-            let name_len = row.name.chars().count();
+            let name = terminal_safe(&row.name);
+            let name_len = name.chars().count();
             let name_pad = name_col_w.saturating_sub(name_len);
 
             let spans = vec![
                 Span::styled(prefix, theme.accent),
                 Span::styled(icon, icon_style),
-                Span::styled(&row.name, name_style),
+                Span::styled(name, name_style),
                 Span::raw(" ".repeat(name_pad)),
                 Span::raw("   "),
                 Span::styled(fav_icon, fav_style),
@@ -517,8 +518,8 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         // Section: Overview
         lines.push(Line::from(vec![
             Span::styled("Profile:       ", theme.label_dim),
-            Span::styled(&row.name, theme.title),
-            Span::styled(format!("  ({})", row.uuid), theme.label_dim),
+            Span::styled(terminal_safe(&row.name), theme.title),
+            Span::styled(format!("  ({})", terminal_safe(&row.uuid)), theme.label_dim),
         ]));
 
         let (status_str, status_style) = if row.is_active {
@@ -565,7 +566,7 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
                     .unwrap_or_default();
                 lines.push(Line::from(vec![
                     Span::styled("Tunnel IP:     ", theme.label_dim),
-                    Span::styled(format!("{addr}{gw_str}"), theme.accent),
+                    Span::styled(terminal_safe(&format!("{addr}{gw_str}")), theme.accent),
                 ]));
             }
 
@@ -581,7 +582,10 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             lines.push(Line::from(vec![
                 Span::styled("DNS Resolver:  ", theme.label_dim),
                 Span::styled(
-                    format!("{dns} (configured DNS; live priority not verified)"),
+                    format!(
+                        "{} (configured DNS; live priority not verified)",
+                        terminal_safe(dns)
+                    ),
                     theme.text_secondary,
                 ),
             ]));
@@ -593,32 +597,35 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         if let Some(diag) = info.map(|i| &i.diagnostics) {
             lines.push(Line::from(vec![
                 Span::styled("Remote Peer:   ", theme.label_dim),
-                Span::styled(&diag.endpoint, theme.text_primary),
+                Span::styled(terminal_safe(&diag.endpoint), theme.text_primary),
             ]));
 
             lines.push(Line::from(vec![
                 Span::styled("Total Data:    ", theme.label_dim),
                 Span::styled(
-                    format!("↑ {}  ↓ {}", diag.transfer_tx, diag.transfer_rx),
+                    terminal_safe(&format!("↑ {}  ↓ {}", diag.transfer_tx, diag.transfer_rx)),
                     theme.accent,
                 ),
             ]));
 
             lines.push(Line::from(vec![
                 Span::styled("Handshake:     ", theme.label_dim),
-                Span::styled(&diag.latest_handshake, theme.text_secondary),
+                Span::styled(terminal_safe(&diag.latest_handshake), theme.text_secondary),
             ]));
 
             if diag.keepalive != "N/A" && !diag.keepalive.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled("Keepalive:     ", theme.label_dim),
-                    Span::styled(format!("{}s", diag.keepalive), theme.text_secondary),
+                    Span::styled(
+                        format!("{}s", terminal_safe(&diag.keepalive)),
+                        theme.text_secondary,
+                    ),
                 ]));
             }
 
             lines.push(Line::from(vec![
                 Span::styled("Allowed IPs:   ", theme.label_dim),
-                Span::styled(&diag.allowed_ips, theme.text_secondary),
+                Span::styled(terminal_safe(&diag.allowed_ips), theme.text_secondary),
             ]));
         }
 
@@ -626,7 +633,10 @@ fn render_telemetry_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
                 Span::styled("Config Info:   ", theme.label_dim),
-                Span::styled(custom.replace('\n', " | "), theme.text_secondary),
+                Span::styled(
+                    terminal_safe(&custom.replace('\n', " | ")),
+                    theme.text_secondary,
+                ),
             ]));
         }
 
@@ -806,6 +816,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn render_pending_toast(frame: &mut Frame, area: Rect, text: &str, state: &TuiState) {
+    let text = terminal_safe(text);
     let theme = &state.theme;
     let toast_rect = toast_frame(frame, area, toast_width(area, text.chars().count()), 3);
 
@@ -850,6 +861,7 @@ fn render_connecting_toast(
         "Waiting for WireGuard handshake..."
     };
 
+    let action_str = terminal_safe(&action_str);
     let max_len = (action_str.chars().count() + 2).max(sub_str.chars().count());
     let toast_rect = toast_frame(frame, area, toast_width(area, max_len), 4);
 
@@ -954,6 +966,32 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn modal_block(theme: &crate::tui::theme::Theme, title: Span<'static>) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.active_border)
+        .title(title)
+}
+
+fn mode_button(
+    theme: &crate::tui::theme::Theme,
+    label: &str,
+    is_current: bool,
+    is_cursor: bool,
+) -> [Span<'static>; 2] {
+    let style = match (is_cursor, is_current) {
+        (true, true) => theme.selected_item,
+        (true, false) => theme.key_badge_accent,
+        (false, true) => theme.status_pill_connected,
+        (false, false) => theme.key_badge,
+    };
+    [
+        Span::styled(format!(" [ {label} ] "), style),
+        Span::raw("  "),
+    ]
+}
+
 fn render_command_palette_modal(
     frame: &mut Frame,
     area: Rect,
@@ -978,7 +1016,7 @@ fn render_command_palette_modal(
     // Search bar
     let search_bar = Paragraph::new(Line::from(vec![
         Span::styled(" 🔍 > ", theme.accent),
-        Span::styled(&cp.filter, theme.title),
+        Span::styled(terminal_safe(&cp.filter), theme.title),
         Span::styled("█", theme.accent),
     ]))
     .block(
@@ -1050,11 +1088,7 @@ fn render_command_palette_modal(
     .alignment(Alignment::Center);
     frame.render_widget(footer, chunks[2]);
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme.active_border)
-        .title(Span::styled(" Menu (Ctrl+P) ", theme.header));
+    let outer = modal_block(theme, Span::styled(" Menu (Ctrl+P) ", theme.header));
     frame.render_widget(outer, popup_area);
 }
 
@@ -1075,8 +1109,7 @@ fn render_theme_picker_modal(
         .margin(1)
         .split(popup_area);
 
-    let items: Vec<ListItem> = tp
-        .themes
+    let items: Vec<ListItem> = THEMES
         .iter()
         .enumerate()
         .map(|(idx, (id, label))| {
@@ -1136,11 +1169,7 @@ fn render_theme_picker_modal(
     .alignment(Alignment::Center);
     frame.render_widget(footer, chunks[1]);
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme.active_border)
-        .title(Span::styled(" 🎨 Select Color Theme ", theme.header));
+    let outer = modal_block(theme, Span::styled(" 🎨 Select Color Theme ", theme.header));
     frame.render_widget(outer, popup_area);
 }
 
@@ -1178,11 +1207,7 @@ fn render_help_modal(frame: &mut Frame, area: Rect, state: &TuiState) {
         ]));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme.active_border)
-        .title(Span::styled(" Keybindings Help ", theme.title));
+    let block = modal_block(theme, Span::styled(" Keybindings Help ", theme.title));
 
     let help_widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(help_widget, popup_area);
@@ -1230,18 +1255,7 @@ fn render_port_forward_modal(
         };
         let is_current = pf.mode == *mode;
         let is_cursor = pf.highlighted_mode == idx;
-        let text = format!(" [ {label} ] ");
-        let style = if is_cursor && is_current {
-            theme.selected_item
-        } else if is_cursor {
-            theme.key_badge_accent
-        } else if is_current {
-            theme.status_pill_connected
-        } else {
-            theme.key_badge
-        };
-        mode_spans.push(Span::styled(text, style));
-        mode_spans.push(Span::raw("  "));
+        mode_spans.extend(mode_button(theme, label, is_current, is_cursor));
     }
 
     let mode_style = if pf.focus == PortForwardFocus::Mode {
@@ -1275,7 +1289,7 @@ fn render_port_forward_modal(
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(chunks[1]);
     frame.render_widget(
-        Paragraph::new(pf.host.as_str()).block(
+        Paragraph::new(terminal_safe(&pf.host)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(host_style)
@@ -1284,7 +1298,7 @@ fn render_port_forward_modal(
         endpoint[0],
     );
     frame.render_widget(
-        Paragraph::new(pf.port.as_str()).block(
+        Paragraph::new(terminal_safe(&pf.port)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(port_style)
@@ -1318,11 +1332,7 @@ fn render_port_forward_modal(
     frame.render_widget(footer, footer_chunk);
 
     frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(theme.active_border)
-            .title(Span::styled(" Port Forwarding ", theme.title)),
+        modal_block(theme, Span::styled(" Port Forwarding ", theme.title)),
         popup_area,
     );
 }
@@ -1371,18 +1381,7 @@ fn render_split_tunnel_modal(
         };
         let is_current = st.mode == *mode;
         let is_cursor = st.focus == SplitTunnelFocus::Mode && st.highlighted_mode == idx;
-        let text = format!(" [ {label} ] ");
-        let style = if is_cursor && is_current {
-            theme.selected_item
-        } else if is_cursor {
-            theme.key_badge_accent
-        } else if is_current {
-            theme.status_pill_connected
-        } else {
-            theme.key_badge
-        };
-        mode_spans.push(Span::styled(text, style));
-        mode_spans.push(Span::raw("  "));
+        mode_spans.extend(mode_button(theme, label, is_current, is_cursor));
     }
 
     let mode_style = if st.focus == SplitTunnelFocus::Mode {
@@ -1474,11 +1473,7 @@ fn render_split_tunnel_modal(
     let modal_footer = Paragraph::new(Line::from(modal_keys)).alignment(Alignment::Center);
     frame.render_widget(modal_footer, footer_chunk);
 
-    let outer_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme.active_border)
-        .title(Span::styled(" Global Split Tunneling ", theme.title));
+    let outer_block = modal_block(theme, Span::styled(" Global Split Tunneling ", theme.title));
     frame.render_widget(outer_block, popup_area);
 }
 
@@ -1510,7 +1505,7 @@ fn render_entry_column(
         theme.border
     };
     let input_widget = Paragraph::new(Line::from(vec![
-        Span::styled(params.input_value, theme.title),
+        Span::styled(terminal_safe(params.input_value), theme.title),
         Span::styled(if params.is_input_focused { "█" } else { "" }, theme.accent),
     ]))
     .block(
@@ -1548,7 +1543,7 @@ fn render_entry_column(
                         theme.accent,
                     ),
                     Span::styled(
-                        val,
+                        terminal_safe(val),
                         if is_sel {
                             theme.title
                         } else {
@@ -1583,7 +1578,7 @@ fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state:
         Line::raw(""),
         Line::from(vec![
             Span::raw("Are you sure you want to permanently delete '"),
-            Span::styled(name, theme.warning),
+            Span::styled(terminal_safe(name), theme.warning),
             Span::raw("' from NetworkManager?"),
         ]),
         Line::raw(""),
@@ -1597,11 +1592,8 @@ fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state:
 
     let widget = Paragraph::new(text)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(theme.warning)
-                .title(Span::styled(" Confirm Delete ", theme.warning)),
+            modal_block(theme, Span::styled(" Confirm Delete ", theme.warning))
+                .border_style(theme.warning),
         )
         .alignment(Alignment::Center);
 
@@ -1611,6 +1603,22 @@ fn render_confirm_delete_modal(frame: &mut Frame, area: Rect, name: &str, state:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_buttons_keep_current_and_cursor_highlights_distinct() {
+        let theme = crate::tui::theme::Theme::from_config(&Default::default());
+        for (current, cursor, expected) in [
+            (true, true, theme.selected_item),
+            (false, true, theme.key_badge_accent),
+            (true, false, theme.status_pill_connected),
+            (false, false, theme.key_badge),
+        ] {
+            let spans = mode_button(&theme, "Disabled", current, cursor);
+            assert_eq!(spans[0].style, expected);
+            assert_eq!(spans[0].content, " [ Disabled ] ");
+            assert_eq!(spans[1].content, "  ");
+        }
+    }
 
     #[test]
     fn every_footer_key_is_a_real_palette_shortcut() {
@@ -1675,21 +1683,7 @@ mod render_tests {
 
         // 120x30 is the minimum the real layout accepts; below that the size
         // warning takes over and no overlay is drawn.
-        let mut terminal =
-            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw should succeed");
-
-        let buffer = terminal.backend().buffer().clone();
-        let screen: String = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let screen = rendered_frame(&state, 120, 30);
         assert!(
             screen.contains("Enabling Lockdown Mode"),
             "the pending label must be on screen: {screen}"
@@ -1854,23 +1848,7 @@ mod render_tests {
                 &state.config.global_split_tunnel,
             ));
 
-            let mut terminal =
-                Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
-            terminal
-                .draw(|frame| {
-                    render(frame, &state);
-                })
-                .expect("draw should succeed");
-
-            let buffer = terminal.backend().buffer().clone();
-            (0..buffer.area.height)
-                .map(|y| {
-                    (0..buffer.area.width)
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect::<String>()
-                })
-                .collect::<Vec<String>>()
-                .join("\n")
+            rendered_frame(&state, 120, 30)
         };
 
         assert!(
@@ -1891,23 +1869,7 @@ mod render_tests {
             &state.config.qbittorrent.url,
         ));
 
-        let mut terminal =
-            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
-        terminal
-            .draw(|frame| {
-                render(frame, &state);
-            })
-            .expect("draw should succeed");
-
-        let buffer = terminal.backend().buffer().clone();
-        let rendered = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
+        let rendered = rendered_frame(&state, 120, 30);
 
         assert!(
             rendered.contains("Port Forwarding Mode"),
@@ -1945,23 +1907,23 @@ mod render_tests {
         state.modal = ActiveModal::PortForward(modal);
         state.qbit_webui_reachable = Some(false);
 
-        let rendered = rendered_port_forward_modal(&state);
+        let rendered = rendered_frame(&state, 120, 30);
         assert!(
             rendered.contains("qBittorrent WebUI unavailable"),
             "a refused WebUI must warn while Auto-Sync is highlighted: {rendered}"
         );
 
         state.qbit_webui_reachable = Some(true);
-        let up = rendered_port_forward_modal(&state);
+        let up = rendered_frame(&state, 120, 30);
         assert!(
             !up.contains("WebUI unavailable"),
             "a live WebUI must not warn: {up}"
         );
     }
 
-    fn rendered_port_forward_modal(state: &TuiState) -> String {
+    fn rendered_frame(state: &TuiState, width: u16, height: u16) -> String {
         let mut terminal =
-            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
+            Terminal::new(TestBackend::new(width, height)).expect("test terminal should build");
         terminal
             .draw(|frame| {
                 render(frame, state);
@@ -2010,10 +1972,8 @@ mod render_tests {
     fn the_status_panel_shows_forwarded_port_with_icon() {
         let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
         state.active_profile_name = Some("wg-us".to_string());
-        state.lease = Some(crate::service::lease::LeaseState {
-            port: Some(51820),
-            ..Default::default()
-        });
+        state.active_profile_uuid = Some("uuid-us".into());
+        state.lease = Some(crate::testing::fresh_lease("uuid-us", 51820));
         state.latency_ms = Some(42);
 
         let rendered = rendered_status(&state);
@@ -2067,11 +2027,10 @@ mod render_tests {
         /// qBittorrent sync switched on.
         fn synced_state(status: QbitSyncStatus) -> TuiState {
             let mut state = state_without_daemon();
+            state.active_profile_uuid = Some("uuid-us".into());
             state.lease = Some(LeaseState {
-                port: Some(51820),
-                profile_uuid: Some("uuid-us".to_string()),
                 qbit_sync: status,
-                ..Default::default()
+                ..crate::testing::fresh_lease("uuid-us", 51820)
             });
             state
         }
@@ -2202,23 +2161,7 @@ mod render_tests {
         let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
         state.set_status("Tunnel connected successfully");
 
-        let mut terminal =
-            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
-        terminal
-            .draw(|frame| {
-                render(frame, &state);
-            })
-            .expect("draw should succeed");
-
-        let buffer = terminal.backend().buffer().clone();
-        let rendered = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
+        let rendered = rendered_frame(&state, 120, 30);
 
         let toast_line = rendered
             .lines()
@@ -2238,23 +2181,7 @@ mod render_tests {
     fn terminal_window_size_warning_on_small_dimensions() {
         let state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
 
-        let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test terminal should build");
-        terminal
-            .draw(|frame| {
-                render(frame, &state);
-            })
-            .expect("draw should succeed");
-
-        let buffer = terminal.backend().buffer().clone();
-        let rendered = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
+        let rendered = rendered_frame(&state, 80, 24);
 
         assert!(
             rendered.contains("Terminal window too small") && rendered.contains("120x30"),
@@ -2454,23 +2381,7 @@ mod render_tests {
             started_at: std::time::Instant::now(),
         });
 
-        let mut terminal =
-            Terminal::new(TestBackend::new(120, 30)).expect("test terminal should build");
-        terminal
-            .draw(|frame| {
-                render(frame, &state);
-            })
-            .expect("draw should succeed");
-
-        let buffer = terminal.backend().buffer().clone();
-        let rendered = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
+        let rendered = rendered_frame(&state, 120, 30);
 
         assert!(
             rendered.contains("Connecting: wg-cz"),

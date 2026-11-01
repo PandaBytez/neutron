@@ -18,6 +18,139 @@ use neutron::config::SplitTunnelMode;
 use neutron::nm::{CliNmClient, NmIntrospect, NmLifecycle};
 use neutron::testing::{require_sandbox, sample_wireguard_config, sandbox_profile_name};
 
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn effective_dns_competitor_refuses_protected_activation_before_connection_up() {
+    require_sandbox();
+    let path = neutron::config::default_config_path().unwrap();
+    let original = neutron::config::load(&path).unwrap();
+    struct Restore(PathBuf, neutron::config::AppConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = neutron::config::save(&self.0, &self.1);
+        }
+    }
+    let _restore = Restore(path.clone(), original);
+    neutron::config::save(&path, &neutron::config::AppConfig::default()).unwrap();
+    let fixture = Fixture::import_config(
+        "dnspref",
+        &sample_wireguard_config("10.253.55.2/32, fd00:55::2/128", "10.253.55.1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    struct Competitor;
+    impl Drop for Competitor {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("nmcli")
+                .args(["connection", "delete", "neutron-dns-competitor"])
+                .output();
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", "ndns0"])
+                .output();
+        }
+    }
+    let _competitor = Competitor;
+    assert!(
+        std::process::Command::new("nmcli")
+            .args([
+                "connection",
+                "add",
+                "type",
+                "dummy",
+                "ifname",
+                "ndns0",
+                "con-name",
+                "neutron-dns-competitor",
+                "ipv4.method",
+                "manual",
+                "ipv4.addresses",
+                "198.18.250.2/24",
+                "ipv4.dns",
+                "198.18.250.1",
+                "ipv4.dns-priority",
+                "-2000",
+                "ipv6.method",
+                "disabled",
+                "connection.autoconnect",
+                "no",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("nmcli")
+            .args(["connection", "up", "neutron-dns-competitor"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    neutron::config::update(&path, |cfg| cfg.kill_switch_enabled = true).unwrap();
+    let error = CliNmClient.connect(&fixture.uuid).unwrap_err().to_string();
+    assert!(
+        error.contains("DNS protection refused") && error.contains("-2000"),
+        "{error}"
+    );
+    assert!(
+        CliNmClient
+            .list_wireguard_profiles()
+            .unwrap()
+            .iter()
+            .any(|p| p.uuid == fixture.uuid && !p.is_active())
+    );
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn a_queued_connect_rechecks_the_manual_tunnel_after_acquiring_the_policy_lock() {
+    require_sandbox();
+    let path = neutron::config::default_config_path().unwrap();
+    let original = neutron::config::load(&path).unwrap();
+    struct Restore(PathBuf, neutron::config::AppConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = neutron::config::save(&self.0, &self.1);
+        }
+    }
+    let _restore = Restore(path.clone(), original);
+    neutron::config::save(&path, &neutron::config::AppConfig::default()).unwrap();
+    let content = sample_wireguard_config("10.253.56.2/32", "10.253.56.1")
+        .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0")
+        .replace("0.0.0.0/0, ::/0", "198.19.0.0/16");
+    let pending = Fixture::import_config("queued", &content);
+    let manual = Fixture::import_config("manual", &content);
+    let held = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(format!("{}.policy.lock", path.display()))
+        .unwrap();
+    held.lock().unwrap();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| CliNmClient.connect(&pending.uuid));
+        assert!(
+            std::process::Command::new("nmcli")
+                .args(["connection", "up", &manual.uuid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        drop(held);
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(neutron::error::AppError::AlreadyActive)
+        ));
+    });
+    let active: Vec<_> = CliNmClient
+        .list_wireguard_profiles()
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.is_active())
+        .map(|p| p.uuid)
+        .collect();
+    assert_eq!(active, std::slice::from_ref(&manual.uuid));
+}
+
 /// A WireGuard profile that exists in NetworkManager for the duration of a test
 /// and is removed afterwards, including on panic.
 struct Fixture {
@@ -59,7 +192,139 @@ impl Fixture {
             .args(["-g", key, "connection", "show", &self.uuid])
             .output()
             .expect("nmcli should run");
+        assert!(
+            output.status.success(),
+            "nmcli rejected {key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn protected_activation_refuses_ipv4_only_and_partial_dual_stack_profiles() {
+    require_sandbox();
+    let path = neutron::config::default_config_path().unwrap();
+    let original = neutron::config::load(&path).unwrap();
+    struct Restore(PathBuf, neutron::config::AppConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = neutron::config::save(&self.0, &self.1);
+        }
+    }
+    let _restore = Restore(path.clone(), original);
+    neutron::config::save(&path, &neutron::config::AppConfig::default()).unwrap();
+    let v4 = Fixture::import_config(
+        "v4refuse",
+        &sample_wireguard_config("10.253.38.2/32", "10.253.38.1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    let partial = Fixture::import_config(
+        "partial",
+        &sample_wireguard_config("10.253.39.2/32, fd00:39::2/128", "10.253.39.1")
+            .replace("0.0.0.0/0, ::/0", "10.253.39.0/24, ::/0")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    neutron::config::update(&path, |cfg| cfg.kill_switch_enabled = true).unwrap();
+    for (fixture, warning) in [(&v4, "unsupported IP family"), (&partial, "AllowedIPs")] {
+        let error = CliNmClient.connect(&fixture.uuid).unwrap_err().to_string();
+        assert!(error.contains(warning), "{error}");
+        assert!(
+            CliNmClient
+                .list_wireguard_profiles()
+                .unwrap()
+                .iter()
+                .any(|p| p.uuid == fixture.uuid && !p.is_active())
+        );
+    }
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn protected_activation_routes_excluded_dns_via_the_tunnel_in_both_families() {
+    require_sandbox();
+    let path = neutron::config::default_config_path().unwrap();
+    let original = neutron::config::load(&path).unwrap();
+    struct Restore(PathBuf, neutron::config::AppConfig);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = neutron::config::save(&self.0, &self.1);
+        }
+    }
+    let _restore = Restore(path.clone(), original);
+    neutron::config::save(&path, &neutron::config::AppConfig::default()).unwrap();
+    let fixture = Fixture::import_config(
+        "dnsroute",
+        &sample_wireguard_config("10.253.40.2/32, fd00:40::2/128", "198.18.40.1, fd00:40::1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    // Out-of-band stale split state must not survive a Disabled activation.
+    let stale = neutron::nm::split_tunnel::set_args(
+        &fixture.uuid,
+        SplitTunnelMode::Include,
+        &["198.19.0.0/16".into()],
+        &[],
+    );
+    assert!(
+        std::process::Command::new("nmcli")
+            .args(stale)
+            .status()
+            .unwrap()
+            .success()
+    );
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    assert_eq!(fixture.get("ipv4.never-default"), "no");
+    assert_eq!(fixture.get("ipv4.routes"), "");
+    assert!(
+        std::process::Command::new("nmcli")
+            .args(["connection", "down", &fixture.uuid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    neutron::config::update(&path, |cfg| {
+        cfg.kill_switch_enabled = true;
+        cfg.global_split_tunnel.mode = SplitTunnelMode::Exclude;
+        cfg.global_split_tunnel.cidrs = vec!["198.18.40.0/24".into(), "fd00:40::/64".into()];
+    })
+    .unwrap();
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    let assert_dns_routes = || {
+        for (family, dns) in [("-4", "198.18.40.1"), ("-6", "fd00:40::1")] {
+            for protocol in ["udp", "tcp"] {
+                let output = std::process::Command::new("ip")
+                    .args([
+                        family, "route", "get", dns, "ipproto", protocol, "dport", "53",
+                    ])
+                    .output()
+                    .unwrap();
+                let route = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    route.contains(&format!("dev {}", fixture.name)),
+                    "DNS escaped tunnel: {route}"
+                );
+            }
+        }
+    };
+    assert_dns_routes();
+    // Refresh must merge the DNS exceptions back after replacing split routes.
+    neutron::config::update(&path, |cfg| {
+        cfg.global_split_tunnel.domains = vec!["198.18.41.1".into()];
+    })
+    .unwrap();
+    neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
+    assert_dns_routes();
+    for property in ["ipv4.routed-dns", "ipv6.routed-dns"] {
+        assert!(matches!(
+            fixture.get(property).as_str(),
+            "0" | "no" | "0 (no)"
+        ));
     }
 }
 
@@ -100,12 +365,83 @@ fn idle_on_demand_tunnel_stays_active_and_carries_its_first_packet() {
     }
     let a_key = "OMHVnT2Gm0ZBb3xF2Cq0hZ0jVQ1z3T0lQ0Z0YQ0Z0X8=";
     let b_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=";
-    let peer = Fixture::import_config(
-        "idlepeer",
-        &format!(
-            "[Interface]\nPrivateKey = {a_key}\nAddress = 10.253.34.1/32\nListenPort = 51834\n\n[Peer]\nPublicKey = {}\nAllowedIPs = 10.253.34.2/32\n",
-            public_key(b_key)
-        ),
+    let namespace = sandbox_profile_name("idlepeer");
+    struct PeerNamespace(String);
+    impl Drop for PeerNamespace {
+        fn drop(&mut self) {
+            let _ = Command::new("ip").args(["netns", "del", &self.0]).output();
+        }
+    }
+    assert!(
+        Command::new("ip")
+            .args(["netns", "add", &namespace])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _peer_namespace = PeerNamespace(namespace.clone());
+    let peer_name = "wg-idle-peer";
+    // The test server is outside the app's NM namespace, not a second managed tunnel.
+    assert!(
+        Command::new("ip")
+            .args(["link", "add", peer_name, "type", "wireguard"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut configure = Command::new("wg")
+        .args([
+            "set",
+            peer_name,
+            "private-key",
+            "/dev/stdin",
+            "listen-port",
+            "51834",
+            "peer",
+            &public_key(b_key),
+            "allowed-ips",
+            "10.253.34.2/32",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    configure
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(a_key.as_bytes())
+        .unwrap();
+    assert!(configure.wait().unwrap().success());
+    assert!(
+        Command::new("ip")
+            .args(["link", "set", peer_name, "netns", &namespace])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("nsenter")
+            .arg(format!("--net=/run/netns/{namespace}"))
+            .args(["ip", "link", "set", peer_name, "up"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("nsenter")
+            .arg(format!("--net=/run/netns/{namespace}"))
+            .args(["ip", "address", "add", "10.253.34.1/32", "dev", peer_name])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("nsenter")
+            .arg(format!("--net=/run/netns/{namespace}"))
+            .args(["ip", "route", "add", "10.253.34.2/32", "dev", peer_name])
+            .status()
+            .unwrap()
+            .success()
     );
     let client = Fixture::import_config(
         "idleclient",
@@ -115,21 +451,16 @@ fn idle_on_demand_tunnel_stays_active_and_carries_its_first_packet() {
         ),
     );
     CliNmClient
-        .connect(&peer.uuid)
-        .expect("passive responder should stay active");
-    CliNmClient
         .connect(&client.uuid)
         .expect("idle on-demand client should stay active");
     std::thread::sleep(std::time::Duration::from_secs(16));
-    for fixture in [&peer, &client] {
-        assert!(
-            CliNmClient
-                .list_wireguard_profiles()
-                .unwrap()
-                .iter()
-                .any(|p| p.uuid == fixture.uuid && p.is_active())
-        );
-    }
+    assert!(
+        CliNmClient
+            .list_wireguard_profiles()
+            .unwrap()
+            .iter()
+            .any(|p| p.uuid == client.uuid && p.is_active())
+    );
     assert_eq!(
         neutron::nm::network_info::interface_receive_bytes(&client.name),
         Some(0)
@@ -151,7 +482,14 @@ fn idle_on_demand_tunnel_stays_active_and_carries_its_first_packet() {
         rx > 0,
         "first packet should trigger authenticated tunnel traffic"
     );
-    assert!(neutron::nm::network_info::interface_receive_bytes(&peer.name).unwrap() > 0);
+    let peer_stats = Command::new("nsenter")
+        .arg(format!("--net=/run/netns/{namespace}"))
+        .args(["ip", "-j", "-s", "link", "show", "dev", peer_name])
+        .output()
+        .unwrap();
+    assert!(peer_stats.status.success());
+    let stats: serde_json::Value = serde_json::from_slice(&peer_stats.stdout).unwrap();
+    assert!(stats[0]["stats64"]["rx"]["bytes"].as_u64().unwrap() > 0);
 }
 
 #[test]
@@ -168,20 +506,30 @@ fn refreshed_routes_reach_the_active_device_without_reconnecting() {
     cfg.global_split_tunnel.mode = SplitTunnelMode::Include;
     // Numeric DNS targets give a deterministic resolver answer without external DNS.
     cfg.global_split_tunnel.domains = vec!["198.18.1.2".into()];
+    let wait_for_routes = |want: &str, reject: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let output = std::process::Command::new("ip")
+                .args(["-4", "route", "show", "dev", &fixture.name])
+                .output()
+                .unwrap();
+            let routes = String::from_utf8_lossy(&output.stdout).into_owned();
+            if routes.contains(want) && (reject.is_empty() || !routes.contains(reject)) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{routes}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
     neutron::config::save(&path, &cfg).unwrap();
     neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
+    wait_for_routes("198.18.1.2", "");
     neutron::config::update(&path, |cfg| {
         cfg.global_split_tunnel.domains = vec!["198.18.1.3".into()]
     })
     .unwrap();
     neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
-    let output = std::process::Command::new("ip")
-        .args(["-4", "route", "show", "dev", &fixture.name])
-        .output()
-        .unwrap();
-    let routes = String::from_utf8_lossy(&output.stdout);
-    assert!(routes.contains("198.18.1.3"), "{routes}");
-    assert!(!routes.contains("198.18.1.2"), "{routes}");
+    wait_for_routes("198.18.1.3", "198.18.1.2");
     assert!(
         CliNmClient
             .list_wireguard_profiles()
@@ -203,6 +551,7 @@ fn activation_prepares_connected_lockdown_before_first_traffic() {
     impl Drop for Restore {
         fn drop(&mut self) {
             let _ = CliNmClient.disable_lockdown();
+            self.0.lockdown_enabled = false;
             let _ = neutron::config::save(&self.1, &self.0);
         }
     }

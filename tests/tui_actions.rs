@@ -17,26 +17,20 @@ use neutron::tui::state::{ActiveModal, CommandPaletteState, TuiState};
 
 #[test]
 fn every_palette_action_is_implemented_by_the_dispatcher() {
-    let sandbox = std::env::temp_dir().join(format!(
-        "neutron-actions-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&sandbox).expect("sandbox should be created");
+    let sandbox = testing::scratch_dir("actions");
 
     // SAFETY: this file holds a single test, so it is the only thread reading
     // the environment. `autostart::dir()` and `default_config_path()` both
     // resolve through here, so nothing escapes the sandbox.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
 
+    let config_path = testing::temp_config_path("actions");
+    config::save(&config_path, &AppConfig::default()).expect("config should save");
     let client = MockNmClient::new(vec![
         profile("wg-eu", "uuid-eu", ProfileState::Active),
         profile("wg-us", "uuid-us", ProfileState::Inactive),
-    ]);
-    let config_path = testing::temp_config_path("actions");
-    config::save(&config_path, &AppConfig::default()).expect("config should save");
+    ])
+    .with_config_path(config_path.clone());
 
     let mut state = TuiState::new(config_path.clone(), AppConfig::default());
     neutron::tui::events::reload_profiles(&mut state, &client).expect("profiles should load");

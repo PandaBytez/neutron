@@ -5,10 +5,7 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+permissions: {}
 
 concurrency:
   group: "pages"
@@ -18,13 +15,22 @@ jobs:
   build:
     name: Build Documentation
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Install mdBook
         run: |
-          tag=$(curl -sL https://api.github.com/repos/rust-lang/mdBook/releases/latest | jq -r '.tag_name')
-          url="https://github.com/rust-lang/mdBook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz"
-          curl -sSL "$url" | tar -xz --directory=/usr/local/bin
+          set -euo pipefail
+          asset_dir=$(mktemp -d)
+          trap 'rm -rf "$asset_dir"' EXIT
+          # Digest published by rust-lang/mdBook for release asset 272868230.
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz \
+            -o "$asset_dir/mdbook.tar.gz"
+          printf '%s  %s\n' c0b903f01dd8f4edc644372ad2b80b1fdddd12552d37b6a098657cbd8eddd768 "$asset_dir/mdbook.tar.gz" | sha256sum --check --strict
+          tar -xzf "$asset_dir/mdbook.tar.gz" -C "$asset_dir" mdbook
+          install -m 755 "$asset_dir/mdbook" /usr/local/bin/mdbook
       - name: Build mdBook
         run: |
           mdbook build
@@ -36,6 +42,9 @@ jobs:
 
   deploy:
     name: Deploy to GitHub Pages
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -15,7 +15,10 @@ fn main() {
         })
     {
         if let Err(error) = neutron::firewall::helper::run() {
-            eprintln!("Error: {error}");
+            eprintln!(
+                "Error: {}",
+                neutron::process::terminal_safe(&error.to_string())
+            );
             std::process::exit(1);
         }
         return;
@@ -23,7 +26,10 @@ fn main() {
 
     let client = CliNmClient;
     if let Err(error) = app::run(&client) {
-        eprintln!("Error: {error}");
+        eprintln!(
+            "Error: {}",
+            neutron::process::terminal_safe(&error.to_string())
+        );
         std::process::exit(1);
     }
 }

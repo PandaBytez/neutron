@@ -13,7 +13,7 @@
 
 use crate::config::QBittorrentConfig;
 use crate::error::AppResult;
-use crate::nm::NmIntrospect;
+use crate::nm::{NmIntrospect, NmLifecycle};
 use crate::portforward::qbittorrent::{QBittorrentClient, QBittorrentSyncReport};
 
 /// Push `port` into the qBittorrent instance described by `config`, binding it
@@ -29,18 +29,46 @@ use crate::portforward::qbittorrent::{QBittorrentClient, QBittorrentSyncReport};
 /// Whether the interface is applied at all follows from the WebUI URL: a local
 /// qBittorrent listens on the tunnel, because a NAT-PMP port only arrives there
 /// (see [`crate::config::webui_is_local`]).
-pub fn sync_port<C: NmIntrospect>(
+pub fn sync_port<C: NmIntrospect + NmLifecycle>(
     client: &C,
+    path: &std::path::Path,
     config: &QBittorrentConfig,
     uuid: &str,
     port: u16,
+    expires_at: Option<u64>,
 ) -> AppResult<QBittorrentSyncReport> {
-    let interface = client.tunnel_interface(uuid);
-    QBittorrentClient::new(config).sync_port(port, interface.as_deref())
+    crate::config::coordinate_policy(path, || {
+        if !client
+            .list_wireguard_profiles()?
+            .iter()
+            .any(|p| p.uuid == uuid && p.is_active())
+        {
+            return Err(crate::error::AppError::QBittorrent(
+                "the leased tunnel is no longer active; sync refused".into(),
+            ));
+        }
+        let interface = client.tunnel_interface(uuid);
+        QBittorrentClient::new(config).sync_port(port, interface.as_deref(), expires_at)
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_sync_refuses_a_tunnel_that_is_no_longer_active_without_contacting_the_webui() {
+        let path = crate::testing::temp_config_path("qbit-stale-owner");
+        let server = crate::testing::MockQBittorrentWebUi::start();
+        let client = crate::testing::MockNmClient::new(vec![crate::testing::profile(
+            "B",
+            "B",
+            crate::nm::ProfileState::Active,
+        )]);
+        let result = sync_port(&client, &path, &config(server.url()), "A", 51820, None);
+        assert!(result.unwrap_err().to_string().contains("no longer active"));
+        assert!(server.paths().is_empty());
+        crate::testing::remove_temp_config(&path);
+    }
+
     use super::*;
     use crate::testing::{
         MockNmClient, MockQBittorrentWebUi, curl_available, unreachable_qbittorrent_url,
@@ -55,21 +83,33 @@ mod tests {
         }
     }
 
+    fn active_client() -> MockNmClient {
+        MockNmClient::new(vec![crate::testing::profile(
+            "wg-eu",
+            "uuid-eu",
+            crate::nm::ProfileState::Active,
+        )])
+    }
+
     #[test]
     fn an_unreachable_webui_is_an_error_rather_than_a_silent_no_op() {
-        let client = MockNmClient::default();
+        let client = active_client();
+        let path = crate::testing::temp_config_path("qbit-unreachable");
 
         let result = sync_port(
             &client,
+            &path,
             &config(unreachable_qbittorrent_url()),
             "uuid-eu",
             51820,
+            None,
         );
 
         assert!(
             result.is_err(),
             "an unreachable WebUI must not look like a successful push"
         );
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -78,15 +118,25 @@ mod tests {
             return;
         }
         let server = MockQBittorrentWebUi::start();
-        let client = MockNmClient::default();
+        let client = active_client();
+        let path = crate::testing::temp_config_path("qbit-bind");
 
-        sync_port(&client, &config(server.url()), "uuid-eu", 51820).expect("push should succeed");
+        sync_port(
+            &client,
+            &path,
+            &config(server.url()),
+            "uuid-eu",
+            51820,
+            None,
+        )
+        .expect("push should succeed");
 
         let pushed = server.last_set_preferences();
         assert!(
             pushed.contains("wg0"),
             "the tunnel's interface must reach qBittorrent: {pushed}"
         );
+        crate::testing::remove_temp_config(&path);
     }
 
     #[test]
@@ -100,9 +150,18 @@ mod tests {
             return;
         }
         let server = MockQBittorrentWebUi::start();
-        let client = MockNmClient::default().without_tunnel_interface();
+        let client = active_client().without_tunnel_interface();
+        let path = crate::testing::temp_config_path("qbit-no-interface");
 
-        sync_port(&client, &config(server.url()), "uuid-eu", 51820).expect("port sync should work");
+        sync_port(
+            &client,
+            &path,
+            &config(server.url()),
+            "uuid-eu",
+            51820,
+            None,
+        )
+        .expect("port sync should work");
 
         let pushed = server.last_set_preferences();
         assert!(
@@ -113,5 +172,6 @@ mod tests {
             pushed.contains("listen_port"),
             "the port itself must still be applied: {pushed}"
         );
+        crate::testing::remove_temp_config(&path);
     }
 }

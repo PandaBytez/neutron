@@ -22,6 +22,133 @@ const ROUTING_KEYS: [&str; 2] = [
     "wireguard.ip6-auto-default-route",
 ];
 
+#[test]
+fn activation_clears_stale_split_properties_even_when_saved_mode_is_disabled() {
+    let (client, path) = connected_client();
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Include, &["192.0.2.0/24".into()], &[])
+        .unwrap();
+    client.switch_to("uuid-us").unwrap();
+    for family in ["ipv4", "ipv6"] {
+        assert_eq!(
+            client
+                .setting("uuid-us", &format!("{family}.never-default"))
+                .as_deref(),
+            Some("no")
+        );
+        assert_eq!(
+            client
+                .setting("uuid-us", &format!("{family}.routes"))
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            client
+                .setting("uuid-us", &format!("{family}.routed-dns"))
+                .as_deref(),
+            Some("yes")
+        );
+    }
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn protected_activation_refuses_unsupported_families_partial_peers_and_dns() {
+    let path = testing::temp_toml_config_path("activation-security");
+    config::save(
+        &path,
+        &AppConfig {
+            kill_switch_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (key, value, warning) in [
+        ("ipv6.method", "disabled", "unsupported IP family"),
+        ("ipv4.method", "disabled", "unsupported IP family"),
+        (
+            "wireguard.peers",
+            "KEY allowed-ips=10.0.0.0/8;::/0",
+            "AllowedIPs",
+        ),
+        ("ipv4.dns", "", "explicit tunnel DNS"),
+    ] {
+        let client = MockNmClient::new(vec![testing::inactive("wg", "uuid")])
+            .with_config_path(path.clone())
+            .with_setting("uuid", key, value);
+        let error = client.connect("uuid").unwrap_err().to_string();
+        assert!(error.contains(warning), "{error}");
+        assert!(client.active_uuids().is_empty());
+        assert!(client.setting("uuid", "ipv4.routes").is_none());
+    }
+    let client =
+        MockNmClient::new(vec![testing::inactive("wg", "uuid")]).with_config_path(path.clone());
+    client.connect("uuid").unwrap();
+    assert_eq!(
+        client.setting("uuid", "ipv4.dns-search").as_deref(),
+        Some("~.")
+    );
+    assert_eq!(
+        client.setting("uuid", "ipv4.routed-dns").as_deref(),
+        Some("no")
+    );
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn protected_dns_host_routes_survive_split_replacement_and_disabled_mode() {
+    let path = testing::temp_toml_config_path("dns-host-routes");
+    config::save(
+        &path,
+        &AppConfig {
+            kill_switch_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let client = MockNmClient::new(vec![testing::inactive("wg", "uuid")])
+        .with_config_path(path.clone())
+        .with_setting("uuid", "ipv4.dns", "198.18.40.1")
+        .with_setting("uuid", "ipv6.dns", "fd00:40::1");
+    client.connect("uuid").unwrap();
+    for mode in [
+        SplitTunnelMode::Exclude,
+        SplitTunnelMode::Include,
+        SplitTunnelMode::Disabled,
+    ] {
+        let split = SplitTunnelConfig {
+            mode,
+            cidrs: vec!["198.18.40.0/24".into(), "fd00:40::/64".into()],
+            domains: vec![],
+        };
+        neutron::app::split_tunnel::apply_and_persist_global_split_tunnel(&client, &path, &split)
+            .unwrap();
+        assert!(
+            client
+                .setting("uuid", "ipv4.routes")
+                .unwrap()
+                .contains("198.18.40.1/32 0.0.0.0 5 table=254")
+        );
+        assert!(
+            client
+                .setting("uuid", "ipv6.routes")
+                .unwrap()
+                .contains("fd00:40::1/128 :: 5 table=254")
+        );
+        if mode == SplitTunnelMode::Disabled {
+            assert_eq!(
+                client.setting("uuid", "ipv4.never-default").as_deref(),
+                Some("no")
+            );
+            assert_eq!(
+                client.setting("uuid", "ipv6.never-default").as_deref(),
+                Some("no")
+            );
+        }
+    }
+    testing::remove_temp_config(&path);
+}
+
 /// Fail if any profile has been left in a state where NetworkManager would
 /// install no routes for it.
 fn assert_every_profile_still_routes(client: &MockNmClient, context: &str) {
@@ -40,12 +167,13 @@ fn assert_every_profile_still_routes(client: &MockNmClient, context: &str) {
 }
 
 fn connected_client() -> (MockNmClient, std::path::PathBuf) {
+    let path = testing::temp_toml_config_path("active-policies");
+    config::save(&path, &AppConfig::default()).expect("config should save");
     let client = MockNmClient::new(vec![
         profile("wg-eu", "uuid-eu", ProfileState::Active),
         profile("wg-us", "uuid-us", ProfileState::Inactive),
-    ]);
-    let path = testing::temp_config_path("active-policies");
-    config::save(&path, &AppConfig::default()).expect("config should save");
+    ])
+    .with_config_path(path.clone());
     (client, path)
 }
 
@@ -83,15 +211,29 @@ fn disabling_the_kill_switch_on_a_live_tunnel_keeps_it_routing() {
 #[test]
 fn enabling_the_kill_switch_on_a_live_tunnel_keeps_it_routing() {
     let (client, path) = connected_client();
+    // An inactive IPv4-only profile must not abort the global kill-switch sweep,
+    // though activating that profile without lockdown will still be refused.
+    let client = client.with_setting("uuid-us", "ipv6.method", "disabled");
 
     neutron::app::set_global_kill_switch(&client, &path, true).expect("enable should succeed");
 
-    assert_every_profile_still_routes(&client, "kill switch enabled");
+    assert_eq!(
+        client
+            .setting("uuid-eu", "wireguard.ip4-auto-default-route")
+            .as_deref(),
+        Some("yes")
+    );
     assert_eq!(
         client.setting("uuid-eu", "ipv4.dns-priority").as_deref(),
         Some("-1500"),
         "enabling must give the tunnel's resolvers exclusive priority"
     );
+    assert_eq!(
+        client.setting("uuid-us", "ipv4.dns-priority").as_deref(),
+        Some("-1500"),
+        "inactive IPv4-only profile still receives base kill-switch priority"
+    );
+    assert!(client.switch_to("uuid-us").is_err());
     assert_eq!(client.active_uuid().as_deref(), Some("uuid-eu"));
 
     testing::remove_temp_config(&path);
@@ -112,6 +254,41 @@ fn cycling_the_kill_switch_never_regresses_routing() {
             Some("uuid-eu"),
             "the live tunnel must survive every toggle"
         );
+        if enable {
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routes").as_deref(),
+                Some("10.2.0.1/32 0.0.0.0 5 table=254")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.dns-search").as_deref(),
+                Some("~.")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.may-fail").as_deref(),
+                Some("no")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routed-dns").as_deref(),
+                Some("no")
+            );
+        } else {
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routes").as_deref(),
+                Some("")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.dns-search").as_deref(),
+                Some("")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.may-fail").as_deref(),
+                Some("yes")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routed-dns").as_deref(),
+                Some("yes")
+            );
+        }
     }
 
     testing::remove_temp_config(&path);
@@ -291,17 +468,9 @@ fn switching_fails_when_active_profile_teardown_fails() {
     );
 }
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
-    let sandbox = std::env::temp_dir().join(format!(
-        "neutron-sync-lockdown-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let sandbox = testing::scratch_dir("sync-lockdown");
     let config_dir = sandbox.join("neutron");
     let profiles_dir = config_dir.join("profiles");
     std::fs::create_dir_all(&profiles_dir).unwrap();
@@ -319,7 +488,7 @@ fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
     };
     config::save(&config_path, &config).expect("config should save");
 
-    let client = MockNmClient::new(vec![]);
+    let client = MockNmClient::new(vec![]).with_config_path(config_path.clone());
     let report = neutron::app::sync::sync_profiles_dir(&client, &config).unwrap();
     assert_eq!(report.imported, vec!["test-sync".to_string()]);
     neutron::app::rebuild_lockdown_if_enabled(&client, &config_path).unwrap();
@@ -333,18 +502,61 @@ fn sync_reconciles_lockdown_allow_rules_when_lockdown_enabled() {
 }
 
 #[test]
+fn mock_policy_replay_uses_only_supplied_domain_ips_on_every_lifecycle_path() {
+    let scratch = testing::scratch_dir("mock-domain-policy");
+    let path = scratch.join("config.toml");
+    let config = AppConfig {
+        global_split_tunnel: SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            cidrs: vec!["10.1.2.3/8".into()],
+            domains: vec!["  FIXTURE.EXAMPLE  ".into()],
+        },
+        ..Default::default()
+    };
+    config::save(&path, &config).unwrap();
+    let client = MockNmClient::new(vec![testing::inactive("wg-fixture", "uuid-fixture")])
+        .with_config_path(path.clone())
+        .with_domain_ips(
+            "fixture.example",
+            vec![
+                "192.0.2.123".parse().unwrap(),
+                "2001:db8::123".parse().unwrap(),
+            ],
+        );
+    client.connect("uuid-fixture").unwrap();
+    client.switch_to("uuid-fixture").unwrap();
+    client
+        .import_wireguard_profile(&scratch.join("wg-imported.conf"))
+        .unwrap();
+    for uuid in ["uuid-fixture", "uuid-wg-imported"] {
+        assert_eq!(
+            client.setting(uuid, "ipv4.routes").as_deref(),
+            Some("10.0.0.0/8, 192.0.2.123/32")
+        );
+        assert_eq!(
+            client.setting(uuid, "ipv6.routes").as_deref(),
+            Some("2001:db8::123/128")
+        );
+    }
+
+    // A separate mock has no answers, even for the same domain and fixture path.
+    let unresolved = MockNmClient::new(vec![testing::inactive("wg-fixture", "uuid-fixture")])
+        .with_config_path(path);
+    assert!(unresolved.connect("uuid-fixture").is_err());
+    assert!(unresolved.switch_to("uuid-fixture").is_err());
+    assert!(
+        unresolved
+            .import_wireguard_profile(&scratch.join("wg-unresolved.conf"))
+            .is_err()
+    );
+    assert!(unresolved.active_uuids().is_empty());
+    assert!(unresolved.setting("uuid-fixture", "ipv4.routes").is_none());
+    std::fs::remove_dir_all(scratch).unwrap();
+}
+
+#[test]
 fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
-    let _env_lock = ENV_LOCK.lock().unwrap();
-    let sandbox = std::env::temp_dir().join(format!(
-        "neutron-import-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let config_dir = sandbox.join("neutron");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
+    let config_path = testing::temp_toml_config_path("import-policy");
 
     let config = AppConfig {
         kill_switch_enabled: true,
@@ -357,9 +569,7 @@ fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
     };
     config::save(&config_path, &config).expect("config should save");
 
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
-
-    let client = MockNmClient::new(vec![]);
+    let client = MockNmClient::new(vec![]).with_config_path(config_path.clone());
     client
         .import_wireguard_profile(std::path::Path::new("/tmp/wg-imported.conf"))
         .expect("import should succeed");
@@ -386,23 +596,12 @@ fn importing_profile_inherits_global_kill_switch_and_split_tunnel() {
         "importing must inherit active global split tunnel configuration"
     );
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-    let _ = std::fs::remove_dir_all(&sandbox);
+    testing::remove_temp_config(&config_path);
 }
 
 #[test]
 fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel() {
-    let _env_lock = ENV_LOCK.lock().unwrap();
-    let sandbox = std::env::temp_dir().join(format!(
-        "neutron-activate-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let config_dir = sandbox.join("neutron");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
+    let config_path = testing::temp_toml_config_path("activate-policy");
 
     let config = AppConfig {
         kill_switch_enabled: true,
@@ -415,9 +614,8 @@ fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel(
     };
     config::save(&config_path, &config).expect("config should save");
 
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &sandbox) };
-
-    let client = MockNmClient::new(vec![profile("wg-raw", "uuid-raw", ProfileState::Inactive)]);
+    let client = MockNmClient::new(vec![profile("wg-raw", "uuid-raw", ProfileState::Inactive)])
+        .with_config_path(config_path.clone());
     client.connect("uuid-raw").expect("connect should succeed");
 
     assert_eq!(
@@ -431,8 +629,7 @@ fn activating_unconfigured_profile_inherits_global_kill_switch_and_split_tunnel(
         "connecting must apply global split tunnel routing to profile"
     );
 
-    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-    let _ = std::fs::remove_dir_all(&sandbox);
+    testing::remove_temp_config(&config_path);
 }
 
 #[test]

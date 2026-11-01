@@ -233,7 +233,7 @@ impl From<PortForwardConfigDe> for PortForwardConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QBittorrentConfig {
     /// Legacy sync toggle, deserialized only so pre-mode configs keep
     /// loading; the port-forward mode decides syncing now (see
@@ -255,6 +255,21 @@ pub struct QBittorrentConfig {
     /// WebUI on another host that must keep its own interface (`false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<bool>,
+    /// True for current tri-state binding overrides. Missing or false marks
+    /// legacy configs whose `bind_interface = false` was the v0.1.3 default.
+    #[serde(default)]
+    pub binding_overrides_migrated: bool,
+}
+
+impl std::fmt::Debug for QBittorrentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QBittorrentConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("bind_interface", &self.bind_interface)
+            .finish_non_exhaustive()
+    }
 }
 
 fn default_qbittorrent_url() -> String {
@@ -322,6 +337,7 @@ impl Default for QBittorrentConfig {
             username: None,
             password: None,
             bind_interface: None,
+            binding_overrides_migrated: true,
         }
     }
 }
@@ -395,17 +411,14 @@ pub fn load(path: &Path) -> AppResult<AppConfig> {
             config.port_forwarding.mode = PortForwardMode::Forward;
         }
     }
-    // Same story, one field over: v0.1.3 wrote `bind_interface` unconditionally
-    // -- a plain `bool` with no `skip_serializing_if` -- so *every* existing
-    // config carries `bind_interface = false`. Read as the tri-state override
-    // that is a forced "never bind", which would switch the feature off for
-    // exactly the installs the URL-derived default exists for: a local qBittorrent
-    // would stop being bound to the tunnel and the forward would never arrive.
-    // An explicit `false` is therefore read for what it was -- the old default.
-    // `--bind true` still forces it on, and `--bind false` clears a force.
-    if config.qbittorrent.bind_interface == Some(false) {
+    // v0.1.3 always wrote the old boolean default. Migrate it once, then persist
+    // the marker so a new explicit false (including CLI --bind false) survives.
+    if !config.qbittorrent.binding_overrides_migrated
+        && config.qbittorrent.bind_interface == Some(false)
+    {
         config.qbittorrent.bind_interface = None;
     }
+    config.qbittorrent.binding_overrides_migrated = true;
     Ok(config)
 }
 
@@ -417,7 +430,11 @@ fn read_profile_info(config_path: &Path) -> AppResult<Option<BTreeMap<String, St
     let path = profile_info_path(config_path);
     match fs::read_to_string(&path) {
         Ok(data) => serde_json::from_str(&data).map(Some).map_err(|error| {
-            AppError::Config(format!("could not parse {}: {error}", path.display()))
+            AppError::Config(format!(
+                "could not parse {}: {}",
+                path.display(),
+                AppError::from(error)
+            ))
         }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(AppError::Config(format!(
@@ -428,7 +445,7 @@ fn read_profile_info(config_path: &Path) -> AppResult<Option<BTreeMap<String, St
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> AppResult<()> {
-    let _lock = lock_config(path)?;
+    let _lock = lock_sidecar(path, ".lock")?;
     save_unlocked(path, config)
 }
 
@@ -436,49 +453,72 @@ static IN_PROCESS_POLICY_LOCKS: std::sync::Mutex<
     Option<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
 > = std::sync::Mutex::new(None);
 
-fn path_policy_mutex(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
-    let mut lock = IN_PROCESS_POLICY_LOCKS.lock().unwrap();
+fn path_policy_mutex(path: &Path) -> AppResult<std::sync::Arc<std::sync::Mutex<()>>> {
+    let mut lock = IN_PROCESS_POLICY_LOCKS
+        .lock()
+        .map_err(|_| AppError::Config("policy coordination mutex poisoned".into()))?;
     let map = lock.get_or_insert_with(std::collections::HashMap::new);
-    map.entry(path.to_path_buf())
+    Ok(map
+        .entry(path.to_path_buf())
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
-        .clone()
+        .clone())
 }
 
 /// Coordinate global policy sweeps and activation so concurrent workers cannot
 /// interleave profile changes and overwrite settings with stale configurations.
 pub fn coordinate_policy<R>(path: &Path, f: impl FnOnce() -> AppResult<R>) -> AppResult<R> {
-    let mutex = path_policy_mutex(path);
-    let _mem_lock = mutex
-        .lock()
-        .map_err(|_| AppError::Config("policy coordination mutex poisoned".to_string()))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".policy.lock");
-    let lock = options.open(PathBuf::from(lock_path))?;
-    lock.lock()?;
+    coordinate_policy_with_timeout(path, std::time::Duration::from_secs(10), f)
+}
+
+fn coordinate_policy_with_timeout<R>(
+    path: &Path,
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> AppResult<R>,
+) -> AppResult<R> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mutex = path_policy_mutex(path)?;
+    let _mem_lock = loop {
+        match mutex.try_lock() {
+            Ok(lock) => break lock,
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return Err(AppError::PolicyBusy),
+            Err(_) => {
+                return Err(AppError::Config(
+                    "policy coordination mutex poisoned".into(),
+                ));
+            }
+        }
+    };
+    let _lock = lock_sidecar_until(path, ".policy.lock", deadline)?;
     f()
 }
 
 /// Serialize narrow read-modify-write edits across threads and Neutron processes.
 /// Lock a stable sidecar, since atomic replacement changes the config's inode.
 pub fn update(path: &Path, edit: impl FnOnce(&mut AppConfig)) -> AppResult<AppConfig> {
-    let _lock = lock_config(path)?;
+    let _lock = lock_sidecar(path, ".lock")?;
     let mut config = load(path)?;
     edit(&mut config);
     save_unlocked(path, &config)?;
     Ok(config)
 }
 
-fn lock_config(path: &Path) -> AppResult<fs::File> {
+/// Hold a stable sidecar lock, with a bounded wait, until the file is dropped.
+pub(crate) fn lock_sidecar(path: &Path, suffix: &str) -> AppResult<fs::File> {
+    lock_sidecar_until(
+        path,
+        suffix,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+}
+
+fn lock_sidecar_until(
+    path: &Path,
+    suffix: &str,
+    deadline: std::time::Instant,
+) -> AppResult<fs::File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -490,10 +530,37 @@ fn lock_config(path: &Path) -> AppResult<fs::File> {
         options.mode(0o600);
     }
     let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".lock");
+    lock_path.push(suffix);
     let lock = options.open(PathBuf::from(lock_path))?;
-    lock.lock()?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err(AppError::PolicyBusy),
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
     Ok(lock)
+}
+
+/// Confirmed reset alone may quarantine unreadable notes; ordinary saves stay strict.
+pub(crate) fn recover_profile_info(path: &Path) -> AppResult<Option<PathBuf>> {
+    let _lock = lock_sidecar(path, ".lock")?;
+    if read_profile_info(path).is_ok() {
+        return Ok(None);
+    }
+    let info = profile_info_path(path);
+    if !fs::symlink_metadata(&info)?.is_file() {
+        return Err(AppError::Config(
+            "profile notes are not a regular file; left untouched".into(),
+        ));
+    }
+    let backup = PathBuf::from(format!("{}.corrupt", temporary_path(&info).display()));
+    fs::rename(&info, &backup)?;
+    write_atomically(&info, "{}")?;
+    Ok(Some(backup))
 }
 
 fn save_unlocked(path: &Path, config: &AppConfig) -> AppResult<()> {
@@ -626,6 +693,102 @@ pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_and_file_lock_waits_are_bounded() {
+        let path = crate::testing::temp_config_path("bounded-policy-lock");
+        coordinate_policy(&path, || {
+            let start = std::time::Instant::now();
+            let result: AppResult<()> =
+                coordinate_policy_with_timeout(&path, std::time::Duration::from_millis(20), || {
+                    panic!("must not enter busy policy")
+                });
+            assert!(matches!(result, Err(AppError::PolicyBusy)));
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            Ok(())
+        })
+        .unwrap();
+        let held = lock_sidecar(&path, ".policy.lock").unwrap();
+        assert!(matches!(
+            coordinate_policy_with_timeout(&path, std::time::Duration::from_millis(20), || Ok(())),
+            Err(AppError::PolicyBusy)
+        ));
+        drop(held);
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn security_parse_errors_never_retain_password_source() {
+        use std::error::Error;
+        for (label, body) in [
+            (
+                "secret-syntax",
+                "[qbittorrent]\npassword = \"sentinel_password\" trailing\n",
+            ),
+            (
+                "secret-type",
+                "[qbittorrent]\npassword = [\"sentinel_password\"]\n",
+            ),
+            (
+                "secret-type.json",
+                r#"{"qbittorrent":{"password":["sentinel_password"]}}"#,
+            ),
+            (
+                "secret-enum.json",
+                r#"{"port_forwarding":{"mode":"sentinel_password"}}"#,
+            ),
+        ] {
+            let path = unique_path(label);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            let error = load(&path).unwrap_err();
+            assert!(!error.to_string().contains("sentinel_password"));
+            assert!(!format!("{error:?}").contains("sentinel_password"));
+            assert!(error.source().is_none());
+            assert!(error.to_string().contains("at "));
+            cleanup(&path);
+        }
+        let config = QBittorrentConfig {
+            password: Some("sentinel_password".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{config:?}").contains("sentinel_password"));
+    }
+
+    #[test]
+    fn documented_config_example_matches_the_current_schema() {
+        let docs = include_str!("../../docs/configuration.md");
+        let body = docs
+            .split_once("```toml\n")
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0;
+        let config: super::AppConfig = toml::from_str(body).expect("documented TOML should parse");
+        assert!(!config.kill_switch_enabled);
+        assert!(!config.lockdown_enabled);
+        assert_eq!(config.excluded_profile_ids.len(), 1);
+        assert_eq!(config.favorite_profile_ids.len(), 1);
+        assert_eq!(
+            config.global_split_tunnel.mode,
+            super::SplitTunnelMode::Include
+        );
+        assert_eq!(config.global_split_tunnel.cidrs.len(), 3);
+        assert_eq!(config.global_split_tunnel.domains.len(), 2);
+        assert_eq!(config.theme.active_border.as_deref(), Some("#88c0d0"));
+        assert_eq!(config.qbittorrent.bind_interface, Some(false));
+        assert!(config.qbittorrent.binding_overrides_migrated);
+        assert!(!config.qbittorrent.binds_tunnel_interface());
+        // False defaults alone would not detect an ignored or misplaced security key.
+        let mut sample: toml::Value = toml::from_str(body).unwrap();
+        for key in ["kill_switch_enabled", "lockdown_enabled"] {
+            *sample.get_mut(key).expect("documented root security key") =
+                toml::Value::Boolean(true);
+        }
+        let enabled: super::AppConfig = sample.try_into().unwrap();
+        assert!(enabled.kill_switch_enabled && enabled.lockdown_enabled);
+    }
+
     use super::*;
 
     #[test]
@@ -952,6 +1115,65 @@ mod tests {
 
         assert!(loaded.qbittorrent.binds_tunnel_interface());
         cleanup(&path);
+    }
+
+    #[test]
+    fn an_explicit_false_roundtrips_and_survives_narrow_updates() {
+        for label in ["pf-explicit-false", "pf-explicit-false.json"] {
+            let path = unique_path(label);
+            let config = AppConfig {
+                qbittorrent: QBittorrentConfig {
+                    url: "http://localhost:8080".to_string(),
+                    bind_interface: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            save(&path, &config).expect("config should save");
+            let loaded = load(&path).expect("config should load");
+            assert_eq!(loaded.qbittorrent.bind_interface, Some(false));
+            assert!(!loaded.qbittorrent.binds_tunnel_interface());
+
+            update(&path, |cfg| cfg.qbittorrent.bind_interface = Some(true))
+                .expect("binding should be enabled");
+            // The CLI uses this same update path for --bind false.
+            update(&path, |cfg| cfg.qbittorrent.bind_interface = Some(false))
+                .expect("binding should be disabled");
+            update(&path, |cfg| cfg.theme.preset = "gruvbox".into())
+                .expect("unrelated setting should update");
+            let loaded = load(&path).expect("config should reload");
+            assert_eq!(loaded.qbittorrent.bind_interface, Some(false));
+            assert!(!loaded.qbittorrent.binds_tunnel_interface());
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn legacy_binding_default_migrates_before_an_explicit_false_update() {
+        for (label, body) in [
+            (
+                "pf-legacy-bind-marker",
+                "[qbittorrent]\nurl = \"http://localhost:8080\"\nbind_interface = false\nbinding_overrides_migrated = false\n",
+            ),
+            (
+                "pf-legacy-bind.json",
+                r#"{"qbittorrent":{"url":"http://localhost:8080","bind_interface":false}}"#,
+            ),
+        ] {
+            let path = unique_path(label);
+            fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+                .expect("fixture dir should be created");
+            fs::write(&path, body).expect("legacy fixture should write");
+            let loaded = load(&path).expect("legacy config should load");
+            assert_eq!(loaded.qbittorrent.bind_interface, None);
+            assert!(loaded.qbittorrent.binds_tunnel_interface());
+            update(&path, |cfg| cfg.qbittorrent.bind_interface = Some(false))
+                .expect("binding should be disabled");
+            let loaded = load(&path).expect("config should reload");
+            assert_eq!(loaded.qbittorrent.bind_interface, Some(false));
+            assert!(!loaded.qbittorrent.binds_tunnel_interface());
+            cleanup(&path);
+        }
     }
 
     #[test]

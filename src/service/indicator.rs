@@ -10,8 +10,6 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::error::AppResult;
-#[cfg(test)]
-use crate::nm::NmLifecycle;
 use crate::nm::{NmClient, NmIntrospect};
 use crate::service::lease::QbitSyncStatus;
 
@@ -19,6 +17,12 @@ pub const INDICATOR_BUS_NAME: &str = "io.github.pandabytez.neutron.indicator";
 
 pub type ToolTipTuple = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
 pub type MenuLayoutResult<'a> = (u32, (i32, HashMap<String, Value<'a>>, Vec<Value<'a>>));
+type MenuItemProperties = (i32, HashMap<String, Value<'static>>);
+type MenuSnapshot = (
+    u32,
+    HashMap<String, Value<'static>>,
+    Vec<MenuItemProperties>,
+);
 
 const CONNECTED_48_ARGB32: &[u8] = include_bytes!("../../resources/status/connected_48.argb32");
 const CONNECTED_24_ARGB32: &[u8] = include_bytes!("../../resources/status/connected_24.argb32");
@@ -26,6 +30,12 @@ const DISCONNECTED_48_ARGB32: &[u8] =
     include_bytes!("../../resources/status/disconnected_48.argb32");
 const DISCONNECTED_24_ARGB32: &[u8] =
     include_bytes!("../../resources/status/disconnected_24.argb32");
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuAction {
+    Toggle,
+    Switch(String),
+}
 
 /// State shared between TUI/CLI and background StatusNotifierItem D-Bus service.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +46,26 @@ pub struct IndicatorSharedState {
     pub favorite_profiles: Vec<(String, String)>,
     pub favorite_id_map: HashMap<i32, String>,
     pub menu_revision: u32,
+    pub action_tx: Option<std::sync::mpsc::Sender<MenuAction>>,
+}
+
+impl IndicatorSharedState {
+    fn update_active_profile(&mut self, name: Option<String>, uuid: Option<String>) {
+        if self.active_uuid != uuid {
+            self.forwarded_port = None;
+        }
+        self.active_profile = name;
+        self.active_uuid = uuid;
+    }
+
+    pub fn ensure_favorite_ids(&mut self) {
+        for (uuid, _) in &self.favorite_profiles {
+            if !self.favorite_id_map.values().any(|known| known == uuid) {
+                let id = self.favorite_id_map.keys().max().copied().unwrap_or(99) + 1;
+                self.favorite_id_map.insert(id, uuid.clone());
+            }
+        }
+    }
 }
 
 pub fn install_status_icons() {
@@ -91,6 +121,11 @@ pub fn is_indicator_running() -> bool {
 
 /// Ensure background indicator daemon is running (spawn once if not already active).
 pub fn ensure_indicator_daemon_running() {
+    #[cfg(unix)]
+    if crate::app::has_stale_daemon(std::path::Path::new("/proc")) {
+        crate::app::stop_daemons(std::path::Path::new("/proc"), Duration::from_secs(1));
+    }
+
     if is_indicator_running() {
         return;
     }
@@ -242,10 +277,167 @@ pub struct DBusMenu<C> {
     pub state: Arc<Mutex<IndicatorSharedState>>,
 }
 
+impl<C> DBusMenu<C>
+where
+    C: NmClient,
+{
+    fn build_menu_items(&self) -> MenuSnapshot {
+        let (prof, active_uuid, port_opt, favorites, id_map, rev) =
+            if let Ok(mut st) = self.state.lock() {
+                st.ensure_favorite_ids();
+                (
+                    st.active_profile.clone(),
+                    st.active_uuid.clone(),
+                    st.forwarded_port,
+                    st.favorite_profiles.clone(),
+                    st.favorite_id_map.clone(),
+                    st.menu_revision,
+                )
+            } else {
+                (None, None, None, Vec::new(), HashMap::new(), 1)
+            };
+
+        let mut items = Vec::new();
+
+        // 1. Toggle Connect / Disconnect
+        let toggle_label = if let Some(ref name) = prof {
+            format!("Disconnect ({name})")
+        } else {
+            "Quick Connect (Random Eligible)".to_string()
+        };
+        let mut toggle_props = HashMap::new();
+        toggle_props.insert("label".to_string(), Value::from(toggle_label));
+        toggle_props.insert("enabled".to_string(), Value::from(true));
+        toggle_props.insert("visible".to_string(), Value::from(true));
+        items.push((2i32, toggle_props));
+
+        // 2. Favorite Profiles Quick Actions
+        if !favorites.is_empty() {
+            let mut fav_sep = HashMap::new();
+            fav_sep.insert("type".to_string(), Value::from("separator"));
+            fav_sep.insert("visible".to_string(), Value::from(true));
+            items.push((10i32, fav_sep));
+
+            for (uuid, name) in &favorites {
+                let is_active = active_uuid.as_deref() == Some(uuid.as_str());
+                let label = if is_active {
+                    format!("{name} (Active)")
+                } else {
+                    name.clone()
+                };
+                let mut fav_props = HashMap::new();
+                fav_props.insert("label".to_string(), Value::from(label));
+                fav_props.insert("enabled".to_string(), Value::from(true));
+                fav_props.insert("visible".to_string(), Value::from(true));
+                let item_id = id_map
+                    .iter()
+                    .find(|(_, known)| *known == uuid)
+                    .map(|(id, _)| *id)
+                    .unwrap_or(-1);
+                items.push((item_id, fav_props));
+            }
+        }
+
+        // 3. Port Forwarding (Copy)
+        if let Some(port) = port_opt {
+            let mut port_sep = HashMap::new();
+            port_sep.insert("type".to_string(), Value::from("separator"));
+            port_sep.insert("visible".to_string(), Value::from(true));
+            items.push((11i32, port_sep));
+
+            let mut port_props = HashMap::new();
+            port_props.insert(
+                "label".to_string(),
+                Value::from(format!("Forwarded Port: {port} (Copy)")),
+            );
+            port_props.insert("enabled".to_string(), Value::from(true));
+            port_props.insert("visible".to_string(), Value::from(true));
+            items.push((5i32, port_props));
+        }
+
+        // 4. Separator
+        let mut sep_props = HashMap::new();
+        sep_props.insert("type".to_string(), Value::from("separator"));
+        sep_props.insert("visible".to_string(), Value::from(true));
+        items.push((3i32, sep_props));
+
+        // 5. Quit
+        let mut quit_props = HashMap::new();
+        quit_props.insert("label".to_string(), Value::from("Quit Neutron"));
+        quit_props.insert("enabled".to_string(), Value::from(true));
+        quit_props.insert("visible".to_string(), Value::from(true));
+        items.push((4i32, quit_props));
+
+        let mut root_props = HashMap::new();
+        root_props.insert("children-display".to_string(), Value::from("submenu"));
+
+        (rev, root_props, items)
+    }
+
+    fn dispatch_action(&self, action: MenuAction)
+    where
+        C: crate::firewall::FirewallClient,
+    {
+        let tx = self.state.lock().ok().and_then(|st| st.action_tx.clone());
+        if let Some(tx) = tx
+            && tx.send(action.clone()).is_ok()
+        {
+            return;
+        }
+        handle_menu_action(&self.client, &self.state, None, action);
+    }
+}
+
+fn handle_menu_action<C>(
+    client: &C,
+    state: &Arc<Mutex<IndicatorSharedState>>,
+    config_path: Option<&std::path::Path>,
+    action: MenuAction,
+) where
+    C: NmClient + crate::firewall::FirewallClient,
+{
+    match action {
+        MenuAction::Toggle => {
+            let is_conn = state
+                .lock()
+                .map(|st| st.active_profile.is_some())
+                .unwrap_or(false);
+            if is_conn {
+                let _ = client.disconnect_active();
+            } else {
+                let _ = crate::service::run_startup_random(client);
+            }
+            if let Some(path) = config_path {
+                let _ = crate::app::rebuild_lockdown_if_enabled(client, path);
+            }
+            refresh_active_state(client, state);
+        }
+        MenuAction::Switch(uuid) => match client.switch_to(&uuid) {
+            Ok(()) => refresh_active_state(client, state),
+            Err(err) => warn!("Failed to switch to favorite profile '{uuid}': {err}"),
+        },
+    }
+}
+
+fn refresh_active_state<C: NmClient>(client: &C, state: &Arc<Mutex<IndicatorSharedState>>) {
+    let Ok(profiles) = client.list_wireguard_profiles() else {
+        return;
+    };
+    let active = profiles.iter().find(|p| p.is_active());
+    let active_name = active.map(|profile| profile.name.clone());
+    let active_uuid = active.map(|profile| profile.uuid.clone());
+    if let Ok(mut st) = state.lock()
+        && (st.active_profile != active_name || st.active_uuid != active_uuid)
+    {
+        st.update_active_profile(active_name, active_uuid);
+        st.menu_revision += 1;
+    }
+}
+
 #[interface(name = "com.canonical.dbusmenu")]
 impl<C> DBusMenu<C>
 where
-    C: NmClient + Clone + Send + Sync + 'static,
+    C: NmClient + crate::firewall::FirewallClient + Clone + Send + Sync + 'static,
 {
     #[zbus(property)]
     fn version(&self) -> u32 {
@@ -263,104 +455,35 @@ where
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> MenuLayoutResult<'_> {
-        let (prof, active_uuid, port_opt, favorites, rev) = if let Ok(mut st) = self.state.lock() {
-            let active_prof = st.active_profile.clone();
-            let active_id = st.active_uuid.clone();
-            let port = st.forwarded_port;
-            let favs = st.favorite_profiles.clone();
-            let rev = st.menu_revision;
-            for (uuid, _) in &favs {
-                if !st.favorite_id_map.values().any(|known| known == uuid) {
-                    let id = st.favorite_id_map.keys().max().copied().unwrap_or(99) + 1;
-                    st.favorite_id_map.insert(id, uuid.clone());
-                }
-            }
-            (active_prof, active_id, port, favs, rev)
-        } else {
-            (None, None, None, Vec::new(), 1)
-        };
-
-        let mut children = Vec::new();
-
-        // 1. Toggle Connect / Disconnect
-        let toggle_label = if let Some(ref name) = prof {
-            format!("Disconnect ({name})")
-        } else {
-            "Quick Connect (Random Eligible)".to_string()
-        };
-        let mut toggle_props = HashMap::new();
-        toggle_props.insert("label".to_string(), Value::from(toggle_label));
-        toggle_props.insert("enabled".to_string(), Value::from(true));
-        toggle_props.insert("visible".to_string(), Value::from(true));
-        children.push(Value::from((2i32, toggle_props, Vec::<Value<'_>>::new())));
-
-        // 2. Favorite Profiles Quick Actions
-        if !favorites.is_empty() {
-            let mut fav_sep = HashMap::new();
-            fav_sep.insert("type".to_string(), Value::from("separator"));
-            fav_sep.insert("visible".to_string(), Value::from(true));
-            children.push(Value::from((10i32, fav_sep, Vec::<Value<'_>>::new())));
-
-            for (uuid, name) in &favorites {
-                let is_active = active_uuid.as_deref() == Some(uuid.as_str());
-                let label = if is_active {
-                    format!("{name} (Active)")
-                } else {
-                    name.clone()
-                };
-                let mut fav_props = HashMap::new();
-                fav_props.insert("label".to_string(), Value::from(label));
-                fav_props.insert("enabled".to_string(), Value::from(true));
-                fav_props.insert("visible".to_string(), Value::from(true));
-                let item_id = self
-                    .state
-                    .lock()
-                    .ok()
-                    .and_then(|st| {
-                        st.favorite_id_map
-                            .iter()
-                            .find(|(_, known)| *known == uuid)
-                            .map(|(id, _)| *id)
-                    })
-                    .unwrap_or(-1);
-                children.push(Value::from((item_id, fav_props, Vec::<Value<'_>>::new())));
-            }
-        }
-
-        // 3. Port Forwarding (Copy)
-        if let Some(port) = port_opt {
-            let mut port_sep = HashMap::new();
-            port_sep.insert("type".to_string(), Value::from("separator"));
-            port_sep.insert("visible".to_string(), Value::from(true));
-            children.push(Value::from((11i32, port_sep, Vec::<Value<'_>>::new())));
-
-            let mut port_props = HashMap::new();
-            port_props.insert(
-                "label".to_string(),
-                Value::from(format!("Forwarded Port: {port} (Copy)")),
-            );
-            port_props.insert("enabled".to_string(), Value::from(true));
-            port_props.insert("visible".to_string(), Value::from(true));
-            children.push(Value::from((5i32, port_props, Vec::<Value<'_>>::new())));
-        }
-
-        // 4. Separator
-        let mut sep_props = HashMap::new();
-        sep_props.insert("type".to_string(), Value::from("separator"));
-        sep_props.insert("visible".to_string(), Value::from(true));
-        children.push(Value::from((3i32, sep_props, Vec::<Value<'_>>::new())));
-
-        // 5. Quit
-        let mut quit_props = HashMap::new();
-        quit_props.insert("label".to_string(), Value::from("Quit Neutron"));
-        quit_props.insert("enabled".to_string(), Value::from(true));
-        quit_props.insert("visible".to_string(), Value::from(true));
-        children.push(Value::from((4i32, quit_props, Vec::<Value<'_>>::new())));
-
-        let mut root_props = HashMap::new();
-        root_props.insert("children-display".to_string(), Value::from("submenu"));
-
+        let (rev, root_props, items) = self.build_menu_items();
+        let children = items
+            .into_iter()
+            .map(|(id, props)| Value::from((id, props, Vec::<Value<'_>>::new())))
+            .collect();
         (rev, (0, root_props, children))
+    }
+
+    fn get_group_properties(
+        &self,
+        ids: Vec<i32>,
+        _property_names: Vec<String>,
+    ) -> Vec<(i32, HashMap<String, Value<'_>>)> {
+        let (_, root_props, items) = self.build_menu_items();
+        let mut all = Vec::with_capacity(items.len() + 1);
+        all.push((0i32, root_props));
+        all.extend(items);
+        if ids.is_empty() {
+            return all;
+        }
+        all.into_iter().filter(|(id, _)| ids.contains(id)).collect()
+    }
+
+    fn get_property(&self, id: i32, name: &str) -> zbus::fdo::Result<Value<'_>> {
+        self.get_group_properties(vec![id], Vec::new())
+            .into_iter()
+            .find(|(item_id, _)| *item_id == id)
+            .and_then(|(_, mut props)| props.remove(name))
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown menu property {id}:{name}")))
     }
 
     fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: u32) {
@@ -369,19 +492,7 @@ where
         }
 
         match id {
-            2 => {
-                let is_conn = self
-                    .state
-                    .lock()
-                    .map(|st| st.active_profile.is_some())
-                    .unwrap_or(false);
-                let client = self.client.clone();
-                if is_conn {
-                    let _ = client.disconnect_active();
-                } else {
-                    let _ = crate::service::run_startup_random(&client);
-                }
-            }
+            2 => self.dispatch_action(MenuAction::Toggle),
             5 => {
                 if let Ok(st) = self.state.lock()
                     && let Some(port) = st.forwarded_port
@@ -393,7 +504,8 @@ where
                 std::process::exit(0);
             }
             item_id if item_id >= 100 => {
-                let target_uuid = self.state.lock().ok().and_then(|st| {
+                let target_uuid = self.state.lock().ok().and_then(|mut st| {
+                    st.ensure_favorite_ids();
                     st.favorite_id_map
                         .get(&item_id)
                         .filter(|uuid| {
@@ -403,18 +515,27 @@ where
                         })
                         .cloned()
                 });
-                if let Some(uuid) = target_uuid
-                    && let Err(err) = self.client.switch_to(&uuid)
-                {
-                    warn!("Failed to switch to favorite profile '{uuid}': {err}");
+                if let Some(uuid) = target_uuid {
+                    self.dispatch_action(MenuAction::Switch(uuid));
                 }
             }
             _ => {}
         }
     }
 
+    fn event_group(&self, events: Vec<(i32, String, Value<'_>, u32)>) -> Vec<i32> {
+        for (id, event_id, data, timestamp) in events {
+            self.event(id, &event_id, data, timestamp);
+        }
+        Vec::new()
+    }
+
     fn about_to_show(&self, _id: i32) -> bool {
         false
+    }
+
+    fn about_to_show_group(&self, _ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+        (Vec::new(), Vec::new())
     }
 
     #[zbus(signal)]
@@ -432,29 +553,24 @@ fn copy_to_clipboard(text: &str) {
         return;
     }
     use std::io::Write;
-    if let Ok(mut child) = std::process::Command::new("xclip")
-        .args(["-selection", "clipboard"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        if let Ok(status) = child.wait()
-            && status.success()
+    for (program, args) in [
+        ("xclip", ["-selection", "clipboard"]),
+        ("xsel", ["--clipboard", "--input"]),
+    ] {
+        if let Ok(mut child) = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
         {
-            return;
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait()
+                && status.success()
+            {
+                return;
+            }
         }
-    }
-    if let Ok(mut child) = std::process::Command::new("xsel")
-        .args(["--clipboard", "--input"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
     }
 }
 
@@ -464,7 +580,7 @@ pub fn spawn_indicator_service<C>(
     shared_state: Arc<Mutex<IndicatorSharedState>>,
 ) -> std::thread::JoinHandle<()>
 where
-    C: NmClient + Clone + Send + Sync + 'static,
+    C: NmClient + crate::firewall::FirewallClient + Clone + Send + Sync + 'static,
 {
     install_status_icons();
 
@@ -498,6 +614,24 @@ where
                 debug!("Indicator instance is already running, exiting duplicate.");
                 return;
             }
+
+            let (action_tx, action_rx) = std::sync::mpsc::channel::<MenuAction>();
+            if let Ok(mut st) = shared_state.lock() {
+                st.action_tx = Some(action_tx);
+            }
+            let client_for_actions = client.clone();
+            let state_for_actions = shared_state.clone();
+            let config_path = crate::config::default_config_path().ok();
+            std::thread::spawn(move || {
+                while let Ok(action) = action_rx.recv() {
+                    handle_menu_action(
+                        &client_for_actions,
+                        &state_for_actions,
+                        config_path.as_deref(),
+                        action,
+                    );
+                }
+            });
 
             let sni = StatusNotifierItem {
                 state: shared_state.clone(),
@@ -614,9 +748,14 @@ where
 /// Runs only when the port-forward mode is `ForwardAndSync`: the daemon calls
 /// this on every lease renewal, so a broken integration would reach a
 /// third-party Web API unattended.
-fn sync_qbittorrent_port<C: NmIntrospect>(client: &C, uuid: &str, port: u16) -> QbitSyncStatus {
-    let Ok(config) =
-        crate::config::default_config_path().and_then(|path| crate::config::load(&path))
+fn sync_qbittorrent_port<C: NmIntrospect + crate::nm::NmLifecycle>(
+    client: &C,
+    uuid: &str,
+    port: u16,
+    expires_at: Option<u64>,
+) -> QbitSyncStatus {
+    let Ok((path, config)) = crate::config::default_config_path()
+        .and_then(|path| crate::config::load(&path).map(|cfg| (path, cfg)))
     else {
         return QbitSyncStatus::Pending;
     };
@@ -624,7 +763,14 @@ fn sync_qbittorrent_port<C: NmIntrospect>(client: &C, uuid: &str, port: u16) -> 
         return QbitSyncStatus::Pending;
     }
 
-    match crate::app::qbittorrent::sync_port(client, &config.qbittorrent, uuid, port) {
+    match crate::app::qbittorrent::sync_port(
+        client,
+        &path,
+        &config.qbittorrent,
+        uuid,
+        port,
+        expires_at,
+    ) {
         Ok(report) => {
             info!(
                 "qBittorrent port synced to {port} (interface: {:?})",
@@ -663,6 +809,8 @@ struct LeaseTracker {
     /// Last mapping attempt, including failures. Independent of lease validity
     /// so unsupported gateways are not retried on every poll (BUG-033).
     attempted_at: Option<std::time::Instant>,
+    /// Bound quick retries while a newly active tunnel's gateway becomes reachable.
+    mapping_failures: u8,
     /// When the current mapping lease expires. None when no lease is held (BUG-014).
     expires_at: Option<std::time::Instant>,
     /// Granted lease duration, or zero if unmapped.
@@ -690,6 +838,7 @@ impl LeaseTracker {
             self.tunnel_uuid = active_uuid.clone();
             self.release();
             self.attempted_at = None;
+            self.mapping_failures = 0;
         }
     }
 
@@ -708,6 +857,7 @@ impl LeaseTracker {
         }
         if just_enabled {
             self.attempted_at = None;
+            self.mapping_failures = 0;
         }
         self.is_due()
     }
@@ -745,7 +895,11 @@ impl LeaseTracker {
     fn is_due_at(&self, now: std::time::Instant) -> bool {
         self.attempted_at.is_none_or(|at| {
             let renew_after = if self.lifetime.is_zero() {
-                crate::portforward::RENEW_INTERVAL
+                if self.mapping_failures < 3 {
+                    POLL_INTERVAL
+                } else {
+                    crate::portforward::RENEW_INTERVAL
+                }
             } else {
                 (self.lifetime / 2).min(crate::portforward::RENEW_INTERVAL)
             };
@@ -767,9 +921,11 @@ impl LeaseTracker {
 
         let Some(mapped) = mapped else {
             self.release();
+            self.mapping_failures = self.mapping_failures.saturating_add(1);
             return false;
         };
 
+        self.mapping_failures = 0;
         let duration = std::time::Duration::from_secs(mapped.lifetime_secs as u64);
         self.lifetime = duration;
         self.expires_at = Some(now + duration);
@@ -786,6 +942,7 @@ impl LeaseTracker {
     /// address). Backs off the next attempt without dropping a held lease.
     fn note_mapping_miss(&mut self) {
         self.attempted_at = Some(std::time::Instant::now());
+        self.mapping_failures = self.mapping_failures.saturating_add(1);
     }
 
     /// Whether qBittorrent synchronization is required (BUG-055).
@@ -836,20 +993,20 @@ impl LeaseTracker {
             port: self.port,
             profile_uuid,
             qbit_sync: self.qbit_sync,
+            expires_at: self.expires_at.and_then(|expires| {
+                let remaining = expires.checked_duration_since(std::time::Instant::now())?;
+                Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs()
+                        + remaining.as_secs(),
+                )
+            }),
             // Stamped on publication; the caller has no business inventing a time.
             ..Default::default()
         }
     }
-}
-
-/// The currently active WireGuard profile, if any.
-#[cfg(test)]
-fn active_profile<C: NmLifecycle>(client: &C) -> Option<crate::nm::WireguardProfile> {
-    client
-        .list_wireguard_profiles()
-        .ok()?
-        .into_iter()
-        .find(|profile| profile.is_active())
 }
 
 /// How often the tray re-reads NetworkManager. Each poll spawns `nmcli`, so this
@@ -915,23 +1072,49 @@ where
     info!("Starting Neutron persistent AppIndicator daemon...");
 
     let state = Arc::new(Mutex::new(IndicatorSharedState::default()));
+    if let Ok(mut st) = state.lock() {
+        let profiles = client.list_wireguard_profiles().unwrap_or_default();
+        let active = profiles.iter().find(|p| p.is_active());
+        let app_cfg = crate::config::default_config_path()
+            .ok()
+            .and_then(|path| crate::config::load(&path).ok())
+            .unwrap_or_default();
+        st.update_active_profile(
+            active.map(|p| p.name.clone()),
+            active.map(|p| p.uuid.clone()),
+        );
+        st.favorite_profiles = profiles
+            .iter()
+            .filter(|p| app_cfg.favorite_profile_ids.contains(&p.uuid))
+            .map(|p| (p.uuid.clone(), p.name.clone()))
+            .collect();
+        st.ensure_favorite_ids();
+        st.menu_revision = 1;
+    }
     let _handle = spawn_indicator_service(client.clone(), state.clone());
 
     let mut lease = LeaseTracker::default();
     let mut prev_active_uuid: Option<Option<String>> = None;
     let mut last_domain_refresh = std::time::Instant::now();
+    let mut domain_refresh: Option<std::thread::JoinHandle<AppResult<bool>>> = None;
 
     loop {
-        let profiles = client.list_wireguard_profiles().unwrap_or_default();
-        let active = profiles.iter().find(|p| p.is_active());
-        let active_name = active.map(|profile| profile.name.clone());
-        let active_uuid = active.map(|profile| profile.uuid.clone());
+        let mut profiles = client.list_wireguard_profiles().unwrap_or_default();
+        let mut active = profiles.iter().find(|p| p.is_active());
+        let mut active_name = active.map(|profile| profile.name.clone());
+        let mut active_uuid = active.map(|profile| profile.uuid.clone());
 
         if prev_active_uuid.as_ref() != Some(&active_uuid)
             && let Ok(path) = crate::config::default_config_path()
         {
             match crate::app::rebuild_lockdown_if_enabled(&client, &path) {
-                Ok(()) => prev_active_uuid = Some(active_uuid.clone()),
+                Ok(()) => {
+                    profiles = client.list_wireguard_profiles().unwrap_or_default();
+                    active = profiles.iter().find(|p| p.is_active());
+                    active_name = active.map(|profile| profile.name.clone());
+                    active_uuid = active.map(|profile| profile.uuid.clone());
+                    prev_active_uuid = Some(active_uuid.clone());
+                }
                 Err(error) => warn!("lockdown reconciliation failed; will retry: {error}"),
             }
         }
@@ -946,6 +1129,17 @@ where
             .filter(|p| app_cfg.favorite_profile_ids.contains(&p.uuid))
             .map(|p| (p.uuid.clone(), p.name.clone()))
             .collect();
+
+        if let Ok(mut st) = state.lock()
+            && (st.active_profile != active_name
+                || st.active_uuid != active_uuid
+                || st.favorite_profiles != favorites)
+        {
+            st.update_active_profile(active_name.clone(), active_uuid.clone());
+            st.favorite_profiles = favorites.clone();
+            st.ensure_favorite_ids();
+            st.menu_revision += 1;
+        }
 
         let renewal_due = lease.begin_poll(&active_uuid, app_cfg.port_forwarding.mode.is_enabled());
         if let Some(profile) = active {
@@ -962,7 +1156,12 @@ where
                 if let Some(port) =
                     lease.claim_qbit_push(&app_cfg.port_forwarding.mode, &app_cfg.qbittorrent)
                 {
-                    lease.qbit_sync = sync_qbittorrent_port(&client, &profile.uuid, port);
+                    lease.qbit_sync = sync_qbittorrent_port(
+                        &client,
+                        &profile.uuid,
+                        port,
+                        lease.publication(active_uuid.clone()).expires_at,
+                    );
                 }
             } else {
                 // Drop the stamp so turning sync back on pushes on the next poll
@@ -971,34 +1170,44 @@ where
             }
         }
 
-        if active.is_some() && last_domain_refresh.elapsed() >= Duration::from_secs(30) {
+        if domain_refresh
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = domain_refresh.take()
+        {
+            match worker.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => warn!("active domain-route refresh failed: {error}"),
+                Err(_) => warn!("active domain-route refresh worker stopped"),
+            }
+        }
+        if active.is_some()
+            && domain_refresh.is_none()
+            && last_domain_refresh.elapsed() >= Duration::from_secs(30)
+        {
             last_domain_refresh = std::time::Instant::now();
-            if let Ok(path) = crate::config::default_config_path()
-                && let Err(error) =
+            if let Ok(path) = crate::config::default_config_path() {
+                let client = client.clone();
+                domain_refresh = Some(std::thread::spawn(move || {
                     crate::app::split_tunnel::refresh_active_domain_routes(&client, &path)
-            {
-                warn!("active domain-route refresh failed: {error}");
+                }));
             }
         }
         lease.check_expiry();
 
         // Republished every poll even when nothing changed: the timestamp is how
         // a reader tells a held lease from one left behind by a dead daemon.
+        // Only a live foreign owner stops renewal; publication I/O is best effort.
         if !crate::service::lease::publish(&lease.publication(active_uuid.clone())) {
             warn!("Lease publication rejected by active owner, exiting duplicate indicator.");
             return Ok(());
         }
 
         if let Ok(mut st) = state.lock()
-            && (st.active_profile != active_name
-                || st.active_uuid != active_uuid
-                || st.forwarded_port != lease.port
-                || st.favorite_profiles != favorites)
+            && st.active_uuid == active_uuid
+            && st.forwarded_port != lease.port
         {
-            st.active_profile = active_name;
-            st.active_uuid = active_uuid.clone();
             st.forwarded_port = lease.port;
-            st.favorite_profiles = favorites;
             st.menu_revision += 1;
         }
 
@@ -1009,7 +1218,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nm::{ProfileState, WireguardProfile};
+    use crate::nm::ProfileState;
     use crate::testing::MockNmClient;
 
     fn make_sni(active_profile: Option<String>, port: Option<u16>) -> StatusNotifierItem {
@@ -1149,6 +1358,32 @@ mod tests {
     }
 
     #[test]
+    fn switching_profiles_clears_the_shared_port_but_renaming_preserves_it() {
+        use crate::nm::NmLifecycle;
+        use crate::testing::profile;
+        let client = MockNmClient::new(vec![
+            profile("A", "uuid-a", ProfileState::Active),
+            profile("B", "uuid-b", ProfileState::Inactive),
+        ]);
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: Some("A".into()),
+            active_uuid: Some("uuid-a".into()),
+            forwarded_port: Some(51820),
+            ..Default::default()
+        }));
+        client.switch_to("uuid-b").unwrap();
+        refresh_active_state(&client, &state);
+        let mut shared = state.lock().unwrap();
+        assert_eq!(shared.active_uuid.as_deref(), Some("uuid-b"));
+        assert_eq!(shared.forwarded_port, None);
+        shared.forwarded_port = Some(40000);
+        shared.update_active_profile(Some("B renamed".into()), Some("uuid-b".into()));
+        assert_eq!(shared.forwarded_port, Some(40000));
+        shared.update_active_profile(None, None);
+        assert_eq!(shared.forwarded_port, None);
+    }
+
+    #[test]
     fn favorite_switch_does_not_hold_shared_state_lock() {
         use crate::testing::profile;
         let state = Arc::new(Mutex::new(IndicatorSharedState {
@@ -1173,6 +1408,20 @@ mod tests {
             state.try_lock().is_ok(),
             "shared state lock must remain available during/after favorite switch"
         );
+        assert_eq!(
+            state.lock().unwrap().active_uuid.as_deref(),
+            Some("uuid-fav")
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.lock().unwrap().action_tx = Some(tx);
+        menu.event(100, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        menu.event(2, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MenuAction::Switch("uuid-fav".into()))
+        );
+        assert_eq!(rx.try_recv().ok(), Some(MenuAction::Toggle));
     }
 
     #[test]
@@ -1204,9 +1453,16 @@ mod tests {
         // Children: toggle(2), sep(10), fav 100, fav 101, sep(12), quit(4)
         assert_eq!(children.len(), 6);
 
-        // Click item 101 -> maps to uuid-2
+        // Click item 101 -> maps to uuid-2 and updates active_uuid immediately
         menu.event(101, "clicked", zbus::zvariant::Value::from(0u32), 0);
         assert_eq!(client.calls(), vec!["switch:uuid-2"]);
+        assert_eq!(state.lock().unwrap().active_uuid.as_deref(), Some("uuid-2"));
+        let group_props = menu.get_group_properties(vec![100, 101], vec![]);
+        assert_eq!(group_props.len(), 2);
+        assert_eq!(
+            group_props[1].1.get("label"),
+            Some(&Value::from("WireGuard (Active)"))
+        );
 
         // Non-existent item 199 is a no-op
         menu.event(199, "clicked", zbus::zvariant::Value::from(0u32), 0);
@@ -1219,7 +1475,7 @@ mod tests {
             vec!["switch:uuid-2"],
             "removed IDs must not select their replacement"
         );
-        menu.event(101, "clicked", Value::from(0u32), 0);
+        menu.event_group(vec![(101, "clicked".into(), Value::from(0u32), 0)]);
         assert_eq!(client.calls(), vec!["switch:uuid-2", "switch:uuid-2"]);
     }
 
@@ -1398,11 +1654,90 @@ mod tests {
     }
 
     #[test]
+    fn a_transient_mapping_failure_after_switch_retries_and_pushes_the_new_port() {
+        let mut lease = LeaseTracker::default();
+        let old = Some("uuid-old".into());
+        let new = Some("uuid-new".into());
+        let mode = crate::config::PortForwardMode::ForwardAndSync;
+        let cfg = crate::config::QBittorrentConfig::default();
+        assert!(lease.begin_poll(&old, true));
+        lease.record(Some(test_mapping(51820)));
+        lease.claim_qbit_push(&mode, &cfg);
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+
+        assert!(lease.begin_poll(&new, true));
+        let now = std::time::Instant::now();
+        lease.record_at(None, now);
+        assert_eq!(lease.publication(new.clone()).port, None);
+        assert!(!lease.is_due_at(now + POLL_INTERVAL - Duration::from_nanos(1)));
+        assert!(lease.is_due_at(now + POLL_INTERVAL));
+        lease.record_at(Some(test_mapping(40000)), now + POLL_INTERVAL);
+        assert_eq!(lease.claim_qbit_push(&mode, &cfg), Some(40000));
+    }
+
+    #[test]
+    fn an_unready_tunnel_address_gets_a_quick_retry() {
+        let mut lease = LeaseTracker::default();
+        assert!(lease.begin_poll(&Some("uuid-new".into()), true));
+        lease.note_mapping_miss();
+        let attempted = lease.attempted_at.unwrap();
+        assert!(lease.is_due_at(attempted + POLL_INTERVAL));
+        lease.note_mapping_miss();
+        lease.note_mapping_miss();
+        let attempted = lease.attempted_at.unwrap();
+        assert!(!lease.is_due_at(attempted + POLL_INTERVAL));
+        assert!(lease.is_due_at(attempted + crate::portforward::RENEW_INTERVAL));
+    }
+
+    #[test]
+    fn a_successful_mapping_resets_failure_backoff_without_changing_renewal() {
+        let mut lease = LeaseTracker::default();
+        for _ in 0..3 {
+            lease.record(None);
+        }
+        let now = std::time::Instant::now();
+        lease.record_at(Some(test_mapping(51820)), now);
+        let renew_after = Duration::from_secs(u64::from(crate::portforward::LIFETIME) / 2);
+        assert!(!lease.is_due_at(now + renew_after - Duration::from_nanos(1)));
+        assert!(lease.is_due_at(now + renew_after));
+        lease.record_at(None, now + renew_after);
+        assert!(lease.is_due_at(now + renew_after + POLL_INTERVAL));
+    }
+
+    #[test]
+    fn repeated_mapping_failures_exhaust_quick_retries() {
+        let mut lease = LeaseTracker::default();
+        let uuid = Some("uuid-unsupported".into());
+        assert!(lease.begin_poll(&uuid, true));
+        let mut now = std::time::Instant::now();
+        for _ in 0..3 {
+            assert!(lease.is_due_at(now));
+            lease.record_at(None, now);
+            now += POLL_INTERVAL;
+        }
+        let attempted = lease.attempted_at.unwrap();
+        assert!(!lease.is_due_at(now));
+        assert!(
+            !lease.is_due_at(
+                attempted + crate::portforward::RENEW_INTERVAL - Duration::from_nanos(1)
+            )
+        );
+        assert!(lease.is_due_at(attempted + crate::portforward::RENEW_INTERVAL));
+        assert!(!lease.begin_poll(&uuid, false));
+        assert!(lease.begin_poll(&uuid, true));
+        lease.record(None);
+        assert!(lease.is_due_at(lease.attempted_at.unwrap() + POLL_INTERVAL));
+    }
+
+    #[test]
     fn failed_mapping_keeps_backoff_until_interval_or_tunnel_change() {
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".into()));
-        for mapped in [Some(test_mapping(51820)), None, None] {
-            lease.record(mapped);
+        for _ in 0..3 {
+            lease.record(None);
+        }
+        for _ in 0..3 {
+            lease.record(None);
             let attempted = lease.attempted_at.unwrap();
             lease.release();
             assert_eq!(lease.port, None);
@@ -1417,6 +1752,8 @@ mod tests {
             lease.is_due(),
             "a new tunnel should get its first attempt immediately"
         );
+        lease.record(None);
+        assert!(lease.is_due_at(lease.attempted_at.unwrap() + POLL_INTERVAL));
     }
 
     #[test]
@@ -1605,32 +1942,5 @@ mod tests {
 
         // Children should contain: toggle (2), separator (3), quit (4) (no port item)
         assert_eq!(children.len(), 3);
-    }
-
-    #[test]
-    fn active_profile_extracts_active_profile_from_client() {
-        let profiles = vec![
-            WireguardProfile {
-                name: "wg-1".to_string(),
-                uuid: "uuid-1".to_string(),
-                state: ProfileState::Inactive,
-            },
-            WireguardProfile {
-                name: "wg-2".to_string(),
-                uuid: "uuid-2".to_string(),
-                state: ProfileState::Active,
-            },
-        ];
-        let client = MockNmClient::new(profiles);
-        let active = active_profile(&client);
-        assert!(active.is_some());
-        assert_eq!(active.unwrap().name, "wg-2");
-
-        let client_none = MockNmClient::new(vec![WireguardProfile {
-            name: "wg-1".to_string(),
-            uuid: "uuid-1".to_string(),
-            state: ProfileState::Inactive,
-        }]);
-        assert!(active_profile(&client_none).is_none());
     }
 }

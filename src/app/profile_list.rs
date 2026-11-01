@@ -54,17 +54,10 @@ pub fn build_rows(
 
 #[cfg(test)]
 mod tests {
-    use crate::nm::{ProfileState, WireguardProfile};
+    use crate::nm::ProfileState;
+    use crate::testing::profile;
 
     use super::*;
-
-    fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile {
-        WireguardProfile {
-            name: name.to_string(),
-            uuid: uuid.to_string(),
-            state,
-        }
-    }
 
     #[test]
     fn builds_rows_with_eligible_and_state_labels() {

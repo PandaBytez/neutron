@@ -8,6 +8,6 @@
 - [Split Tunneling](split-tunneling.md)
 - [NAT-PMP Port Forwarding](port-forwarding.md)
 - [Configuration & Themes](configuration.md)
-- [Packaging & Distribution](packaging-distribution.md)
+- [Installation & Releases](packaging-distribution.md)
 - [Implementation Notes](implementation.md)
 - [Testing & Quality Checks](testing.md)

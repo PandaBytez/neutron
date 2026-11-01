@@ -85,10 +85,10 @@ fn detect_container_tool() -> Result<&'static str, String> {
 fn image_exists(tool: &str, image: &str) -> bool {
     let output = Command::new(tool).args(["image", "exists", image]).output();
 
-    if let Ok(out) = output {
-        if out.status.success() {
-            return true;
-        }
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        return true;
     }
 
     let inspect = Command::new(tool)
@@ -166,47 +166,31 @@ fn run_system_tests(root: &Path, args: &[String]) -> i32 {
         return 1;
     }
 
-    let mut test_args = vec![
-        "test".to_string(),
-        "--".to_string(),
-        "--ignored".to_string(),
-        "--test-threads=1".to_string(),
-    ];
+    run_in_container(root, &system_test_args(args))
+}
 
-    if args.iter().any(|a| a == "--nm") {
-        test_args = vec![
-            "test".to_string(),
-            "--test".to_string(),
-            "system_nm".to_string(),
-            "--".to_string(),
-            "--ignored".to_string(),
-            "--test-threads=1".to_string(),
-        ];
+fn system_test_args(args: &[String]) -> Vec<String> {
+    let target = if args.iter().any(|a| a == "--nm") {
+        Some("system_nm")
     } else if args.iter().any(|a| a == "--firewall") {
-        test_args = vec![
-            "test".to_string(),
-            "--test".to_string(),
-            "system_firewall".to_string(),
-            "--".to_string(),
-            "--ignored".to_string(),
-            "--test-threads=1".to_string(),
-        ];
+        Some("system_firewall")
     } else if args.iter().any(|a| a == "--uninstall") {
-        test_args = vec![
-            "test".to_string(),
-            "--test".to_string(),
-            "system_uninstall".to_string(),
-            "--".to_string(),
-            "--ignored".to_string(),
-            "--test-threads=1".to_string(),
-        ];
-    } else if let Some(idx) = args.iter().position(|a| a == "--filter") {
-        if let Some(pattern) = args.get(idx + 1) {
-            test_args.push(pattern.clone());
-        }
+        Some("system_uninstall")
+    } else {
+        None
+    };
+    let mut test_args = vec!["test".to_string()];
+    if let Some(target) = target {
+        test_args.extend(["--test".to_string(), target.to_string()]);
     }
-
-    run_in_container(root, &test_args)
+    test_args.extend(["--", "--ignored", "--test-threads=1"].map(String::from));
+    if target.is_none()
+        && let Some(idx) = args.iter().position(|a| a == "--filter")
+        && let Some(pattern) = args.get(idx + 1)
+    {
+        test_args.push(pattern.clone());
+    }
+    test_args
 }
 
 fn run_leak_tests(root: &Path, args: &[String]) -> i32 {
@@ -250,7 +234,9 @@ fn build_docs(root: &Path, args: &[String]) -> i32 {
     let tool = match detect_container_tool() {
         Ok(t) => t,
         Err(err) => {
-            eprintln!("Error: {err}\nPlease install mdbook with: cargo install mdbook");
+            eprintln!(
+                "Error: {err}\nPlease install mdbook with: cargo install mdbook --version 0.4.52 --locked"
+            );
             return 1;
         }
     };
@@ -357,90 +343,20 @@ fn run_host_tests(root: &Path) -> i32 {
     run_status(status)
 }
 
-/// The settings files a reinstall must not disturb.
-///
-/// Directories mirror the app's own config candidates (see
-/// `config::default_config_path`), and within them only the settings sidecars are
-/// captured -- not the `profiles/` drop directory, which holds the user's own
-/// `.conf` files. A restore only ever puts back a file that was captured, so
-/// anything created while the install ran is left alone.
-const SETTINGS_DIRS: [&str; 3] = ["neutron", "neutron-vpn", "wireguard-manager"];
-
-fn config_home() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config")
-}
-
-/// Settings as they were before the reinstall.
-struct SettingsSnapshot(Vec<(PathBuf, Vec<u8>)>);
-
-impl SettingsSnapshot {
-    /// `home` is the XDG config root, taken as an argument so this is testable
-    /// without mutating the environment.
-    fn capture_in(home: &Path) -> Self {
-        let mut files = Vec::new();
-        for dir in SETTINGS_DIRS {
-            let Ok(entries) = std::fs::read_dir(home.join(dir)) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file()
-                    && let Ok(bytes) = std::fs::read(&path)
-                {
-                    files.push((path, bytes));
-                }
-            }
-        }
-        Self(files)
-    }
-
-    /// Put back anything the install changed or removed. Returns what was
-    /// restored, so the caller reports it rather than reverting in silence.
-    fn restore_if_changed(&self) -> Vec<PathBuf> {
-        let mut restored = Vec::new();
-        for (path, original) in &self.0 {
-            if std::fs::read(path).is_ok_and(|now| now == *original) {
-                continue;
-            }
-            if std::fs::write(path, original).is_ok() {
-                restored.push(path.clone());
-            }
-        }
-        restored
-    }
-
-    fn describe(&self) -> String {
-        if self.0.is_empty() {
-            "none existed, so there was nothing to disturb".to_string()
-        } else {
-            self.0
-                .iter()
-                .map(|(path, _)| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    }
-}
-
 /// Rebuild and install the binary, leaving lockdown *and settings* alone.
 ///
 /// The point is iteration speed. `cargo install` touches nothing privileged and
 /// writes no settings, so working on the TUI or the UI does not mean disabling
 /// lockdown and re-authenticating through `pkexec` on every rebuild. That is
-/// asserted rather than assumed: the settings files are captured beforehand and
-/// restored if the install turns out to touch them.
+/// Settings are never restored over concurrent user edits.
 ///
 /// The trade-off is the refresh helper: `/usr/local/libexec/neutron-lockdown-helper`
 /// is a *copy* of the binary taken when lockdown was enabled, and it is left
 /// stale on purpose. A rule refresh runs that copy, not this build, so after
 /// changing firewall code run `neutron lockdown enable` once to refresh it.
 ///
-/// Extra arguments go straight to `cargo install`, so `--debug`, `--root DIR`,
-/// and `--locked` all work: `cargo xtask reinstall -- --debug`.
+/// Extra arguments go straight to `cargo install`, so `--debug` and `--root DIR`
+/// work: `cargo xtask reinstall -- --debug`. Dependencies are locked by default.
 /// What `cargo reinstall` does, printed for `-h` / `--help`.
 ///
 /// Handled here rather than forwarded: `cargo install --help` would print
@@ -449,15 +365,14 @@ impl SettingsSnapshot {
 const REINSTALL_USAGE: &str = "\
 cargo reinstall [-- <cargo install flags>]
 
-Rebuilds and installs Neutron, keeping your lockdown state and your settings.
+Rebuilds and installs Neutron with --locked, keeping your lockdown state and your settings.
 
   cargo reinstall                 release build, installed to $CARGO_HOME/bin
   cargo reinstall -- --debug      much faster rebuild for iterating
   cargo reinstall -- --root DIR   install somewhere other than CARGO_HOME
 
 Left alone: the firewall rules, the root-owned refresh helper, the polkit
-action, and every settings file (captured beforehand and restored if the
-install touches them).
+action, and every settings file. No settings snapshot or rollback is performed.
 
 Restarted: the tray/lease daemon, if it was running. An install replaces the
 binary underneath a running process, which would otherwise go on using the old
@@ -480,13 +395,7 @@ fn run_reinstall(root: &Path, args: &[String]) -> i32 {
         Some(rest) => rest,
         None => args,
     };
-    let settings = SettingsSnapshot::capture_in(&config_home());
-    let mut command = Command::new("cargo");
-    command
-        .args(["install", "--path", ".", "--force"])
-        .args(forwarded)
-        .current_dir(root);
-    if run_status(command.status()) != 0 {
+    if run_status(reinstall_command(root, forwarded).status()) != 0 {
         eprintln!("Reinstall failed; nothing was changed.");
         return 1;
     }
@@ -515,24 +424,21 @@ fn run_reinstall(root: &Path, args: &[String]) -> i32 {
     for (pid, argv0) in running_instances(&program).others {
         println!("Left running: pid {pid} ({argv0}) still has the build it started with.");
     }
-    let restored = settings.restore_if_changed();
-    if restored.is_empty() {
-        println!("Settings unchanged: {}.", settings.describe());
-    } else {
-        // Should not happen: `cargo install` writes no settings. Reported rather
-        // than fixed silently, because it means something else is writing them.
-        println!("Settings restored -- the install changed these:");
-        for path in &restored {
-            println!("  {}", path.display());
-        }
-        println!(
-            "A running Neutron instance rewrites settings as it polls; restart it to pick up this build."
-        );
-    }
+    println!("Settings left untouched; concurrent edits and deletions are preserved.");
     println!(
         "If you changed firewall code, run `neutron lockdown enable` once to refresh the helper copy."
     );
     0
+}
+
+fn reinstall_command(root: &Path, forwarded: &[String]) -> Command {
+    let mut command = Command::new("cargo");
+    command.args(["install", "--path", ".", "--force"]);
+    if !forwarded.iter().any(|arg| arg == "--locked") {
+        command.arg("--locked");
+    }
+    command.args(forwarded).current_dir(root);
+    command
 }
 
 /// The running Neutron processes, split by what this task may do to them.
@@ -708,6 +614,67 @@ fn run_status(status: std::io::Result<ExitStatus>) -> i32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reinstall_locks_dependencies_and_preserves_user_flags_without_running_cargo() {
+        let flags = ["--debug", "--root", "/scratch/install", "--offline"].map(String::from);
+        let command = reinstall_command(Path::new("/scratch/project"), &flags);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "install",
+                "--path",
+                ".",
+                "--force",
+                "--locked",
+                "--debug",
+                "--root",
+                "/scratch/install",
+                "--offline"
+            ]
+        );
+        assert_eq!(
+            command.get_current_dir(),
+            Some(Path::new("/scratch/project"))
+        );
+        let explicit = ["--locked", "--debug"].map(String::from);
+        assert_eq!(
+            reinstall_command(Path::new("/scratch/project"), &explicit)
+                .get_args()
+                .filter(|arg| *arg == "--locked")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn system_test_selectors_keep_precedence_and_filter_only_without_a_target() {
+        for (input, expected) in [
+            (vec![], vec!["test"]),
+            (vec!["--filter"], vec!["test"]),
+            (vec!["--filter", "leak_"], vec!["test"]),
+            (
+                vec!["--uninstall", "--firewall", "--nm", "--filter", "leak_"],
+                vec!["test", "--test", "system_nm"],
+            ),
+            (
+                vec!["--uninstall", "--firewall", "--filter", "leak_"],
+                vec!["test", "--test", "system_firewall"],
+            ),
+            (
+                vec!["--uninstall", "--filter", "leak_"],
+                vec!["test", "--test", "system_uninstall"],
+            ),
+        ] {
+            let mut expected = expected;
+            expected.extend(["--", "--ignored", "--test-threads=1"]);
+            if input == ["--filter", "leak_"] {
+                expected.push("leak_");
+            }
+            let args: Vec<String> = input.into_iter().map(String::from).collect();
+            assert_eq!(system_test_args(&args), expected, "input: {args:?}");
+        }
+    }
+
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "neutron-xtask-{label}-{}",
@@ -718,80 +685,6 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
-    }
-
-    #[test]
-    fn unchanged_settings_are_left_alone() {
-        let home = scratch("unchanged");
-        let config = home.join("neutron/config.toml");
-        std::fs::create_dir_all(config.parent().expect("parent")).expect("dir should be created");
-        std::fs::write(&config, "lockdown_enabled = true\n").expect("write should succeed");
-
-        let snapshot = SettingsSnapshot::capture_in(&home);
-        assert_eq!(snapshot.0.len(), 1, "one settings file captured");
-        assert!(
-            snapshot.restore_if_changed().is_empty(),
-            "an untouched file must not be rewritten"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&config).expect("read should succeed"),
-            "lockdown_enabled = true\n"
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn a_clobbered_or_deleted_settings_file_is_restored() {
-        let home = scratch("restored");
-        let config = home.join("neutron/config.toml");
-        let notes = home.join("neutron/profile-info.json");
-        std::fs::create_dir_all(config.parent().expect("parent")).expect("dir should be created");
-        std::fs::write(&config, "lockdown_enabled = true\n").expect("write should succeed");
-        std::fs::write(&notes, "{}").expect("write should succeed");
-        let snapshot = SettingsSnapshot::capture_in(&home);
-
-        // Both ways this can go wrong: rewritten, and removed outright.
-        std::fs::write(&config, "lockdown_enabled = false\n").expect("write should succeed");
-        std::fs::remove_file(&notes).expect("remove should succeed");
-
-        let mut restored = snapshot.restore_if_changed();
-        restored.sort();
-        assert_eq!(
-            restored,
-            vec![config.clone(), notes.clone()],
-            "both restored"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&config).expect("read should succeed"),
-            "lockdown_enabled = true\n"
-        );
-        assert!(notes.exists(), "a deleted sidecar must come back");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn a_file_created_during_the_install_is_left_alone() {
-        // Restoring must never delete or overwrite something that was not
-        // captured, or a reinstall would eat settings the user just made.
-        let home = scratch("created");
-        let config = home.join("neutron/config.toml");
-        std::fs::create_dir_all(config.parent().expect("parent")).expect("dir should be created");
-        std::fs::write(&config, "original\n").expect("write should succeed");
-        let snapshot = SettingsSnapshot::capture_in(&home);
-
-        let fresh = home.join("neutron/fresh.json");
-        std::fs::write(&fresh, "{\"new\": true}").expect("write should succeed");
-
-        assert!(snapshot.restore_if_changed().is_empty());
-        assert!(fresh.exists(), "a new file must survive the restore");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn a_missing_config_directory_captures_nothing_and_does_not_panic() {
-        let snapshot = SettingsSnapshot::capture_in(&scratch("absent"));
-        assert!(snapshot.0.is_empty());
-        assert!(snapshot.restore_if_changed().is_empty());
     }
 
     /// A `/proc` entry as the scan sees it: a numeric directory with `comm` and
@@ -864,7 +757,7 @@ mod tests {
                 .position(|arg| arg == IMAGE_NAME)
                 .expect("the image name is in the argument list");
 
-            for (index, arg) in args.iter().enumerate().skip(image + 1) {
+            for arg in args.iter().skip(image + 1) {
                 assert!(
                     !arg.starts_with('-'),
                     "runtime option {arg} must precede the image, not the command: {args:?}"
@@ -898,7 +791,7 @@ mod tests {
         for expected in [
             "lockdown",
             "settings",
-            "restored",
+            "No settings snapshot or rollback",
             "neutron lockdown enable",
             "cargo install",
             "daemon",

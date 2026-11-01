@@ -3,7 +3,7 @@
 //! and cannot enable or disable lockdown. Permanent rules authorize refreshes.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use super::*;
@@ -12,6 +12,10 @@ use crate::nm::{NmIntrospect, NmLifecycle};
 pub const NAME: &str = "neutron-lockdown-helper";
 pub(super) const PATH: &str = "/usr/local/libexec/neutron-lockdown-helper";
 pub(super) const LOCK_PATH: &str = "/run/neutron-lockdown.lock";
+pub(super) const LOCK_DIR: &str = "/run/neutron-lockdown";
+pub(super) const PRIVATE_LOCK_PATH: &str = "/run/neutron-lockdown/lock";
+pub(super) const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const WARM_CHUNK_TUNNELS: usize = 4;
 const ACTION_ID: &str = "io.github.pandabytez.neutron.lockdown-refresh";
 const LEGACY_POLICY_PATH: &str = "/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules";
 /// Action directory polkit only reads at startup (see [`action_directory`]).
@@ -21,17 +25,27 @@ const LOCAL_ACTION_DIR: &str = "/usr/local/share/polkit-1/actions";
 const SHARED_ACTION_DIR: &str = "/usr/share/polkit-1/actions";
 
 pub(super) fn install_script() -> AppResult<String> {
-    let executable = std::env::current_exe()?;
-    let executable = executable
-        .to_str()
-        .ok_or_else(|| AppError::Firewall("Neutron executable path is not valid UTF-8".into()))?;
     let version = crate::process::run_with_timeout(
         "pkaction",
         &["--version"],
         std::time::Duration::from_secs(5),
     )?;
-    let action_dir = action_directory(&version)?;
+    install_script_for(&version, std::process::id())
+}
+
+fn install_script_for(version: &str, installer_pid: u32) -> AppResult<String> {
+    // The caller blocks in run_script until installation finishes. Linux pins
+    // its executable inode even if an attacker replaces the original pathname.
+    let executable = format!("/proc/{installer_pid}/exe");
+    let source = std::fs::metadata("/proc/self/exe")?;
+    let source_identity = format!("{}:{}", source.dev(), source.ino());
+    let action_dir = action_directory(version)?;
     let action_path = format!("{action_dir}/{ACTION_ID}.policy");
+    let obsolete_dir = if action_dir == LOCAL_ACTION_DIR {
+        SHARED_ACTION_DIR
+    } else {
+        LOCAL_ACTION_DIR
+    };
     let policy_start = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
@@ -50,17 +64,15 @@ pub(super) fn install_script() -> AppResult<String> {
     let policy_end = "</annotate>\n  </action>\n</policyconfig>\n";
     // A newly created local actions directory may not invalidate polkit's
     // cache. Reload the authority by its D-Bus owner's PID, not by process name.
-    let reload = if action_dir == LOCAL_ACTION_DIR {
-        polkit_reload()
-    } else {
-        ""
-    };
+    let reload = polkit_reload();
     // Replace atomically: another process may still be executing the old copy.
     // pkexec resolves symlinks before matching exec.path (e.g. /usr/local on
     // Fedora Atomic), so record the installed helper's canonical path.
     Ok(format!(
-        "install -d -m 755 /usr/local/libexec\n\
-         install -m 755 -- {} {PATH}.new\n\
+        "exec 8<{}\n\
+         [ \"$(stat -Lc '%d:%i' /proc/self/fd/8)\" = {} ] || {{ echo 'Installer executable changed' >&2; exit 1; }}\n\
+         install -d -m 755 /usr/local/libexec\n\
+         install -m 755 -- /proc/self/fd/8 {PATH}.new\n\
          mv -f -- {PATH}.new {PATH}\n\
          helper_path=$(readlink -f -- {PATH})\n\
          helper_path_xml=$(printf %s \"$helper_path\" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g')\n\
@@ -68,6 +80,7 @@ pub(super) fn install_script() -> AppResult<String> {
          printf %s {} \"$helper_path_xml\" {} > {action_path}.new\n\
          chmod 644 {action_path}.new\n\
          mv -f -- {action_path}.new {action_path}\n\
+         rm -f -- {obsolete_dir}/{ACTION_ID}.policy\n\
          rm -f -- {LEGACY_POLICY_PATH}\n\
          {reload}\
          attempt=0\n\
@@ -77,7 +90,8 @@ pub(super) fn install_script() -> AppResult<String> {
            sleep 1\n\
          done\n\
          if [ -d /run/systemd/system ]; then systemctl enable firewalld.service; fi\n",
-        shell_quote(executable),
+        shell_quote(&executable),
+        shell_quote(&source_identity),
         shell_quote(&policy_start),
         shell_quote(policy_end),
     ))
@@ -99,10 +113,11 @@ fn polkit_reload() -> &'static str {
 ///
 /// Order is revoke-then-delete: the polkit authorization goes first, so the
 /// binary is never briefly reachable through a policy that outlives it.
-fn installed_files() -> [String; 3] {
+fn installed_files() -> [String; 4] {
     [
         format!("{LOCAL_ACTION_DIR}/{ACTION_ID}.policy"),
         format!("{SHARED_ACTION_DIR}/{ACTION_ID}.policy"),
+        LEGACY_POLICY_PATH.to_string(),
         PATH.to_string(),
     ]
 }
@@ -112,7 +127,76 @@ fn installed_files() -> [String; 3] {
 pub(super) fn is_installed() -> bool {
     installed_files()
         .iter()
-        .any(|path| Path::new(path).exists())
+        .any(|path| std::fs::symlink_metadata(path).is_ok())
+}
+
+const HARDENED_DEFAULTS: &str = "<defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>yes</allow_active></defaults>";
+
+pub(super) fn has_hardened_authorization() -> bool {
+    let files = installed_files();
+    hardened_authorization_at(
+        Path::new(&files[2]),
+        &[Path::new(&files[0]), Path::new(&files[1])],
+    )
+}
+
+fn hardened_authorization_at(legacy: &Path, policies: &[&Path]) -> bool {
+    if std::fs::symlink_metadata(legacy).is_ok() {
+        return false;
+    }
+    let mut found = false;
+    for path in policies {
+        match std::fs::read_to_string(path) {
+            Ok(policy) => {
+                found = true;
+                let compact: String = policy.chars().filter(|c| !c.is_whitespace()).collect();
+                if !compact.contains(HARDENED_DEFAULTS)
+                    || compact.matches("<defaults>").count() != 1
+                {
+                    return false;
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(path).is_err() => {}
+            Err(_) => return false,
+        }
+    }
+    found
+}
+
+/// Evaluate under the root lock after authentication, so disable never retains
+/// a legacy grant introduced while the password prompt was open.
+pub(super) fn revoke_unsafe_authorization_script() -> String {
+    let files = installed_files();
+    revoke_unsafe_authorization_script_for(LEGACY_POLICY_PATH, &files[..2], &uninstall_script())
+}
+
+fn revoke_unsafe_authorization_script_for(
+    legacy: &str,
+    policies: &[String],
+    revoke: &str,
+) -> String {
+    let mut script = format!(
+        "hardened=true\nfound=false\n[ ! -e {legacy} ] && [ ! -L {legacy} ] || hardened=false\n",
+        legacy = shell_quote(legacy),
+    );
+    for path in policies {
+        script.push_str(&format!(
+            "if [ -e {path} ] || [ -L {path} ]; then\n\
+               found=true\n\
+               policy=$(tr -d '[:space:]' < {path}) || hardened=false\n\
+               case \"$policy\" in *'{HARDENED_DEFAULTS}'*) ;; *) hardened=false;; esac\n\
+               rest=${{policy#*<defaults>}}\n\
+               case \"$rest\" in *'<defaults>'*) hardened=false;; esac\n\
+             fi\n",
+            path = shell_quote(path),
+        ));
+    }
+    script.push_str("if [ \"$hardened:$found\" != true:true ]; then\n");
+    script.push_str(revoke);
+    script.push_str("fi\n");
+    script
 }
 
 /// The teardown's top-level shell statements, one per entry.
@@ -171,7 +255,7 @@ fn action_directory(version: &str) -> AppResult<&'static str> {
 }
 
 fn authorization_command() -> std::process::Command {
-    let mut command = crate::process::host_command("pkcheck");
+    let mut command = std::process::Command::new("pkcheck");
     // Unprivileged callers cannot supply --detail, even for their own process.
     // The dedicated action binds pkexec to the helper without caller details.
     command
@@ -187,16 +271,29 @@ fn authorization_command() -> std::process::Command {
 
 /// Invoke only the narrowly authorized helper; never fall back to a password prompt.
 pub(super) fn refresh(activating: Option<&str>) -> AppResult<()> {
+    if is_installed() && !has_hardened_authorization() {
+        return Err(AppError::Firewall(
+            "Password-free lockdown refresh is unavailable. Run `neutron lockdown enable` once from an active local session to upgrade the helper; existing protection remains in place.".into(),
+        ));
+    }
     // Older installations already have permanent protection. They can keep using
     // matching rules until the next explicit enable installs the helper.
     if !std::path::Path::new(PATH).exists() {
         let tunnels = tunnels(activating)?;
-        if refresh_batches(&tunnels)?.is_empty() {
+        let active: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
+        let required = if activating.is_some() {
+            lockdown_enable_batches(&active)
+        } else {
+            lockdown_enable_batches(&tunnels)
+        };
+        let allowed = lockdown_enable_batches(&tunnels);
+        if partial_refresh_batches(&required, &allowed)?.is_empty() {
+            verify_partial_protection(&required, &allowed)?;
             return Ok(());
         }
         return Err(AppError::Firewall(
             "Lockdown rules need refreshing. Run `neutron lockdown enable` once to install \
-             the password-free refresh helper; existing protection remains in place."
+              the password-free refresh helper; existing protection remains in place."
                 .into(),
         ));
     }
@@ -215,7 +312,8 @@ pub(super) fn refresh(activating: Option<&str>) -> AppResult<()> {
              or repair authorization; existing protection remains in place."
         )));
     }
-    let mut child = crate::process::host_command_with_env("pkexec", &[("SHELL", "/bin/sh")])
+    let mut child = std::process::Command::new("pkexec")
+        .env("SHELL", "/bin/sh")
         .arg("--disable-internal-agent")
         .arg(std::fs::canonicalize(PATH)?)
         .stdin(Stdio::piped())
@@ -242,29 +340,153 @@ pub fn run() -> AppResult<()> {
     // No caller-controlled command lookup in this privileged process.
     // SAFETY: main invokes the helper before starting any threads.
     unsafe { std::env::set_var("PATH", "/usr/sbin:/usr/bin:/sbin:/bin") };
+    let identity = crate::process::run_with_timeout("id", &["-u"], LOCK_TIMEOUT)?;
+    if identity != "0" {
+        return Err(AppError::Firewall(
+            "Lockdown refresh requires administrator authorization".into(),
+        ));
+    }
+    if !has_hardened_authorization() {
+        return Err(AppError::Firewall("Unsafe lockdown refresh authorization; run `neutron lockdown enable` to migrate legacy grants".into()));
+    }
     let mut requested = String::new();
     std::io::stdin().take(37).read_to_string(&mut requested)?;
     if !is_valid_activation_uuid(&requested) {
         return Err(AppError::Firewall("Invalid activation UUID".into()));
     }
-    let lock = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(LOCK_PATH)?;
-    lock.lock()?;
-    // Check while holding the same lock as authenticated toggles. A delayed
-    // refresh can never undo a disable, even when user config still says ON.
-    if marked_removal_batches()?.is_empty() {
+    if !requested.is_empty() {
+        let _lock = acquire_lock(Path::new(LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        secure_lock_directory(Path::new(LOCK_DIR), 0)?;
+        let _private_lock = acquire_lock(Path::new(PRIVATE_LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        if marked_removal_batches()?.is_empty() {
+            return absent_protection_result(true);
+        }
+        bootstrap_disconnected_dns()?;
+        let tunnels = tunnels_with(Some(requested.as_str()), prime_interfaces)?;
+        let active: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
+        let required = lockdown_enable_batches(&active);
+        let allowed = lockdown_enable_batches(&tunnels);
+        let batches = partial_refresh_batches(&required, &allowed)?;
+        let mut script = String::from("set -e\n");
+        script.push_str(&interface_validation_script(&tunnels));
+        script.push_str(&build_firewall_script(&batches));
+        script.push_str(&retire_tag_guards_script());
+        run_script(&script, false)?;
+        return verify_partial_protection(&required, &allowed);
+    }
+
+    let mut warmed_inactive = WARM_CHUNK_TUNNELS;
+    loop {
+        let _lock = acquire_lock(Path::new(LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        secure_lock_directory(Path::new(LOCK_DIR), 0)?;
+        let _private_lock = acquire_lock(Path::new(PRIVATE_LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        // Check while holding the same lock as authenticated toggles. A delayed
+        // refresh can never undo a disable, even when user config still says ON.
+        if marked_removal_batches()?.is_empty() {
+            return absent_protection_result(false);
+        }
+        bootstrap_disconnected_dns()?;
+        let tunnels = tunnels_with(None, prime_interfaces)?;
+        let total_inactive = tunnels.iter().filter(|t| !t.is_active).count();
+        let mut remaining_inactive = warmed_inactive;
+        let chunk_tunnels: Vec<_> = tunnels
+            .iter()
+            .filter(|t| {
+                t.is_active || {
+                    let take = remaining_inactive > 0;
+                    remaining_inactive = remaining_inactive.saturating_sub(1);
+                    take
+                }
+            })
+            .cloned()
+            .collect();
+        let required = lockdown_enable_batches(&chunk_tunnels);
+        let allowed = lockdown_enable_batches(&tunnels);
+        let batches = partial_refresh_batches(&required, &allowed)?;
+        let mut script = String::from("set -e\n");
+        script.push_str(&interface_validation_script(&tunnels));
+        script.push_str(&build_firewall_script(&batches));
+        script.push_str(&retire_tag_guards_script());
+        run_script(&script, false)?;
+        if warmed_inactive >= total_inactive
+            || (batches.is_empty() && verify_protection(&allowed).is_ok())
+        {
+            return verify_protection(&allowed);
+        }
+        verify_partial_protection(&required, &allowed)?;
+        warmed_inactive += WARM_CHUNK_TUNNELS;
+    }
+}
+
+fn absent_protection_result(activating: bool) -> AppResult<()> {
+    if activating {
+        Err(AppError::Firewall(
+            "Lockdown protection is absent; activation refused. Run `neutron lockdown enable` to restore protection.".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+// Reboot can restore connected DNS drops before any tunnel or resolver cache exists.
+fn bootstrap_disconnected_dns() -> AppResult<()> {
+    if crate::nm::CliNmClient
+        .list_wireguard_profiles()?
+        .iter()
+        .any(|p| p.is_active())
+    {
         return Ok(());
     }
-    let tunnels = tunnels((!requested.is_empty()).then_some(requested.as_str()))?;
-    let batches = refresh_batches(&tunnels)?;
-    if batches.is_empty() {
+    let permanent = marked_removal_batches()?;
+    let runtime = normalized_runtime_removals()?;
+    if !permanent.iter().chain(&runtime).any(|b| {
+        b.windows(2).any(|p| p == ["--dport", "53"]) && b.last().is_some_and(|s| s == "DROP")
+    }) {
         return Ok(());
     }
-    run_script(&build_firewall_script(&batches), false)
+    let bootstrap = lockdown_enable_batches(&[]);
+    let batches = partial_refresh_batches_for(permanent, runtime, &bootstrap, &bootstrap);
+    run_script(&build_firewall_script(&batches), false)?;
+    verify_protection(&bootstrap)
+}
+
+fn verify_protection(desired: &[Vec<String>]) -> AppResult<()> {
+    verify_partial_protection(desired, desired)
+}
+
+fn verify_partial_protection(required: &[Vec<String>], allowed: &[Vec<String>]) -> AppResult<()> {
+    verify_partial_protection_with(
+        required,
+        allowed,
+        &marked_removal_batches()?,
+        &normalized_runtime_removals()?,
+    )
+}
+
+#[cfg(test)]
+fn verify_protection_with(
+    desired: &[Vec<String>],
+    permanent: &[Vec<String>],
+    runtime: &[Vec<String>],
+) -> AppResult<()> {
+    verify_partial_protection_with(desired, desired, permanent, runtime)
+}
+
+fn verify_partial_protection_with(
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+    permanent: &[Vec<String>],
+    runtime: &[Vec<String>],
+) -> AppResult<()> {
+    if partial_rules_match(permanent, required, allowed)
+        && partial_rules_match(runtime, required, allowed)
+    {
+        Ok(())
+    } else {
+        Err(AppError::Firewall(
+            "Incomplete IPv4/IPv6 runtime or permanent lockdown protection; activation refused. Run `neutron lockdown enable` to repair protection.".into(),
+        ))
+    }
 }
 
 /// Whether piped stdin is an acceptable activation UUID for the privileged
@@ -285,8 +507,58 @@ fn is_valid_activation_uuid(requested: &str) -> bool {
 }
 
 fn tunnels(activating: Option<&str>) -> AppResult<Vec<WireguardTunnel>> {
+    tunnels_with(activating, |_| Ok(()))
+}
+
+// Allow DNS through verified live links before resolving active hostname peers.
+fn prime_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<()> {
+    let active: Vec<_> = tunnels
+        .iter()
+        .filter(|t| t.is_active)
+        .map(|t| WireguardTunnel {
+            endpoints: Vec::new(),
+            ..t.clone()
+        })
+        .collect();
+    if active.is_empty() {
+        return Ok(());
+    }
+    let required = lockdown_enable_batches(&active);
+    let permanent = marked_removal_batches()?;
+    let runtime = normalized_runtime_removals()?;
+    let mut allowed = required.clone();
+    for batch in permanent.iter().chain(&runtime) {
+        let destination = batch.windows(2).find(|p| p[0] == "-d");
+        let port = batch.windows(2).find(|p| p[0] == "--dport");
+        if batch[4] == "mangle"
+            && batch.last().is_some_and(|s| s == "ACCEPT")
+            && batch.windows(2).any(|p| p == ["-p", "udp"])
+            && destination.is_some_and(|p| p[1].parse::<IpAddr>().is_ok())
+            && port.is_some_and(|p| p[1].parse::<u16>().is_ok())
+            && !batch.iter().any(|s| s == "-o" || s == "conntrack")
+        {
+            let mut peer = batch.clone();
+            peer[2] = "--add-rule".into();
+            allowed.push(peer);
+        }
+    }
+    let batches = partial_refresh_batches_for(permanent, runtime, &required, &allowed);
+    let mut script = String::from("set -e\n");
+    script.push_str(&interface_validation_script(&active));
+    script.push_str(&build_firewall_script(&batches));
+    script.push_str(&retire_tag_guards_script());
+    run_script(&script, false)?;
+    verify_partial_protection(&required, &allowed)
+}
+
+fn tunnels_with(
+    activating: Option<&str>,
+    prime: impl FnOnce(&[WireguardTunnel]) -> AppResult<()>,
+) -> AppResult<Vec<WireguardTunnel>> {
     let client = crate::nm::CliNmClient;
-    let mut tunnels = client.wireguard_tunnels()?;
+    let original = client.wireguard_tunnels()?;
+    let mut tunnels = validate_tunnel_interfaces(&original)?;
+    prime(&tunnels)?;
     if let Some(uuid) = activating {
         if !client
             .list_wireguard_profiles()?
@@ -300,31 +572,176 @@ fn tunnels(activating: Option<&str>) -> AppResult<Vec<WireguardTunnel>> {
         let interface = client.tunnel_interface(uuid).ok_or_else(|| {
             AppError::Firewall("WireGuard activation has no configured interface".into())
         })?;
-        for tunnel in &mut tunnels {
-            if tunnel.interface.as_ref() == Some(&interface) {
+        validate_tunnel_interfaces(&[WireguardTunnel {
+            interface: Some(interface.clone()),
+            ..Default::default()
+        }])?;
+        for (source, tunnel) in original.iter().zip(&mut tunnels) {
+            if source.interface.as_ref() == Some(&interface) {
                 tunnel.is_active = true;
             }
         }
     }
+    for (tunnel, source) in tunnels.iter_mut().zip(&original) {
+        if source.is_active
+            && tunnel
+                .endpoints
+                .iter()
+                .any(|e| e.host.parse::<IpAddr>().is_err())
+            && let Some(interface) = &tunnel.interface
+            && let Ok(output) = crate::process::run_with_timeout(
+                "wg",
+                &["show", interface, "endpoints"],
+                LOCK_TIMEOUT,
+            )
+        {
+            let live: Vec<_> = output
+                .lines()
+                .filter_map(|line| {
+                    let endpoint = crate::nm::parse_endpoint(line.split_whitespace().nth(1)?)?;
+                    endpoint.host.parse::<IpAddr>().is_ok().then_some(endpoint)
+                })
+                .collect();
+            if !live.is_empty() {
+                tunnel.endpoints = live;
+                continue;
+            }
+        }
+        let mut pinned = Vec::new();
+        for endpoint in &tunnel.endpoints {
+            if endpoint.host.parse::<IpAddr>().is_ok() {
+                pinned.push(endpoint.clone());
+            } else {
+                let ips = crate::nm::split_tunnel::resolve_domain_ips(&endpoint.host);
+                if ips.is_empty() {
+                    if tunnel.is_active {
+                        return Err(AppError::Firewall(format!(
+                            "Could not resolve WireGuard endpoint {}",
+                            endpoint.host
+                        )));
+                    }
+                    tracing::warn!(
+                        "Inactive WireGuard endpoint {} could not be resolved; no allowance added",
+                        endpoint.host
+                    );
+                    continue;
+                }
+                pinned.extend(ips.into_iter().map(|ip| Endpoint {
+                    host: ip.to_string(),
+                    port: endpoint.port,
+                }));
+            }
+        }
+        tunnel.endpoints = pinned;
+    }
     Ok(tunnels)
 }
 
-fn refresh_batches(tunnels: &[WireguardTunnel]) -> AppResult<Vec<Vec<String>>> {
-    let desired = lockdown_enable_batches(tunnels);
-    let permanent = marked_removal_batches()?;
-    let runtime: Vec<_> = runtime_removal_batches()?
+fn acquire_lock(path: &Path, owner: u32, timeout: std::time::Duration) -> AppResult<std::fs::File> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (!metadata.is_file() || metadata.uid() != owner || metadata.nlink() != 1)
+    {
+        return Err(AppError::Firewall("Unsafe lockdown lock file".into()));
+    }
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file() || metadata.uid() != owner || metadata.nlink() != 1 {
+        return Err(AppError::Firewall("Unsafe lockdown lock file".into()));
+    }
+    // Repair the existing inode, never unlink it: old helpers/toggles may hold it.
+    lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(AppError::Firewall(
+                        "Timed out waiting for lockdown lock".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+}
+
+fn secure_lock_directory(path: &Path, owner: u32) -> AppResult<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.uid() != owner {
+        return Err(AppError::Firewall("Unsafe lockdown lock directory".into()));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+pub(super) fn normalized_runtime_removals() -> AppResult<Vec<Vec<String>>> {
+    Ok(runtime_removal_batches()?
         .into_iter()
         .map(|mut batch| {
             batch.insert(0, "--permanent".into());
             batch
         })
-        .collect();
+        .collect())
+}
+
+fn partial_refresh_batches(
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+) -> AppResult<Vec<Vec<String>>> {
+    Ok(partial_refresh_batches_for(
+        marked_removal_batches()?,
+        normalized_runtime_removals()?,
+        required,
+        allowed,
+    ))
+}
+
+#[cfg(test)]
+fn refresh_batches_for(
+    permanent: Vec<Vec<String>>,
+    runtime: Vec<Vec<String>>,
+    desired: &[Vec<String>],
+) -> Vec<Vec<String>> {
+    partial_refresh_batches_for(permanent, runtime, desired, desired)
+}
+
+pub(super) fn partial_refresh_batches_for(
+    permanent: Vec<Vec<String>>,
+    runtime: Vec<Vec<String>>,
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+) -> Vec<Vec<String>> {
     let mut batches = Vec::new();
+    let allowed_specs: std::collections::BTreeSet<_> = allowed.iter().map(|b| &b[3..]).collect();
     for (current, is_permanent) in [(permanent, true), (runtime, false)] {
-        if rules_match(&current, &desired) {
+        if partial_rules_match(&current, required, allowed) {
             continue;
         }
-        let rebuild = lockdown_rebuild_batches(current, tunnels);
+        let installed_specs: std::collections::BTreeSet<_> =
+            current.iter().map(|b| &b[3..]).collect();
+        let removals: Vec<_> = current
+            .iter()
+            .filter(|b| !allowed_specs.contains(&b[3..]))
+            .cloned()
+            .collect();
+        let additions: Vec<_> = required
+            .iter()
+            .filter(|b| !installed_specs.contains(&b[3..]))
+            .cloned()
+            .collect();
+        let rebuild = lockdown_rebuild_batches_for(removals, &additions);
         batches.extend(rebuild.into_iter().map(|mut batch| {
             if !is_permanent {
                 batch.remove(0);
@@ -332,18 +749,82 @@ fn refresh_batches(tunnels: &[WireguardTunnel]) -> AppResult<Vec<Vec<String>>> {
             batch
         }));
     }
-    Ok(batches)
+    batches
 }
 
+#[cfg(test)]
 fn rules_match(removals: &[Vec<String>], desired: &[Vec<String>]) -> bool {
+    partial_rules_match(removals, desired, desired)
+}
+
+fn partial_rules_match(
+    removals: &[Vec<String>],
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+) -> bool {
     let installed: std::collections::BTreeSet<_> = removals.iter().map(|b| &b[3..]).collect();
-    let desired: std::collections::BTreeSet<_> = desired.iter().map(|b| &b[3..]).collect();
-    installed == desired
+    let required: std::collections::BTreeSet<_> = required.iter().map(|b| &b[3..]).collect();
+    let allowed: std::collections::BTreeSet<_> = allowed.iter().map(|b| &b[3..]).collect();
+    required.is_subset(&installed) && installed.is_subset(&allowed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_refresh_migrates_lan_rules_below_connected_dns_drops() {
+        let connected = lockdown_enable_batches(&[WireguardTunnel {
+            interface: Some("wg0".into()),
+            is_active: true,
+            ..Default::default()
+        }]);
+        for old_priority in [1, 2] {
+            let mut old = lockdown_enable_batches(&[]);
+            for rule in &mut old {
+                rule[2] = "--remove-rule".into();
+                if rule.iter().any(|arg| arg == "-d") {
+                    rule[6] = old_priority.to_string();
+                }
+            }
+            let delta =
+                partial_refresh_batches_for(old.clone(), old.clone(), &connected, &connected);
+            for permanent in [true, false] {
+                let mut installed = old.clone();
+                for batch in delta
+                    .iter()
+                    .filter(|b| (b[0] == "--permanent") == permanent)
+                {
+                    let mut rule = batch.clone();
+                    if !permanent {
+                        rule.insert(0, "--permanent".into());
+                    }
+                    if rule[2] == "--add-rule" {
+                        rule[2] = "--remove-rule".into();
+                        installed.push(rule);
+                        // firewalld inserts new rules after existing equal-priority rules.
+                        installed.sort_by_key(|r| r[6].parse::<i32>().unwrap());
+                    } else {
+                        installed.retain(|r| r != &rule);
+                    }
+                }
+                assert!(rules_match(&installed, &connected));
+                for family in FAMILIES {
+                    let last_dns = installed
+                        .iter()
+                        .rposition(|r| {
+                            r[3] == family && r.windows(2).any(|p| p == ["--dport", "53"])
+                        })
+                        .unwrap();
+                    let first_lan = installed
+                        .iter()
+                        .position(|r| r[3] == family && r.iter().any(|arg| arg == "-d"))
+                        .unwrap();
+                    assert!(last_dns < first_lan, "DNS must precede LAN: {installed:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn authorization_check_is_unprivileged_and_noninteractive() {
@@ -359,6 +840,118 @@ mod tests {
                 &std::process::id().to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn preactivation_requires_complete_both_family_both_scope_policy_without_guards() {
+        assert!(absent_protection_result(false).is_ok());
+        assert!(absent_protection_result(true).is_err());
+        let desired = lockdown_enable_batches(&[]);
+        let complete: Vec<_> = desired
+            .iter()
+            .map(|batch| {
+                let mut batch = batch.clone();
+                batch[2] = "--remove-rule".into();
+                batch
+            })
+            .collect();
+        assert!(verify_protection_with(&desired, &complete, &complete).is_ok());
+        assert!(verify_protection_with(&desired, &[], &[]).is_err());
+        for family in FAMILIES {
+            let incomplete: Vec<_> = complete
+                .iter()
+                .filter(|batch| batch[3] != family)
+                .cloned()
+                .collect();
+            assert!(verify_protection_with(&desired, &incomplete, &complete).is_err());
+            assert!(verify_protection_with(&desired, &complete, &incomplete).is_err());
+        }
+        let mut guarded = complete.clone();
+        let mut guard = add_rule("ipv6", -1, &["-j", "DROP"]);
+        guard[2] = "--remove-rule".into();
+        guarded.push(guard);
+        assert!(verify_protection_with(&desired, &complete, &guarded).is_err());
+        let mut missing = complete.clone();
+        missing.pop();
+        assert!(verify_protection_with(&desired, &complete, &missing).is_err());
+    }
+
+    #[test]
+    fn authorization_rejects_legacy_and_mixed_installed_policies() {
+        let dir = crate::testing::scratch_dir("legacy-authorization");
+        let legacy = dir.join("legacy.rules");
+        let local = dir.join("local.policy");
+        let shared = dir.join("shared.policy");
+        let policies = [local.as_path(), shared.as_path()];
+        let script = revoke_unsafe_authorization_script_for(
+            legacy.to_str().unwrap(),
+            &[
+                local.to_str().unwrap().into(),
+                shared.to_str().unwrap().into(),
+            ],
+            "printf revoked\n",
+        );
+        let revoked = || {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("set -e\n{script}")])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout == b"revoked"
+        };
+        assert!(!hardened_authorization_at(&legacy, &policies));
+        assert!(revoked());
+        std::fs::write(&local, HARDENED_DEFAULTS).unwrap();
+        assert!(hardened_authorization_at(&legacy, &policies));
+        assert!(!revoked());
+        std::fs::write(&legacy, "polkit.Result.YES").unwrap();
+        assert!(!hardened_authorization_at(&legacy, &policies));
+        assert!(revoked());
+        std::fs::remove_file(&legacy).unwrap();
+        std::fs::write(
+            &shared,
+            HARDENED_DEFAULTS.replace("allow_active>yes", "allow_active>auth_admin"),
+        )
+        .unwrap();
+        assert!(!hardened_authorization_at(&legacy, &policies));
+        assert!(revoked());
+        std::fs::write(&shared, HARDENED_DEFAULTS).unwrap();
+        assert!(hardened_authorization_at(&legacy, &policies));
+        assert!(!revoked());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lock_repairs_same_inode_and_bounds_contention() {
+        let dir = crate::testing::scratch_dir("firewall-lock");
+        let path = dir.join("lock");
+        let first = std::fs::File::create(&path).unwrap();
+        first
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let metadata = first.metadata().unwrap();
+        let private_dir = dir.join("private");
+        secure_lock_directory(&private_dir, metadata.uid()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private_dir).unwrap().mode() & 0o777,
+            0o700
+        );
+        let private_path = private_dir.join("lock");
+        let private_lock = acquire_lock(&private_path, metadata.uid(), LOCK_TIMEOUT).unwrap();
+        assert_eq!(private_lock.metadata().unwrap().mode() & 0o777, 0o600);
+        drop(private_lock);
+        let symlink = dir.join("symlink");
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        assert!(acquire_lock(&symlink, metadata.uid(), LOCK_TIMEOUT).is_err());
+        first.lock().unwrap();
+        let start = std::time::Instant::now();
+        assert!(acquire_lock(&path, metadata.uid(), std::time::Duration::from_millis(60)).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), metadata.ino());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        drop(first);
+        drop(acquire_lock(&path, metadata.uid(), LOCK_TIMEOUT).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -395,23 +988,14 @@ mod tests {
 
     #[test]
     fn install_script_quotes_paths_and_targets_the_polkit_action() {
-        if std::process::Command::new("pkaction")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("Skipping install script test: 'pkaction' is not installed.");
-            return;
-        }
-        let script = install_script().expect("install script should render");
-        let executable = std::env::current_exe().expect("test binary has a path");
-        let raw_exe = executable.to_string_lossy().into_owned();
+        let script = install_script_for("pkaction version 126", std::process::id()).unwrap();
+        let raw_exe = format!("/proc/{}/exe", std::process::id());
         let quoted_exe = format!("'{raw_exe}'");
         // The executable path must only ever appear single-quoted: the
         // whole script runs as root via pkexec, so an unquoted path with
         // spaces or metacharacters would be a command injection.
         assert!(
-            script.contains(&format!("install -m 755 -- {quoted_exe} ")),
+            script.contains(&format!("exec 8<{quoted_exe}\n")),
             "executable must be quoted in the install step: {script}"
         );
         assert_eq!(
@@ -431,6 +1015,49 @@ mod tests {
             script.contains(&format!("pkaction --action-id {ACTION_ID}")),
             "script must verify the action is registered: {script}"
         );
+        assert!(script.contains("<allow_active>yes</allow_active>"));
+        assert!(script.contains("<allow_inactive>no</allow_inactive>"));
+        assert!(!script.contains("auth_admin"));
+        assert!(script.contains("stat -Lc '%d:%i' /proc/self/fd/8"));
+        assert!(script.contains("install -m 755 -- /proc/self/fd/8"));
+        assert!(script.contains(&format!("rm -f -- {SHARED_ACTION_DIR}/{ACTION_ID}.policy")));
+    }
+
+    #[test]
+    fn proc_executable_copy_survives_source_path_replacement() {
+        let dir = crate::testing::scratch_dir("installer-executable");
+        let source = dir.join("installer");
+        let destination = dir.join("helper");
+        std::fs::copy("/bin/sleep", &source).unwrap();
+        let mut installer = std::process::Command::new(&source)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let original = std::fs::metadata(&source).unwrap();
+        let replacement = dir.join("replacement");
+        std::fs::copy("/bin/true", &replacement).unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+        let script = format!(
+            "set -e\nexec 8</proc/{}/exe\n\
+             [ \"$(stat -Lc '%d:%i' /proc/self/fd/8)\" = '{}:{}' ]\n\
+             install -m 755 -- /proc/self/fd/8 {}\n",
+            installer.id(),
+            original.dev(),
+            original.ino(),
+            shell_quote(destination.to_str().unwrap()),
+        );
+        let copied = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap();
+        installer.kill().unwrap();
+        installer.wait().unwrap();
+        assert!(copied.success());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            std::fs::read("/bin/sleep").unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -463,6 +1090,7 @@ mod tests {
             .map(|statement| statement.trim_end_matches(" || true"))
             .collect();
         assert_eq!(revoked, installed_files());
+        assert!(revoked.contains(&LEGACY_POLICY_PATH));
         assert!(
             revoked[0].ends_with(".policy") && revoked[1].ends_with(".policy"),
             "authorization is revoked first: {revoked:?}"
@@ -504,8 +1132,83 @@ mod tests {
             ..Default::default()
         }]);
         assert!(!rules_match(&restored, &connected));
+        let connected_removals: Vec<_> = connected
+            .iter()
+            .map(|b| {
+                let mut b = b.clone();
+                b[2] = "--remove-rule".into();
+                b
+            })
+            .collect();
+        let disconnected_with_wg0 = lockdown_enable_batches(&[WireguardTunnel {
+            interface: Some("wg0".into()),
+            is_active: false,
+            ..Default::default()
+        }]);
+        let delta = refresh_batches_for(
+            connected_removals.clone(),
+            connected_removals,
+            &disconnected_with_wg0,
+        );
+        // Only the 4 DNS rules + 4 guard rules per scope (24 batches total) should run;
+        // unchanged interface/LAN/loopback/DROP rules stay in place.
+        assert_eq!(delta.len(), 24);
+        assert!(
+            !delta.iter().any(|b| b.contains(&"wg0".to_string())),
+            "unchanged tunnel interface rules must not be torn down and re-added: {delta:?}"
+        );
         restored.pop();
         assert!(!rules_match(&restored, &disconnected));
         assert!(!rules_match(&[], &disconnected));
+    }
+
+    #[test]
+    fn progressive_enable_and_preactivation_preserve_warmed_inactive_rules() {
+        let active = WireguardTunnel {
+            interface: Some("wg-active".into()),
+            is_active: true,
+            ..Default::default()
+        };
+        let inactive = WireguardTunnel {
+            interface: Some("wg-standby".into()),
+            is_active: false,
+            ..Default::default()
+        };
+        let required = lockdown_enable_batches(std::slice::from_ref(&active));
+        let allowed = lockdown_enable_batches(&[active.clone(), inactive.clone()]);
+
+        // Fresh blocking phase only installs base + active tunnel rules, not inactive ones.
+        let initial = partial_refresh_batches_for(Vec::new(), Vec::new(), &required, &allowed);
+        assert!(initial.iter().any(|b| b.contains(&"wg-active".to_string())));
+        assert!(
+            !initial
+                .iter()
+                .any(|b| b.contains(&"wg-standby".to_string())),
+            "inactive tunnels are deferred to background warming: {initial:?}"
+        );
+
+        // Matching refreshes preserve all warmed inactive rules without writes.
+        let installed_full: Vec<_> = allowed
+            .iter()
+            .map(|b| {
+                let mut b = b.clone();
+                b[2] = "--remove-rule".into();
+                b
+            })
+            .collect();
+        assert!(
+            partial_refresh_batches_for(
+                installed_full.clone(),
+                installed_full.clone(),
+                &required,
+                &allowed
+            )
+            .is_empty(),
+            "matching refresh must not tear down already-warmed inactive rules"
+        );
+        assert!(
+            verify_partial_protection_with(&required, &allowed, &installed_full, &installed_full)
+                .is_ok()
+        );
     }
 }

@@ -12,9 +12,20 @@ use std::time::{Duration, Instant};
 
 use crate::error::{AppError, AppResult};
 
-/// Build a [`Command`] for `program` to execute on the system.
-pub fn host_command(program: &str) -> Command {
-    Command::new(program)
+/// Escape terminal controls in displayed data, without changing command arguments
+/// or ordinary Unicode text. Also escape line separators and bidi controls.
+pub fn terminal_safe(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control()
+            || matches!(ch, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            safe.extend(ch.escape_default());
+        } else {
+            safe.push(ch);
+        }
+    }
+    safe
 }
 
 /// Resolve the path or name of the currently running application binary,
@@ -27,13 +38,6 @@ pub fn current_app_path() -> std::ffi::OsString {
     } else {
         std::ffi::OsString::from("neutron")
     }
-}
-
-/// Like [`host_command`], but also sets environment variables on the process.
-pub fn host_command_with_env(program: &str, envs: &[(&str, &str)]) -> Command {
-    let mut command = Command::new(program);
-    command.envs(envs.iter().copied());
-    command
 }
 
 /// Render a failed command's exit status and stderr into one message. Falls back
@@ -49,16 +53,16 @@ pub fn format_command_error(
         .map(|code| code.to_string())
         .unwrap_or_else(|| "terminated by signal".to_string());
     if stderr.is_empty() {
-        format!("{prefix} (exit {code})")
+        format!("{} (exit {code})", terminal_safe(prefix))
     } else {
-        format!("{stderr} (exit {code})")
+        format!("{} (exit {code})", terminal_safe(stderr))
     }
 }
 
 /// Run `program` with `args`, returning its trimmed stdout, and killing it if it
 /// outlives `timeout`.
 pub fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> AppResult<String> {
-    let mut command = host_command(program);
+    let mut command = Command::new(program);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -124,6 +128,19 @@ pub fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> AppR
 mod tests {
     use super::*;
 
+    #[test]
+    fn security_terminal_controls_are_inert_and_unicode_is_preserved() {
+        let hostile =
+            "\u{6771}\u{4eac} caf\u{e9}\x1b]52;c;payload\x07\r\n\t\x7f\u{9b}\u{2028}\u{202e}";
+        let safe = terminal_safe(hostile);
+        assert!(safe.starts_with("\u{6771}\u{4eac} caf\u{e9}\\u{1b}]52;c;payload"));
+        assert!(!safe.chars().any(char::is_control));
+        assert!(!safe.contains('\u{2028}'));
+        assert_eq!(terminal_safe(&safe), safe);
+        let status = Command::new("false").status().unwrap();
+        assert!(!format_command_error("failure", status, hostile).contains('\x1b'));
+    }
+
     #[cfg(unix)]
     #[test]
     fn command_timeout_kills_long_running_process() {
@@ -183,34 +200,8 @@ mod tests {
     }
 
     #[test]
-    fn host_command_creates_command_for_program() {
-        let command = host_command("nmcli");
-
-        assert_eq!(command.get_program(), "nmcli");
-        assert_eq!(command.get_args().count(), 0);
-    }
-
-    #[test]
     fn current_app_path_resolves_non_empty() {
         let path = current_app_path();
         assert!(!path.is_empty());
-    }
-
-    #[test]
-    fn host_command_with_env_sets_env_on_command() {
-        let command = host_command_with_env("pkexec", &[("SHELL", "/bin/sh")]);
-
-        assert_eq!(command.get_program(), "pkexec");
-        assert_eq!(command.get_args().count(), 0);
-        let envs: Vec<_> = command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_str().expect("env key should be valid UTF-8"),
-                    value.map(|value| value.to_str().expect("env value should be valid UTF-8")),
-                )
-            })
-            .collect();
-        assert_eq!(envs, [("SHELL", Some("/bin/sh"))]);
     }
 }
