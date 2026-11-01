@@ -882,7 +882,8 @@ mod tests {
         let script = lockdown_enable_script(&[], ":\n");
         // Only injected commands run; the production lock prefix is tested separately.
         let body = script.strip_prefix(&locked_script()).unwrap();
-        let output = Command::new("/bin/sh")
+        // Bash permits hyphens in the mock command functions; dash does not.
+        let output = Command::new("/bin/bash")
             .args(["-c", &format!("set -e\n{fake}{body}")])
             .output()
             .unwrap();
