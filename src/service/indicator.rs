@@ -31,6 +31,12 @@ const DISCONNECTED_48_ARGB32: &[u8] =
 const DISCONNECTED_24_ARGB32: &[u8] =
     include_bytes!("../../resources/status/disconnected_24.argb32");
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuAction {
+    Toggle,
+    Switch(String),
+}
+
 /// State shared between TUI/CLI and background StatusNotifierItem D-Bus service.
 #[derive(Debug, Clone, Default)]
 pub struct IndicatorSharedState {
@@ -40,6 +46,7 @@ pub struct IndicatorSharedState {
     pub favorite_profiles: Vec<(String, String)>,
     pub favorite_id_map: HashMap<i32, String>,
     pub menu_revision: u32,
+    pub action_tx: Option<std::sync::mpsc::Sender<MenuAction>>,
 }
 
 impl IndicatorSharedState {
@@ -359,27 +366,71 @@ where
         (rev, root_props, items)
     }
 
-    fn refresh_active_state(&self) {
-        let Ok(profiles) = self.client.list_wireguard_profiles() else {
-            return;
-        };
-        let active = profiles.iter().find(|p| p.is_active());
-        let active_name = active.map(|profile| profile.name.clone());
-        let active_uuid = active.map(|profile| profile.uuid.clone());
-        if let Ok(mut st) = self.state.lock()
-            && (st.active_profile != active_name || st.active_uuid != active_uuid)
+    fn dispatch_action(&self, action: MenuAction)
+    where
+        C: crate::firewall::FirewallClient,
+    {
+        let tx = self.state.lock().ok().and_then(|st| st.action_tx.clone());
+        if let Some(tx) = tx
+            && tx.send(action.clone()).is_ok()
         {
-            st.active_profile = active_name;
-            st.active_uuid = active_uuid;
-            st.menu_revision += 1;
+            return;
         }
+        handle_menu_action(&self.client, &self.state, None, action);
+    }
+}
+
+fn handle_menu_action<C>(
+    client: &C,
+    state: &Arc<Mutex<IndicatorSharedState>>,
+    config_path: Option<&std::path::Path>,
+    action: MenuAction,
+) where
+    C: NmClient + crate::firewall::FirewallClient,
+{
+    match action {
+        MenuAction::Toggle => {
+            let is_conn = state
+                .lock()
+                .map(|st| st.active_profile.is_some())
+                .unwrap_or(false);
+            if is_conn {
+                let _ = client.disconnect_active();
+            } else {
+                let _ = crate::service::run_startup_random(client);
+            }
+            if let Some(path) = config_path {
+                let _ = crate::app::rebuild_lockdown_if_enabled(client, path);
+            }
+            refresh_active_state(client, state);
+        }
+        MenuAction::Switch(uuid) => match client.switch_to(&uuid) {
+            Ok(()) => refresh_active_state(client, state),
+            Err(err) => warn!("Failed to switch to favorite profile '{uuid}': {err}"),
+        },
+    }
+}
+
+fn refresh_active_state<C: NmClient>(client: &C, state: &Arc<Mutex<IndicatorSharedState>>) {
+    let Ok(profiles) = client.list_wireguard_profiles() else {
+        return;
+    };
+    let active = profiles.iter().find(|p| p.is_active());
+    let active_name = active.map(|profile| profile.name.clone());
+    let active_uuid = active.map(|profile| profile.uuid.clone());
+    if let Ok(mut st) = state.lock()
+        && (st.active_profile != active_name || st.active_uuid != active_uuid)
+    {
+        st.active_profile = active_name;
+        st.active_uuid = active_uuid;
+        st.menu_revision += 1;
     }
 }
 
 #[interface(name = "com.canonical.dbusmenu")]
 impl<C> DBusMenu<C>
 where
-    C: NmClient + Clone + Send + Sync + 'static,
+    C: NmClient + crate::firewall::FirewallClient + Clone + Send + Sync + 'static,
 {
     #[zbus(property)]
     fn version(&self) -> u32 {
@@ -434,19 +485,7 @@ where
         }
 
         match id {
-            2 => {
-                let is_conn = self
-                    .state
-                    .lock()
-                    .map(|st| st.active_profile.is_some())
-                    .unwrap_or(false);
-                if is_conn {
-                    let _ = self.client.disconnect_active();
-                } else {
-                    let _ = crate::service::run_startup_random(&self.client);
-                }
-                self.refresh_active_state();
-            }
+            2 => self.dispatch_action(MenuAction::Toggle),
             5 => {
                 if let Ok(st) = self.state.lock()
                     && let Some(port) = st.forwarded_port
@@ -470,10 +509,7 @@ where
                         .cloned()
                 });
                 if let Some(uuid) = target_uuid {
-                    match self.client.switch_to(&uuid) {
-                        Ok(()) => self.refresh_active_state(),
-                        Err(err) => warn!("Failed to switch to favorite profile '{uuid}': {err}"),
-                    }
+                    self.dispatch_action(MenuAction::Switch(uuid));
                 }
             }
             _ => {}
@@ -537,7 +573,7 @@ pub fn spawn_indicator_service<C>(
     shared_state: Arc<Mutex<IndicatorSharedState>>,
 ) -> std::thread::JoinHandle<()>
 where
-    C: NmClient + Clone + Send + Sync + 'static,
+    C: NmClient + crate::firewall::FirewallClient + Clone + Send + Sync + 'static,
 {
     install_status_icons();
 
@@ -571,6 +607,24 @@ where
                 debug!("Indicator instance is already running, exiting duplicate.");
                 return;
             }
+
+            let (action_tx, action_rx) = std::sync::mpsc::channel::<MenuAction>();
+            if let Ok(mut st) = shared_state.lock() {
+                st.action_tx = Some(action_tx);
+            }
+            let client_for_actions = client.clone();
+            let state_for_actions = shared_state.clone();
+            let config_path = crate::config::default_config_path().ok();
+            std::thread::spawn(move || {
+                while let Ok(action) = action_rx.recv() {
+                    handle_menu_action(
+                        &client_for_actions,
+                        &state_for_actions,
+                        config_path.as_deref(),
+                        action,
+                    );
+                }
+            });
 
             let sni = StatusNotifierItem {
                 state: shared_state.clone(),
@@ -1270,6 +1324,16 @@ mod tests {
             state.lock().unwrap().active_uuid.as_deref(),
             Some("uuid-fav")
         );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.lock().unwrap().action_tx = Some(tx);
+        menu.event(100, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        menu.event(2, "clicked", zbus::zvariant::Value::from(0u32), 0);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MenuAction::Switch("uuid-fav".into()))
+        );
+        assert_eq!(rx.try_recv().ok(), Some(MenuAction::Toggle));
     }
 
     #[test]

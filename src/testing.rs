@@ -616,19 +616,37 @@ impl NmPolicy for MockNmClient {
             ));
         }
 
-        if enable {
-            let mut config = match self.policy_config_path() {
-                Some(path) => crate::config::load(path)?,
-                None => crate::config::AppConfig::default(),
-            };
-            config.kill_switch_enabled = true;
-            for uuid in self.uuids() {
-                self.apply_policy_config(&uuid, &config)?;
+        let mut config = match self.policy_config_path() {
+            Some(path) => crate::config::load(path).unwrap_or_default(),
+            None => crate::config::AppConfig::default(),
+        };
+        config.kill_switch_enabled = enable;
+        let active_uuids = self.active_uuids();
+        for uuid in self.uuids() {
+            match self.apply_policy_config(&uuid, &config) {
+                Ok(()) => {}
+                Err(_) if !active_uuids.contains(&uuid) => {
+                    let has_ipv6 = self
+                        .setting(&uuid, "ipv6.method")
+                        .is_none_or(|m| !matches!(m.trim(), "" | "--" | "disabled" | "ignore"));
+                    let mut args = crate::nm::kill_switch::set_args(&uuid, enable, has_ipv6);
+                    if !enable {
+                        args.extend([
+                            "-ipv4.dns-search".into(),
+                            "~.".into(),
+                            "-ipv6.dns-search".into(),
+                            "~.".into(),
+                            "ipv4.may-fail".into(),
+                            "yes".into(),
+                            "ipv6.may-fail".into(),
+                            "yes".into(),
+                        ]);
+                    }
+                    self.apply_args(&args);
+                }
+                Err(err) => return Err(err),
             }
-            return Ok(());
         }
-
-        self.apply_to_all(|uuid| crate::nm::kill_switch::set_args(uuid, enable, true));
         Ok(())
     }
 

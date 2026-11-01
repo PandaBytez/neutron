@@ -211,15 +211,29 @@ fn disabling_the_kill_switch_on_a_live_tunnel_keeps_it_routing() {
 #[test]
 fn enabling_the_kill_switch_on_a_live_tunnel_keeps_it_routing() {
     let (client, path) = connected_client();
+    // An inactive IPv4-only profile must not abort the global kill-switch sweep,
+    // though activating that profile without lockdown will still be refused.
+    let client = client.with_setting("uuid-us", "ipv6.method", "disabled");
 
     neutron::app::set_global_kill_switch(&client, &path, true).expect("enable should succeed");
 
-    assert_every_profile_still_routes(&client, "kill switch enabled");
+    assert_eq!(
+        client
+            .setting("uuid-eu", "wireguard.ip4-auto-default-route")
+            .as_deref(),
+        Some("yes")
+    );
     assert_eq!(
         client.setting("uuid-eu", "ipv4.dns-priority").as_deref(),
         Some("-1500"),
         "enabling must give the tunnel's resolvers exclusive priority"
     );
+    assert_eq!(
+        client.setting("uuid-us", "ipv4.dns-priority").as_deref(),
+        Some("-1500"),
+        "inactive IPv4-only profile still receives base kill-switch priority"
+    );
+    assert!(client.switch_to("uuid-us").is_err());
     assert_eq!(client.active_uuid().as_deref(), Some("uuid-eu"));
 
     testing::remove_temp_config(&path);
@@ -240,6 +254,41 @@ fn cycling_the_kill_switch_never_regresses_routing() {
             Some("uuid-eu"),
             "the live tunnel must survive every toggle"
         );
+        if enable {
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routes").as_deref(),
+                Some("10.2.0.1/32 0.0.0.0 5 table=254")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.dns-search").as_deref(),
+                Some("~.")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.may-fail").as_deref(),
+                Some("no")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routed-dns").as_deref(),
+                Some("no")
+            );
+        } else {
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routes").as_deref(),
+                Some("")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.dns-search").as_deref(),
+                Some("")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.may-fail").as_deref(),
+                Some("yes")
+            );
+            assert_eq!(
+                client.setting("uuid-eu", "ipv4.routed-dns").as_deref(),
+                Some("yes")
+            );
+        }
     }
 
     testing::remove_temp_config(&path);

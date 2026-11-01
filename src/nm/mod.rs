@@ -371,22 +371,34 @@ impl NmLifecycle for CliNmClient {
 impl NmPolicy for CliNmClient {
     fn set_kill_switch_all(&self, enable: bool) -> AppResult<()> {
         let profiles = self.list_wireguard_profiles()?;
-        if enable {
-            let path = crate::config::default_config_path()?;
-            let mut config = crate::config::load(&path)?;
-            config.kill_switch_enabled = true;
-            for profile in &profiles {
-                prepare_profile(&profile.uuid, &config, &mut run_nmcli)?;
+        let mut config = crate::config::default_config_path()
+            .and_then(|path| crate::config::load(&path))
+            .unwrap_or_default();
+        config.kill_switch_enabled = enable;
+        for (profile, mut fallback) in
+            profiles
+                .iter()
+                .zip(kill_switch_arg_batches(&profiles, enable, profile_has_ipv6))
+        {
+            match prepare_profile(&profile.uuid, &config, &mut run_nmcli) {
+                Ok(()) => {}
+                Err(_) if !profile.is_active() => {
+                    if !enable {
+                        fallback.extend([
+                            "-ipv4.dns-search".into(),
+                            "~.".into(),
+                            "-ipv6.dns-search".into(),
+                            "~.".into(),
+                            "ipv4.may-fail".into(),
+                            "yes".into(),
+                            "ipv6.may-fail".into(),
+                            "yes".into(),
+                        ]);
+                    }
+                    run_nmcli_owned(&fallback)?;
+                }
+                Err(err) => return Err(err),
             }
-            return Ok(());
-        }
-        // NOTE: unlike `set_autoconnect_all` below, this still aborts on the
-        // first failure, so later profiles keep their previous kill-switch
-        // value while the caller sees a single error. Converting it to
-        // `apply_to_every_profile` is a behavior change to a security-relevant
-        // setting and is deliberately left out of the autoconnect fix.
-        for args in kill_switch_arg_batches(&profiles, enable, profile_has_ipv6) {
-            run_nmcli_owned(&args)?;
         }
         Ok(())
     }
@@ -1017,6 +1029,11 @@ fn activate(uuid: &str, teardown_active: bool) -> AppResult<()> {
             None
         };
         if config.lockdown_enabled {
+            if let Some(endpoint) = settings.endpoint.as_deref().and_then(parse_endpoint)
+                && endpoint.host.parse::<std::net::IpAddr>().is_err()
+            {
+                let _ = split_tunnel::resolve_domain_ips(&endpoint.host);
+            }
             CliNmClient.refresh_lockdown(Some(uuid))?;
         }
         let result = (|| {
@@ -1110,8 +1127,16 @@ pub(crate) fn prepare_profile_with(
             }
         }
     } else {
-        args.extend(["-ipv4.dns-search".into(), "~.".into()]);
-        args.extend(["-ipv6.dns-search".into(), "~.".into()]);
+        args.extend([
+            "-ipv4.dns-search".into(),
+            "~.".into(),
+            "-ipv6.dns-search".into(),
+            "~.".into(),
+            "ipv4.may-fail".into(),
+            "yes".into(),
+            "ipv6.may-fail".into(),
+            "yes".into(),
+        ]);
     }
     run(&args.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|error| {
         AppError::Config(format!(
