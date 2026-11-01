@@ -335,6 +335,7 @@ fn activation_prepares_connected_lockdown_before_first_traffic() {
     impl Drop for Restore {
         fn drop(&mut self) {
             let _ = CliNmClient.disable_lockdown();
+            self.0.lockdown_enabled = false;
             let _ = neutron::config::save(&self.1, &self.0);
         }
     }

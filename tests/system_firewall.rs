@@ -63,6 +63,9 @@ struct Lockdown;
 impl Drop for Lockdown {
     fn drop(&mut self) {
         let _ = CliNmClient.disable_lockdown();
+        if let Ok(path) = neutron::config::default_config_path() {
+            let _ = neutron::config::update(&path, |cfg| cfg.lockdown_enabled = false);
+        }
         let _ = std::process::Command::new("ip")
             .args(["link", "del", "wg-test"])
             .status();
