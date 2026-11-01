@@ -75,6 +75,12 @@ Never run `cargo test -- --ignored` directly on the host or set
   cross-backend checks.
 - Container reload checks do not establish persistence across an actual reboot.
 
+The firewall tier also benchmarks enable, three switches, and disable with 21
+profiles. Command-count assertions catch per-profile link snapshots and per-rule
+Python process regressions; wall-clock measurements are printed for comparison,
+not used as a fragile CI timing threshold. For a release-build comparison inside
+the sandbox, run `python3 tests/lockdown_performance.py <release-binary>` there.
+
 ## Build the Documentation
 
 Run documentation builds only after main-source verification. GitHub Pages pins

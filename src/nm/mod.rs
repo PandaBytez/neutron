@@ -474,22 +474,65 @@ impl NmPolicy for CliNmClient {
 /// Read-only introspection of tunnels, diagnostics and addresses.
 impl NmIntrospect for CliNmClient {
     fn wireguard_tunnels(&self) -> AppResult<Vec<WireguardTunnel>> {
+        use zbus::zvariant::{OwnedObjectPath, OwnedValue};
         let profiles = self.list_wireguard_profiles()?;
+        let connection = zbus::blocking::Connection::system().map_err(|error| {
+            AppError::Config(format!("cannot inspect NetworkManager profiles: {error}"))
+        })?;
+        let settings_proxy = zbus::blocking::Proxy::new(
+            &connection,
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager/Settings",
+            "org.freedesktop.NetworkManager.Settings",
+        )
+        .map_err(|error| {
+            AppError::Config(format!("cannot inspect NetworkManager profiles: {error}"))
+        })?;
         let mut tunnels = Vec::new();
         for profile in &profiles {
-            // `-g` (get-values) prints only the property value, so no field
-            // prefix has to be stripped.
-            let interface = run_nmcli(&[
-                "-g",
-                "connection.interface-name",
-                "connection",
-                "show",
-                &profile.uuid,
-            ])
-            .map(|value| parse_interface_name(&value))?;
-            let endpoints =
-                run_nmcli(&["-g", "wireguard.peers", "connection", "show", &profile.uuid])
-                    .map(|value| extract_endpoints(&value))?;
+            let path: OwnedObjectPath = settings_proxy
+                .call("GetConnectionByUuid", &profile.uuid)
+                .map_err(|error| {
+                AppError::Config(format!("cannot inspect profile {}: {error}", profile.uuid))
+            })?;
+            let proxy = zbus::blocking::Proxy::new(
+                &connection,
+                "org.freedesktop.NetworkManager",
+                path,
+                "org.freedesktop.NetworkManager.Settings.Connection",
+            )
+            .map_err(|error| {
+                AppError::Config(format!("cannot inspect profile {}: {error}", profile.uuid))
+            })?;
+            // GetSettings excludes secrets and avoids one nmcli process per property.
+            let settings: std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, OwnedValue>,
+            > = proxy.call("GetSettings", &()).map_err(|error| {
+                AppError::Config(format!("cannot read profile {}: {error}", profile.uuid))
+            })?;
+            let interface = settings
+                .get("connection")
+                .and_then(|s| s.get("interface-name"))
+                .and_then(|v| <&str>::try_from(v).ok())
+                .and_then(parse_interface_name);
+            let mut endpoints = Vec::new();
+            if let Some(value) = settings.get("wireguard").and_then(|s| s.get("peers")) {
+                let peers: Vec<std::collections::HashMap<String, OwnedValue>> =
+                    value.try_clone().and_then(Vec::try_from).map_err(|_| {
+                        AppError::NmParseFailed("invalid WireGuard peer settings".into())
+                    })?;
+                for peer in peers {
+                    if let Some(endpoint) = peer.get("endpoint") {
+                        let value = <&str>::try_from(endpoint).map_err(|_| {
+                            AppError::NmParseFailed("invalid WireGuard endpoint".into())
+                        })?;
+                        endpoints.push(parse_endpoint(value).ok_or_else(|| {
+                            AppError::NmParseFailed("invalid WireGuard endpoint".into())
+                        })?);
+                    }
+                }
+            }
             tunnels.push(WireguardTunnel {
                 interface,
                 endpoints,
@@ -764,6 +807,7 @@ fn parse_interface_name(value: &str) -> Option<String> {
 /// around `=`, trailing `,`/`;`), so this scans tolerantly: it finds each
 /// `endpoint` marker, skips an optional `=` and whitespace, then reads the
 /// address token up to the next delimiter.
+#[cfg(test)]
 fn extract_endpoints(text: &str) -> Vec<Endpoint> {
     let mut endpoints = Vec::new();
     for segment in text.split("endpoint").skip(1) {
@@ -786,6 +830,7 @@ fn extract_endpoints(text: &str) -> Vec<Endpoint> {
 /// fail to parse as an IP address, and the endpoint gets treated as a hostname
 /// -- which the firewall can only allow by destination port, opening UDP/51820
 /// to *every* host instead of pinning the VPN peer.
+#[cfg(test)]
 fn unescape_nmcli(token: &str) -> String {
     let mut out = String::with_capacity(token.len());
     let mut chars = token.chars();

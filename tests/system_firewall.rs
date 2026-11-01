@@ -21,6 +21,27 @@ use neutron::testing::require_sandbox;
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
+fn lockdown_operations_do_not_spawn_per_rule_python_or_per_profile_link_queries() {
+    require_sandbox();
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/lockdown_performance.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_neutron"))
+        .env("NEUTRON_PERFORMANCE_ASSERT", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
 fn hostname_activation_after_reload_bootstraps_dns_then_closes_physical_dns() {
     require_sandbox();
     let output = std::process::Command::new("python3")

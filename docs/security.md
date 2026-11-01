@@ -95,6 +95,12 @@ The Kill Switch only protects traffic while a tunnel connection is actively esta
 `mangle OUTPUT` via a single batched `pkexec` invocation. This runs before
 filter-table established-connection accepts on both firewalld backends.
 
+Rule reads use firewalld's D-Bus API. Privileged rule writes call the same direct
+API through `dbus-send`, avoiding a Python `firewall-cmd` startup for every rule.
+Rules still change individually in guard-protected order, with no global reload
+or whole-configuration replacement. Legacy arguments containing commas fall back
+to `firewall-cmd` so their exact argument values are preserved.
+
 ### Ruleset Hierarchy (OUTPUT Chain)
 
 | Priority | Match Criteria | Target | Purpose |

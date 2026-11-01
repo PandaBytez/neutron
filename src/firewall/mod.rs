@@ -289,47 +289,56 @@ fn read_marked_rules_with(family: &str, table: &str, tool: &str) -> AppResult<St
     }))
 }
 
-/// Read direct rules across all tables and chains.
-fn read_direct_all_rules(permanent: bool) -> AppResult<String> {
-    let mut args = vec!["--direct", "--get-all-rules"];
-    if permanent {
-        args.insert(0, "--permanent");
-    }
-    let output = Command::new(FIREWALL_CMD)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+/// Read rule arguments natively, without starting the Python firewall-cmd frontend.
+fn read_rule_batches(permanent: bool) -> AppResult<Vec<Vec<String>>> {
+    let connection = zbus::blocking::Connection::system()
         .map_err(|error| AppError::Firewall(error.to_string()))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-
-    Err(AppError::Firewall(
-        String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    ))
-}
-
-fn runtime_removal_batches() -> AppResult<Vec<Vec<String>>> {
-    Ok(read_direct_all_rules(false)?
-        .lines()
-        .filter(|line| line_is_marked(line))
-        .filter_map(|line| {
-            let parts: Vec<_> = line.split_whitespace().collect();
-            if parts.len() < 5
-                || !FAMILIES.contains(&parts[0])
-                || !MANAGED_TABLES.contains(&parts[1])
-                || parts[2] != "OUTPUT"
+    let (path, interface) = if permanent {
+        (
+            "/org/fedoraproject/FirewallD1/config",
+            "org.fedoraproject.FirewallD1.config.direct",
+        )
+    } else {
+        (
+            "/org/fedoraproject/FirewallD1",
+            "org.fedoraproject.FirewallD1.direct",
+        )
+    };
+    let proxy =
+        zbus::blocking::Proxy::new(&connection, "org.fedoraproject.FirewallD1", path, interface)
+            .map_err(|error| AppError::Firewall(error.to_string()))?;
+    let rules: Vec<(String, String, String, i32, Vec<String>)> = proxy
+        .call("getAllRules", &())
+        .map_err(|error| AppError::Firewall(error.to_string()))?;
+    Ok(rules
+        .into_iter()
+        .filter_map(|(family, table, chain, priority, args)| {
+            if !FAMILIES.contains(&family.as_str())
+                || !MANAGED_TABLES.contains(&table.as_str())
+                || chain != "OUTPUT"
+                || !args.iter().any(|arg| arg == LOCKDOWN_MARKER)
             {
                 return None;
             }
-            let mut batch = vec!["--direct".into(), "--remove-rule".into()];
-            batch.extend(parts.into_iter().map(str::to_string));
+            let mut batch = vec![
+                "--direct".into(),
+                "--remove-rule".into(),
+                family,
+                table,
+                chain,
+                priority.to_string(),
+            ];
+            if permanent {
+                batch.insert(0, "--permanent".into());
+            }
+            batch.extend(args);
             Some(batch)
         })
         .collect())
+}
+
+fn runtime_removal_batches() -> AppResult<Vec<Vec<String>>> {
+    read_rule_batches(false)
 }
 
 /// Enumerate under the root lock, not before a potentially long password prompt.
@@ -342,7 +351,8 @@ fn live_removal_script(permanent: bool, keep_guards: bool) -> String {
         ":"
     };
     format!(
-        "rules=$(firewall-cmd {scope} --direct --get-all-rules)\n\
+        "{rule_function}\n\
+         rules=$(firewall-cmd {scope} --direct --get-all-rules)\n\
          set -f\n\
          printf '%s\\n' \"$rules\" | while IFS= read -r rule; do\n\
            set -- $rule\n\
@@ -355,9 +365,10 @@ fn live_removal_script(permanent: bool, keep_guards: bool) -> String {
            marked=false\n\
            for arg do [ \"$arg\" != '{LOCKDOWN_MARKER}' ] || marked=true; done\n\
            if [ \"$marked\" = true ]; then\n\
-             firewall-cmd {scope} --direct --remove-rule \"$@\"\n\
+              firewall_rule {scope} --direct --remove-rule \"$@\"\n\
            fi\n\
-         done\n"
+         done\n",
+        rule_function = firewall_rule_function()
     )
 }
 
@@ -426,17 +437,17 @@ fn locked_script_for(path: &str, owner: u32, timeout: u64, fd: u8) -> String {
 /// Only exact interface names may become OUTPUT allowances. Existing links must
 /// be kernel WireGuard devices; absent links are allowed for inactive profiles.
 fn validate_tunnel_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<Vec<WireguardTunnel>> {
+    let listing = crate::process::run_with_timeout(
+        "ip",
+        &["-json", "-details", "link", "show"],
+        helper::LOCK_TIMEOUT,
+    )?;
+    let links: serde_json::Value = serde_json::from_str(&listing)
+        .map_err(|error| AppError::Firewall(format!("Invalid link introspection: {error}")))?;
+    let links = links
+        .as_array()
+        .ok_or_else(|| AppError::Firewall("Invalid link introspection".into()))?;
     validate_tunnel_interfaces_with(tunnels, |interface| {
-        let listing = crate::process::run_with_timeout(
-            "ip",
-            &["-json", "-details", "link", "show"],
-            helper::LOCK_TIMEOUT,
-        )?;
-        let links: serde_json::Value = serde_json::from_str(&listing)
-            .map_err(|error| AppError::Firewall(format!("Invalid link introspection: {error}")))?;
-        let links = links
-            .as_array()
-            .ok_or_else(|| AppError::Firewall("Invalid link introspection".into()))?;
         Ok(links
             .iter()
             .find(|link| link["ifname"] == interface)
@@ -571,7 +582,7 @@ fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
     )))
 }
 
-/// Render `firewall-cmd` argument batches into a single `/bin/sh` script that
+/// Render direct-rule argument batches into a single `/bin/sh` script that
 /// runs each in order and aborts on the first failure (`set -e`). Rebuild guards
 /// keep partially applied permanent rules fail-closed.
 ///
@@ -581,8 +592,11 @@ fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
 /// commands into one `sh -c` safe against command injection.
 fn build_firewall_script(batches: &[Vec<String>]) -> String {
     let mut script = String::from("set -e\n");
+    if !batches.is_empty() {
+        script.push_str(firewall_rule_function());
+    }
     for batch in batches {
-        script.push_str(FIREWALL_CMD);
+        script.push_str("firewall_rule");
         for arg in batch {
             script.push(' ');
             script.push_str(&shell_quote(arg));
@@ -590,6 +604,43 @@ fn build_firewall_script(batches: &[Vec<String>]) -> String {
         script.push('\n');
     }
     script
+}
+
+// dbus-send is already required by helper installation and avoids Python startup per rule.
+fn firewall_rule_function() -> &'static str {
+    r#"firewall_rule() {
+  for arg do
+    case "$arg" in *,*) firewall-cmd "$@"; return;; esac
+  done
+  path=/org/fedoraproject/FirewallD1
+  interface=org.fedoraproject.FirewallD1.direct
+  if [ "$1" = --permanent ]; then
+    path=/org/fedoraproject/FirewallD1/config
+    interface=org.fedoraproject.FirewallD1.config.direct
+    shift
+  fi
+  if [ "$1" != --direct ]; then firewall-cmd "$@"; return; fi
+  shift
+  case "$1" in
+    --add-rule) method=addRule;;
+    --remove-rule) method=removeRule;;
+    *) echo 'Unsupported direct firewall operation' >&2; return 1;;
+  esac
+  shift
+  family=$1 table=$2 chain=$3 priority=$4
+  shift 4
+  rule_args=$(IFS=,; printf %s "$*")
+  if reply=$(dbus-send --system --print-reply --dest=org.fedoraproject.FirewallD1 "$path" "$interface.$method" \
+      "string:$family" "string:$table" "string:$chain" "int32:$priority" "array:string:$rule_args" 2>&1); then
+    return 0
+  fi
+  case "$method:$reply" in
+    'addRule:Error org.fedoraproject.FirewallD1.Exception: ALREADY_ENABLED:'*|'removeRule:Error org.fedoraproject.FirewallD1.Exception: NOT_ENABLED:'*) return 0;;
+  esac
+  printf '%s\n' "$reply" >&2
+  return 1
+}
+"#
 }
 
 /// POSIX-safe single-quote escaping: wrap `arg` in single quotes, rewriting any
@@ -653,6 +704,9 @@ fn lockdown_rebuild_batches_for(
 /// teardown safety check so we never leave the user locked out. The read is
 /// unprivileged, so this check costs no password prompt.
 fn family_has_marked_rule(family: &str) -> AppResult<bool> {
+    if let Ok(rules) = read_rule_batches(true) {
+        return Ok(rules.iter().any(|batch| batch[3] == family));
+    }
     for table in MANAGED_TABLES {
         if read_marked_rules(family, table)?
             .lines()
@@ -680,22 +734,13 @@ fn direct_args(verb: &str, family: &str, table: &str) -> Vec<String> {
 
 /// Removal batches for every Neutron-tagged rule across all families.
 fn marked_removal_batches() -> AppResult<Vec<Vec<String>>> {
-    let mut batches = Vec::new();
-    for family in FAMILIES {
-        for table in MANAGED_TABLES {
-            batches.extend(parse_marked_removals(
-                family,
-                table,
-                &read_marked_rules(family, table)?,
-            ));
-        }
-    }
-    Ok(batches)
+    read_rule_batches(true)
 }
 
 /// Parse `--get-rules` output (a newline-separated list of `<priority> <args>`)
 /// into a `--remove-rule` batch for each Neutron-tagged rule. Untagged (foreign)
 /// rules are skipped so user-defined direct rules are preserved.
+#[cfg(test)]
 fn parse_marked_removals(family: &str, table: &str, listing: &str) -> Vec<Vec<String>> {
     listing
         .lines()
@@ -838,6 +883,49 @@ fn reload_batch() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn direct_bus_writes_ignore_only_their_exact_idempotent_errors() {
+        let fake = "dbus-send() { printf '%s\\n' \"$ERROR\" >&2; return 1; }\n";
+        for (verb, error, succeeds) in [
+            (
+                "--add-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: ALREADY_ENABLED: rule exists",
+                true,
+            ),
+            (
+                "--remove-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: NOT_ENABLED: rule absent",
+                true,
+            ),
+            (
+                "--add-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: COMMAND_FAILED: ALREADY_ENABLED interface failed",
+                false,
+            ),
+            (
+                "--add-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: NOT_ENABLED: wrong operation",
+                false,
+            ),
+            (
+                "--remove-rule",
+                "Error org.fedoraproject.FirewallD1.Exception: ALREADY_ENABLED: wrong operation",
+                false,
+            ),
+        ] {
+            let script = format!(
+                "set -e\n{fake}{}firewall_rule --direct {verb} ipv4 mangle OUTPUT 0 -o lo -j ACCEPT\n",
+                firewall_rule_function()
+            );
+            let output = Command::new("/bin/bash")
+                .args(["-c", &script])
+                .env("ERROR", error)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), succeeds, "{verb}: {error}");
+        }
+    }
+
+    #[test]
     fn absent_interface_names_never_become_firewall_allowances() {
         for name in ["enp9s0", "wg-pending"] {
             let mut pending = tunnel(name, &[("192.0.2.1", 51820)]);
@@ -897,7 +985,7 @@ ip() {{
       *'-o link show dev'*) printf '3: wg-race: group %s\n' "$GROUP";;
     esac
 }}
-firewall-cmd() {{ printf '%s\n' "$*" >> {dir}/calls; }}
+dbus-send() {{ printf '%s\n' "$*" >> {dir}/calls; }}
 "#,
             dir = shell_quote(dir.to_str().unwrap())
         );
@@ -921,9 +1009,9 @@ firewall-cmd() {{ printf '%s\n' "$*" >> {dir}/calls; }}
                 assert!(
                     calls
                         .lines()
-                        .all(|line| line.contains("--add-rule") && line.contains("-j DROP"))
+                        .all(|line| line.contains(".addRule") && line.contains("-j,DROP"))
                 );
-                assert!(!calls.contains("--remove-rule"));
+                assert!(!calls.contains(".removeRule"));
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -1434,7 +1522,7 @@ firewall-cmd() {{ printf '%s\n' "$*" >> {dir}/calls; }}
                 );
             } else {
                 assert!(
-                    !script.contains("--permanent"),
+                    script.contains("rules=$(firewall-cmd  --direct --get-all-rules)"),
                     "runtime teardown must not touch permanent rules: {script}"
                 );
             }
@@ -1478,7 +1566,7 @@ firewall-cmd() {{ printf '%s\n' "$*" >> {dir}/calls; }}
             "guards must be kept on rebuild"
         );
         assert!(
-            !live_removal_script(true, false).contains("$4"),
+            !live_removal_script(true, false).contains("[ \"$4\" != -1 ] || continue"),
             "guards must be removed on disable"
         );
     }
@@ -1576,8 +1664,8 @@ firewall-cmd() {{ printf '%s\n' "$*" >> {dir}/calls; }}
         // `set -e` stops subsequent commands after a failure.
         assert!(script.starts_with("set -e\n"));
         // One `firewall-cmd` line per batch, each argument single-quoted.
-        assert!(script.contains("\nfirewall-cmd '--reload'\n"));
-        assert!(script.contains("\nfirewall-cmd '-o' 'wg0'\n"));
+        assert!(script.contains("\nfirewall_rule '--reload'\n"));
+        assert!(script.contains("\nfirewall_rule '-o' 'wg0'\n"));
     }
 
     #[test]
@@ -1597,8 +1685,8 @@ firewall-cmd() {{ printf '%s\n' "$*" >> {dir}/calls; }}
         // the value is emitted as the inert `'\''` sequence, so it can never
         // close the quote early and start a new command.
         assert_eq!(
-            script,
-            "set -e\nfirewall-cmd '-o' 'wg0'\\''; reboot; echo '\\''' '-j' 'ACCEPT'\n"
+            script.lines().last().unwrap(),
+            "firewall_rule '-o' 'wg0'\\''; reboot; echo '\\''' '-j' 'ACCEPT'"
         );
     }
 
