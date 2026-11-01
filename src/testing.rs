@@ -706,14 +706,18 @@ impl NmPolicy for MockNmClient {
 /// Lifecycle seam.
 impl NmLifecycle for MockNmClient {
     fn list_wireguard_profiles(&self) -> AppResult<Vec<WireguardProfile>> {
-        if self
-            .fail_list_count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                if c > 0 { Some(c - 1) } else { None }
-            })
-            .is_ok()
-        {
-            return Err(AppError::CommandFailed("simulated".to_string()));
+        loop {
+            let count = self.fail_list_count.load(Ordering::SeqCst);
+            if count == 0 {
+                break;
+            }
+            if self
+                .fail_list_count
+                .compare_exchange(count, count - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(AppError::CommandFailed("simulated".to_string()));
+            }
         }
         let active = self.active_uuids();
         let deleted = self.deleted.lock().expect("mock mutex poisoned");
