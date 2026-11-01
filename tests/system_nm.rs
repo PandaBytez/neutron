@@ -300,20 +300,30 @@ fn refreshed_routes_reach_the_active_device_without_reconnecting() {
     cfg.global_split_tunnel.mode = SplitTunnelMode::Include;
     // Numeric DNS targets give a deterministic resolver answer without external DNS.
     cfg.global_split_tunnel.domains = vec!["198.18.1.2".into()];
+    let wait_for_routes = |want: &str, reject: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let output = std::process::Command::new("ip")
+                .args(["-4", "route", "show", "dev", &fixture.name])
+                .output()
+                .unwrap();
+            let routes = String::from_utf8_lossy(&output.stdout).into_owned();
+            if routes.contains(want) && (reject.is_empty() || !routes.contains(reject)) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{routes}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
     neutron::config::save(&path, &cfg).unwrap();
     neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
+    wait_for_routes("198.18.1.2", "");
     neutron::config::update(&path, |cfg| {
         cfg.global_split_tunnel.domains = vec!["198.18.1.3".into()]
     })
     .unwrap();
     neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
-    let output = std::process::Command::new("ip")
-        .args(["-4", "route", "show", "dev", &fixture.name])
-        .output()
-        .unwrap();
-    let routes = String::from_utf8_lossy(&output.stdout);
-    assert!(routes.contains("198.18.1.3"), "{routes}");
-    assert!(!routes.contains("198.18.1.2"), "{routes}");
+    wait_for_routes("198.18.1.3", "198.18.1.2");
     assert!(
         CliNmClient
             .list_wireguard_profiles()
