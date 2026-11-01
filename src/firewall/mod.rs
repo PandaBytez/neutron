@@ -140,40 +140,7 @@ pub trait FirewallClient {
 impl FirewallClient for crate::nm::CliNmClient {
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()> {
         let tunnels = validate_tunnel_interfaces(tunnels)?;
-        let active_tunnels: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
-        let required = lockdown_enable_batches(&active_tunnels);
-        let allowed = lockdown_enable_batches(&tunnels);
-        // Everything that mutates the firewall runs in ONE privileged batch so
-        // the user is prompted for a password at most once. Reads are
-        // unprivileged and never prompt.
-        //
-        // Permanent fail-closed guards protect every intermediate rebuild state.
-        let mut script = locked_script();
-        script.push_str(&interface_validation_script(&tunnels));
-        script.push_str(&helper::install_script()?);
-        if let (Ok(permanent), Ok(runtime)) = (
-            marked_removal_batches(),
-            helper::normalized_runtime_removals(),
-        ) {
-            let batches =
-                helper::partial_refresh_batches_for(permanent, runtime, &required, &allowed);
-            if !batches.is_empty() {
-                script.push_str(&build_firewall_script(&batches));
-            }
-        } else {
-            for permanent in [true, false] {
-                let mut batches = lockdown_rebuild_batches(Vec::new(), &active_tunnels);
-                if !permanent {
-                    for batch in &mut batches {
-                        batch.remove(0);
-                    }
-                }
-                script.push_str(&build_firewall_script(&batches[..2]));
-                script.push_str(&live_removal_script(permanent, true));
-                script.push_str(&build_firewall_script(&batches[2..]));
-            }
-        }
-        script.push_str(&retire_tag_guards_script());
+        let script = lockdown_enable_script(&tunnels, &helper::install_script()?);
         run_script(&script, true)?;
         if tunnels.iter().any(|t| !t.is_active) {
             std::thread::spawn(|| {
@@ -416,6 +383,27 @@ fn locked_script() -> String {
         helper::LOCK_TIMEOUT.as_secs(),
         7,
     ));
+    script
+}
+
+fn lockdown_enable_script(tunnels: &[WireguardTunnel], installation: &str) -> String {
+    let active: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
+    let mut script = locked_script();
+    script.push_str(&interface_validation_script(tunnels));
+    script.push_str(installation);
+    // A snapshot taken before authentication can be invalid by the time these locks are held.
+    for permanent in [true, false] {
+        let mut batches = lockdown_rebuild_batches(Vec::new(), &active);
+        if !permanent {
+            for batch in &mut batches {
+                batch.remove(0);
+            }
+        }
+        script.push_str(&build_firewall_script(&batches[..2]));
+        script.push_str(&live_removal_script(permanent, true));
+        script.push_str(&build_firewall_script(&batches[2..]));
+    }
+    script.push_str(&retire_tag_guards_script());
     script
 }
 
@@ -824,7 +812,7 @@ fn local_network_batches(family: &str) -> Vec<Vec<String>> {
     };
     networks
         .iter()
-        .map(|network| add_rule(family, 1, &["-d", network, "-j", "ACCEPT"]))
+        .map(|network| add_rule(family, 2, &["-d", network, "-j", "ACCEPT"]))
         .collect()
 }
 
@@ -882,6 +870,43 @@ fn reload_batch() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enable_rebuilds_empty_post_authorization_state_in_both_scopes() {
+        let dir = crate::testing::scratch_dir("enable-live-state");
+        let fake = format!(
+            "ip() {{ :; }}\n\
+             firewall-cmd() {{ :; }}\n\
+             dbus-send() {{ printf '%s\\n' \"$*\" >> {}; }}\n",
+            shell_quote(dir.join("calls").to_str().unwrap()),
+        );
+        let script = lockdown_enable_script(&[], ":\n");
+        // Only injected commands run; the production lock prefix is tested separately.
+        let body = script.strip_prefix(&locked_script()).unwrap();
+        let output = Command::new("/bin/sh")
+            .args(["-c", &format!("set -e\n{fake}{body}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        for interface in [
+            "org.fedoraproject.FirewallD1.direct.addRule",
+            "org.fedoraproject.FirewallD1.config.direct.addRule",
+        ] {
+            for family in FAMILIES {
+                assert!(
+                    calls.lines().any(|line| {
+                        line.contains(interface)
+                            && line.contains(&format!("string:{family}"))
+                            && line.contains("int32:10")
+                            && line.contains("neutron-lockdown,-j,DROP")
+                    }),
+                    "missing {family} default drop: {calls}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn direct_bus_writes_ignore_only_their_exact_idempotent_errors() {
         let fake = "dbus-send() { printf '%s\\n' \"$ERROR\" >&2; return 1; }\n";

@@ -50,6 +50,14 @@ pub struct IndicatorSharedState {
 }
 
 impl IndicatorSharedState {
+    fn update_active_profile(&mut self, name: Option<String>, uuid: Option<String>) {
+        if self.active_uuid != uuid {
+            self.forwarded_port = None;
+        }
+        self.active_profile = name;
+        self.active_uuid = uuid;
+    }
+
     pub fn ensure_favorite_ids(&mut self) {
         for (uuid, _) in &self.favorite_profiles {
             if !self.favorite_id_map.values().any(|known| known == uuid) {
@@ -421,8 +429,7 @@ fn refresh_active_state<C: NmClient>(client: &C, state: &Arc<Mutex<IndicatorShar
     if let Ok(mut st) = state.lock()
         && (st.active_profile != active_name || st.active_uuid != active_uuid)
     {
-        st.active_profile = active_name;
-        st.active_uuid = active_uuid;
+        st.update_active_profile(active_name, active_uuid);
         st.menu_revision += 1;
     }
 }
@@ -1072,8 +1079,10 @@ where
             .ok()
             .and_then(|path| crate::config::load(&path).ok())
             .unwrap_or_default();
-        st.active_profile = active.map(|p| p.name.clone());
-        st.active_uuid = active.map(|p| p.uuid.clone());
+        st.update_active_profile(
+            active.map(|p| p.name.clone()),
+            active.map(|p| p.uuid.clone()),
+        );
         st.favorite_profiles = profiles
             .iter()
             .filter(|p| app_cfg.favorite_profile_ids.contains(&p.uuid))
@@ -1126,8 +1135,7 @@ where
                 || st.active_uuid != active_uuid
                 || st.favorite_profiles != favorites)
         {
-            st.active_profile = active_name.clone();
-            st.active_uuid = active_uuid.clone();
+            st.update_active_profile(active_name.clone(), active_uuid.clone());
             st.favorite_profiles = favorites.clone();
             st.ensure_favorite_ids();
             st.menu_revision += 1;
@@ -1196,6 +1204,7 @@ where
         }
 
         if let Ok(mut st) = state.lock()
+            && st.active_uuid == active_uuid
             && st.forwarded_port != lease.port
         {
             st.forwarded_port = lease.port;
@@ -1346,6 +1355,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn switching_profiles_clears_the_shared_port_but_renaming_preserves_it() {
+        use crate::nm::NmLifecycle;
+        use crate::testing::profile;
+        let client = MockNmClient::new(vec![
+            profile("A", "uuid-a", ProfileState::Active),
+            profile("B", "uuid-b", ProfileState::Inactive),
+        ]);
+        let state = Arc::new(Mutex::new(IndicatorSharedState {
+            active_profile: Some("A".into()),
+            active_uuid: Some("uuid-a".into()),
+            forwarded_port: Some(51820),
+            ..Default::default()
+        }));
+        client.switch_to("uuid-b").unwrap();
+        refresh_active_state(&client, &state);
+        let mut shared = state.lock().unwrap();
+        assert_eq!(shared.active_uuid.as_deref(), Some("uuid-b"));
+        assert_eq!(shared.forwarded_port, None);
+        shared.forwarded_port = Some(40000);
+        shared.update_active_profile(Some("B renamed".into()), Some("uuid-b".into()));
+        assert_eq!(shared.forwarded_port, Some(40000));
+        shared.update_active_profile(None, None);
+        assert_eq!(shared.forwarded_port, None);
     }
 
     #[test]

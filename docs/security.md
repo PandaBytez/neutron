@@ -107,7 +107,7 @@ to `firewall-cmd` so their exact argument values are preserved.
 | :---: | :--- | :---: | :--- |
 | **0** | `-o lo` | `ACCEPT` | Allow local loopback communication |
 | **1** | `-p udp/tcp --dport 53` | `ACCEPT` / `DROP` | Allow bootstrap DNS when disconnected; block non-tunnel DNS when connected |
-| **1** | `-d <LAN_SUBNETS>` | `ACCEPT` | Keep local LAN devices reachable (Router, Printer, NAS) |
+| **2** | `-d <LAN_SUBNETS>` | `ACCEPT` | Keep local LAN devices reachable (Router, Printer, NAS) |
 | **0** | `-o <TUNNEL_IFACE>` | `ACCEPT` | Allow traffic on verified, existing WireGuard interfaces |
 | **0** | `-p udp -d <PEER_HOST> --dport <PEER_PORT>` | `ACCEPT` | Allow encrypted WireGuard handshake packets, including UDP/53 |
 | **10** | All remaining packets | `DROP` | Block other outbound traffic before filter-table accepts |
@@ -166,6 +166,10 @@ open descriptor rather than trusting a replaceable executable pathname.
 
 Mutations take the legacy `/run/neutron-lockdown.lock` and then the private
 `/run/neutron-lockdown/lock`, preserving old inode coordination across upgrades.
+Authenticated enable enumerates and rebuilds the rules under these locks, even
+on repeat enable, so changes made during its password prompt cannot invalidate
+a precomputed diff. Automatic refreshes remain incremental. DNS rules have a
+strictly earlier priority than LAN allowances, including after incremental updates.
 The private directory is root-owned `0700`, lock files are root-owned `0600`, and
 each lock acquisition is bounded to 10 seconds. Unsafe file types, owners, or
 links are rejected; lock files are not unlinked during teardown. This bounds lock

@@ -12,7 +12,7 @@ binary = sys.argv[1]
 namespace = "neutron-bootstrap-peer"
 peer = ["nsenter", f"--net=/run/netns/{namespace}"]
 name = f"nbt{os.getpid()}"
-resolver = "203.0.113.53"
+resolver = "192.168.249.53"
 resolv_conf = Path("/etc/resolv.conf")
 original_dns = resolv_conf.read_bytes()
 server = None
@@ -55,14 +55,14 @@ PersistentKeepalive = 0
         run("ip", "netns", "add", namespace)
         run("ip", "link", "add", "nb-physical", "type", "veth", "peer", "name", "nb-peer")
         run("ip", "link", "set", "nb-peer", "netns", namespace)
-        run("ip", "addr", "add", "203.0.113.1/24", "dev", "nb-physical")
+        run("ip", "addr", "add", "192.168.249.1/24", "dev", "nb-physical")
         run(*peer, "ip", "addr", "add", f"{resolver}/24", "dev", "nb-peer")
         run("ip", "link", "set", "nb-physical", "up")
         run(*peer, "ip", "link", "set", "nb-peer", "up")
         server = subprocess.Popen([*peer, sys.executable, "-u", "-c", """
 import socket, struct
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(('203.0.113.53', 53))
+sock.bind(('192.168.249.53', 53))
 print('ready', flush=True)
 while True:
     query, client = sock.recvfrom(4096)
@@ -98,7 +98,7 @@ while True:
         rules = run("firewall-cmd", "--direct", "--get-all-rules")
         assert any(f"-o {name} " in rule and "ACCEPT" in rule for rule in rules.splitlines()), rules
         assert any("198.18.251.1" in rule and "--dport 53" in rule and "ACCEPT" in rule for rule in rules.splitlines()), rules
-        # Bootstrap DNS is closed again, including to the physical-side resolver.
+        # Bootstrap DNS closes ahead of the retained LAN allowance on physical egress.
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         probe.settimeout(0.5)
         try:

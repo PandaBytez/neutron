@@ -513,8 +513,10 @@ pub struct TuiState {
     pub toast: Option<Toast>,
     pub connecting: Option<ConnectingState>,
     pub connect_tx: Option<std::sync::mpsc::Sender<(String, String, bool)>>,
-    pub split_tunnel_tx: Option<std::sync::mpsc::Sender<(SplitTunnelConfig, SplitTunnelConfig)>>,
-    pub pending_split: Option<SplitTunnelConfig>,
+    pub split_tunnel_tx:
+        Option<std::sync::mpsc::Sender<(u64, SplitTunnelConfig, SplitTunnelConfig)>>,
+    pub pending_split: Option<u64>,
+    split_request_id: u64,
     pub profile_refresh_requested: bool,
     pub action_tx: Option<std::sync::mpsc::Sender<AsyncAction>>,
     pub diag_tx: Option<std::sync::mpsc::Sender<(String, bool)>>,
@@ -605,6 +607,7 @@ impl TuiState {
             connect_tx: None,
             split_tunnel_tx: None,
             pending_split: None,
+            split_request_id: 0,
             profile_refresh_requested: false,
             action_tx: None,
             diag_tx: None,
@@ -621,9 +624,14 @@ impl TuiState {
         client: &C,
         new_cfg: SplitTunnelConfig,
     ) -> crate::error::AppResult<()> {
+        self.split_request_id = self.split_request_id.checked_add(1).ok_or_else(|| {
+            crate::error::AppError::Config(
+                "split request counter exhausted; restart Neutron".into(),
+            )
+        })?;
         let original = std::mem::replace(&mut self.config.global_split_tunnel, new_cfg.clone());
         let result = if let Some(ref tx) = self.split_tunnel_tx {
-            tx.send((original, new_cfg.clone()))
+            tx.send((self.split_request_id, original, new_cfg.clone()))
                 .map_err(|_| crate::error::AppError::Config("split policy worker stopped".into()))
         } else {
             crate::app::split_tunnel::apply_split_config_if_unchanged(
@@ -638,7 +646,7 @@ impl TuiState {
             self.set_error(error);
             self.reload_split_tunnel();
         } else if self.split_tunnel_tx.is_some() {
-            self.pending_split = Some(new_cfg);
+            self.pending_split = Some(self.split_request_id);
         } else {
             self.uncertain_policies
                 .remove(&crate::error::Policy::SplitTunnel);
@@ -658,14 +666,11 @@ impl TuiState {
 
     pub fn finish_split(
         &mut self,
+        request_id: u64,
         applied: SplitTunnelConfig,
         result: crate::error::AppResult<()>,
     ) {
-        if self
-            .pending_split
-            .as_ref()
-            .is_some_and(|pending| pending != &applied)
-        {
+        if self.pending_split != Some(request_id) {
             // An older reply must not replace a newer edit still queued.
             if let Err(error) = result {
                 self.set_error(&error);
@@ -1034,19 +1039,20 @@ mod tests {
             mode: SplitTunnelMode::Exclude,
             ..Default::default()
         };
-        state.pending_split = Some(pending.clone());
+        state.pending_split = Some(2);
 
         // Stale failure: the error surfaces, but the newer pending edit stays.
         state.finish_split(
+            1,
             stale,
             Err(crate::error::AppError::Config("stale boom".into())),
         );
         assert!(state.status_is_error);
-        assert_eq!(state.pending_split, Some(pending.clone()));
+        assert_eq!(state.pending_split, Some(2));
 
         // Stale success: silently dropped, pending edit and status untouched.
-        state.finish_split(SplitTunnelConfig::default(), Ok(()));
-        assert_eq!(state.pending_split, Some(pending.clone()));
+        state.finish_split(1, SplitTunnelConfig::default(), Ok(()));
+        assert_eq!(state.pending_split, Some(2));
         assert!(state.status_is_error);
         assert!(state.status_message.contains("stale boom"));
 
@@ -1054,7 +1060,7 @@ mod tests {
         state.modal = ActiveModal::SplitTunnel(SplitTunnelModalState::from_config(
             &SplitTunnelConfig::default(),
         ));
-        state.finish_split(pending.clone(), Ok(()));
+        state.finish_split(2, pending.clone(), Ok(()));
         assert!(state.pending_split.is_none());
         assert_eq!(state.config.global_split_tunnel, pending);
         assert_eq!(
@@ -1068,7 +1074,9 @@ mod tests {
         }
 
         // Fresh failure: error surfaces and config reverts to what is on disk.
+        state.pending_split = Some(3);
         state.finish_split(
+            3,
             pending,
             Err(crate::error::AppError::Config("fresh boom".into())),
         );

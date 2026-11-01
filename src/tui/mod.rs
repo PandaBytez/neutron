@@ -155,25 +155,26 @@ where
     });
 
     let (split_tunnel_tx, split_tunnel_rx) = std::sync::mpsc::channel::<(
+        u64,
         crate::config::SplitTunnelConfig,
         crate::config::SplitTunnelConfig,
     )>();
     let (st_res_tx, st_res_rx) =
-        std::sync::mpsc::channel::<(crate::config::SplitTunnelConfig, AppResult<()>)>();
+        std::sync::mpsc::channel::<(u64, crate::config::SplitTunnelConfig, AppResult<()>)>();
     state.split_tunnel_tx = Some(split_tunnel_tx);
 
     let client_for_st = client.clone();
     let config_path_for_st = state.config_path.clone();
     thread::spawn(move || {
         // Keep every predecessor: dropping an intermediate edit breaks snapshot checks.
-        while let Ok((original, cfg)) = split_tunnel_rx.recv() {
+        while let Ok((request_id, original, cfg)) = split_tunnel_rx.recv() {
             let res = crate::app::split_tunnel::apply_split_config_if_unchanged(
                 &client_for_st,
                 &config_path_for_st,
                 &original,
                 &cfg,
             );
-            let _ = st_res_tx.send((cfg, res));
+            let _ = st_res_tx.send((request_id, cfg, res));
         }
     });
 
@@ -253,7 +254,7 @@ fn run_event_loop<C, B>(
     lat_rx: &std::sync::mpsc::Receiver<u32>,
     cache_rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
     conn_res_rx: &std::sync::mpsc::Receiver<(String, AppResult<()>, bool)>,
-    st_res_rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
+    st_res_rx: &std::sync::mpsc::Receiver<(u64, crate::config::SplitTunnelConfig, AppResult<()>)>,
     action_res_rx: &std::sync::mpsc::Receiver<crate::tui::state::AsyncActionResult>,
     monitor_events: &Arc<AtomicU64>,
     initial_refresh_needed: bool,
@@ -458,10 +459,10 @@ fn drain_connection_results(
 
 fn drain_split_results(
     state: &mut TuiState,
-    rx: &std::sync::mpsc::Receiver<(crate::config::SplitTunnelConfig, AppResult<()>)>,
+    rx: &std::sync::mpsc::Receiver<(u64, crate::config::SplitTunnelConfig, AppResult<()>)>,
 ) {
-    while let Ok((applied_cfg, res)) = rx.try_recv() {
-        state.finish_split(applied_cfg, res);
+    while let Ok((request_id, applied_cfg, res)) = rx.try_recv() {
+        state.finish_split(request_id, applied_cfg, res);
     }
 }
 
@@ -884,7 +885,8 @@ mod tests {
             cidrs: vec!["10.0.0.0/8".to_string()],
             domains: Vec::new(),
         };
-        tx.send((applied.clone(), Ok(()))).unwrap();
+        state.pending_split = Some(1);
+        tx.send((1, applied.clone(), Ok(()))).unwrap();
         drain_split_results(&mut state, &rx);
         assert!(state.pending_split.is_none());
         assert_eq!(state.config.global_split_tunnel, applied);

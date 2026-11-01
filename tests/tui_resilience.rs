@@ -361,7 +361,7 @@ fn split_worker_failure_reconciles_modal_and_pending_state() {
     rejected_cfg.cidrs.push("192.168.1.0/24".to_string());
 
     state.apply_split_tunnel(&client, rejected_cfg).unwrap();
-    let (original, pending) = st_rx.recv().unwrap();
+    let (request_id, original, pending) = st_rx.recv().unwrap();
     assert_eq!(original, config::SplitTunnelConfig::default());
     assert_eq!(pending.cidrs, vec!["192.168.1.0/24".to_string()]);
 
@@ -372,7 +372,11 @@ fn split_worker_failure_reconciles_modal_and_pending_state() {
         vec!["192.168.1.0/24".to_string()]
     );
 
-    state.finish_split(pending, Err(AppError::CommandFailed("rejected".into())));
+    state.finish_split(
+        request_id,
+        pending,
+        Err(AppError::CommandFailed("rejected".into())),
+    );
     assert!(state.pending_split.is_none());
     assert!(state.config.global_split_tunnel.cidrs.is_empty());
     if let neutron::tui::state::ActiveModal::SplitTunnel(modal) = &state.modal {
@@ -413,13 +417,13 @@ fn stale_split_snapshot_reloads_without_overwriting_cli_exclusions() {
         // Apply through keyboard dispatch, using the modal's stale snapshot.
         if queued {
             press(&mut state, &client, KeyCode::Enter).unwrap();
-            let (original, edited) = rx.try_recv().unwrap();
+            let (request_id, original, edited) = rx.try_recv().unwrap();
             assert_eq!(original, SplitTunnelConfig::default());
             let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
                 &client, &path, &original, &edited,
             );
             assert!(result.is_err());
-            state.finish_split(edited, result);
+            state.finish_split(request_id, edited, result);
         } else {
             assert!(press(&mut state, &client, KeyCode::Enter).is_err());
         }
@@ -461,7 +465,7 @@ fn rapid_split_edits_queue_each_predecessor_and_ignore_older_replies() {
     state.apply_split_tunnel(&client, second.clone()).unwrap();
 
     for (base, edited) in [(original, first.clone()), (first, second.clone())] {
-        let (captured, requested) = rx.try_recv().unwrap();
+        let (request_id, captured, requested) = rx.try_recv().unwrap();
         assert_eq!(captured, base);
         assert_eq!(requested, edited);
         let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
@@ -469,7 +473,7 @@ fn rapid_split_edits_queue_each_predecessor_and_ignore_older_replies() {
         );
         assert!(result.is_ok(), "{result:?}");
         let older_reply = requested != second;
-        state.finish_split(requested, result);
+        state.finish_split(request_id, requested, result);
         assert_eq!(state.config.global_split_tunnel, second);
         assert_eq!(state.pending_split.is_some(), older_reply);
     }
@@ -506,6 +510,54 @@ fn stopped_split_worker_reloads_persisted_settings_and_modal() {
             &SplitTunnelConfig::default()
         ),)
     );
+    testing::remove_temp_config(&path);
+}
+
+#[test]
+fn returning_to_an_earlier_split_mode_keeps_newer_edits_pending() {
+    let client = MockNmClient::default();
+    let (mut state, path) = state_for(&client, "tui-split-repeated-mode");
+    let first = SplitTunnelConfig {
+        mode: SplitTunnelMode::Include,
+        cidrs: vec!["192.0.2.0/24".into()],
+        domains: Vec::new(),
+    };
+    let second = SplitTunnelConfig {
+        mode: SplitTunnelMode::Exclude,
+        ..first.clone()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.split_tunnel_tx = Some(tx);
+    for config in [first.clone(), second, first.clone()] {
+        state.apply_split_tunnel(&client, config).unwrap();
+    }
+    let latest = state.pending_split;
+    for _ in 0..2 {
+        let (request_id, original, edited) = rx.recv().unwrap();
+        let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
+            &client, &path, &original, &edited,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        state.finish_split(request_id, edited, result);
+        assert_eq!(state.pending_split, latest);
+        assert_eq!(state.config.global_split_tunnel, first);
+    }
+    let mut final_edit = first.clone();
+    final_edit.cidrs.push("198.51.100.0/24".into());
+    state
+        .apply_split_tunnel(&client, final_edit.clone())
+        .unwrap();
+    for _ in 0..2 {
+        let (request_id, original, edited) = rx.recv().unwrap();
+        let result = neutron::app::split_tunnel::apply_split_config_if_unchanged(
+            &client, &path, &original, &edited,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        state.finish_split(request_id, edited, result);
+    }
+    assert!(state.pending_split.is_none());
+    assert_eq!(state.config.global_split_tunnel, final_edit);
+    assert_eq!(config::load(&path).unwrap().global_split_tunnel, final_edit);
     testing::remove_temp_config(&path);
 }
 

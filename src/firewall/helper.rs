@@ -773,6 +773,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn incremental_refresh_migrates_lan_rules_below_connected_dns_drops() {
+        let connected = lockdown_enable_batches(&[WireguardTunnel {
+            interface: Some("wg0".into()),
+            is_active: true,
+            ..Default::default()
+        }]);
+        for old_priority in [1, 2] {
+            let mut old = lockdown_enable_batches(&[]);
+            for rule in &mut old {
+                rule[2] = "--remove-rule".into();
+                if rule.iter().any(|arg| arg == "-d") {
+                    rule[6] = old_priority.to_string();
+                }
+            }
+            let delta =
+                partial_refresh_batches_for(old.clone(), old.clone(), &connected, &connected);
+            for permanent in [true, false] {
+                let mut installed = old.clone();
+                for batch in delta
+                    .iter()
+                    .filter(|b| (b[0] == "--permanent") == permanent)
+                {
+                    let mut rule = batch.clone();
+                    if !permanent {
+                        rule.insert(0, "--permanent".into());
+                    }
+                    if rule[2] == "--add-rule" {
+                        rule[2] = "--remove-rule".into();
+                        installed.push(rule);
+                        // firewalld inserts new rules after existing equal-priority rules.
+                        installed.sort_by_key(|r| r[6].parse::<i32>().unwrap());
+                    } else {
+                        installed.retain(|r| r != &rule);
+                    }
+                }
+                assert!(rules_match(&installed, &connected));
+                for family in FAMILIES {
+                    let last_dns = installed
+                        .iter()
+                        .rposition(|r| {
+                            r[3] == family && r.windows(2).any(|p| p == ["--dport", "53"])
+                        })
+                        .unwrap();
+                    let first_lan = installed
+                        .iter()
+                        .position(|r| r[3] == family && r.iter().any(|arg| arg == "-d"))
+                        .unwrap();
+                    assert!(last_dns < first_lan, "DNS must precede LAN: {installed:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn authorization_check_is_unprivileged_and_noninteractive() {
         let command = authorization_command();
         assert_eq!(command.get_program(), "pkcheck");
@@ -1133,7 +1187,7 @@ mod tests {
             "inactive tunnels are deferred to background warming: {initial:?}"
         );
 
-        // Once active rules (or full warmed rules) are installed, repeat enable is a 0-batch no-op.
+        // Matching refreshes preserve all warmed inactive rules without writes.
         let installed_full: Vec<_> = allowed
             .iter()
             .map(|b| {
@@ -1150,7 +1204,7 @@ mod tests {
                 &allowed
             )
             .is_empty(),
-            "repeat enable must not tear down already-warmed inactive rules"
+            "matching refresh must not tear down already-warmed inactive rules"
         );
         assert!(
             verify_partial_protection_with(&required, &allowed, &installed_full, &installed_full)
