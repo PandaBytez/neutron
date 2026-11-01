@@ -49,14 +49,34 @@ pub fn ensure_app_dirs(config: &AppConfig) -> std::io::Result<()> {
 
 /// Scan the configured `profiles_dir` inbox and import any new `.conf` files into NetworkManager.
 ///
-/// Source removal is best-effort after import or a matching profile name.
+/// Claim files before import so an editor's replacement is never consumed.
 pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResult<SyncReport> {
+    sync_profiles_dir_with(client, config, |path| client.import_wireguard_profile(path))
+}
+
+fn sync_profiles_dir_with<C: NmClient>(
+    client: &C,
+    config: &AppConfig,
+    mut import: impl FnMut(&Path) -> AppResult<String>,
+) -> AppResult<SyncReport> {
     let dir = config::resolve_profiles_dir(config);
     let _ = ensure_profiles_dir(&dir);
 
     if !dir.is_dir() {
         return Ok(SyncReport::default());
     }
+    let _lock = match config::lock_sidecar(&dir.join("sync"), ".lock") {
+        Ok(lock) => lock,
+        Err(error) => {
+            return Ok(SyncReport {
+                errors: vec![format!(
+                    "Could not lock profiles directory {}: {error}",
+                    terminal_safe(&dir.display().to_string())
+                )],
+                ..Default::default()
+            });
+        }
+    };
 
     let existing_profiles = client.list_wireguard_profiles()?;
     let existing_names: HashSet<String> = existing_profiles.into_iter().map(|p| p.name).collect();
@@ -76,7 +96,8 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("conf") {
+        if entry.file_type()?.is_file() && path.extension().and_then(|e| e.to_str()) == Some("conf")
+        {
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -92,23 +113,52 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
                 continue;
             }
 
-            match client.import_wireguard_profile(&path) {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let processing = dir.join(format!(".import-{}-{stamp}", std::process::id()));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            let claimed = processing.join(entry.file_name());
+            if let Err(err) = builder
+                .create(&processing)
+                .and_then(|_| fs::rename(&path, &claimed))
+            {
+                let _ = fs::remove_dir(&processing);
+                report.errors.push(terminal_safe(&format!(
+                    "Could not claim {} for import: {err}",
+                    path.display()
+                )));
+                continue;
+            }
+            match import(&claimed) {
                 Ok(_) => {
                     report.imported.push(stem);
-                    if let Err(err) = fs::remove_file(&path) {
+                    if let Err(err) = fs::remove_file(&claimed) {
                         report.errors.push(terminal_safe(&format!(
                             "Failed to remove imported inbox file {}: {err}",
-                            path.display()
+                            claimed.display()
                         )));
                     }
                 }
                 Err(err) => {
+                    // hard_link never overwrites a newer inbox file.
+                    if fs::hard_link(&claimed, &path).is_ok() {
+                        let _ = fs::remove_file(&claimed);
+                    }
                     report.errors.push(terminal_safe(&format!(
-                        "{}: {err}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
+                        "{}: {err}; source retained at {}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        if claimed.exists() { &claimed } else { &path }.display()
                     )));
                 }
             }
+            let _ = fs::remove_dir(&processing);
         }
     }
 
@@ -117,6 +167,49 @@ pub fn sync_profiles_dir<C: NmClient>(client: &C, config: &AppConfig) -> AppResu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replacing_an_inbox_file_during_import_preserves_the_replacement_and_failed_snapshot() {
+        for fail in [false, true] {
+            let dir = crate::testing::scratch_dir("claimed-import");
+            let original = dir.join("wg-test.conf");
+            std::fs::write(&original, "old contents").unwrap();
+            let mut cfg = crate::config::AppConfig::default();
+            cfg.general.profiles_dir = dir.to_str().unwrap().into();
+            let report = super::sync_profiles_dir_with(
+                &crate::testing::MockNmClient::default(),
+                &cfg,
+                |claimed| {
+                    assert_eq!(std::fs::read_to_string(claimed).unwrap(), "old contents");
+                    assert_ne!(claimed, original);
+                    assert_eq!(claimed.file_name(), original.file_name());
+                    std::fs::write(&original, "new contents").unwrap();
+                    if fail {
+                        Err(crate::error::AppError::Config("import rejected".into()))
+                    } else {
+                        Ok("imported".into())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(&original).unwrap(), "new contents");
+            assert_eq!(report.imported.len(), usize::from(!fail));
+            if fail {
+                let processing = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .find(|e| e.file_name().to_string_lossy().starts_with(".import-"))
+                    .unwrap()
+                    .path();
+                assert_eq!(
+                    std::fs::read_to_string(processing.join("wg-test.conf")).unwrap(),
+                    "old contents"
+                );
+                assert!(report.errors[0].contains("source retained"));
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     use super::*;
     use crate::nm::{ProfileState, WireguardProfile};
     use crate::testing::{MockNmClient, scratch_dir};
@@ -244,10 +337,10 @@ mod tests {
         };
 
         let report = sync_profiles_dir(&client, &config).unwrap();
-        assert_eq!(report.imported, vec!["stuck".to_string()]);
+        assert!(report.imported.is_empty());
         assert_eq!(report.errors.len(), 1);
         assert!(
-            report.errors[0].contains("Failed to remove imported inbox file"),
+            report.errors[0].contains("Could not lock profiles directory"),
             "removal failure must be reported, not swallowed: {:?}",
             report.errors
         );

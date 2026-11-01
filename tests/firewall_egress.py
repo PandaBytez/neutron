@@ -94,6 +94,10 @@ while True:
         run(*peer_exec, "ip", "addr", "del", peer, "dev", "wg-peer")
         run("ip", "addr", "add", address, "dev", "phy-test", "nodad")
         run(*peer_exec, "ip", "addr", "add", peer, "dev", "peer-test", "nodad")
+    # Reuse the formerly trusted name on a physical device. Its new device group
+    # must not inherit the deleted WireGuard link's permanent allowance.
+    run("ip", "link", "del", "wg-test")
+    run("ip", "link", "set", "phy-test", "name", "wg-test")
     for sock in sockets:
         try:
             sock.send(b"must-not-escape")

@@ -36,7 +36,7 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     proc_root: &std::path::Path,
     assume_yes: bool,
 ) -> AppResult<()> {
-    let (before, settings_readable) = load_for_teardown(path);
+    let (mut before, mut settings_readable) = load_for_teardown(path);
     if !assume_yes && !confirm_reset(&before)? {
         println!("Reset cancelled; nothing was changed.");
         return Ok(());
@@ -52,6 +52,13 @@ pub fn handle_reset_command<C: NmClient + FirewallClient>(
     // explaining why -- so the privileged, hard-to-reverse step gets the
     // opportunity to abort while the settings are still intact.
     let revoked_lockdown = revoke_installed_state(client, autostart_dir)?;
+    if let Some(backup) = config::recover_profile_info(path)? {
+        eprintln!(
+            "Corrupt profile notes preserved at {}",
+            terminal_safe(&backup.display().to_string())
+        );
+        (before, settings_readable) = load_for_teardown(path);
+    }
 
     // Withdraw the policies Neutron wrote into the NetworkManager profiles. Gated
     // on saved intent so a reset on a clean install does not sweep every profile
@@ -332,6 +339,50 @@ fn report_manual_unit(config_root: Option<&std::path::Path>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_quarantines_corrupt_notes_only_after_successful_firewall_teardown() {
+        let root = crate::testing::scratch_dir("reset-corrupt-notes");
+        let path = root.join("config.toml");
+        let mut cfg = config::AppConfig {
+            kill_switch_enabled: true,
+            lockdown_enabled: true,
+            ..Default::default()
+        };
+        cfg.global_split_tunnel.mode = config::SplitTunnelMode::Include;
+        cfg.global_split_tunnel.cidrs = vec!["10.0.0.0/8".into()];
+        cfg.qbittorrent.password = Some("sentinel".into());
+        config::save(&path, &cfg).unwrap();
+        std::fs::write(root.join("profile-info.json"), "broken notes").unwrap();
+        let failed = crate::testing::MockNmClient::default()
+            .with_installed_lockdown_state()
+            .fail_lockdown();
+        assert!(handle_reset_command(&failed, &path, None, &root.join("fake-proc"), true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("profile-info.json")).unwrap(),
+            "broken notes"
+        );
+        let client = crate::testing::MockNmClient::default().with_installed_lockdown_state();
+        handle_reset_command(&client, &path, None, &root.join("fake-proc"), true).unwrap();
+        let reset = config::load(&path).unwrap();
+        assert!(!reset.kill_switch_enabled && !reset.lockdown_enabled);
+        assert!(reset.qbittorrent.password.is_none());
+        assert_eq!(client.kill_switch_calls(), ["kill-switch-all:off"]);
+        assert_eq!(
+            client.split_tunnel_calls(),
+            ["split-tunnel-all:disabled:0:0"]
+        );
+        let backup = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().extension().is_some_and(|e| e == "corrupt"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.path()).unwrap(),
+            "broken notes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use crate::testing::{
         remove_temp_config as cleanup_test_config, scratch_dir, temp_config_path,

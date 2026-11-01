@@ -191,6 +191,22 @@ pub fn inactive(name: &str, uuid: &str) -> WireguardProfile {
     profile(name, uuid, ProfileState::Inactive)
 }
 
+/// A live, unexpired lease fixture. Never writes the production publication file.
+pub fn fresh_lease(uuid: &str, port: u16) -> crate::service::lease::LeaseState {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("fixture clock")
+        .as_secs();
+    crate::service::lease::LeaseState {
+        profile_uuid: Some(uuid.into()),
+        port: Some(port),
+        updated_at: now,
+        publisher_pid: std::process::id(),
+        expires_at: Some(now + 60),
+        ..Default::default()
+    }
+}
+
 pub fn profile(name: &str, uuid: &str, state: ProfileState) -> WireguardProfile {
     WireguardProfile {
         name: name.to_string(),
@@ -754,13 +770,30 @@ impl NmLifecycle for MockNmClient {
             // Under the policy lock, as the real client does, so a concurrent
             // toggle cannot be read half-applied.
             crate::config::coordinate_policy(config_path, || {
-                self.apply_policy_args(profile_identifier, config_path)
+                crate::nm::refuse_parallel_connect(
+                    &self.list_wireguard_profiles()?,
+                    profile_identifier,
+                    false,
+                )?;
+                self.apply_policy_args(profile_identifier, config_path)?;
+                if !self.unhealthy {
+                    self.add_active(profile_identifier);
+                }
+                Ok(())
             })?;
         } else {
+            crate::nm::refuse_parallel_connect(
+                &self.list_wireguard_profiles()?,
+                profile_identifier,
+                false,
+            )?;
             self.apply_args(&crate::nm::tunnel_routing::set_args(
                 profile_identifier,
                 true,
             ));
+            if !self.unhealthy {
+                self.add_active(profile_identifier);
+            }
         }
         if self.unhealthy {
             // As the real client does: the tunnel came up but carries no
@@ -769,7 +802,6 @@ impl NmLifecycle for MockNmClient {
                 "{profile_identifier}: connected but no traffic is passing"
             )));
         }
-        self.add_active(profile_identifier);
         record(&self.connected, profile_identifier.to_string());
         Ok(())
     }
@@ -804,20 +836,26 @@ impl NmLifecycle for MockNmClient {
         }
         if let Some(config_path) = self.policy_config_path() {
             crate::config::coordinate_policy(config_path, || {
-                self.apply_policy_args(profile_identifier, config_path)
+                self.apply_policy_args(profile_identifier, config_path)?;
+                if !self.unhealthy {
+                    self.replace_active(profile_identifier);
+                }
+                Ok(())
             })?;
         } else {
             self.apply_args(&crate::nm::tunnel_routing::set_args(
                 profile_identifier,
                 true,
             ));
+            if !self.unhealthy {
+                self.replace_active(profile_identifier);
+            }
         }
         if self.unhealthy {
             return Err(AppError::TunnelUnhealthy(format!(
                 "{profile_identifier}: connected but no traffic is passing"
             )));
         }
-        self.replace_active(profile_identifier);
         Ok(())
     }
 

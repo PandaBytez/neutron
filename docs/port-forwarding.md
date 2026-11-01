@@ -60,6 +60,12 @@ Legacy configs with the old `enabled` flags keep loading: `[port_forwarding] ena
 3. **Profile Switch / Disconnect Cleanup**: When switching profiles or disconnecting, the active port is cleared immediately to prevent displaying stale mappings.
 4. **Clipboard Integration**: The tray's Copy Forwarded Port action copies the port for pasting into BitTorrent or game servers.
 
+The publication carries the mapping's expiry separately from the daemon heartbeat.
+A fresh heartbeat cannot extend an expired mapping. The TUI accepts a port only for
+the active profile's UUID; old publications without expiry remain recognizable as
+daemon heartbeats but do not supply a usable port. Sync rechecks the active tunnel
+under the lifecycle policy lock and rejects expired queued mappings before writing.
+
 The daemon publishes its lease under `$XDG_RUNTIME_DIR/neutron/lease.json` for
 the TUI to read. On a headless system without `XDG_RUNTIME_DIR`, it still renews
 the lease and performs configured automatic qBittorrent sync, but warns that
@@ -116,6 +122,9 @@ The TUI Command Palette also offers manual qBittorrent sync. It runs in a
 background worker with a pending indicator, then reports success or failure in
 the status message. It uses the published port/profile snapshot and does not
 overwrite the daemon's automatic-sync badge verdict.
+
+Host/port edits remain local drafts until confirmation. Escape cancels them, and
+the confirmed port must be within 1–65535. Only one WebUI probe is queued at a time.
 
 ### Interface Binding
 

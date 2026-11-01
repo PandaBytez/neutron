@@ -23,6 +23,10 @@ impl std::fmt::Display for Policy {
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("another policy operation is pending; finish or cancel it before retrying")]
+    PolicyBusy,
+    #[error("another WireGuard profile became active; use switch to replace it")]
+    AlreadyActive,
     #[error(
         "{policy}: {outcome}; saved intent may differ from effective protection. Retry the policy action to reconcile: {source}"
     )]

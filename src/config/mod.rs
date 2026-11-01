@@ -453,22 +453,45 @@ static IN_PROCESS_POLICY_LOCKS: std::sync::Mutex<
     Option<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
 > = std::sync::Mutex::new(None);
 
-fn path_policy_mutex(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
-    let mut lock = IN_PROCESS_POLICY_LOCKS.lock().unwrap();
+fn path_policy_mutex(path: &Path) -> AppResult<std::sync::Arc<std::sync::Mutex<()>>> {
+    let mut lock = IN_PROCESS_POLICY_LOCKS
+        .lock()
+        .map_err(|_| AppError::Config("policy coordination mutex poisoned".into()))?;
     let map = lock.get_or_insert_with(std::collections::HashMap::new);
-    map.entry(path.to_path_buf())
+    Ok(map
+        .entry(path.to_path_buf())
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
-        .clone()
+        .clone())
 }
 
 /// Coordinate global policy sweeps and activation so concurrent workers cannot
 /// interleave profile changes and overwrite settings with stale configurations.
 pub fn coordinate_policy<R>(path: &Path, f: impl FnOnce() -> AppResult<R>) -> AppResult<R> {
-    let mutex = path_policy_mutex(path);
-    let _mem_lock = mutex
-        .lock()
-        .map_err(|_| AppError::Config("policy coordination mutex poisoned".to_string()))?;
-    let _lock = lock_sidecar(path, ".policy.lock")?;
+    coordinate_policy_with_timeout(path, std::time::Duration::from_secs(10), f)
+}
+
+fn coordinate_policy_with_timeout<R>(
+    path: &Path,
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> AppResult<R>,
+) -> AppResult<R> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mutex = path_policy_mutex(path)?;
+    let _mem_lock = loop {
+        match mutex.try_lock() {
+            Ok(lock) => break lock,
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return Err(AppError::PolicyBusy),
+            Err(_) => {
+                return Err(AppError::Config(
+                    "policy coordination mutex poisoned".into(),
+                ));
+            }
+        }
+    };
+    let _lock = lock_sidecar_until(path, ".policy.lock", deadline)?;
     f()
 }
 
@@ -482,8 +505,20 @@ pub fn update(path: &Path, edit: impl FnOnce(&mut AppConfig)) -> AppResult<AppCo
     Ok(config)
 }
 
-/// Hold a blocking lock on a stable sidecar until the returned file is dropped.
+/// Hold a stable sidecar lock, with a bounded wait, until the file is dropped.
 pub(crate) fn lock_sidecar(path: &Path, suffix: &str) -> AppResult<fs::File> {
+    lock_sidecar_until(
+        path,
+        suffix,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+}
+
+fn lock_sidecar_until(
+    path: &Path,
+    suffix: &str,
+    deadline: std::time::Instant,
+) -> AppResult<fs::File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -497,8 +532,35 @@ pub(crate) fn lock_sidecar(path: &Path, suffix: &str) -> AppResult<fs::File> {
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(suffix);
     let lock = options.open(PathBuf::from(lock_path))?;
-    lock.lock()?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err(AppError::PolicyBusy),
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
     Ok(lock)
+}
+
+/// Confirmed reset alone may quarantine unreadable notes; ordinary saves stay strict.
+pub(crate) fn recover_profile_info(path: &Path) -> AppResult<Option<PathBuf>> {
+    let _lock = lock_sidecar(path, ".lock")?;
+    if read_profile_info(path).is_ok() {
+        return Ok(None);
+    }
+    let info = profile_info_path(path);
+    if !fs::symlink_metadata(&info)?.is_file() {
+        return Err(AppError::Config(
+            "profile notes are not a regular file; left untouched".into(),
+        ));
+    }
+    let backup = PathBuf::from(format!("{}.corrupt", temporary_path(&info).display()));
+    fs::rename(&info, &backup)?;
+    write_atomically(&info, "{}")?;
+    Ok(Some(backup))
 }
 
 fn save_unlocked(path: &Path, config: &AppConfig) -> AppResult<()> {
@@ -631,6 +693,29 @@ pub fn resolve_profiles_dir(config: &AppConfig) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_and_file_lock_waits_are_bounded() {
+        let path = crate::testing::temp_config_path("bounded-policy-lock");
+        coordinate_policy(&path, || {
+            let start = std::time::Instant::now();
+            let result: AppResult<()> =
+                coordinate_policy_with_timeout(&path, std::time::Duration::from_millis(20), || {
+                    panic!("must not enter busy policy")
+                });
+            assert!(matches!(result, Err(AppError::PolicyBusy)));
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            Ok(())
+        })
+        .unwrap();
+        let held = lock_sidecar(&path, ".policy.lock").unwrap();
+        assert!(matches!(
+            coordinate_policy_with_timeout(&path, std::time::Duration::from_millis(20), || Ok(())),
+            Err(AppError::PolicyBusy)
+        ));
+        drop(held);
+        crate::testing::remove_temp_config(&path);
+    }
+
     #[test]
     fn security_parse_errors_never_retain_password_source() {
         use std::error::Error;

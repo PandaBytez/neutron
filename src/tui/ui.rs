@@ -1972,10 +1972,8 @@ mod render_tests {
     fn the_status_panel_shows_forwarded_port_with_icon() {
         let mut state = TuiState::new(std::path::PathBuf::from("/tmp/x"), AppConfig::default());
         state.active_profile_name = Some("wg-us".to_string());
-        state.lease = Some(crate::service::lease::LeaseState {
-            port: Some(51820),
-            ..Default::default()
-        });
+        state.active_profile_uuid = Some("uuid-us".into());
+        state.lease = Some(crate::testing::fresh_lease("uuid-us", 51820));
         state.latency_ms = Some(42);
 
         let rendered = rendered_status(&state);
@@ -2029,11 +2027,10 @@ mod render_tests {
         /// qBittorrent sync switched on.
         fn synced_state(status: QbitSyncStatus) -> TuiState {
             let mut state = state_without_daemon();
+            state.active_profile_uuid = Some("uuid-us".into());
             state.lease = Some(LeaseState {
-                port: Some(51820),
-                profile_uuid: Some("uuid-us".to_string()),
                 qbit_sync: status,
-                ..Default::default()
+                ..crate::testing::fresh_lease("uuid-us", 51820)
             });
             state
         }

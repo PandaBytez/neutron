@@ -518,6 +518,9 @@ pub struct TuiState {
     pub profile_refresh_requested: bool,
     pub action_tx: Option<std::sync::mpsc::Sender<AsyncAction>>,
     pub diag_tx: Option<std::sync::mpsc::Sender<(String, bool)>>,
+    pub diag_in_flight: bool,
+    pub diag_requested: Option<(String, bool)>,
+    pub qbit_probe_in_flight: bool,
     pub modal: ActiveModal,
     pub should_quit: bool,
 }
@@ -532,6 +535,7 @@ pub enum AsyncAction {
         uuid: String,
         port: u16,
         config: crate::config::QBittorrentConfig,
+        expires_at: u64,
     },
     Delete(String),
     ProbeQbitWebUi,
@@ -557,6 +561,20 @@ pub enum AsyncActionResult {
 }
 
 impl TuiState {
+    pub fn request_diagnostics(&mut self, uuid: String, active: bool) {
+        self.diag_requested = Some((uuid, active));
+        self.dispatch_diagnostics();
+    }
+
+    pub fn dispatch_diagnostics(&mut self) {
+        if !self.diag_in_flight
+            && let Some(request) = self.diag_requested.take()
+            && let Some(tx) = &self.diag_tx
+        {
+            self.diag_in_flight = tx.send(request).is_ok();
+        }
+    }
+
     pub fn new(config_path: PathBuf, config: AppConfig) -> Self {
         let theme = Theme::from_config(&config.theme);
         Self {
@@ -590,6 +608,9 @@ impl TuiState {
             profile_refresh_requested: false,
             action_tx: None,
             diag_tx: None,
+            diag_in_flight: false,
+            diag_requested: None,
+            qbit_probe_in_flight: false,
             modal: ActiveModal::None,
             should_quit: false,
         }
@@ -755,13 +776,22 @@ impl TuiState {
     /// the same thing to a reader, since an unpublished lease is not being
     /// renewed and so is not a port anyone can rely on.
     pub fn forwarded_port(&self) -> Option<u16> {
-        self.lease.as_ref()?.port
+        let lease = self.lease.as_ref()?;
+        if lease.profile_uuid.as_ref()? != self.active_profile_uuid.as_ref()? {
+            return None;
+        }
+        lease.usable_port()
     }
 
     /// What the daemon's last push to qBittorrent came to, or `None` when it is
     /// not publishing a lease to have pushed.
     pub fn qbit_sync(&self) -> Option<QbitSyncStatus> {
-        Some(self.lease.as_ref()?.qbit_sync)
+        let lease = self.lease.as_ref()?;
+        Some(if self.forwarded_port().is_some() {
+            lease.qbit_sync
+        } else {
+            QbitSyncStatus::Pending
+        })
     }
 
     pub fn selected_row(&self) -> Option<&ProfileListRow> {
@@ -778,6 +808,41 @@ impl TuiState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_keep_one_in_flight_and_only_the_latest_pending_selection() {
+        let mut state = TuiState::new(PathBuf::new(), AppConfig::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.diag_tx = Some(tx);
+        state.request_diagnostics("first".into(), false);
+        assert_eq!(rx.recv().unwrap().0, "first");
+        for index in 0..100 {
+            state.request_diagnostics(format!("pending-{index}"), true);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.diag_requested.as_ref().unwrap().0, "pending-99");
+        state.diag_in_flight = false;
+        state.dispatch_diagnostics();
+        assert_eq!(rx.recv().unwrap().0, "pending-99");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn foreign_or_expired_leases_never_supply_the_active_tunnels_port_or_sync_verdict() {
+        let mut state = TuiState::new(PathBuf::new(), AppConfig::default());
+        state.active_profile_uuid = Some("B".into());
+        let mut lease = crate::testing::fresh_lease("A", 51820);
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+        state.lease = Some(lease.clone());
+        assert!(state.forwarded_port().is_none());
+        assert_eq!(state.qbit_sync(), Some(QbitSyncStatus::Pending));
+        state.active_profile_uuid = Some("A".into());
+        assert_eq!(state.forwarded_port(), Some(51820));
+        lease.expires_at = Some(0);
+        state.lease = Some(lease);
+        assert!(state.forwarded_port().is_none());
+        assert_eq!(state.qbit_sync(), Some(QbitSyncStatus::Pending));
+    }
+
     use super::*;
 
     #[test]

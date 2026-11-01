@@ -72,6 +72,11 @@ check, not a DNS response or packet-delivery probe. A failed lookup, malformed
 result, or non-tunnel egress triggers `nmcli connection down` and an error;
 disconnection failure is reported too. Saved properties alone are not verification.
 
+Neutron also reads NetworkManager's effective DNS configuration over D-Bus,
+including priorities resolved from global defaults. A non-tunnel resolver with
+priority `-1500` or lower refuses protected activation. After activation/reapply,
+the tunnel must appear with its protected DNS priority; failures trigger teardown.
+
 With the kill switch enabled **without lockdown**, activation refuses an
 unsupported IPv4 or IPv6 family. With split mode disabled, peers must allow both
 `0.0.0.0/0` and `::/0`. An IPv4-only or partial tunnel is not silently IPv6-safe:
@@ -97,13 +102,33 @@ filter-table established-connection accepts on both firewalld backends.
 | **0** | `-o lo` | `ACCEPT` | Allow local loopback communication |
 | **1** | `-p udp/tcp --dport 53` | `ACCEPT` / `DROP` | Allow bootstrap DNS when disconnected; block non-tunnel DNS when connected |
 | **1** | `-d <LAN_SUBNETS>` | `ACCEPT` | Keep local LAN devices reachable (Router, Printer, NAS) |
-| **0** | `-o <TUNNEL_IFACE>` | `ACCEPT` | Allow first traffic on configured WireGuard interfaces |
-| **1** | `-p udp -d <PEER_HOST> --dport <PEER_PORT>` | `ACCEPT` | Allow encrypted WireGuard handshake packets out |
+| **0** | `-o <TUNNEL_IFACE>` | `ACCEPT` | Allow traffic on verified, existing WireGuard interfaces |
+| **0** | `-p udp -d <PEER_HOST> --dport <PEER_PORT>` | `ACCEPT` | Allow encrypted WireGuard handshake packets, including UDP/53 |
 | **10** | All remaining packets | `DROP` | Block other outbound traffic before filter-table accepts |
 
-Activation installs the target interface and connected DNS policy before bringing
-the tunnel up. DNS drops precede LAN allowances. An `ACCEPT` here finishes this
+Activation installs pinned peer allowances and connected DNS policy before bringing
+the tunnel up. Interface allowances are added only after the link exists and has
+been verified as WireGuard. DNS drops precede LAN allowances. An `ACCEPT` here finishes this
 table; it does not bypass other firewall policy.
+
+Interface allowances also require Neutron's device-group tag (`1313166676`). The
+helper tags only verified WireGuard links whose group is default or already owned
+by Neutron, and refuses foreign groups without changing them. A later physical
+device with the same name has no tag and cannot inherit the permanent allowance.
+Disable clears Neutron's tags from surviving WireGuard links.
+
+After a reboot/reload with no active tunnel, the helper repairs disconnected DNS
+policy before resolving peer hostnames. Pre-activation closes that bootstrap DNS
+exception again; pinned peer allowances precede the general DNS drop.
+NetworkManager has its own resolver cache. Neutron temporarily pins hostname peers
+to resolved literals in NM memory before activation, then restores their canonical
+hostnames without reapplying the active link. Updates use NM profile version checks
+and contain no secrets; NM retains its existing keys. Stored profiles are not changed
+by this override. If the activator is forcibly killed, reload the stored NM profile
+to recover a temporary override left in memory.
+For already-active hostname peers, read-only `wg show <interface> endpoints`
+diagnostics supply the live pinned addresses when available, avoiding a second
+bootstrap dependency on DNS through the newly activated tunnel.
 
 ### Helper Authorization and Trust Boundary
 
@@ -125,8 +150,8 @@ It cannot enable or disable lockdown.
 
 Interface allowances use exact names: 1-15 bytes of ASCII letters, digits, `_`,
 or `-`, with no `+` wildcard. Existing links must be verified kernel WireGuard
-devices, even if named `wg...`. Absent interfaces are allowed only for inactive/pending
-profiles; an active interface may not be absent. Authenticated
+devices, even if named `wg...`. Inactive/pending profiles with absent interfaces
+receive no interface allowance; an active interface may not be absent. Authenticated
 toggles recheck the link type after authorization and before writing rules.
 
 Helper installation copies the running executable through `/proc/<pid>/exe`,
@@ -139,6 +164,10 @@ The private directory is root-owned `0700`, lock files are root-owned `0600`, an
 each lock acquisition is bounded to 10 seconds. Unsafe file types, owners, or
 links are rejected; lock files are not unlinked during teardown. This bounds lock
 contention, not the administrator authentication wait.
+
+User-side policy and settings lock waits are also bounded to 10 seconds. A busy
+policy operation reports an error rather than hanging emergency disable or bypassing
+coordination; finish or cancel the pending authorization before retrying.
 
 ### Surgical Teardown Guarantee
 Every single rule installed by Lockdown carries a marker:

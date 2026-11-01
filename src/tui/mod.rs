@@ -284,6 +284,7 @@ where
 
         // Drain any background profile cache updates
         drain_profile_cache(&mut *state, cache_rx);
+        state.dispatch_diagnostics();
 
         // Drain any incoming background connection/disconnection results
         drain_connection_results(
@@ -310,8 +311,8 @@ where
             events::refresh_qbit_webui_probe(state);
 
             if let Some((uuid, _, true)) = state.selected_identity() {
-                if let Some(ref tx) = state.diag_tx {
-                    let _ = tx.send((uuid, true));
+                if state.diag_tx.is_some() {
+                    state.request_diagnostics(uuid, true);
                 } else {
                     state.profile_cache.remove(&uuid);
                     events::update_diagnostics(state, client);
@@ -416,6 +417,7 @@ fn drain_profile_cache(
     rx: &std::sync::mpsc::Receiver<(String, crate::tui::state::CachedProfileInfo)>,
 ) {
     while let Ok((uuid, info)) = rx.try_recv() {
+        state.diag_in_flight = false;
         let matches_sel = state
             .selected_identity()
             .map(|(u, _, _)| u == uuid)

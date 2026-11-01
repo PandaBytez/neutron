@@ -51,9 +51,8 @@ cargo test-leaks
 cargo xtask container-shell
 ```
 
-`cargo xtask reinstall` keeps your settings as they are: the settings files are
-captured before the install and restored if anything changes them, and the
-result is reported rather than silently reverted. It also restarts the tray
+`cargo xtask reinstall` never writes or restores settings, so edits and deletions
+made during the build survive. It also restarts the tray
 daemon, because an install replaces the binary underneath a running process.
 
 Never run `cargo test -- --ignored` directly on the host or set
@@ -65,7 +64,8 @@ Never run `cargo test -- --ignored` directly on the host or set
 - NetworkManager tests check profile import, policy properties, and real
   WireGuard activation, including idle on-demand tunnels.
 - Firewall tests check rule acceptance, legacy-rule migration, surgical teardown,
-  and established IPv4/IPv6 packet egress. The `leak_*` checks are also included
+  established IPv4/IPv6 packet egress, and first hostname activation after a reload
+  against a private physical-side DNS peer. The `leak_*` checks are also included
   in the firewall tier.
 - The ignored library test `interrupted_rebuild_stays_closed_after_reload_and_recovers`
   exercises partial permanent rebuilds and recovery. It runs in the full system

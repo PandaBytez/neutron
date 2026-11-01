@@ -19,6 +19,26 @@ use neutron::firewall::FirewallClient;
 use neutron::nm::{CliNmClient, Endpoint, WireguardTunnel};
 use neutron::testing::require_sandbox;
 
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn hostname_activation_after_reload_bootstraps_dns_then_closes_physical_dns() {
+    require_sandbox();
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/firewall_bootstrap.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_neutron"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The marker Neutron stamps onto every rule it installs.
 const MARKER: &str = "neutron-lockdown";
 

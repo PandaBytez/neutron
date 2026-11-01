@@ -143,6 +143,9 @@ with an existing owner-only (`0600`) file, or a secret-manager pipe. There is no
 `--password` option; terminal input is rejected before reading so it is not
 echoed. Credentials remain in owner-only settings and reach curl through stdin.
 
+WebUI host/port edits in the TUI remain drafts until the mode selector is confirmed.
+Escape cancels without saving; automatic sync never uses unfinished addresses.
+
 ---
 
 ## Theming Engine
@@ -170,11 +173,17 @@ Neutron manages a dedicated profile drop directory at `~/.config/neutron/profile
    ```bash
    cp ~/Downloads/wireguard_configs/*.conf ~/.config/neutron/profiles/
    ```
-2. **Auto-Sync on Launch**: Whenever the TUI or CLI runs, Neutron scans the folder, compares content checksums against NetworkManager, and batch-imports new profiles in milliseconds.
+2. **Auto-Sync on TUI Launch**: If enabled, Neutron imports new profiles while preserving
+   files whose names already exist in NetworkManager. Concurrent scans share an inbox
+   lock. Each source is claimed into a private `.import-*` directory before import,
+   so a newer file saved at its original pathname cannot be deleted.
 3. **Manual Sync Command**: You can trigger an instant sync via CLI or within the TUI:
    ```bash
-   neutron sync
-   ```
+    neutron sync
+    ```
+   Successful imports delete only their claimed source. Failed imports restore the
+   inbox name only if it is still free; otherwise the claimed file stays in its
+   private directory and the error reports the recovery path.
 4. **Secrets**: Do not track the entire configuration directory in Git or publish
    it as dotfiles: settings may contain a qBittorrent password and pending profile
    files may contain WireGuard keys.

@@ -250,6 +250,8 @@ It runs in the background using a snapshot of the daemon's leased port and profi
 UUID. A pending indicator remains until completion; success or failure appears in
 the status message without changing the daemon's automatic-sync badge verdict.
 Without an active published lease, the action reports that no port is available.
+The lease must belong to the active profile and be unexpired. Queued sync rechecks
+ownership under the policy lock before sending a preference update.
 
 For headless renewal and missing `XDG_RUNTIME_DIR` behavior, see the
 [port-forwarding lifecycle](port-forwarding.md#auto-renewal-lifecycle).

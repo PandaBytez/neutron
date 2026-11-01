@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 
 pub(crate) mod autoconnect;
+mod endpoint;
 pub mod health;
 pub mod kill_switch;
 pub mod network_info;
@@ -277,14 +278,17 @@ impl NmLifecycle for CliNmClient {
     }
 
     fn disconnect_active(&self) -> AppResult<()> {
-        let profiles = self.list_wireguard_profiles()?;
-        let active = profiles
-            .iter()
-            .find(|profile| profile.is_active())
-            .ok_or(AppError::NoActiveProfile)?;
+        let path = crate::config::default_config_path()?;
+        crate::config::coordinate_policy(&path, || {
+            let profiles = self.list_wireguard_profiles()?;
+            let active = profiles
+                .iter()
+                .find(|profile| profile.is_active())
+                .ok_or(AppError::NoActiveProfile)?;
 
-        run_nmcli(&["connection", "down", &active.uuid])?;
-        Ok(())
+            run_nmcli(&["connection", "down", &active.uuid])?;
+            Ok(())
+        })
     }
 
     fn switch_to(&self, profile_identifier: &str) -> AppResult<()> {
@@ -304,66 +308,69 @@ impl NmLifecycle for CliNmClient {
             .ok_or_else(|| AppError::Config("import path is not valid UTF-8".to_string()))?;
 
         let config_path = crate::config::default_config_path()?;
-        // The confirmation UUID identifies this import, even during concurrent
-        // profile changes. Pin the locale because nmcli translates this message.
-        let output = crate::process::run_with_timeout(
-            "env",
-            &[
-                "LC_ALL=C",
-                "nmcli",
-                "--colors",
-                "no",
-                "connection",
-                "import",
-                "type",
-                "wireguard",
-                "file",
-                path_str,
-            ],
-            NMCLI_TIMEOUT,
-        )?;
-        let uuid = imported_uuid(&output)?;
-
-        // Stop automatic activation before preparing the imported profile. A
-        // failure must reach the caller so the source file is retained for repair.
-        run_nmcli_owned(&autoconnect::set_args(uuid, false))?;
-        if self
-            .list_wireguard_profiles()?
-            .iter()
-            .any(|p| p.uuid == uuid && p.is_active())
-        {
-            run_nmcli(&["connection", "down", uuid])?;
-        }
         crate::config::coordinate_policy(&config_path, || {
+            // The confirmation UUID identifies this import, even during concurrent
+            // profile changes. Pin the locale because nmcli translates this message.
+            let output = crate::process::run_with_timeout(
+                "env",
+                &[
+                    "LC_ALL=C",
+                    "nmcli",
+                    "--colors",
+                    "no",
+                    "connection",
+                    "import",
+                    "type",
+                    "wireguard",
+                    "file",
+                    path_str,
+                ],
+                NMCLI_TIMEOUT,
+            )?;
+            let uuid = imported_uuid(&output)?;
+
+            // Stop automatic activation before preparing the imported profile. A
+            // failure must reach the caller so the source file is retained for repair.
+            run_nmcli_owned(&autoconnect::set_args(uuid, false))?;
+            if self
+                .list_wireguard_profiles()?
+                .iter()
+                .any(|p| p.uuid == uuid && p.is_active())
+            {
+                run_nmcli(&["connection", "down", uuid])?;
+            }
             let app_cfg = crate::config::load(&config_path)?;
-            prepare_profile(uuid, &app_cfg, &mut run_nmcli)
-        })?;
+            prepare_profile(uuid, &app_cfg, &mut run_nmcli)?;
 
-        let comments = extract_interface_comments(path);
-        if !comments.is_empty() {
-            crate::config::update(&config_path, |cfg| {
-                cfg.profile_custom_info.insert(uuid.to_string(), comments);
-            })?;
-        }
+            let comments = extract_interface_comments(path);
+            if !comments.is_empty() {
+                crate::config::update(&config_path, |cfg| {
+                    cfg.profile_custom_info.insert(uuid.to_string(), comments);
+                })?;
+            }
 
-        Ok(output)
+            Ok(output)
+        })
     }
 
     fn delete_profile(&self, uuid: &str) -> AppResult<()> {
-        // NetworkManager deactivates the connection automatically before
-        // removing it, so an active profile can be deleted directly.
-        run_nmcli(&["connection", "delete", uuid])?;
+        let path = crate::config::default_config_path()?;
+        crate::config::coordinate_policy(&path, || {
+            // NetworkManager deactivates the connection automatically before
+            // removing it, so an active profile can be deleted directly.
+            run_nmcli(&["connection", "delete", uuid])?;
 
-        // Drop any Neutron-side metadata keyed by this UUID so it doesn't linger
-        // after the profile is gone. Best-effort: a config failure here must not
-        // mask the successful deletion.
-        if let Ok(config_path) = crate::config::default_config_path() {
-            let _ = crate::config::update(&config_path, |cfg| {
-                crate::config::forget_profile(cfg, uuid);
-            });
-        }
+            // Drop any Neutron-side metadata keyed by this UUID so it doesn't linger
+            // after the profile is gone. Best-effort: a config failure here must not
+            // mask the successful deletion.
+            if let Ok(config_path) = crate::config::default_config_path() {
+                let _ = crate::config::update(&config_path, |cfg| {
+                    crate::config::forget_profile(cfg, uuid);
+                });
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -452,6 +459,13 @@ impl NmPolicy for CliNmClient {
                 &mut run_nmcli,
                 &mut |args| crate::process::run_with_timeout("ip", args, NMCLI_TIMEOUT),
             )?;
+            if protected && let Err(error) = verify_effective_dns(&interface, true) {
+                return Err(disconnect_policy_error(
+                    &profile.uuid,
+                    error,
+                    &mut run_nmcli,
+                ));
+            }
         }
         Ok(())
     }
@@ -791,7 +805,7 @@ fn unescape_nmcli(token: &str) -> String {
 
 /// Parse a single `host:port` endpoint token, handling bracketed IPv6 literals
 /// (`[::1]:51820`). Returns `None` for malformed tokens or invalid ports.
-fn parse_endpoint(token: &str) -> Option<Endpoint> {
+pub(crate) fn parse_endpoint(token: &str) -> Option<Endpoint> {
     let (host, port) = if let Some(rest) = token.strip_prefix('[') {
         // Bracketed IPv6 literal: `[addr]:port`.
         let (host, after) = rest.split_once(']')?;
@@ -1015,7 +1029,16 @@ fn activate(uuid: &str, teardown_active: bool) -> AppResult<()> {
     use crate::firewall::FirewallClient;
     let path = crate::config::default_config_path()?;
     crate::config::coordinate_policy(&path, || {
+        let profiles = CliNmClient.list_wireguard_profiles()?;
+        refuse_parallel_connect(&profiles, uuid, teardown_active)?;
         let config = crate::config::load(&path)?;
+        if config.lockdown_enabled
+            && config.global_split_tunnel.mode.is_enabled()
+            && !config.global_split_tunnel.domains.is_empty()
+            && !profiles.iter().any(|p| p.is_active())
+        {
+            CliNmClient.refresh_lockdown(None)?;
+        }
         prepare_profile(uuid, &config, &mut run_nmcli)?;
         let settings = parse_peer_settings(&run_nmcli(&["connection", "show", uuid])?);
         let protected_dns = if config.kill_switch_enabled {
@@ -1028,15 +1051,20 @@ fn activate(uuid: &str, teardown_active: bool) -> AppResult<()> {
         } else {
             None
         };
-        if config.lockdown_enabled {
-            if let Some(endpoint) = settings.endpoint.as_deref().and_then(parse_endpoint)
-                && endpoint.host.parse::<std::net::IpAddr>().is_err()
-            {
-                let _ = split_tunnel::resolve_domain_ips(&endpoint.host);
-            }
-            CliNmClient.refresh_lockdown(Some(uuid))?;
-        }
+        let mut endpoint_pin = if config.lockdown_enabled {
+            endpoint::EndpointPin::prepare(uuid, || {
+                if !profiles.iter().any(|p| p.is_active()) {
+                    CliNmClient.refresh_lockdown(None)?;
+                }
+                Ok(())
+            })?
+        } else {
+            None
+        };
         let result = (|| {
+            if config.lockdown_enabled {
+                CliNmClient.refresh_lockdown(Some(uuid))?;
+            }
             if teardown_active {
                 for profile in CliNmClient
                     .list_wireguard_profiles()?
@@ -1055,6 +1083,9 @@ fn activate(uuid: &str, teardown_active: bool) -> AppResult<()> {
                     )?;
                 }
             }
+            if let Some((interface, _)) = &protected_dns {
+                verify_effective_dns(interface, false)?;
+            }
             activate_prepared(
                 uuid,
                 config.general.verify_tunnel_on_connect,
@@ -1062,6 +1093,9 @@ fn activate(uuid: &str, teardown_active: bool) -> AppResult<()> {
                 &mut run_nmcli,
             )?;
             if let Some((interface, dns)) = protected_dns {
+                if let Err(error) = verify_effective_dns(&interface, true) {
+                    return Err(disconnect_policy_error(uuid, error, &mut run_nmcli));
+                }
                 verify_dns_or_disconnect(uuid, &interface, &dns, &mut run_nmcli, &mut |args| {
                     crate::process::run_with_timeout("ip", args, NMCLI_TIMEOUT)
                 })?;
@@ -1070,12 +1104,113 @@ fn activate(uuid: &str, teardown_active: bool) -> AppResult<()> {
         })();
         if config.lockdown_enabled {
             let reconciliation = CliNmClient.refresh_lockdown(None);
-            if result.is_ok() {
-                reconciliation?;
+            if result.is_ok()
+                && let Err(error) = reconciliation
+            {
+                if let Some(pin) = &mut endpoint_pin {
+                    pin.restore()?;
+                }
+                return Err(error);
             }
+        }
+        if let Some(pin) = &mut endpoint_pin {
+            pin.restore()?;
         }
         result
     })
+}
+
+pub(crate) fn refuse_parallel_connect(
+    profiles: &[WireguardProfile],
+    uuid: &str,
+    switching: bool,
+) -> AppResult<()> {
+    if !switching && profiles.iter().any(|p| p.is_active() && p.uuid != uuid) {
+        return Err(AppError::AlreadyActive);
+    }
+    Ok(())
+}
+
+type DnsSelection = (String, i32, Vec<String>);
+
+fn read_dns_selection() -> AppResult<Vec<DnsSelection>> {
+    use zbus::zvariant::OwnedValue;
+    let connection = zbus::blocking::Connection::system().map_err(dns_selection_error)?;
+    let proxy = zbus::blocking::Proxy::new(
+        &connection,
+        "org.freedesktop.NetworkManager",
+        "/org/freedesktop/NetworkManager/DnsManager",
+        "org.freedesktop.NetworkManager.DnsManager",
+    )
+    .map_err(dns_selection_error)?;
+    let configuration: Vec<std::collections::HashMap<String, OwnedValue>> = proxy
+        .get_property("Configuration")
+        .map_err(dns_selection_error)?;
+    configuration
+        .iter()
+        .map(|entry| {
+            let field = |name| {
+                entry.get(name).ok_or_else(|| {
+                    dns_selection_error("incomplete NetworkManager DNS configuration")
+                })
+            };
+            Ok((
+                <&str>::try_from(field("interface")?)
+                    .map_err(dns_selection_error)?
+                    .to_string(),
+                i32::try_from(field("priority")?).map_err(dns_selection_error)?,
+                Vec::<String>::try_from(
+                    field("nameservers")?
+                        .try_clone()
+                        .map_err(dns_selection_error)?,
+                )
+                .map_err(dns_selection_error)?,
+            ))
+        })
+        .collect()
+}
+
+fn dns_selection_error(error: impl std::fmt::Display) -> AppError {
+    AppError::Config(format!(
+        "cannot verify effective NetworkManager DNS selection: {error}"
+    ))
+}
+
+fn check_dns_selection(
+    interface: &str,
+    resolvers: &[DnsSelection],
+    require_tunnel: bool,
+) -> AppResult<()> {
+    let mut found = false;
+    for (device, priority, servers) in resolvers
+        .iter()
+        .filter(|(_, _, servers)| !servers.is_empty())
+    {
+        if device == interface && *priority == -1500 {
+            found = true;
+        } else if *priority <= -1500 {
+            return Err(AppError::Config(format!(
+                "DNS protection refused: {device} DNS priority {priority} competes with the tunnel ({servers:?})"
+            )));
+        }
+    }
+    if require_tunnel && !found {
+        return Err(AppError::Config(
+            "protected tunnel DNS was not selected by NetworkManager".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_effective_dns(interface: &str, require_tunnel: bool) -> AppResult<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let result = check_dns_selection(interface, &read_dns_selection()?, require_tunnel);
+        if result.is_ok() || std::time::Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Shared checked policy preparation for import and every activation path.
@@ -1426,18 +1561,21 @@ fn verify_or_disconnect(
         return Ok(());
     }
 
-    // Roll the activation back so the dead tunnel stops owning the default
-    // route. Best-effort: report the diagnosis even if the teardown fails,
-    // since that is the actionable part.
-    if let Err(error) = run(&["connection", "down", uuid]) {
-        tracing::warn!("could not deactivate unhealthy tunnel {uuid}: {error}");
-    }
+    Err(disconnect_unhealthy(uuid, interface, run))
+}
 
-    Err(AppError::TunnelUnhealthy(format!(
-        "{interface}: the peer never completed a handshake (server down, or the \
-         profile's keys are no longer valid). Disconnected so it does not \
-         black-hole your traffic."
-    )))
+fn disconnect_unhealthy(
+    uuid: &str,
+    interface: &str,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppError {
+    let outcome = match run(&["connection", "down", uuid]) {
+        Ok(_) => "Disconnected so it does not black-hole your traffic.".into(),
+        Err(error) => format!("Disconnection failed: {error}; the tunnel may still be active."),
+    };
+    AppError::TunnelUnhealthy(format!(
+        "{interface}: the peer never completed a handshake (server down, or the profile's keys are no longer valid). {outcome}"
+    ))
 }
 
 fn run_nmcli(args: &[&str]) -> AppResult<String> {
@@ -1453,6 +1591,56 @@ fn run_nmcli_owned(args: &[String]) -> AppResult<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effective_dns_selection_rejects_competing_and_missing_resolvers() {
+        let tunnel = ("wg0".into(), -1500, vec!["10.2.0.1".into()]);
+        assert!(check_dns_selection("wg0", std::slice::from_ref(&tunnel), true).is_ok());
+        for priority in [-2000, -1500] {
+            let physical = ("eth0".into(), priority, vec!["192.168.1.1".into()]);
+            assert!(check_dns_selection("wg0", &[tunnel.clone(), physical], true).is_err());
+        }
+        assert!(check_dns_selection("wg0", &[], true).is_err());
+        assert!(check_dns_selection("wg0", &[], false).is_ok());
+        assert!(
+            check_dns_selection(
+                "wg0",
+                &[tunnel, ("eth0".into(), 100, vec!["192.168.1.1".into()])],
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_manual_connection_winning_the_lock_prevents_parallel_startup_activation() {
+        let profiles = [WireguardProfile {
+            name: "manual".into(),
+            uuid: "uuid-manual".into(),
+            state: ProfileState::Active,
+        }];
+        assert!(matches!(
+            refuse_parallel_connect(&profiles, "uuid-startup", false),
+            Err(AppError::AlreadyActive)
+        ));
+        assert!(refuse_parallel_connect(&profiles, "uuid-startup", true).is_ok());
+        assert!(refuse_parallel_connect(&profiles, "uuid-manual", false).is_ok());
+    }
+
+    #[test]
+    fn unhealthy_tunnel_error_reports_failed_teardown_instead_of_claiming_disconnection() {
+        let error = disconnect_unhealthy("uuid", "wg0", &mut |_| {
+            Err(AppError::CommandFailed("down denied".into()))
+        })
+        .to_string();
+        assert!(error.contains("down denied") && error.contains("may still be active"));
+        assert!(!error.contains("Disconnected so"));
+        assert!(
+            disconnect_unhealthy("uuid", "wg0", &mut |_| Ok(String::new()))
+                .to_string()
+                .contains("Disconnected so")
+        );
+    }
+
     use super::*;
 
     #[test]

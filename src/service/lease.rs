@@ -90,9 +90,18 @@ pub struct LeaseState {
     /// parses, and zero is read as "unknown" rather than as a dead process.
     #[serde(default)]
     pub publisher_pid: u32,
+    /// Mapping deadline, independent of publication heartbeat. Missing legacy deadlines fail closed.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 impl LeaseState {
+    pub fn usable_port(&self) -> Option<u16> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        (now < self.expires_at?)
+            .then_some(self.port?)
+            .filter(|port| *port != 0)
+    }
     /// Whether this was published recently enough to still describe reality.
     ///
     /// Bounded on both sides. Too old means the lease has expired at the gateway;
@@ -250,7 +259,11 @@ pub fn publish_to(path: &std::path::Path, state: &LeaseState) -> bool {
 /// [`read`] from an explicit path.
 pub fn read_from(path: &std::path::Path) -> Option<LeaseState> {
     let body = std::fs::read_to_string(path).ok()?;
-    let state: LeaseState = serde_json::from_str(&body).ok()?;
+    let mut state: LeaseState = serde_json::from_str(&body).ok()?;
+    if state.usable_port().is_none() {
+        state.port = None;
+        state.qbit_sync = QbitSyncStatus::Pending;
+    }
     (state.is_fresh() && state.is_publisher_alive()).then_some(state)
 }
 
@@ -265,6 +278,21 @@ pub fn live_owner_of(path: &std::path::Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fresh_heartbeat_does_not_extend_mapping_expiry_or_validate_legacy_ports() {
+        let path = temp_lease_path("expired-mapping");
+        let mut state = held_at(now_secs());
+        for expires_at in [Some(now_secs() - 1), None] {
+            state.expires_at = expires_at;
+            assert!(publish_to(&path, &state));
+            let read = read_from(&path).unwrap();
+            assert!(read.port.is_none());
+            assert_eq!(live_owner_of(&path), Some(std::process::id()));
+            assert_eq!(read.qbit_sync, QbitSyncStatus::Pending);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     use super::*;
 
     fn now_secs() -> u64 {
@@ -281,6 +309,7 @@ mod tests {
             qbit_sync: QbitSyncStatus::Synchronized,
             updated_at,
             publisher_pid: std::process::id(),
+            expires_at: Some(now_secs() + STALE_AFTER.as_secs()),
         }
     }
 

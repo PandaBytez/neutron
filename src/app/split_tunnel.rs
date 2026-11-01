@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::config::{self, AppConfig, SplitTunnelConfig, SplitTunnelMode};
 use crate::error::{AppError, AppResult};
-use crate::nm::{self, NmPolicy};
+use crate::nm::{self, NmLifecycle, NmPolicy};
 
 /// Get the global split tunnel configuration from app config.
 pub fn get_global_split_tunnel(config: &AppConfig) -> SplitTunnelConfig {
@@ -70,17 +70,79 @@ fn apply_and_persist_uncoordinated<C: NmPolicy>(
 
 /// Re-resolve split-tunnel domains and reapply routing rules to NetworkManager if
 /// resolved IP endpoints changed during an active session (record rotation).
-pub fn refresh_active_domain_routes<C: NmPolicy>(client: &C, path: &Path) -> AppResult<bool> {
+#[derive(PartialEq, Eq)]
+struct DomainRoutes {
+    active: Vec<String>,
+    split: SplitTunnelConfig,
+    kill_switch: bool,
+    lockdown: bool,
+    v4: Vec<String>,
+    v6: Vec<String>,
+}
+
+static APPLIED_DOMAIN_ROUTES: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, DomainRoutes>>,
+> = std::sync::Mutex::new(None);
+
+pub fn refresh_active_domain_routes<C: NmPolicy + NmLifecycle>(
+    client: &C,
+    path: &Path,
+) -> AppResult<bool> {
+    refresh_active_domain_routes_with(client, path, nm::split_tunnel::resolve_domain_ips)
+}
+
+fn refresh_active_domain_routes_with<C: NmPolicy + NmLifecycle>(
+    client: &C,
+    path: &Path,
+    resolve: impl FnMut(&str) -> Vec<std::net::IpAddr>,
+) -> AppResult<bool> {
     config::coordinate_policy(path, || {
         let app_cfg = config::load(path)?;
         let split = &app_cfg.global_split_tunnel;
         if !split.mode.is_enabled() || split.domains.is_empty() {
             return Ok(false);
         }
-        let (v4, v6) =
-            nm::split_tunnel::routes_for_checked(split.mode, &split.cidrs, &split.domains)?;
-        client.apply_split_tunnel_all(split.mode, &v4, &v6)?;
+        let active: Vec<_> = client
+            .list_wireguard_profiles()?
+            .into_iter()
+            .filter(|p| p.is_active())
+            .map(|p| p.uuid)
+            .collect();
+        let (v4, v6) = nm::split_tunnel::routes_for_checked_with(
+            split.mode,
+            &split.cidrs,
+            &split.domains,
+            resolve,
+        )?;
+        let snapshot = DomainRoutes {
+            active,
+            split: split.clone(),
+            kill_switch: app_cfg.kill_switch_enabled,
+            lockdown: app_cfg.lockdown_enabled,
+            v4,
+            v6,
+        };
+        {
+            let mut cache = APPLIED_DOMAIN_ROUTES
+                .lock()
+                .map_err(|_| AppError::Config("domain route cache poisoned".into()))?;
+            let cache = cache.get_or_insert_with(std::collections::HashMap::new);
+            if snapshot.active.is_empty() {
+                cache.remove(path);
+                return Ok(false);
+            }
+            if cache.get(path) == Some(&snapshot) {
+                return Ok(false);
+            }
+            cache.remove(path);
+        }
+        client.apply_split_tunnel_all(split.mode, &snapshot.v4, &snapshot.v6)?;
         client.reapply_active_routes()?;
+        APPLIED_DOMAIN_ROUTES
+            .lock()
+            .map_err(|_| AppError::Config("domain route cache poisoned".into()))?
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(path.to_path_buf(), snapshot);
         Ok(true)
     })
 }
@@ -273,6 +335,43 @@ pub fn format_global_status(st_cfg: &SplitTunnelConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unchanged_domain_results_skip_writes_and_policy_changes_invalidate_the_cache() {
+        let path = testing::temp_config_path("domain-delta");
+        let client = MockNmClient::new(vec![WireguardProfile {
+            state: ProfileState::Active,
+            ..test_profile()
+        }]);
+        let mut cfg = AppConfig::default();
+        cfg.global_split_tunnel.mode = SplitTunnelMode::Include;
+        cfg.global_split_tunnel.domains = vec!["fixture.test".into()];
+        config::save(&path, &cfg).unwrap();
+        let a = |_: &str| vec!["192.0.2.1".parse().unwrap()];
+        assert!(refresh_active_domain_routes_with(&client, &path, a).unwrap());
+        assert!(
+            !refresh_active_domain_routes_with(&client, &path, |_| vec![
+                "192.0.2.1".parse().unwrap()
+            ])
+            .unwrap()
+        );
+        assert_eq!(client.split_tunnel_calls().len(), 1);
+        assert!(
+            refresh_active_domain_routes_with(&client, &path, |_| vec![
+                "192.0.2.2".parse().unwrap()
+            ])
+            .unwrap()
+        );
+        config::update(&path, |cfg| cfg.lockdown_enabled = true).unwrap();
+        assert!(
+            refresh_active_domain_routes_with(&client, &path, |_| vec![
+                "192.0.2.2".parse().unwrap()
+            ])
+            .unwrap()
+        );
+        assert_eq!(client.split_tunnel_calls().len(), 3);
+        testing::remove_temp_config(&path);
+    }
+
     use super::*;
     use crate::nm::{ProfileState, WireguardProfile};
     use crate::testing::{self, MockNmClient};
@@ -430,7 +529,8 @@ mod tests {
 
     #[test]
     fn refresh_active_domain_routes_updates_rules_when_enabled() {
-        let profile = test_profile();
+        let mut profile = test_profile();
+        profile.state = ProfileState::Active;
         let client = MockNmClient::new(vec![profile]);
         let path = testing::temp_config_path("st-refresh");
 

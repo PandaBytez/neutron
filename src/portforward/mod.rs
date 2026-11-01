@@ -197,10 +197,24 @@ pub fn request_mapping_from(
     local_ip: Option<Ipv4Addr>,
     gateway: Ipv4Addr,
 ) -> AppResult<PortMapping> {
+    let started = std::time::Instant::now();
     let mapping = map_protocol(local_ip, gateway, OP_MAP_UDP, 0)?;
     // Best effort: a provider that only forwards UDP still gives a usable port.
     let _ = map_protocol(local_ip, gateway, OP_MAP_TCP, mapping.port);
-    Ok(mapping)
+    let elapsed = started.elapsed();
+    let spent = elapsed
+        .as_secs()
+        .saturating_add(u64::from(elapsed.subsec_nanos() != 0));
+    let remaining = u64::from(mapping.lifetime_secs).saturating_sub(spent);
+    if remaining == 0 {
+        return Err(AppError::PortForward(
+            "mapping expired while requesting TCP forwarding".into(),
+        ));
+    }
+    Ok(PortMapping {
+        lifetime_secs: remaining as u32,
+        ..mapping
+    })
 }
 
 fn map_protocol(

@@ -361,14 +361,17 @@ pub fn run() -> AppResult<()> {
         if marked_removal_batches()?.is_empty() {
             return absent_protection_result(true);
         }
-        let tunnels = tunnels(Some(requested.as_str()))?;
+        bootstrap_disconnected_dns()?;
+        let tunnels = tunnels_with(Some(requested.as_str()), prime_interfaces)?;
         let active: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
         let required = lockdown_enable_batches(&active);
         let allowed = lockdown_enable_batches(&tunnels);
         let batches = partial_refresh_batches(&required, &allowed)?;
-        if !batches.is_empty() {
-            run_script(&build_firewall_script(&batches), false)?;
-        }
+        let mut script = String::from("set -e\n");
+        script.push_str(&interface_validation_script(&tunnels));
+        script.push_str(&build_firewall_script(&batches));
+        script.push_str(&retire_tag_guards_script());
+        run_script(&script, false)?;
         return verify_partial_protection(&required, &allowed);
     }
 
@@ -382,7 +385,8 @@ pub fn run() -> AppResult<()> {
         if marked_removal_batches()?.is_empty() {
             return absent_protection_result(false);
         }
-        let tunnels = tunnels(None)?;
+        bootstrap_disconnected_dns()?;
+        let tunnels = tunnels_with(None, prime_interfaces)?;
         let total_inactive = tunnels.iter().filter(|t| !t.is_active).count();
         let mut remaining_inactive = warmed_inactive;
         let chunk_tunnels: Vec<_> = tunnels
@@ -399,9 +403,11 @@ pub fn run() -> AppResult<()> {
         let required = lockdown_enable_batches(&chunk_tunnels);
         let allowed = lockdown_enable_batches(&tunnels);
         let batches = partial_refresh_batches(&required, &allowed)?;
-        if !batches.is_empty() {
-            run_script(&build_firewall_script(&batches), false)?;
-        }
+        let mut script = String::from("set -e\n");
+        script.push_str(&interface_validation_script(&tunnels));
+        script.push_str(&build_firewall_script(&batches));
+        script.push_str(&retire_tag_guards_script());
+        run_script(&script, false)?;
         if warmed_inactive >= total_inactive
             || (batches.is_empty() && verify_protection(&allowed).is_ok())
         {
@@ -420,6 +426,28 @@ fn absent_protection_result(activating: bool) -> AppResult<()> {
     } else {
         Ok(())
     }
+}
+
+// Reboot can restore connected DNS drops before any tunnel or resolver cache exists.
+fn bootstrap_disconnected_dns() -> AppResult<()> {
+    if crate::nm::CliNmClient
+        .list_wireguard_profiles()?
+        .iter()
+        .any(|p| p.is_active())
+    {
+        return Ok(());
+    }
+    let permanent = marked_removal_batches()?;
+    let runtime = normalized_runtime_removals()?;
+    if !permanent.iter().chain(&runtime).any(|b| {
+        b.windows(2).any(|p| p == ["--dport", "53"]) && b.last().is_some_and(|s| s == "DROP")
+    }) {
+        return Ok(());
+    }
+    let bootstrap = lockdown_enable_batches(&[]);
+    let batches = partial_refresh_batches_for(permanent, runtime, &bootstrap, &bootstrap);
+    run_script(&build_firewall_script(&batches), false)?;
+    verify_protection(&bootstrap)
 }
 
 fn verify_protection(desired: &[Vec<String>]) -> AppResult<()> {
@@ -479,9 +507,58 @@ fn is_valid_activation_uuid(requested: &str) -> bool {
 }
 
 fn tunnels(activating: Option<&str>) -> AppResult<Vec<WireguardTunnel>> {
+    tunnels_with(activating, |_| Ok(()))
+}
+
+// Allow DNS through verified live links before resolving active hostname peers.
+fn prime_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<()> {
+    let active: Vec<_> = tunnels
+        .iter()
+        .filter(|t| t.is_active)
+        .map(|t| WireguardTunnel {
+            endpoints: Vec::new(),
+            ..t.clone()
+        })
+        .collect();
+    if active.is_empty() {
+        return Ok(());
+    }
+    let required = lockdown_enable_batches(&active);
+    let permanent = marked_removal_batches()?;
+    let runtime = normalized_runtime_removals()?;
+    let mut allowed = required.clone();
+    for batch in permanent.iter().chain(&runtime) {
+        let destination = batch.windows(2).find(|p| p[0] == "-d");
+        let port = batch.windows(2).find(|p| p[0] == "--dport");
+        if batch[4] == "mangle"
+            && batch.last().is_some_and(|s| s == "ACCEPT")
+            && batch.windows(2).any(|p| p == ["-p", "udp"])
+            && destination.is_some_and(|p| p[1].parse::<IpAddr>().is_ok())
+            && port.is_some_and(|p| p[1].parse::<u16>().is_ok())
+            && !batch.iter().any(|s| s == "-o" || s == "conntrack")
+        {
+            let mut peer = batch.clone();
+            peer[2] = "--add-rule".into();
+            allowed.push(peer);
+        }
+    }
+    let batches = partial_refresh_batches_for(permanent, runtime, &required, &allowed);
+    let mut script = String::from("set -e\n");
+    script.push_str(&interface_validation_script(&active));
+    script.push_str(&build_firewall_script(&batches));
+    script.push_str(&retire_tag_guards_script());
+    run_script(&script, false)?;
+    verify_partial_protection(&required, &allowed)
+}
+
+fn tunnels_with(
+    activating: Option<&str>,
+    prime: impl FnOnce(&[WireguardTunnel]) -> AppResult<()>,
+) -> AppResult<Vec<WireguardTunnel>> {
     let client = crate::nm::CliNmClient;
-    let mut tunnels = client.wireguard_tunnels()?;
-    validate_tunnel_interfaces(&tunnels)?;
+    let original = client.wireguard_tunnels()?;
+    let mut tunnels = validate_tunnel_interfaces(&original)?;
+    prime(&tunnels)?;
     if let Some(uuid) = activating {
         if !client
             .list_wireguard_profiles()?
@@ -499,11 +576,63 @@ fn tunnels(activating: Option<&str>) -> AppResult<Vec<WireguardTunnel>> {
             interface: Some(interface.clone()),
             ..Default::default()
         }])?;
-        for tunnel in &mut tunnels {
-            if tunnel.interface.as_ref() == Some(&interface) {
+        for (source, tunnel) in original.iter().zip(&mut tunnels) {
+            if source.interface.as_ref() == Some(&interface) {
                 tunnel.is_active = true;
             }
         }
+    }
+    for (tunnel, source) in tunnels.iter_mut().zip(&original) {
+        if source.is_active
+            && tunnel
+                .endpoints
+                .iter()
+                .any(|e| e.host.parse::<IpAddr>().is_err())
+            && let Some(interface) = &tunnel.interface
+            && let Ok(output) = crate::process::run_with_timeout(
+                "wg",
+                &["show", interface, "endpoints"],
+                LOCK_TIMEOUT,
+            )
+        {
+            let live: Vec<_> = output
+                .lines()
+                .filter_map(|line| {
+                    let endpoint = crate::nm::parse_endpoint(line.split_whitespace().nth(1)?)?;
+                    endpoint.host.parse::<IpAddr>().is_ok().then_some(endpoint)
+                })
+                .collect();
+            if !live.is_empty() {
+                tunnel.endpoints = live;
+                continue;
+            }
+        }
+        let mut pinned = Vec::new();
+        for endpoint in &tunnel.endpoints {
+            if endpoint.host.parse::<IpAddr>().is_ok() {
+                pinned.push(endpoint.clone());
+            } else {
+                let ips = crate::nm::split_tunnel::resolve_domain_ips(&endpoint.host);
+                if ips.is_empty() {
+                    if tunnel.is_active {
+                        return Err(AppError::Firewall(format!(
+                            "Could not resolve WireGuard endpoint {}",
+                            endpoint.host
+                        )));
+                    }
+                    tracing::warn!(
+                        "Inactive WireGuard endpoint {} could not be resolved; no allowance added",
+                        endpoint.host
+                    );
+                    continue;
+                }
+                pinned.extend(ips.into_iter().map(|ip| Endpoint {
+                    host: ip.to_string(),
+                    port: endpoint.port,
+                }));
+            }
+        }
+        tunnel.endpoints = pinned;
     }
     Ok(tunnels)
 }

@@ -132,8 +132,8 @@ Most maintenance is a cargo alias, so nothing needs installing first:
 
 `cargo reinstall` is the one to reach for while working on the app: it runs
 `cargo install --locked --path . --force` and touches nothing privileged, so you do not
-disable lockdown and re-authenticate on every rebuild. It verifies your settings
-came through unchanged and restores them if anything touches them.
+disable lockdown and re-authenticate on every rebuild. Settings are left alone:
+concurrent edits and deletions are never overwritten by a snapshot rollback.
 
 Two caveats it deliberately does not hide: the root-owned refresh helper is a
 *copy* of the binary taken when lockdown was enabled, so after changing firewall
@@ -144,6 +144,10 @@ Podman — see [testing](docs/testing.md).
 
 Auto-connect is **off by default**. Press **`a`** in the TUI to enable it and install the desktop autostart entry,
 which connects an eligible WireGuard profile at login.
+
+An ordinary `neutron connect` refuses to add a second active WireGuard tunnel;
+use `neutron switch <profile>` to replace one. Startup selection also rechecks
+under the activation lock so a concurrent manual connection wins.
 
 For headless servers without an XDG desktop environment, an optional user service is provided in [`systemd/`](systemd/).
 

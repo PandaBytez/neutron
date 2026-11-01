@@ -741,9 +741,14 @@ where
 /// Runs only when the port-forward mode is `ForwardAndSync`: the daemon calls
 /// this on every lease renewal, so a broken integration would reach a
 /// third-party Web API unattended.
-fn sync_qbittorrent_port<C: NmIntrospect>(client: &C, uuid: &str, port: u16) -> QbitSyncStatus {
-    let Ok(config) =
-        crate::config::default_config_path().and_then(|path| crate::config::load(&path))
+fn sync_qbittorrent_port<C: NmIntrospect + crate::nm::NmLifecycle>(
+    client: &C,
+    uuid: &str,
+    port: u16,
+    expires_at: Option<u64>,
+) -> QbitSyncStatus {
+    let Ok((path, config)) = crate::config::default_config_path()
+        .and_then(|path| crate::config::load(&path).map(|cfg| (path, cfg)))
     else {
         return QbitSyncStatus::Pending;
     };
@@ -751,7 +756,14 @@ fn sync_qbittorrent_port<C: NmIntrospect>(client: &C, uuid: &str, port: u16) -> 
         return QbitSyncStatus::Pending;
     }
 
-    match crate::app::qbittorrent::sync_port(client, &config.qbittorrent, uuid, port) {
+    match crate::app::qbittorrent::sync_port(
+        client,
+        &path,
+        &config.qbittorrent,
+        uuid,
+        port,
+        expires_at,
+    ) {
         Ok(report) => {
             info!(
                 "qBittorrent port synced to {port} (interface: {:?})",
@@ -963,6 +975,16 @@ impl LeaseTracker {
             port: self.port,
             profile_uuid,
             qbit_sync: self.qbit_sync,
+            expires_at: self.expires_at.and_then(|expires| {
+                let remaining = expires.checked_duration_since(std::time::Instant::now())?;
+                Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs()
+                        + remaining.as_secs(),
+                )
+            }),
             // Stamped on publication; the caller has no business inventing a time.
             ..Default::default()
         }
@@ -1054,6 +1076,7 @@ where
     let mut lease = LeaseTracker::default();
     let mut prev_active_uuid: Option<Option<String>> = None;
     let mut last_domain_refresh = std::time::Instant::now();
+    let mut domain_refresh: Option<std::thread::JoinHandle<AppResult<bool>>> = None;
 
     loop {
         let mut profiles = client.list_wireguard_profiles().unwrap_or_default();
@@ -1114,7 +1137,12 @@ where
                 if let Some(port) =
                     lease.claim_qbit_push(&app_cfg.port_forwarding.mode, &app_cfg.qbittorrent)
                 {
-                    lease.qbit_sync = sync_qbittorrent_port(&client, &profile.uuid, port);
+                    lease.qbit_sync = sync_qbittorrent_port(
+                        &client,
+                        &profile.uuid,
+                        port,
+                        lease.publication(active_uuid.clone()).expires_at,
+                    );
                 }
             } else {
                 // Drop the stamp so turning sync back on pushes on the next poll
@@ -1123,13 +1151,27 @@ where
             }
         }
 
-        if active.is_some() && last_domain_refresh.elapsed() >= Duration::from_secs(30) {
+        if domain_refresh
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = domain_refresh.take()
+        {
+            match worker.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => warn!("active domain-route refresh failed: {error}"),
+                Err(_) => warn!("active domain-route refresh worker stopped"),
+            }
+        }
+        if active.is_some()
+            && domain_refresh.is_none()
+            && last_domain_refresh.elapsed() >= Duration::from_secs(30)
+        {
             last_domain_refresh = std::time::Instant::now();
-            if let Ok(path) = crate::config::default_config_path()
-                && let Err(error) =
+            if let Ok(path) = crate::config::default_config_path() {
+                let client = client.clone();
+                domain_refresh = Some(std::thread::spawn(move || {
                     crate::app::split_tunnel::refresh_active_domain_routes(&client, &path)
-            {
-                warn!("active domain-route refresh failed: {error}");
+                }));
             }
         }
         lease.check_expiry();

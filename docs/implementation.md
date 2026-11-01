@@ -76,14 +76,16 @@ the handshake.
 Imports use `nmcli connection import type wireguard file <path>`. The profile
 UUID comes from that command's validated C-locale confirmation, rather than
 guessing from concurrent profile-list changes. The profile
-inbox consumes source files after successful import; source removal is
-best-effort, and matching filenames are currently skipped by profile name rather
+inbox claims each source into a private processing directory before importing it.
+Only the claimed source is consumed on success; a replacement at the inbox name
+is preserved. Failed imports retain their source, and matching filenames are skipped by profile name rather
 than content comparison. Interface comments are retained as application metadata.
 
 ## Saved Intent and Effective Policy
 
-The long-lived indicator refreshes domain routes every 30 seconds and reapplies
-them to active NetworkManager devices. Automatic firewall reconciliation and
+The long-lived indicator resolves domain routes every 30 seconds on a single
+background worker, skipping unchanged successful results. Changed routes are reapplied
+to active NetworkManager devices without holding up lease renewal. Automatic firewall reconciliation and
 domain refresh share coordination with explicit policy changes; failed firewall
 reconciliation is retried. DNS rotation still has a polling interval, not a
 per-query routing guarantee.

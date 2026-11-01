@@ -246,7 +246,6 @@ fn transient_list_failure_retains_refresh_and_eventually_reloads() {
 
 #[test]
 fn manual_qbit_sync_queues_the_lease_snapshot_and_survives_a_stopped_worker() {
-    use neutron::service::lease::LeaseState;
     use neutron::tui::state::{ActiveModal, AsyncAction, CommandPaletteState};
 
     let client = MockNmClient::default();
@@ -256,12 +255,8 @@ fn manual_qbit_sync_queues_the_lease_snapshot_and_survives_a_stopped_worker() {
     state.config.qbittorrent.url = "http://[invalid".into();
     state.config.qbittorrent.username = Some("snapshot-user".into());
     let expected_config = state.config.qbittorrent.clone();
-    state.lease = Some(LeaseState {
-        profile_uuid: Some("uuid-lease".into()),
-        port: Some(51820),
-        ..Default::default()
-    });
-    state.active_profile_uuid = Some("uuid-not-the-lease".into());
+    state.lease = Some(testing::fresh_lease("uuid-lease", 51820));
+    state.active_profile_uuid = Some("uuid-lease".into());
     let (tx, rx) = std::sync::mpsc::channel();
     state.action_tx = Some(tx);
     state.modal = ActiveModal::CommandPalette(CommandPaletteState {
@@ -276,10 +271,16 @@ fn manual_qbit_sync_queues_the_lease_snapshot_and_survives_a_stopped_worker() {
     state.lease = None;
     state.config.qbittorrent.username = None;
     match rx.try_recv().expect("manual sync must reach the worker") {
-        AsyncAction::QbitSync { uuid, port, config } => {
+        AsyncAction::QbitSync {
+            uuid,
+            port,
+            config,
+            expires_at,
+        } => {
             assert_eq!(uuid, "uuid-lease");
             assert_eq!(port, 51820);
             assert_eq!(config, expected_config);
+            assert!(expires_at > 0);
         }
         other => panic!("expected QbitSync task, got {other:?}"),
     }
@@ -291,11 +292,7 @@ fn manual_qbit_sync_queues_the_lease_snapshot_and_survives_a_stopped_worker() {
 
     state.end_pending();
     drop(rx);
-    state.lease = Some(LeaseState {
-        profile_uuid: Some("uuid-lease".into()),
-        port: Some(51820),
-        ..Default::default()
-    });
+    state.lease = Some(testing::fresh_lease("uuid-lease", 51820));
     execute_action(&mut state, &client, "qbit_sync").unwrap();
     assert!(state.status_is_error);
     assert!(state.status_message.contains("worker has stopped"));
@@ -306,16 +303,12 @@ fn manual_qbit_sync_queues_the_lease_snapshot_and_survives_a_stopped_worker() {
 
 #[test]
 fn spinner_actions_do_not_overwrite_or_queue_overlapping_requests() {
-    use neutron::service::lease::LeaseState;
     use neutron::tui::state::AsyncAction;
 
     let client = MockNmClient::default();
     let (mut state, path) = state_for(&client, "tui-spinner-overlap");
-    state.lease = Some(LeaseState {
-        profile_uuid: Some("uuid-lease".into()),
-        port: Some(51820),
-        ..Default::default()
-    });
+    state.lease = Some(testing::fresh_lease("uuid-lease", 51820));
+    state.active_profile_uuid = Some("uuid-lease".into());
     let (tx, rx) = std::sync::mpsc::channel();
     state.action_tx = Some(tx);
 

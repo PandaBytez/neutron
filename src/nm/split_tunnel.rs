@@ -27,15 +27,6 @@ use std::sync::Mutex;
 use crate::config::SplitTunnelMode;
 use crate::error::{AppError, AppResult};
 
-/// Resolve activation/import policy without silently dropping invalid targets.
-pub(crate) fn routes_for_checked(
-    mode: SplitTunnelMode,
-    cidrs: &[String],
-    domains: &[String],
-) -> AppResult<(Vec<String>, Vec<String>)> {
-    routes_for_checked_with(mode, cidrs, domains, resolve_domain_ips)
-}
-
 /// Checked policy resolution with a caller-supplied resolver (no implicit DNS or cache).
 pub(crate) fn routes_for_checked_with(
     mode: SplitTunnelMode,

@@ -37,8 +37,8 @@ pub fn run_startup_random_with_path<C: NmClient>(
 ///
 /// Best-effort: failures are logged, since callers must still work on a system
 /// where the flag could not be cleared.
-fn normalize_autoconnect<C: NmPolicy>(client: &C) {
-    if let Err(error) = client.set_autoconnect_all(false) {
+fn normalize_autoconnect<C: NmPolicy>(client: &C, path: &Path) {
+    if let Err(error) = config::coordinate_policy(path, || client.set_autoconnect_all(false)) {
         warn!("failed to disable NetworkManager autoconnect: {error}");
     }
 }
@@ -59,7 +59,7 @@ where
 
     // Re-applied on every run so profiles imported out-of-band (via GNOME or
     // `nmcli`, which default autoconnect to on) cannot bring themselves up.
-    normalize_autoconnect(client);
+    normalize_autoconnect(client, path);
 
     let active_profiles: Vec<_> = profiles.iter().filter(|p| p.is_active()).collect();
 
@@ -101,6 +101,7 @@ where
         }
 
         match client.connect(&selected.uuid) {
+            Err(AppError::AlreadyActive) => return Ok(StartupRandomResult::SkippedAlreadyActive),
             Ok(()) => {
                 if let Err(error) = config::update(path, |cfg| {
                     cfg.last_random_profile_id = Some(selected.uuid.clone());
@@ -202,29 +203,65 @@ fn set_autoconnect_at_login_in<C: NmPolicy>(
     autostart_dir: &Path,
     enable: bool,
 ) -> AppResult<()> {
-    // NetworkManager must never activate a profile by itself in either state:
-    // the app is the only thing allowed to decide which tunnel is up.
-    client.set_autoconnect_all(false)?;
+    config::coordinate_policy(path, || {
+        // NetworkManager must never activate a profile by itself in either state:
+        // the app is the only thing allowed to decide which tunnel is up.
+        client.set_autoconnect_all(false)?;
 
-    if enable {
-        autostart::install_in(autostart_dir)?;
-    } else {
-        autostart::uninstall_in(autostart_dir)?;
-    }
-
-    if let Err(err) = config::update(path, |cfg| cfg.general.autoconnect_at_login = enable) {
         if enable {
-            let _ = autostart::uninstall_in(autostart_dir);
+            autostart::install_in(autostart_dir)?;
         } else {
-            let _ = autostart::install_in(autostart_dir);
+            autostart::uninstall_in(autostart_dir)?;
         }
-        return Err(err);
-    }
-    Ok(())
+
+        if let Err(err) = config::update(path, |cfg| cfg.general.autoconnect_at_login = enable) {
+            if enable {
+                let _ = autostart::uninstall_in(autostart_dir);
+            } else {
+                let _ = autostart::install_in(autostart_dir);
+            }
+            return Err(err);
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autoconnect_changes_wait_for_the_activation_policy_lock() {
+        let path = crate::testing::temp_config_path("autoconnect-coordination");
+        config::save(&path, &config::AppConfig::default()).unwrap();
+        let dir = crate::testing::scratch_dir("autostart-coordination");
+        let client = crate::testing::MockNmClient::default();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = config::coordinate_policy(&path, || {
+                let worker = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    done_tx
+                        .send(set_autoconnect_at_login_in(&client, &path, &dir, true))
+                        .unwrap();
+                });
+                started_rx.recv().unwrap();
+                assert!(
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_millis(30))
+                        .is_err()
+                );
+                assert!(client.autoconnect_calls().is_empty());
+                Ok(worker)
+            })
+            .unwrap();
+            worker.join().unwrap();
+        });
+        done_rx.recv().unwrap().unwrap();
+        assert_eq!(client.autoconnect_calls(), ["autoconnect-all:off"]);
+        crate::testing::remove_temp_config(&path);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;

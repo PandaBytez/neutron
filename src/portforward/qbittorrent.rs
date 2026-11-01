@@ -238,10 +238,14 @@ impl QBittorrentClient {
         &mut self,
         port: u16,
         interface_name: Option<&str>,
+        expires_at: Option<u64>,
     ) -> AppResult<QBittorrentSyncReport> {
+        ensure_live_mapping(expires_at)?;
         let version = self.app_version().ok();
         let current_prefs = self.get_preferences().ok();
         let previous_port = current_prefs.as_ref().map(|p| p.listen_port);
+
+        ensure_live_mapping(expires_at)?;
 
         self.set_listen_port(port, interface_name)?;
 
@@ -294,6 +298,19 @@ impl QBittorrentClient {
             self.cookie.as_deref(),
         )?)
     }
+}
+
+fn ensure_live_mapping(expires_at: Option<u64>) -> AppResult<()> {
+    if expires_at.is_some_and(|expiry| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(true, |now| now.as_secs() >= expiry)
+    }) {
+        return Err(AppError::QBittorrent(
+            "forwarded port lease expired; sync refused".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn request_config(
@@ -472,6 +489,21 @@ fn extract_cookie(headers: &[(String, String)], cookie_name: &str) -> Option<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expired_mapping_is_rejected_before_any_webui_request() {
+        let mut client = QBittorrentClient::new(&QBittorrentConfig {
+            url: "http://[invalid".into(),
+            ..Default::default()
+        });
+        assert!(
+            client
+                .sync_port(51820, Some("wg0"), Some(0))
+                .unwrap_err()
+                .to_string()
+                .contains("lease expired")
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -709,7 +741,7 @@ mod tests {
         );
 
         let synced = client
-            .sync_port(55432, Some("wg0"))
+            .sync_port(55432, Some("wg0"), None)
             .expect("sync should succeed");
         assert_eq!(
             synced.previous_port,
@@ -728,7 +760,7 @@ mod tests {
         for interface in [None, Some(""), Some(" ")] {
             let mut client = QBittorrentClient::new(&base(false));
             let report = client
-                .sync_port(55433, interface)
+                .sync_port(55433, interface, None)
                 .expect("port-only sync should succeed");
             assert_eq!(report.bound_interface, None);
             let pushed = server.last_set_preferences();

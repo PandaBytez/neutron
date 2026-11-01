@@ -610,7 +610,11 @@ pub fn set_global_lockdown<C: NmIntrospect + FirewallClient>(
             disable()
         });
         // If coordination storage is unavailable, still permit emergency removal.
-        return if entered { result } else { disable() };
+        return if entered || matches!(&result, Err(AppError::PolicyBusy)) {
+            result
+        } else {
+            disable()
+        };
     }
     apply_and_save_policy(
         path,
@@ -822,13 +826,26 @@ fn handle_qbit_command_with_path<C: NmClient>(
             // working with no daemon running. The request renews the existing
             // mapping rather than replacing it, so the port pushed here is the
             // one the daemon is already holding.
-            let port = crate::portforward::port_for_tunnel_address(&addr).ok_or_else(|| {
-                AppError::PortForward(
-                    "gateway did not return a forwarded port via NAT-PMP".to_string(),
-                )
-            })?;
+            let mapping =
+                crate::portforward::mapping_for_tunnel_address(&addr).ok_or_else(|| {
+                    AppError::PortForward(
+                        "gateway did not return a forwarded port via NAT-PMP".to_string(),
+                    )
+                })?;
 
-            let report = qbittorrent::sync_port(client, &app_cfg.qbittorrent, &active.uuid, port)?;
+            let expires_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| AppError::PortForward("system clock is before the Unix epoch".into()))?
+                .as_secs()
+                + u64::from(mapping.lifetime_secs);
+            let report = qbittorrent::sync_port(
+                client,
+                path,
+                &app_cfg.qbittorrent,
+                &active.uuid,
+                mapping.port,
+                Some(expires_at),
+            )?;
 
             println!("qBittorrent port synchronized successfully!");
             if let Some(prev) = report.previous_port {

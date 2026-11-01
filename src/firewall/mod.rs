@@ -63,6 +63,8 @@ const FIREWALL_CMD: &str = "firewall-cmd";
 /// among any other firewall rules and can be removed surgically at teardown
 /// without disturbing the user's own direct rules.
 const LOCKDOWN_MARKER: &str = "neutron-lockdown";
+// A device-local tag prevents a permanent name allowance matching a later physical link.
+const TUNNEL_GROUP: &str = "1313166676";
 
 /// The iptables `comment` match that stamps [`LOCKDOWN_MARKER`] onto a rule.
 const MARKER_ARGS: [&str; 4] = ["-m", "comment", "--comment", LOCKDOWN_MARKER];
@@ -137,17 +139,17 @@ pub trait FirewallClient {
 
 impl FirewallClient for crate::nm::CliNmClient {
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()> {
-        validate_tunnel_interfaces(tunnels)?;
+        let tunnels = validate_tunnel_interfaces(tunnels)?;
         let active_tunnels: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
         let required = lockdown_enable_batches(&active_tunnels);
-        let allowed = lockdown_enable_batches(tunnels);
+        let allowed = lockdown_enable_batches(&tunnels);
         // Everything that mutates the firewall runs in ONE privileged batch so
         // the user is prompted for a password at most once. Reads are
         // unprivileged and never prompt.
         //
         // Permanent fail-closed guards protect every intermediate rebuild state.
         let mut script = locked_script();
-        script.push_str(&interface_validation_script(tunnels));
+        script.push_str(&interface_validation_script(&tunnels));
         script.push_str(&helper::install_script()?);
         if let (Ok(permanent), Ok(runtime)) = (
             marked_removal_batches(),
@@ -171,6 +173,7 @@ impl FirewallClient for crate::nm::CliNmClient {
                 script.push_str(&build_firewall_script(&batches[2..]));
             }
         }
+        script.push_str(&retire_tag_guards_script());
         run_script(&script, true)?;
         if tunnels.iter().any(|t| !t.is_active) {
             std::thread::spawn(|| {
@@ -201,6 +204,12 @@ impl FirewallClient for crate::nm::CliNmClient {
         let mut script = locked_script();
         script.push_str(&live_removal_script(true, false));
         script.push_str(&live_removal_script(false, false));
+        script.push_str(&format!(
+            "ip -o link show group {TUNNEL_GROUP} | \
+             awk -F ': ' '{{print $2}}' | cut -d '@' -f 1 | while IFS= read -r interface; do\n\
+               ip link set dev \"$interface\" group 0\n\
+             done\n"
+        ));
         if revoke_grant {
             script.push_str(&helper::uninstall_script());
         } else {
@@ -416,7 +425,7 @@ fn locked_script_for(path: &str, owner: u32, timeout: u64, fd: u8) -> String {
 
 /// Only exact interface names may become OUTPUT allowances. Existing links must
 /// be kernel WireGuard devices; absent links are allowed for inactive profiles.
-fn validate_tunnel_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<()> {
+fn validate_tunnel_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<Vec<WireguardTunnel>> {
     validate_tunnel_interfaces_with(tunnels, |interface| {
         let listing = crate::process::run_with_timeout(
             "ip",
@@ -438,8 +447,9 @@ fn validate_tunnel_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<()> {
 fn validate_tunnel_interfaces_with(
     tunnels: &[WireguardTunnel],
     mut is_wireguard: impl FnMut(&str) -> AppResult<Option<bool>>,
-) -> AppResult<()> {
-    for tunnel in tunnels {
+) -> AppResult<Vec<WireguardTunnel>> {
+    let mut tunnels = tunnels.to_vec();
+    for tunnel in &mut tunnels {
         let Some(interface) = tunnel.interface.as_deref() else {
             if tunnel.is_active {
                 return Err(AppError::Firewall(
@@ -460,7 +470,7 @@ fn validate_tunnel_interfaces_with(
         }
         match is_wireguard(interface)? {
             Some(true) => {}
-            None if !tunnel.is_active => {}
+            None if !tunnel.is_active => tunnel.interface = None,
             _ => {
                 return Err(AppError::Firewall(format!(
                     "Interface {interface} is not WireGuard"
@@ -468,13 +478,23 @@ fn validate_tunnel_interfaces_with(
             }
         }
     }
-    Ok(())
+    Ok(tunnels)
 }
 
 /// Recheck after authentication, before any firewall writes. User-side checks
 /// alone leave a device-type race across the password prompt.
 fn interface_validation_script(tunnels: &[WireguardTunnel]) -> String {
-    let mut script = String::from("ip link show >/dev/null\n");
+    let mut script = String::from("tagged=false\nip link show >/dev/null\n");
+    let guards: Vec<_> = FAMILIES
+        .iter()
+        .flat_map(|family| {
+            let permanent = add_rule(family, -1, &["-j", "DROP"]);
+            let mut runtime = permanent.clone();
+            runtime.remove(0);
+            [permanent, runtime]
+        })
+        .collect();
+    let guard_script = build_firewall_script(&guards);
     for tunnel in tunnels {
         if let Some(interface) = &tunnel.interface {
             let absent = if !tunnel.is_active {
@@ -485,13 +505,40 @@ fn interface_validation_script(tunnels: &[WireguardTunnel]) -> String {
             script.push_str(&format!(
                 "if ip link show dev {interface} >/dev/null 2>&1; then\n\
                    wireguard_link=$(ip -details -oneline link show dev {interface} type wireguard)\n\
-                   [ -n \"$wireguard_link\" ] || {{ echo 'Interface is not WireGuard' >&2; exit 1; }}\n\
-                 else\n  {absent}\nfi\n",
+                    [ -n \"$wireguard_link\" ] || {{ echo 'Interface is not WireGuard' >&2; exit 1; }}\n\
+                    group=$(ip -o link show dev {interface} | awk '{{for (i=1;i<NF;i++) if ($i == \"group\") print $(i+1)}}')\n\
+                    case \"$group\" in\n\
+                      default|0)\n\
+                        if [ \"$tagged\" = false ]; then\n{guard_script}tagged=true\nfi\n\
+                        ip link set dev {interface} group {TUNNEL_GROUP}\n\
+                        wireguard_link=$(ip -details -oneline link show dev {interface} type wireguard)\n\
+                        [ -n \"$wireguard_link\" ] || {{ echo 'Interface changed while tagging; protection remains guarded' >&2; exit 1; }};;\n\
+                      {TUNNEL_GROUP}) :;;\n\
+                      *) echo 'WireGuard interface has a foreign device group; left unchanged' >&2; exit 1;;\n\
+                    esac\n\
+                  else\n  {absent}\nfi\n",
                 interface = shell_quote(interface),
             ));
         }
     }
     script
+}
+
+fn retire_tag_guards_script() -> String {
+    let removals: Vec<_> = FAMILIES
+        .iter()
+        .flat_map(|family| {
+            let mut permanent = add_rule(family, -1, &["-j", "DROP"]);
+            permanent[2] = "--remove-rule".into();
+            let mut runtime = permanent.clone();
+            runtime.remove(0);
+            [permanent, runtime]
+        })
+        .collect();
+    format!(
+        "if [ \"$tagged\" = true ]; then\n{}fi\n",
+        build_firewall_script(&removals)
+    )
 }
 
 fn run_script(script: &str, authenticate: bool) -> AppResult<()> {
@@ -673,11 +720,23 @@ fn lockdown_family_batches(family: &str, tunnels: &[WireguardTunnel]) -> Vec<Vec
     let mut batches = vec![add_rule(family, 0, &["-o", "lo", "-j", "ACCEPT"])];
 
     let any_active = tunnels.iter().any(|t| t.is_active);
-    // Permit first traffic on configured tunnel interfaces before activation
-    // completes. The DNS exception below still depends on connection state.
+    // Only callers' verified, existing WireGuard links may get an allowance.
     for tunnel in tunnels {
         if let Some(interface) = &tunnel.interface {
-            batches.push(add_rule(family, 0, &["-o", interface, "-j", "ACCEPT"]));
+            batches.push(add_rule(
+                family,
+                0,
+                &[
+                    "-o",
+                    interface,
+                    "-m",
+                    "devgroup",
+                    "--dst-group",
+                    TUNNEL_GROUP,
+                    "-j",
+                    "ACCEPT",
+                ],
+            ));
         }
     }
 
@@ -740,7 +799,7 @@ fn endpoint_rules(family: &str, endpoint: &Endpoint) -> Vec<Vec<String>> {
         .then(|| {
             add_rule(
                 family,
-                1,
+                0,
                 &["-p", "udp", "-d", host, "--dport", &port, "-j", "ACCEPT"],
             )
         })
@@ -778,6 +837,98 @@ fn reload_batch() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn absent_interface_names_never_become_firewall_allowances() {
+        for name in ["enp9s0", "wg-pending"] {
+            let mut pending = tunnel(name, &[("192.0.2.1", 51820)]);
+            pending.is_active = false;
+            let validated = validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).unwrap();
+            assert!(validated[0].interface.is_none());
+            let rules = lockdown_enable_batches(&validated);
+            assert!(!rules.iter().any(|b| b.iter().any(|s| s == name)));
+            assert!(has_rule(
+                &rules,
+                &["-d", "192.0.2.1", "--dport", "51820", "ACCEPT"]
+            ));
+        }
+    }
+
+    #[test]
+    fn port_53_peer_allowance_precedes_connected_dns_drop() {
+        let rules = lockdown_family_batches("ipv4", &[tunnel("wg0", &[("203.0.113.2", 53)])]);
+        let peer = rules
+            .iter()
+            .find(|b| b.iter().any(|s| s == "203.0.113.2"))
+            .unwrap();
+        let dns = rules
+            .iter()
+            .find(|b| {
+                b.windows(2).any(|p| p == ["--dport", "53"])
+                    && b.last().is_some_and(|s| s == "DROP")
+            })
+            .unwrap();
+        assert!(peer[6].parse::<i32>().unwrap() < dns[6].parse::<i32>().unwrap());
+    }
+
+    #[test]
+    fn interface_allowances_require_the_device_local_tag() {
+        let rules = lockdown_enable_batches(&[tunnel("wg0", &[])]);
+        for rule in rules
+            .iter()
+            .filter(|b| b.windows(2).any(|p| p == ["-o", "wg0"]))
+        {
+            assert!(rule.windows(2).any(|p| p == ["--dst-group", TUNNEL_GROUP]));
+        }
+        let script = interface_validation_script(&[tunnel("wg0", &[])]);
+        assert!(script.contains("foreign device group"));
+        assert!(script.find("--add-rule").unwrap() < script.find("ip link set dev").unwrap());
+        assert!(script.contains("Interface changed while tagging"));
+    }
+
+    #[test]
+    fn a_device_replaced_while_tagging_keeps_the_guards_and_foreign_groups_are_untouched() {
+        let dir = crate::testing::scratch_dir("tagging-race");
+        let fake = format!(
+            r#"
+ip() {{
+    case "$*" in
+      *'type wireguard'*) [ -e {dir}/tagged ] || printf verified;;
+      *'link set dev'*) touch {dir}/tagged;;
+      *'-o link show dev'*) printf '3: wg-race: group %s\n' "$GROUP";;
+    esac
+}}
+firewall-cmd() {{ printf '%s\n' "$*" >> {dir}/calls; }}
+"#,
+            dir = shell_quote(dir.to_str().unwrap())
+        );
+        let script = format!(
+            "set -e\n{fake}{}{}",
+            interface_validation_script(&[tunnel("wg-race", &[])]),
+            retire_tag_guards_script()
+        );
+        for group in ["123", "default"] {
+            let output = Command::new("/bin/bash")
+                .args(["-c", &script])
+                .env("GROUP", group)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            if group == "123" {
+                assert!(!dir.join("tagged").exists() && !dir.join("calls").exists());
+            } else {
+                let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                assert_eq!(calls.lines().count(), 4);
+                assert!(
+                    calls
+                        .lines()
+                        .all(|line| line.contains("--add-rule") && line.contains("-j DROP"))
+                );
+                assert!(!calls.contains("--remove-rule"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
