@@ -95,7 +95,9 @@ read failures retry with a delay, and public-IP requests coalesce without losing
 the last request during worker shutdown. Favorite menu IDs remain tied to UUIDs
 across layout refreshes; clicks on removed items are ignored.
 
-Port leases renew at half the granted lifetime (capped at 45 seconds). Failed
+Port leases renew at half the granted lifetime (capped at 45 seconds). Mapping
+failures get two quick retries at two-second intervals before a 45-second backoff;
+switching tunnels or re-enabling forwarding resets that retry budget. Failed
 qBittorrent synchronization retries after 45 seconds, while changed configuration
 can trigger an immediate attempt.
 

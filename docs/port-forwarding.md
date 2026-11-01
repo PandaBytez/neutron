@@ -60,6 +60,11 @@ Legacy configs with the old `enabled` flags keep loading: `[port_forwarding] ena
 3. **Profile Switch / Disconnect Cleanup**: When switching profiles or disconnecting, the active port is cleared immediately to prevent displaying stale mappings.
 4. **Clipboard Integration**: The tray's Copy Forwarded Port action copies the port for pasting into BitTorrent or game servers.
 
+On connect or switch, the daemon requests a lease on its next poll. If the tunnel
+address or gateway is not ready, it makes up to two retries, two seconds after
+each failed attempt, before backing off to 45 seconds between failures. Once a
+port is acquired, configured qBittorrent sync runs in the same poll.
+
 The publication carries the mapping's expiry separately from the daemon heartbeat.
 A fresh heartbeat cannot extend an expired mapping. The TUI accepts a port only for
 the active profile's UUID; old publications without expiry remain recognizable as

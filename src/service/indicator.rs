@@ -802,6 +802,8 @@ struct LeaseTracker {
     /// Last mapping attempt, including failures. Independent of lease validity
     /// so unsupported gateways are not retried on every poll (BUG-033).
     attempted_at: Option<std::time::Instant>,
+    /// Bound quick retries while a newly active tunnel's gateway becomes reachable.
+    mapping_failures: u8,
     /// When the current mapping lease expires. None when no lease is held (BUG-014).
     expires_at: Option<std::time::Instant>,
     /// Granted lease duration, or zero if unmapped.
@@ -829,6 +831,7 @@ impl LeaseTracker {
             self.tunnel_uuid = active_uuid.clone();
             self.release();
             self.attempted_at = None;
+            self.mapping_failures = 0;
         }
     }
 
@@ -847,6 +850,7 @@ impl LeaseTracker {
         }
         if just_enabled {
             self.attempted_at = None;
+            self.mapping_failures = 0;
         }
         self.is_due()
     }
@@ -884,7 +888,11 @@ impl LeaseTracker {
     fn is_due_at(&self, now: std::time::Instant) -> bool {
         self.attempted_at.is_none_or(|at| {
             let renew_after = if self.lifetime.is_zero() {
-                crate::portforward::RENEW_INTERVAL
+                if self.mapping_failures < 3 {
+                    POLL_INTERVAL
+                } else {
+                    crate::portforward::RENEW_INTERVAL
+                }
             } else {
                 (self.lifetime / 2).min(crate::portforward::RENEW_INTERVAL)
             };
@@ -906,9 +914,11 @@ impl LeaseTracker {
 
         let Some(mapped) = mapped else {
             self.release();
+            self.mapping_failures = self.mapping_failures.saturating_add(1);
             return false;
         };
 
+        self.mapping_failures = 0;
         let duration = std::time::Duration::from_secs(mapped.lifetime_secs as u64);
         self.lifetime = duration;
         self.expires_at = Some(now + duration);
@@ -925,6 +935,7 @@ impl LeaseTracker {
     /// address). Backs off the next attempt without dropping a held lease.
     fn note_mapping_miss(&mut self) {
         self.attempted_at = Some(std::time::Instant::now());
+        self.mapping_failures = self.mapping_failures.saturating_add(1);
     }
 
     /// Whether qBittorrent synchronization is required (BUG-055).
@@ -1608,11 +1619,90 @@ mod tests {
     }
 
     #[test]
+    fn a_transient_mapping_failure_after_switch_retries_and_pushes_the_new_port() {
+        let mut lease = LeaseTracker::default();
+        let old = Some("uuid-old".into());
+        let new = Some("uuid-new".into());
+        let mode = crate::config::PortForwardMode::ForwardAndSync;
+        let cfg = crate::config::QBittorrentConfig::default();
+        assert!(lease.begin_poll(&old, true));
+        lease.record(Some(test_mapping(51820)));
+        lease.claim_qbit_push(&mode, &cfg);
+        lease.qbit_sync = QbitSyncStatus::Synchronized;
+
+        assert!(lease.begin_poll(&new, true));
+        let now = std::time::Instant::now();
+        lease.record_at(None, now);
+        assert_eq!(lease.publication(new.clone()).port, None);
+        assert!(!lease.is_due_at(now + POLL_INTERVAL - Duration::from_nanos(1)));
+        assert!(lease.is_due_at(now + POLL_INTERVAL));
+        lease.record_at(Some(test_mapping(40000)), now + POLL_INTERVAL);
+        assert_eq!(lease.claim_qbit_push(&mode, &cfg), Some(40000));
+    }
+
+    #[test]
+    fn an_unready_tunnel_address_gets_a_quick_retry() {
+        let mut lease = LeaseTracker::default();
+        assert!(lease.begin_poll(&Some("uuid-new".into()), true));
+        lease.note_mapping_miss();
+        let attempted = lease.attempted_at.unwrap();
+        assert!(lease.is_due_at(attempted + POLL_INTERVAL));
+        lease.note_mapping_miss();
+        lease.note_mapping_miss();
+        let attempted = lease.attempted_at.unwrap();
+        assert!(!lease.is_due_at(attempted + POLL_INTERVAL));
+        assert!(lease.is_due_at(attempted + crate::portforward::RENEW_INTERVAL));
+    }
+
+    #[test]
+    fn a_successful_mapping_resets_failure_backoff_without_changing_renewal() {
+        let mut lease = LeaseTracker::default();
+        for _ in 0..3 {
+            lease.record(None);
+        }
+        let now = std::time::Instant::now();
+        lease.record_at(Some(test_mapping(51820)), now);
+        let renew_after = Duration::from_secs(u64::from(crate::portforward::LIFETIME) / 2);
+        assert!(!lease.is_due_at(now + renew_after - Duration::from_nanos(1)));
+        assert!(lease.is_due_at(now + renew_after));
+        lease.record_at(None, now + renew_after);
+        assert!(lease.is_due_at(now + renew_after + POLL_INTERVAL));
+    }
+
+    #[test]
+    fn repeated_mapping_failures_exhaust_quick_retries() {
+        let mut lease = LeaseTracker::default();
+        let uuid = Some("uuid-unsupported".into());
+        assert!(lease.begin_poll(&uuid, true));
+        let mut now = std::time::Instant::now();
+        for _ in 0..3 {
+            assert!(lease.is_due_at(now));
+            lease.record_at(None, now);
+            now += POLL_INTERVAL;
+        }
+        let attempted = lease.attempted_at.unwrap();
+        assert!(!lease.is_due_at(now));
+        assert!(
+            !lease.is_due_at(
+                attempted + crate::portforward::RENEW_INTERVAL - Duration::from_nanos(1)
+            )
+        );
+        assert!(lease.is_due_at(attempted + crate::portforward::RENEW_INTERVAL));
+        assert!(!lease.begin_poll(&uuid, false));
+        assert!(lease.begin_poll(&uuid, true));
+        lease.record(None);
+        assert!(lease.is_due_at(lease.attempted_at.unwrap() + POLL_INTERVAL));
+    }
+
+    #[test]
     fn failed_mapping_keeps_backoff_until_interval_or_tunnel_change() {
         let mut lease = LeaseTracker::default();
         lease.follow_tunnel(&Some("uuid-eu".into()));
-        for mapped in [Some(test_mapping(51820)), None, None] {
-            lease.record(mapped);
+        for _ in 0..3 {
+            lease.record(None);
+        }
+        for _ in 0..3 {
+            lease.record(None);
             let attempted = lease.attempted_at.unwrap();
             lease.release();
             assert_eq!(lease.port, None);
@@ -1627,6 +1717,8 @@ mod tests {
             lease.is_due(),
             "a new tunnel should get its first attempt immediately"
         );
+        lease.record(None);
+        assert!(lease.is_due_at(lease.attempted_at.unwrap() + POLL_INTERVAL));
     }
 
     #[test]
