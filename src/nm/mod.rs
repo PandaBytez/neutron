@@ -273,7 +273,7 @@ impl NmLifecycle for CliNmClient {
     fn connect(&self, profile_identifier: &str) -> AppResult<()> {
         let profiles = self.list_wireguard_profiles()?;
         let profile = find_unique_profile_by_identifier(&profiles, profile_identifier)?;
-        activate(&profile.uuid)
+        activate(&profile.uuid, false)
     }
 
     fn disconnect_active(&self) -> AppResult<()> {
@@ -295,20 +295,7 @@ impl NmLifecycle for CliNmClient {
             return Ok(());
         }
 
-        for profile in profiles.iter().filter(|p| p.is_active()) {
-            confirm_teardown(
-                run_nmcli(&["connection", "down", &profile.uuid]).map(|_| ()),
-                || {
-                    self.list_wireguard_profiles().map(|profiles| {
-                        profiles
-                            .iter()
-                            .any(|p| p.uuid == profile.uuid && p.is_active())
-                    })
-                },
-            )?;
-        }
-
-        activate(&target.uuid)
+        activate(&target.uuid, true)
     }
 
     fn import_wireguard_profile(&self, path: &std::path::Path) -> AppResult<String> {
@@ -1012,7 +999,7 @@ fn parse_nmcli_fields(line: &str) -> Vec<String> {
 /// Policy/configuration failures prevent activation. Handshake verification is
 /// only destructive when keepalive is configured to initiate a handshake;
 /// on-demand tunnels can legitimately remain idle until their first packet.
-fn activate(uuid: &str) -> AppResult<()> {
+fn activate(uuid: &str, teardown_active: bool) -> AppResult<()> {
     use crate::firewall::FirewallClient;
     let path = crate::config::default_config_path()?;
     crate::config::coordinate_policy(&path, || {
@@ -1032,20 +1019,38 @@ fn activate(uuid: &str) -> AppResult<()> {
         if config.lockdown_enabled {
             CliNmClient.refresh_lockdown(Some(uuid))?;
         }
-        let result = activate_prepared(
-            uuid,
-            config.general.verify_tunnel_on_connect,
-            settings,
-            &mut run_nmcli,
-        )
-        .and_then(|()| {
+        let result = (|| {
+            if teardown_active {
+                for profile in CliNmClient
+                    .list_wireguard_profiles()?
+                    .into_iter()
+                    .filter(|p| p.is_active() && p.uuid != uuid)
+                {
+                    confirm_teardown(
+                        run_nmcli(&["connection", "down", &profile.uuid]).map(|_| ()),
+                        || {
+                            CliNmClient.list_wireguard_profiles().map(|profiles| {
+                                profiles
+                                    .iter()
+                                    .any(|p| p.uuid == profile.uuid && p.is_active())
+                            })
+                        },
+                    )?;
+                }
+            }
+            activate_prepared(
+                uuid,
+                config.general.verify_tunnel_on_connect,
+                settings,
+                &mut run_nmcli,
+            )?;
             if let Some((interface, dns)) = protected_dns {
                 verify_dns_or_disconnect(uuid, &interface, &dns, &mut run_nmcli, &mut |args| {
                     crate::process::run_with_timeout("ip", args, NMCLI_TIMEOUT)
                 })?;
             }
             Ok(())
-        });
+        })();
         if config.lockdown_enabled {
             let reconciliation = CliNmClient.refresh_lockdown(None);
             if result.is_ok() {

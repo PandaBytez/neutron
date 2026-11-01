@@ -51,6 +51,8 @@ pub fn is_installed_in(dir: &Path) -> bool {
     dir.join(entry_name()).exists()
 }
 
+const LEGACY_ENTRY_NAME: &str = "io.gitlab.neutron_vpn.neutron-autostart.desktop";
+
 /// Write the autostart entry into `dir`, creating it if needed.
 pub fn install_in(dir: &Path) -> AppResult<()> {
     std::fs::create_dir_all(dir)?;
@@ -58,11 +60,13 @@ pub fn install_in(dir: &Path) -> AppResult<()> {
         dir.join(entry_name()),
         entry_contents(&launch_command(AUTOSTART_ARGS)),
     )?;
+    let _ = std::fs::remove_file(dir.join(LEGACY_ENTRY_NAME));
     Ok(())
 }
 
 /// Remove the autostart entry from `dir`. Succeeds when it is already absent.
 pub fn uninstall_in(dir: &Path) -> AppResult<()> {
+    let _ = std::fs::remove_file(dir.join(LEGACY_ENTRY_NAME));
     match std::fs::remove_file(dir.join(entry_name())) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

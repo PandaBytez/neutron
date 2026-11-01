@@ -167,12 +167,12 @@ neutron lockdown disable
 while waiting on authentication and firewalld. Piped output gets a plain
 `Enabling Lockdown...` line instead.
 
-Helper refreshes also require fresh `auth_admin`, not a password-free grant.
-Automatic connections, switching, login selection, and reconciliation may prompt;
-headless denial fails closed and a required pre-activation refresh failure stops
-activation. After upgrading an existing install, authenticate with
-`neutron lockdown enable` to replace its old grant. Disable retains only hardened
-authorization and revokes unsafe grants, including mixed actions and legacy rules.
+Helper refreshes are authorized for active local sessions (`allow_active=yes`)
+without another password prompt; headless or inactive denial fails closed and a
+required pre-activation refresh failure stops activation. After upgrading an
+existing install, authenticate with `neutron lockdown enable` to update the helper
+and its action. Disable retains only hardened authorization and revokes unsafe
+grants, including mixed actions and legacy rules.
 NetworkManager and `nmcli` 1.52+ and iproute2's `ip` are required. Protected DNS
 disables automatic routed-DNS processing and merges explicit resolver host routes
 in main table 254, even for exclusions. After activation/reapply, kernel UDP/TCP
@@ -213,7 +213,7 @@ session, and Homebrew refuses to run as root. Neutron detects whether it was
 installed by Homebrew or `cargo install` and runs the matching removal. It stops
 the tray daemon, deletes the autostart entry, and -- in one privileged batch, and
 only if any lockdown state is present -- lifts the firewall rules and revokes the
-authenticated refresh helper and action. Settings are kept unless `--purge` is given. An unrecognized install is refused without changing anything; see
+password-free refresh grant (helper and action). Settings are kept unless `--purge` is given. An unrecognized install is refused without changing anything; see
 [security.md](security.md#uninstalling-revokes-everything-it-installed).
 
 ### NAT-PMP & qBittorrent Dynamic Port Sync
@@ -257,6 +257,8 @@ For headless renewal and missing `XDG_RUNTIME_DIR` behavior, see the
 ### System Tray AppIndicator & Background Daemon
 
 Neutron includes a pure-Rust D-Bus `StatusNotifierItem` and `DBusMenu` system tray indicator (`src/service/indicator.rs` via `zbus`) that monitors link health and provides quick desktop controls:
+
+> **Note (GNOME):** Stock GNOME Shell does not render `StatusNotifierItem` tray icons out of the box. Install and enable the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension (`gnome-shell-extension-appindicator`) for the Neutron tray icon and menu to appear.
 
 ![Neutron System Tray AppIndicator](screenshots/Neutron-Tray.png)
 

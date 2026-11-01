@@ -32,9 +32,9 @@ This folder contains an optional one-shot user service that runs the startup ran
     ```
 
 Both NetworkManager and `nmcli` must be 1.52+, and iproute2's `ip` is required
-for protected resolver UDP/TCP kernel egress verification. With lockdown enabled, every
-helper refresh requires fresh administrator authorization, including this
-automatic selector. A headless session without authorization fails closed;
-required pre-activation refresh failure stops activation, not firewall protection.
-Existing installs must authenticate with `neutron lockdown enable` after upgrading
-to replace the old helper grant. This service is not a password-free bypass.
+for protected resolver UDP/TCP kernel egress verification. With lockdown enabled,
+helper refreshes require an active local session (`allow_active=yes`). A headless
+session without authorization fails closed; required pre-activation refresh failure
+stops activation, not firewall protection. Existing installs can run
+`neutron lockdown enable` from an active local session to install or repair
+helper authorization.

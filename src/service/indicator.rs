@@ -17,6 +17,12 @@ pub const INDICATOR_BUS_NAME: &str = "io.github.pandabytez.neutron.indicator";
 
 pub type ToolTipTuple = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
 pub type MenuLayoutResult<'a> = (u32, (i32, HashMap<String, Value<'a>>, Vec<Value<'a>>));
+type MenuItemProperties = (i32, HashMap<String, Value<'static>>);
+type MenuSnapshot = (
+    u32,
+    HashMap<String, Value<'static>>,
+    Vec<MenuItemProperties>,
+);
 
 const CONNECTED_48_ARGB32: &[u8] = include_bytes!("../../resources/status/connected_48.argb32");
 const CONNECTED_24_ARGB32: &[u8] = include_bytes!("../../resources/status/connected_24.argb32");
@@ -34,6 +40,17 @@ pub struct IndicatorSharedState {
     pub favorite_profiles: Vec<(String, String)>,
     pub favorite_id_map: HashMap<i32, String>,
     pub menu_revision: u32,
+}
+
+impl IndicatorSharedState {
+    pub fn ensure_favorite_ids(&mut self) {
+        for (uuid, _) in &self.favorite_profiles {
+            if !self.favorite_id_map.values().any(|known| known == uuid) {
+                let id = self.favorite_id_map.keys().max().copied().unwrap_or(99) + 1;
+                self.favorite_id_map.insert(id, uuid.clone());
+            }
+        }
+    }
 }
 
 pub fn install_status_icons() {
@@ -89,6 +106,11 @@ pub fn is_indicator_running() -> bool {
 
 /// Ensure background indicator daemon is running (spawn once if not already active).
 pub fn ensure_indicator_daemon_running() {
+    #[cfg(unix)]
+    if crate::app::has_stale_daemon(std::path::Path::new("/proc")) {
+        crate::app::stop_daemons(std::path::Path::new("/proc"), Duration::from_secs(1));
+    }
+
     if is_indicator_running() {
         return;
     }
@@ -240,6 +262,120 @@ pub struct DBusMenu<C> {
     pub state: Arc<Mutex<IndicatorSharedState>>,
 }
 
+impl<C> DBusMenu<C>
+where
+    C: NmClient,
+{
+    fn build_menu_items(&self) -> MenuSnapshot {
+        let (prof, active_uuid, port_opt, favorites, id_map, rev) =
+            if let Ok(mut st) = self.state.lock() {
+                st.ensure_favorite_ids();
+                (
+                    st.active_profile.clone(),
+                    st.active_uuid.clone(),
+                    st.forwarded_port,
+                    st.favorite_profiles.clone(),
+                    st.favorite_id_map.clone(),
+                    st.menu_revision,
+                )
+            } else {
+                (None, None, None, Vec::new(), HashMap::new(), 1)
+            };
+
+        let mut items = Vec::new();
+
+        // 1. Toggle Connect / Disconnect
+        let toggle_label = if let Some(ref name) = prof {
+            format!("Disconnect ({name})")
+        } else {
+            "Quick Connect (Random Eligible)".to_string()
+        };
+        let mut toggle_props = HashMap::new();
+        toggle_props.insert("label".to_string(), Value::from(toggle_label));
+        toggle_props.insert("enabled".to_string(), Value::from(true));
+        toggle_props.insert("visible".to_string(), Value::from(true));
+        items.push((2i32, toggle_props));
+
+        // 2. Favorite Profiles Quick Actions
+        if !favorites.is_empty() {
+            let mut fav_sep = HashMap::new();
+            fav_sep.insert("type".to_string(), Value::from("separator"));
+            fav_sep.insert("visible".to_string(), Value::from(true));
+            items.push((10i32, fav_sep));
+
+            for (uuid, name) in &favorites {
+                let is_active = active_uuid.as_deref() == Some(uuid.as_str());
+                let label = if is_active {
+                    format!("{name} (Active)")
+                } else {
+                    name.clone()
+                };
+                let mut fav_props = HashMap::new();
+                fav_props.insert("label".to_string(), Value::from(label));
+                fav_props.insert("enabled".to_string(), Value::from(true));
+                fav_props.insert("visible".to_string(), Value::from(true));
+                let item_id = id_map
+                    .iter()
+                    .find(|(_, known)| *known == uuid)
+                    .map(|(id, _)| *id)
+                    .unwrap_or(-1);
+                items.push((item_id, fav_props));
+            }
+        }
+
+        // 3. Port Forwarding (Copy)
+        if let Some(port) = port_opt {
+            let mut port_sep = HashMap::new();
+            port_sep.insert("type".to_string(), Value::from("separator"));
+            port_sep.insert("visible".to_string(), Value::from(true));
+            items.push((11i32, port_sep));
+
+            let mut port_props = HashMap::new();
+            port_props.insert(
+                "label".to_string(),
+                Value::from(format!("Forwarded Port: {port} (Copy)")),
+            );
+            port_props.insert("enabled".to_string(), Value::from(true));
+            port_props.insert("visible".to_string(), Value::from(true));
+            items.push((5i32, port_props));
+        }
+
+        // 4. Separator
+        let mut sep_props = HashMap::new();
+        sep_props.insert("type".to_string(), Value::from("separator"));
+        sep_props.insert("visible".to_string(), Value::from(true));
+        items.push((3i32, sep_props));
+
+        // 5. Quit
+        let mut quit_props = HashMap::new();
+        quit_props.insert("label".to_string(), Value::from("Quit Neutron"));
+        quit_props.insert("enabled".to_string(), Value::from(true));
+        quit_props.insert("visible".to_string(), Value::from(true));
+        items.push((4i32, quit_props));
+
+        let mut root_props = HashMap::new();
+        root_props.insert("children-display".to_string(), Value::from("submenu"));
+
+        (rev, root_props, items)
+    }
+
+    fn refresh_active_state(&self) {
+        let Ok(profiles) = self.client.list_wireguard_profiles() else {
+            return;
+        };
+        let active = profiles.iter().find(|p| p.is_active());
+        let active_name = active.map(|profile| profile.name.clone());
+        let active_uuid = active.map(|profile| profile.uuid.clone());
+        if let Ok(mut st) = self.state.lock()
+            && (st.active_profile != active_name || st.active_uuid != active_uuid)
+        {
+            st.active_profile = active_name;
+            st.active_uuid = active_uuid;
+            st.menu_revision += 1;
+        }
+    }
+}
+
 #[interface(name = "com.canonical.dbusmenu")]
 impl<C> DBusMenu<C>
 where
@@ -261,104 +397,35 @@ where
         _recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> MenuLayoutResult<'_> {
-        let (prof, active_uuid, port_opt, favorites, rev) = if let Ok(mut st) = self.state.lock() {
-            let active_prof = st.active_profile.clone();
-            let active_id = st.active_uuid.clone();
-            let port = st.forwarded_port;
-            let favs = st.favorite_profiles.clone();
-            let rev = st.menu_revision;
-            for (uuid, _) in &favs {
-                if !st.favorite_id_map.values().any(|known| known == uuid) {
-                    let id = st.favorite_id_map.keys().max().copied().unwrap_or(99) + 1;
-                    st.favorite_id_map.insert(id, uuid.clone());
-                }
-            }
-            (active_prof, active_id, port, favs, rev)
-        } else {
-            (None, None, None, Vec::new(), 1)
-        };
-
-        let mut children = Vec::new();
-
-        // 1. Toggle Connect / Disconnect
-        let toggle_label = if let Some(ref name) = prof {
-            format!("Disconnect ({name})")
-        } else {
-            "Quick Connect (Random Eligible)".to_string()
-        };
-        let mut toggle_props = HashMap::new();
-        toggle_props.insert("label".to_string(), Value::from(toggle_label));
-        toggle_props.insert("enabled".to_string(), Value::from(true));
-        toggle_props.insert("visible".to_string(), Value::from(true));
-        children.push(Value::from((2i32, toggle_props, Vec::<Value<'_>>::new())));
-
-        // 2. Favorite Profiles Quick Actions
-        if !favorites.is_empty() {
-            let mut fav_sep = HashMap::new();
-            fav_sep.insert("type".to_string(), Value::from("separator"));
-            fav_sep.insert("visible".to_string(), Value::from(true));
-            children.push(Value::from((10i32, fav_sep, Vec::<Value<'_>>::new())));
-
-            for (uuid, name) in &favorites {
-                let is_active = active_uuid.as_deref() == Some(uuid.as_str());
-                let label = if is_active {
-                    format!("{name} (Active)")
-                } else {
-                    name.clone()
-                };
-                let mut fav_props = HashMap::new();
-                fav_props.insert("label".to_string(), Value::from(label));
-                fav_props.insert("enabled".to_string(), Value::from(true));
-                fav_props.insert("visible".to_string(), Value::from(true));
-                let item_id = self
-                    .state
-                    .lock()
-                    .ok()
-                    .and_then(|st| {
-                        st.favorite_id_map
-                            .iter()
-                            .find(|(_, known)| *known == uuid)
-                            .map(|(id, _)| *id)
-                    })
-                    .unwrap_or(-1);
-                children.push(Value::from((item_id, fav_props, Vec::<Value<'_>>::new())));
-            }
-        }
-
-        // 3. Port Forwarding (Copy)
-        if let Some(port) = port_opt {
-            let mut port_sep = HashMap::new();
-            port_sep.insert("type".to_string(), Value::from("separator"));
-            port_sep.insert("visible".to_string(), Value::from(true));
-            children.push(Value::from((11i32, port_sep, Vec::<Value<'_>>::new())));
-
-            let mut port_props = HashMap::new();
-            port_props.insert(
-                "label".to_string(),
-                Value::from(format!("Forwarded Port: {port} (Copy)")),
-            );
-            port_props.insert("enabled".to_string(), Value::from(true));
-            port_props.insert("visible".to_string(), Value::from(true));
-            children.push(Value::from((5i32, port_props, Vec::<Value<'_>>::new())));
-        }
-
-        // 4. Separator
-        let mut sep_props = HashMap::new();
-        sep_props.insert("type".to_string(), Value::from("separator"));
-        sep_props.insert("visible".to_string(), Value::from(true));
-        children.push(Value::from((3i32, sep_props, Vec::<Value<'_>>::new())));
-
-        // 5. Quit
-        let mut quit_props = HashMap::new();
-        quit_props.insert("label".to_string(), Value::from("Quit Neutron"));
-        quit_props.insert("enabled".to_string(), Value::from(true));
-        quit_props.insert("visible".to_string(), Value::from(true));
-        children.push(Value::from((4i32, quit_props, Vec::<Value<'_>>::new())));
-
-        let mut root_props = HashMap::new();
-        root_props.insert("children-display".to_string(), Value::from("submenu"));
-
+        let (rev, root_props, items) = self.build_menu_items();
+        let children = items
+            .into_iter()
+            .map(|(id, props)| Value::from((id, props, Vec::<Value<'_>>::new())))
+            .collect();
         (rev, (0, root_props, children))
+    }
+
+    fn get_group_properties(
+        &self,
+        ids: Vec<i32>,
+        _property_names: Vec<String>,
+    ) -> Vec<(i32, HashMap<String, Value<'_>>)> {
+        let (_, root_props, items) = self.build_menu_items();
+        let mut all = Vec::with_capacity(items.len() + 1);
+        all.push((0i32, root_props));
+        all.extend(items);
+        if ids.is_empty() {
+            return all;
+        }
+        all.into_iter().filter(|(id, _)| ids.contains(id)).collect()
+    }
+
+    fn get_property(&self, id: i32, name: &str) -> zbus::fdo::Result<Value<'_>> {
+        self.get_group_properties(vec![id], Vec::new())
+            .into_iter()
+            .find(|(item_id, _)| *item_id == id)
+            .and_then(|(_, mut props)| props.remove(name))
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown menu property {id}:{name}")))
     }
 
     fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: u32) {
@@ -373,12 +440,12 @@ where
                     .lock()
                     .map(|st| st.active_profile.is_some())
                     .unwrap_or(false);
-                let client = self.client.clone();
                 if is_conn {
-                    let _ = client.disconnect_active();
+                    let _ = self.client.disconnect_active();
                 } else {
-                    let _ = crate::service::run_startup_random(&client);
+                    let _ = crate::service::run_startup_random(&self.client);
                 }
+                self.refresh_active_state();
             }
             5 => {
                 if let Ok(st) = self.state.lock()
@@ -391,7 +458,8 @@ where
                 std::process::exit(0);
             }
             item_id if item_id >= 100 => {
-                let target_uuid = self.state.lock().ok().and_then(|st| {
+                let target_uuid = self.state.lock().ok().and_then(|mut st| {
+                    st.ensure_favorite_ids();
                     st.favorite_id_map
                         .get(&item_id)
                         .filter(|uuid| {
@@ -401,18 +469,30 @@ where
                         })
                         .cloned()
                 });
-                if let Some(uuid) = target_uuid
-                    && let Err(err) = self.client.switch_to(&uuid)
-                {
-                    warn!("Failed to switch to favorite profile '{uuid}': {err}");
+                if let Some(uuid) = target_uuid {
+                    match self.client.switch_to(&uuid) {
+                        Ok(()) => self.refresh_active_state(),
+                        Err(err) => warn!("Failed to switch to favorite profile '{uuid}': {err}"),
+                    }
                 }
             }
             _ => {}
         }
     }
 
+    fn event_group(&self, events: Vec<(i32, String, Value<'_>, u32)>) -> Vec<i32> {
+        for (id, event_id, data, timestamp) in events {
+            self.event(id, &event_id, data, timestamp);
+        }
+        Vec::new()
+    }
+
     fn about_to_show(&self, _id: i32) -> bool {
         false
+    }
+
+    fn about_to_show_group(&self, _ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+        (Vec::new(), Vec::new())
     }
 
     #[zbus(signal)]
@@ -898,6 +978,23 @@ where
     info!("Starting Neutron persistent AppIndicator daemon...");
 
     let state = Arc::new(Mutex::new(IndicatorSharedState::default()));
+    if let Ok(mut st) = state.lock() {
+        let profiles = client.list_wireguard_profiles().unwrap_or_default();
+        let active = profiles.iter().find(|p| p.is_active());
+        let app_cfg = crate::config::default_config_path()
+            .ok()
+            .and_then(|path| crate::config::load(&path).ok())
+            .unwrap_or_default();
+        st.active_profile = active.map(|p| p.name.clone());
+        st.active_uuid = active.map(|p| p.uuid.clone());
+        st.favorite_profiles = profiles
+            .iter()
+            .filter(|p| app_cfg.favorite_profile_ids.contains(&p.uuid))
+            .map(|p| (p.uuid.clone(), p.name.clone()))
+            .collect();
+        st.ensure_favorite_ids();
+        st.menu_revision = 1;
+    }
     let _handle = spawn_indicator_service(client.clone(), state.clone());
 
     let mut lease = LeaseTracker::default();
@@ -905,16 +1002,22 @@ where
     let mut last_domain_refresh = std::time::Instant::now();
 
     loop {
-        let profiles = client.list_wireguard_profiles().unwrap_or_default();
-        let active = profiles.iter().find(|p| p.is_active());
-        let active_name = active.map(|profile| profile.name.clone());
-        let active_uuid = active.map(|profile| profile.uuid.clone());
+        let mut profiles = client.list_wireguard_profiles().unwrap_or_default();
+        let mut active = profiles.iter().find(|p| p.is_active());
+        let mut active_name = active.map(|profile| profile.name.clone());
+        let mut active_uuid = active.map(|profile| profile.uuid.clone());
 
         if prev_active_uuid.as_ref() != Some(&active_uuid)
             && let Ok(path) = crate::config::default_config_path()
         {
             match crate::app::rebuild_lockdown_if_enabled(&client, &path) {
-                Ok(()) => prev_active_uuid = Some(active_uuid.clone()),
+                Ok(()) => {
+                    profiles = client.list_wireguard_profiles().unwrap_or_default();
+                    active = profiles.iter().find(|p| p.is_active());
+                    active_name = active.map(|profile| profile.name.clone());
+                    active_uuid = active.map(|profile| profile.uuid.clone());
+                    prev_active_uuid = Some(active_uuid.clone());
+                }
                 Err(error) => warn!("lockdown reconciliation failed; will retry: {error}"),
             }
         }
@@ -929,6 +1032,18 @@ where
             .filter(|p| app_cfg.favorite_profile_ids.contains(&p.uuid))
             .map(|p| (p.uuid.clone(), p.name.clone()))
             .collect();
+
+        if let Ok(mut st) = state.lock()
+            && (st.active_profile != active_name
+                || st.active_uuid != active_uuid
+                || st.favorite_profiles != favorites)
+        {
+            st.active_profile = active_name.clone();
+            st.active_uuid = active_uuid.clone();
+            st.favorite_profiles = favorites.clone();
+            st.ensure_favorite_ids();
+            st.menu_revision += 1;
+        }
 
         let renewal_due = lease.begin_poll(&active_uuid, app_cfg.port_forwarding.mode.is_enabled());
         if let Some(profile) = active {
@@ -974,15 +1089,9 @@ where
         }
 
         if let Ok(mut st) = state.lock()
-            && (st.active_profile != active_name
-                || st.active_uuid != active_uuid
-                || st.forwarded_port != lease.port
-                || st.favorite_profiles != favorites)
+            && st.forwarded_port != lease.port
         {
-            st.active_profile = active_name;
-            st.active_uuid = active_uuid.clone();
             st.forwarded_port = lease.port;
-            st.favorite_profiles = favorites;
             st.menu_revision += 1;
         }
 
@@ -1157,6 +1266,10 @@ mod tests {
             state.try_lock().is_ok(),
             "shared state lock must remain available during/after favorite switch"
         );
+        assert_eq!(
+            state.lock().unwrap().active_uuid.as_deref(),
+            Some("uuid-fav")
+        );
     }
 
     #[test]
@@ -1188,9 +1301,16 @@ mod tests {
         // Children: toggle(2), sep(10), fav 100, fav 101, sep(12), quit(4)
         assert_eq!(children.len(), 6);
 
-        // Click item 101 -> maps to uuid-2
+        // Click item 101 -> maps to uuid-2 and updates active_uuid immediately
         menu.event(101, "clicked", zbus::zvariant::Value::from(0u32), 0);
         assert_eq!(client.calls(), vec!["switch:uuid-2"]);
+        assert_eq!(state.lock().unwrap().active_uuid.as_deref(), Some("uuid-2"));
+        let group_props = menu.get_group_properties(vec![100, 101], vec![]);
+        assert_eq!(group_props.len(), 2);
+        assert_eq!(
+            group_props[1].1.get("label"),
+            Some(&Value::from("WireGuard (Active)"))
+        );
 
         // Non-existent item 199 is a no-op
         menu.event(199, "clicked", zbus::zvariant::Value::from(0u32), 0);
@@ -1203,7 +1323,7 @@ mod tests {
             vec!["switch:uuid-2"],
             "removed IDs must not select their replacement"
         );
-        menu.event(101, "clicked", Value::from(0u32), 0);
+        menu.event_group(vec![(101, "clicked".into(), Value::from(0u32), 0)]);
         assert_eq!(client.calls(), vec!["switch:uuid-2", "switch:uuid-2"]);
     }
 

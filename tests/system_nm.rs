@@ -342,23 +342,7 @@ fn activation_prepares_connected_lockdown_before_first_traffic() {
     let config = sample_wireguard_config("10.253.37.2/32", "10.253.37.1")
         .replace("0.0.0.0/0, ::/0", "198.19.0.0/16")
         .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0");
-    let mut fixture = Fixture::import_config("locked", &config);
-    let interface = fixture.name.replacen("ns", "wg", 1);
-    assert!(interface.len() <= 15);
-    assert!(
-        std::process::Command::new("nmcli")
-            .args([
-                "connection",
-                "modify",
-                &fixture.uuid,
-                "connection.interface-name",
-                &interface
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
-    fixture.name = interface;
+    let fixture = Fixture::import_config("locked", &config);
     // Install the actual application as the refresh helper, not this test binary.
     assert!(
         std::process::Command::new(env!("CARGO_BIN_EXE_neutron"))

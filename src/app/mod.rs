@@ -1009,6 +1009,27 @@ pub fn stop_daemons(proc_root: &std::path::Path, wait: std::time::Duration) -> u
     }
 }
 
+/// Whether any running tray daemon under `proc_root` was started from a
+/// different or since-replaced executable than the current process.
+#[cfg(unix)]
+pub fn has_stale_daemon(proc_root: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let self_exe = proc_root.join(format!("{}/exe", std::process::id()));
+    let self_link = std::fs::read_link(&self_exe).ok();
+    let self_ino = std::fs::metadata(&self_exe)
+        .ok()
+        .map(|m| (m.dev(), m.ino()));
+    neutron_processes_in(proc_root, std::process::id())
+        .into_iter()
+        .filter(|found| found.is_daemon)
+        .any(|found| {
+            let exe = proc_root.join(format!("{}/exe", found.pid));
+            let link = std::fs::read_link(&exe).ok();
+            let ino = std::fs::metadata(&exe).ok().map(|m| (m.dev(), m.ino()));
+            link != self_link || ino != self_ino
+        })
+}
+
 /// The other Neutron processes under `proc_root`, and which of them are the
 /// tray daemon rather than a window.
 ///

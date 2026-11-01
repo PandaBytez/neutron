@@ -52,8 +52,8 @@ cargo build --locked --release --target x86_64-unknown-linux-musl
 ```
 
 The binary is `target/x86_64-unknown-linux-musl/release/neutron`. A headless
-installation does not bypass lockdown authentication: required helper refreshes
-may prompt and fail closed when authorization is unavailable.
+installation without an active local session cannot authorize password-free
+lockdown refreshes and fails closed when authorization is unavailable.
 
 ## Removal
 

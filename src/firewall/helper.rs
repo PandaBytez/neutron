@@ -1,6 +1,6 @@
 //! Root-owned, refresh-only copy installed during an authenticated lockdown toggle.
 //! It derives allowances from NetworkManager, never accepts rules from the caller,
-//! and cannot enable or disable lockdown. Every refresh requires admin authentication.
+//! and cannot enable or disable lockdown. Permanent rules authorize refreshes.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -55,8 +55,8 @@ fn install_script_for(version: &str, installer_pid: u32) -> AppResult<String> {
     <message>Refresh existing Neutron lockdown rules</message>
     <defaults>
       <allow_any>no</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin</allow_active>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">"#
     );
@@ -129,7 +129,7 @@ pub(super) fn is_installed() -> bool {
         .any(|path| std::fs::symlink_metadata(path).is_ok())
 }
 
-const HARDENED_DEFAULTS: &str = "<defaults><allow_any>no</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>";
+const HARDENED_DEFAULTS: &str = "<defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>yes</allow_active></defaults>";
 
 pub(super) fn has_hardened_authorization() -> bool {
     let files = installed_files();
@@ -253,11 +253,26 @@ fn action_directory(version: &str) -> AppResult<&'static str> {
     })
 }
 
-/// Invoke the refresh-only helper with fresh administrator authorization.
+fn authorization_command() -> std::process::Command {
+    let mut command = std::process::Command::new("pkcheck");
+    // Unprivileged callers cannot supply --detail, even for their own process.
+    // The dedicated action binds pkexec to the helper without caller details.
+    command
+        .args([
+            "--action-id",
+            ACTION_ID,
+            "--process",
+            &std::process::id().to_string(),
+        ])
+        .stdin(Stdio::null());
+    command
+}
+
+/// Invoke only the narrowly authorized helper; never fall back to a password prompt.
 pub(super) fn refresh(activating: Option<&str>) -> AppResult<()> {
     if is_installed() && !has_hardened_authorization() {
         return Err(AppError::Firewall(
-            "Administrator-authenticated lockdown refresh is unavailable. Run `neutron lockdown enable` to upgrade the helper; existing protection remains in place.".into(),
+            "Password-free lockdown refresh is unavailable. Run `neutron lockdown enable` once from an active local session to upgrade the helper; existing protection remains in place.".into(),
         ));
     }
     // Older installations already have permanent protection. They can keep using
@@ -271,12 +286,28 @@ pub(super) fn refresh(activating: Option<&str>) -> AppResult<()> {
         }
         return Err(AppError::Firewall(
             "Lockdown rules need refreshing. Run `neutron lockdown enable` once to install \
-              the administrator-authenticated refresh helper; existing protection remains in place."
+              the password-free refresh helper; existing protection remains in place."
                 .into(),
         ));
     }
+    // pkexec's flag only disables its *terminal* agent. Check authorization
+    // without AllowUserInteraction first, so a missing action cannot open a GUI prompt.
+    let authorization = authorization_command().output()?;
+    if !authorization.status.success() {
+        let detail = crate::process::format_command_error(
+            "pkcheck denied authorization",
+            authorization.status,
+            &String::from_utf8_lossy(&authorization.stderr),
+        );
+        return Err(AppError::Firewall(format!(
+            "Password-free lockdown refresh is unavailable: {detail}. \
+             Run `neutron lockdown enable` once from an active local session to install \
+             or repair authorization; existing protection remains in place."
+        )));
+    }
     let mut child = std::process::Command::new("pkexec")
         .env("SHELL", "/bin/sh")
+        .arg("--disable-internal-agent")
         .arg(std::fs::canonicalize(PATH)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -472,14 +503,37 @@ fn normalized_runtime_removals() -> AppResult<Vec<Vec<String>>> {
 }
 
 fn refresh_batches(desired: &[Vec<String>]) -> AppResult<Vec<Vec<String>>> {
-    let permanent = marked_removal_batches()?;
-    let runtime = normalized_runtime_removals()?;
+    Ok(refresh_batches_for(
+        marked_removal_batches()?,
+        normalized_runtime_removals()?,
+        desired,
+    ))
+}
+
+fn refresh_batches_for(
+    permanent: Vec<Vec<String>>,
+    runtime: Vec<Vec<String>>,
+    desired: &[Vec<String>],
+) -> Vec<Vec<String>> {
     let mut batches = Vec::new();
+    let desired_specs: std::collections::BTreeSet<_> = desired.iter().map(|b| &b[3..]).collect();
     for (current, is_permanent) in [(permanent, true), (runtime, false)] {
         if rules_match(&current, desired) {
             continue;
         }
-        let rebuild = lockdown_rebuild_batches_for(current, desired);
+        let installed_specs: std::collections::BTreeSet<_> =
+            current.iter().map(|b| &b[3..]).collect();
+        let removals: Vec<_> = current
+            .iter()
+            .filter(|b| !desired_specs.contains(&b[3..]))
+            .cloned()
+            .collect();
+        let additions: Vec<_> = desired
+            .iter()
+            .filter(|b| !installed_specs.contains(&b[3..]))
+            .cloned()
+            .collect();
+        let rebuild = lockdown_rebuild_batches_for(removals, &additions);
         batches.extend(rebuild.into_iter().map(|mut batch| {
             if !is_permanent {
                 batch.remove(0);
@@ -487,7 +541,7 @@ fn refresh_batches(desired: &[Vec<String>]) -> AppResult<Vec<Vec<String>>> {
             batch
         }));
     }
-    Ok(batches)
+    batches
 }
 
 fn rules_match(removals: &[Vec<String>], desired: &[Vec<String>]) -> bool {
@@ -499,6 +553,22 @@ fn rules_match(removals: &[Vec<String>], desired: &[Vec<String>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_check_is_unprivileged_and_noninteractive() {
+        let command = authorization_command();
+        assert_eq!(command.get_program(), "pkcheck");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "--action-id",
+                ACTION_ID,
+                "--process",
+                &std::process::id().to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn preactivation_requires_complete_both_family_both_scope_policy_without_guards() {
@@ -566,7 +636,11 @@ mod tests {
         assert!(!hardened_authorization_at(&legacy, &policies));
         assert!(revoked());
         std::fs::remove_file(&legacy).unwrap();
-        std::fs::write(&shared, HARDENED_DEFAULTS.replace("auth_admin", "yes")).unwrap();
+        std::fs::write(
+            &shared,
+            HARDENED_DEFAULTS.replace("allow_active>yes", "allow_active>auth_admin"),
+        )
+        .unwrap();
         assert!(!hardened_authorization_at(&legacy, &policies));
         assert!(revoked());
         std::fs::write(&shared, HARDENED_DEFAULTS).unwrap();
@@ -669,10 +743,9 @@ mod tests {
             script.contains(&format!("pkaction --action-id {ACTION_ID}")),
             "script must verify the action is registered: {script}"
         );
-        assert!(script.contains("<allow_active>auth_admin</allow_active>"));
-        assert!(script.contains("<allow_inactive>auth_admin</allow_inactive>"));
-        assert!(!script.contains("<allow_active>yes</allow_active>"));
-        assert!(!script.contains("auth_admin_keep"));
+        assert!(script.contains("<allow_active>yes</allow_active>"));
+        assert!(script.contains("<allow_inactive>no</allow_inactive>"));
+        assert!(!script.contains("auth_admin"));
         assert!(script.contains("stat -Lc '%d:%i' /proc/self/fd/8"));
         assert!(script.contains("install -m 755 -- /proc/self/fd/8"));
         assert!(script.contains(&format!("rm -f -- {SHARED_ACTION_DIR}/{ACTION_ID}.policy")));
@@ -787,6 +860,31 @@ mod tests {
             ..Default::default()
         }]);
         assert!(!rules_match(&restored, &connected));
+        let connected_removals: Vec<_> = connected
+            .iter()
+            .map(|b| {
+                let mut b = b.clone();
+                b[2] = "--remove-rule".into();
+                b
+            })
+            .collect();
+        let disconnected_with_wg0 = lockdown_enable_batches(&[WireguardTunnel {
+            interface: Some("wg0".into()),
+            is_active: false,
+            ..Default::default()
+        }]);
+        let delta = refresh_batches_for(
+            connected_removals.clone(),
+            connected_removals,
+            &disconnected_with_wg0,
+        );
+        // Only the 4 DNS rules + 4 guard rules per scope (24 batches total) should run;
+        // unchanged interface/LAN/loopback/DROP rules stay in place.
+        assert_eq!(delta.len(), 24);
+        assert!(
+            !delta.iter().any(|b| b.contains(&"wg0".to_string())),
+            "unchanged tunnel interface rules must not be torn down and re-added: {delta:?}"
+        );
         restored.pop();
         assert!(!rules_match(&restored, &disconnected));
         assert!(!rules_match(&[], &disconnected));

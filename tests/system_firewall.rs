@@ -178,7 +178,7 @@ fn permanent_lockdown_refreshes_after_reload_without_reenabling_after_disable() 
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
-fn admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user() {
+fn password_free_refresh_uses_real_polkit_as_an_unprivileged_user() {
     require_sandbox();
     const ACTION: &str = "io.github.pandabytez.neutron.lockdown-refresh";
     const TEST_RULE: &str = "/etc/polkit-1/rules.d/00-neutron-test-refresh.rules";
@@ -191,13 +191,19 @@ fn admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user() {
             "denied" | "missing" => {
                 let error = result.unwrap_err().to_string();
                 assert!(
-                    error.contains(if mode == "missing" {
-                        "Administrator-authenticated lockdown refresh is unavailable"
+                    error.contains("Password-free lockdown refresh is unavailable"),
+                    "{error}"
+                );
+                assert!(error.contains("neutron lockdown enable"), "{error}");
+                assert!(
+                    error.contains(if mode == "denied" {
+                        "exit 1)"
                     } else {
-                        "exit "
+                        "upgrade the helper"
                     }),
                     "{error}"
                 );
+                assert!(!error.contains("Only trusted callers"), "{error}");
             }
             _ => panic!("unexpected refresh test mode: {mode}"),
         }
@@ -218,7 +224,7 @@ fn admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user() {
             .args([
                 "--ignored",
                 "--exact",
-                "admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user",
+                "password_free_refresh_uses_real_polkit_as_an_unprivileged_user",
                 "--nocapture",
             ])
             // Bypass the root-only firewall-test pkexec shim.
@@ -276,15 +282,14 @@ fn admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user() {
         helper_path.display()
     )));
     assert!(policy.contains("<allow_any>no</allow_any>"));
-    assert!(policy.contains("<allow_inactive>auth_admin</allow_inactive>"));
-    assert!(policy.contains("<allow_active>auth_admin</allow_active>"));
-    assert!(!policy.contains("auth_admin_keep"));
+    assert!(policy.contains("<allow_inactive>no</allow_inactive>"));
+    assert!(policy.contains("<allow_active>yes</allow_active>"));
     let saved = marked_rules();
     wait_for_authorization(1);
     run_child("denied");
     assert_eq!(marked_rules(), saved);
-    // A forged, well-formed activation request from another user cannot change
-    // global DNS policy or add a personal profile's egress allowances.
+    // A forged, well-formed activation request from an inactive/non-local user
+    // cannot change global DNS policy or add a personal profile's egress allowances.
     let mut forged = std::process::Command::new("runuser")
         .args([
             "-u",
@@ -309,8 +314,8 @@ fn admin_authenticated_refresh_uses_real_polkit_as_an_unprivileged_user() {
     assert!(!forged.wait_with_output().unwrap().status.success());
     assert_eq!(marked_rules(), saved);
 
-    // Simulate explicit administrator approval of this test invocation. This
-    // test-only rule is not the installed policy and grants no production access.
+    // There is no active logind session in this container. Grant only this
+    // action to the test user so both pkcheck and pkexec exercise real polkit.
     std::fs::write(
         TEST_RULE,
         format!(
@@ -745,7 +750,7 @@ fn disable_revokes_legacy_and_mixed_authorization_and_detects_legacy_only_state(
     enable_real_helper();
     std::fs::write(
         OBSOLETE,
-        "<defaults><allow_active>yes</allow_active></defaults>",
+        "<defaults><allow_active>auth_admin</allow_active></defaults>",
     )
     .unwrap();
     assert!(CliNmClient.refresh_lockdown(None).is_err());
@@ -769,7 +774,23 @@ fn hostile_inactive_interfaces_are_rejected_by_enable_and_root_refresh() {
                 .status();
         }
     }
-    for interface in ["eth0", "wg+"] {
+    struct DummyDevice;
+    impl Drop for DummyDevice {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", "eth-test"])
+                .status();
+        }
+    }
+    let _dummy = DummyDevice;
+    assert!(
+        std::process::Command::new("ip")
+            .args(["link", "add", "eth-test", "type", "dummy"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    for interface in ["eth-test", "wg+"] {
         let hostile = WireguardTunnel {
             interface: Some(interface.into()),
             is_active: false,

@@ -59,13 +59,13 @@ bypasses remain intentional. Disabled split mode clears stale split routes durin
 activation, and changing to disabled applies cleanup before saving; protected
 resolver host routes are merged back, not removed with the split policy.
 
-When lockdown is enabled, activation performs authenticated helper refreshes
+When lockdown is enabled, activation performs helper refreshes
 before activation and during reconciliation afterward. Each helper invocation
-requires fresh `auth_admin`, including automatic/headless paths; authorization
-failure does not remove existing protection, and a required pre-activation
-refresh failure aborts activation. Upgrade old grants with an authenticated
-`neutron lockdown enable`. Detection covers both action directories and legacy
-rules; disable retains only hardened authorization and revokes unsafe grants
+is authorized for active local sessions (`allow_active=yes`, `allow_inactive=no`);
+inactive or non-local authorization failure does not remove existing protection,
+and a required pre-activation refresh failure aborts activation. Upgrade old grants
+with an authenticated `neutron lockdown enable`. Detection covers both action directories
+and legacy rules; disable retains only hardened authorization and revokes unsafe grants
 under the root lock. See [helper security](security.md#helper-authorization-and-trust-boundary).
 
 Automatic handshake-failure teardown applies to fresh interfaces whose profiles

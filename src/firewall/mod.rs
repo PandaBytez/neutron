@@ -20,7 +20,7 @@
 //! Everything else is dropped, even before any VPN is connected and across
 //! reboots (the rules are made `--permanent`). Changing the system firewall
 //! requires privileges: explicit toggles authenticate through `pkexec`, while
-//! refreshes also authenticate through a root-owned, refresh-only helper; the `disable`
+//! refreshes in an active local session use a root-owned, refresh-only helper; the `disable`
 //! path always works to lift the block, so the user can never be permanently
 //! locked out.
 //!
@@ -102,7 +102,7 @@ pub trait FirewallClient {
     /// Install the lockdown ruleset, allowing the supplied tunnels' interfaces
     /// and endpoints through. Replaces any previous lockdown rules.
     fn enable_lockdown(&self, tunnels: &[WireguardTunnel]) -> AppResult<()>;
-    /// Refresh an already enabled policy with administrator authentication.
+    /// Refresh an already enabled policy without enabling or disabling lockdown.
     /// `activating` identifies the NM profile whose first traffic must be protected.
     /// `Some(uuid)` fails if protection is absent or cannot be fully verified in
     /// both address families and both scopes. Propagate this before connection up.
@@ -395,7 +395,7 @@ fn locked_script_for(path: &str, owner: u32, timeout: u64, fd: u8) -> String {
 }
 
 /// Only exact interface names may become OUTPUT allowances. Existing links must
-/// be kernel WireGuard devices; absent links reserve the conventional wg prefix.
+/// be kernel WireGuard devices; absent links are allowed for inactive profiles.
 fn validate_tunnel_interfaces(tunnels: &[WireguardTunnel]) -> AppResult<()> {
     validate_tunnel_interfaces_with(tunnels, |interface| {
         let listing = crate::process::run_with_timeout(
@@ -440,10 +440,10 @@ fn validate_tunnel_interfaces_with(
         }
         match is_wireguard(interface)? {
             Some(true) => {}
-            None if !tunnel.is_active && interface.starts_with("wg") && interface.len() > 2 => {}
+            None if !tunnel.is_active => {}
             _ => {
                 return Err(AppError::Firewall(format!(
-                    "Interface {interface} is not WireGuard; absent interfaces must use a wg-prefixed name"
+                    "Interface {interface} is not WireGuard"
                 )));
             }
         }
@@ -457,8 +457,7 @@ fn interface_validation_script(tunnels: &[WireguardTunnel]) -> String {
     let mut script = String::from("ip link show >/dev/null\n");
     for tunnel in tunnels {
         if let Some(interface) = &tunnel.interface {
-            let absent = if !tunnel.is_active && interface.starts_with("wg") && interface.len() > 2
-            {
+            let absent = if !tunnel.is_active {
                 ":"
             } else {
                 "echo 'WireGuard interface disappeared' >&2; exit 1"
@@ -808,7 +807,7 @@ mod tests {
 
     #[test]
     fn interface_validation_rejects_hostile_inactive_profiles_and_physical_collisions() {
-        for name in ["eth0", "wg+", "+", "wg0;bad", "", "wg"] {
+        for name in ["wg+", "+", "wg0;bad", "", "too-long-ifname-1"] {
             let mut pending = tunnel(name, &[]);
             pending.is_active = false;
             assert!(
@@ -816,13 +815,18 @@ mod tests {
                 "{name}"
             );
         }
-        let mut pending = tunnel("wg-test", &[]);
-        pending.is_active = false;
-        assert!(validate_tunnel_interfaces_with(&[pending.clone()], |_| Ok(Some(false))).is_err());
-        assert!(validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).is_ok());
+        for name in ["wg-test", "proton0", "wg"] {
+            let mut pending = tunnel(name, &[]);
+            pending.is_active = false;
+            assert!(
+                validate_tunnel_interfaces_with(&[pending.clone()], |_| Ok(Some(false))).is_err()
+            );
+            assert!(validate_tunnel_interfaces_with(&[pending], |_| Ok(None)).is_ok());
+        }
         assert!(
             validate_tunnel_interfaces_with(&[tunnel("eth0", &[])], |_| Ok(Some(false))).is_err()
         );
+        assert!(validate_tunnel_interfaces_with(&[tunnel("wg-test", &[])], |_| Ok(None)).is_err());
         assert!(
             validate_tunnel_interfaces_with(&[tunnel("custom", &[])], |_| Ok(Some(true))).is_ok()
         );

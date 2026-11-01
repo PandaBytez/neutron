@@ -107,29 +107,26 @@ table; it does not bypass other firewall policy.
 
 ### Helper Authorization and Trust Boundary
 
-Every invocation of the root-owned refresh helper requires **fresh `auth_admin`**
-authorization. The action uses `allow_any=no`, and `auth_admin` for active and
-inactive sessions, not `yes` or `auth_admin_keep`. There is no password-free
-refresh grant. Automatic activation, switching, login selection, profile changes,
-and background firewall/DNS reconciliation may therefore prompt. Missing agents,
-headless denial, or rejected authorization fail closed; required pre-activation
+The root-owned refresh helper is authorized for **active local sessions** (`allow_any=no`,
+`allow_inactive=no`, `allow_active=yes`) and checked with `pkcheck` before invoking
+`pkexec --disable-internal-agent`, so refreshes never fall back to a password prompt.
+Inactive or non-local sessions are denied and fail closed: required pre-activation
 refresh failures stop activation, and existing firewall protection remains.
 
-Existing installations must run `neutron lockdown enable` and authenticate to
-upgrade the old helper and password-free action. Current source refuses the old
-grant, checking both action directories and the legacy rules file, including
-mixed policies and dangling links. A hardened action in one directory does not
-excuse an unsafe grant elsewhere. Authenticated `lockdown disable` rechecks under
-the root lock and revokes the helper and all known authorization files if they
-are not hardened; it preserves only hardened authorization. The refresh-only
-helper derives allowances from NetworkManager and accepts
+Existing installations can run `neutron lockdown enable` to install or upgrade the
+helper and its dedicated polkit action. Current source checks both action directories
+and the legacy rules file, including mixed policies and dangling links. A valid
+action in one directory does not excuse an unsafe grant elsewhere. Authenticated
+`lockdown disable` rechecks under the root lock and revokes the helper and all known
+authorization files if they are not hardened; it preserves only hardened authorization.
+The refresh-only helper derives allowances from NetworkManager and accepts
 only an optional validated activation UUID, never caller-provided firewall rules.
 It cannot enable or disable lockdown.
 
 Interface allowances use exact names: 1-15 bytes of ASCII letters, digits, `_`,
 or `-`, with no `+` wildcard. Existing links must be verified kernel WireGuard
-devices, even if named `wg...`. An absent inactive/pending interface must begin
-with `wg` and have a suffix; an active interface may not be absent. Authenticated
+devices, even if named `wg...`. Absent interfaces are allowed only for inactive/pending
+profiles; an active interface may not be absent. Authenticated
 toggles recheck the link type after authorization and before writing rules.
 
 Helper installation copies the running executable through `/proc/<pid>/exe`,
@@ -160,14 +157,13 @@ they must live outside the app directory:
 
 | Path | Purpose |
 | :--- | :--- |
-| `/usr/local/libexec/neutron-lockdown-helper` | Root-owned, refresh-only copy of the running binary |
-| `/usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy` | Requires fresh `auth_admin` for that copy; polkit 126+ location |
+| `/usr/local/libexec/neutron-lockdown-helper` | Root-owned, refresh-only copy of the running binary, so a rule refresh needs no password |
+| `/usr/local/share/polkit-1/actions/io.github.pandabytez.neutron.lockdown-refresh.policy` | Authorizes that copy for active local sessions (`allow_active=yes`); polkit 126+ location |
 
-`lockdown enable` installs/updates the authenticated helper and migrates old
+`lockdown enable` installs/updates the refresh helper and migrates old
 grants. `lockdown disable` keeps only hardened authorization; otherwise it revokes
 the helper and every known grant. Reset and uninstall revoke them unconditionally.
-Re-enabling and helper refreshes still require authentication. Older polkit uses
-`/usr/share/polkit-1/actions`; the legacy rules file is
+Older polkit uses `/usr/share/polkit-1/actions`; the legacy rules file is
 `/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules`. Detection and revocation
 cover both action directories, the legacy file, and the helper, including dangling
 links. Revocation reloads polkit and reports surviving files rather than ignoring

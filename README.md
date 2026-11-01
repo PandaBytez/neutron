@@ -96,6 +96,8 @@ Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles wit
 neutron restart
 ```
 
+> **Note (GNOME):** To display the system tray icon on GNOME, install and enable the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension (`gnome-shell-extension-appindicator`).
+
 ---
 
 ## 🌐 **[Documentation](https://pandabytez.github.io/neutron/)**
@@ -150,17 +152,14 @@ For headless servers without an XDG desktop environment, an optional user servic
 Lockdown is stored in firewalld's permanent configuration and takes effect when
 firewalld starts, before login. Enabling/disabling it requires administrator
 authentication. Enabling also installs a root-owned refresh helper and a dedicated
-polkit action. **Every helper refresh requires fresh `auth_admin` authorization**;
-there is no password-free grant or retained `auth_admin_keep` authorization.
-The helper cannot turn lockdown on or off.
+polkit action so an active local session can refresh tunnel/DNS allowances
+without another password prompt. The helper cannot turn lockdown on or off.
 
-After upgrading an existing installation, run `neutron lockdown enable` once and
-authenticate to replace the old password-free helper grant. Current source refuses
-to invoke unsafe grants, checking both action directories and legacy rules even
-when a hardened action is also installed. Authenticated disable revokes unsafe
-helper authorization; enable migrates it. All helper-backed operations, including automatic
-activation, switching, login selection, and profile/DNS reconciliation, may prompt.
-Headless operation or denied authentication fails closed: required pre-activation
+After upgrading an existing installation, run `neutron lockdown enable` once from an
+active local session to install/update the helper and its authorization. Current source
+refuses unsafe or legacy grants, checking both action directories and legacy rules.
+Authenticated disable revokes unsafe helper authorization; enable migrates it.
+Headless operation or denied authorization fails closed: required pre-activation
 refresh failure stops activation and existing firewall protection stays in place.
 Enabling lockdown also enables firewalld at boot on systemd systems. Polkit 126+
 uses `/usr/local/share/polkit-1/actions`, supporting immutable `/usr`; older
@@ -190,7 +189,7 @@ machine firewalled with no configuration explaining why.
 
 Run `neutron uninstall` as your normal user. It stops the tray daemon, then — in
 a single privileged batch, so at most one password prompt — lifts lockdown if any
-of its state is actually present, removes the authenticated refresh helper (the
+of its state is actually present, removes the password-free refresh grant (the
 root-owned helper and its polkit action), and removes the autostart entry. It then
 hands the binary to whichever package manager installed it: `brew uninstall
 neutron` for a Homebrew install, `cargo uninstall neutron` for a `cargo install`.
@@ -202,7 +201,7 @@ with no way to authenticate. So the teardown has to happen while the binary stil
 exists — which is why it is a subcommand rather than a package script. The helper
 and all known actions/legacy rules are removed here. `neutron lockdown disable`
 retains only hardened authorization and revokes unsafe grants; leaving a hardened
-helper installed does not waive authentication for enabling or refreshing.
+helper installed lets turning lockdown off and back on avoid extra prompts.
 
 `~/.config/neutron` is **kept** (eligibility pool, favorites, settings) so a
 reinstall finds it intact; add `--purge` to delete it too, which is also how the

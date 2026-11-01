@@ -47,7 +47,7 @@ Neutron is designed with a strictly decoupled architecture where all networking,
 - Uses mangle OUTPUT allow-list rules and a final DROP before filter-table established accepts; see [Security & Kill Switch](security.md).
 - All rules are tagged with a unique comment (`neutron-lockdown`) ensuring surgical removal without modifying user-defined firewall rules.
 - Privilege escalation is consolidated into one `pkexec` shell batch, with permanent fail-closed guards during rebuilds.
-- The refresh-only helper requires fresh administrator authorization, verifies exact WireGuard interfaces, and serializes mutations with root-owned locks and bounded waits; see [Security](security.md).
+- The refresh-only helper is authorized for active local sessions, verifies exact WireGuard interfaces, and serializes mutations with root-owned locks and bounded waits; see [Security](security.md).
 
 ### 3. `portforward/` — NAT-PMP Dynamic Port Leasing & App Integrations
 - Implements RFC 6886 NAT-PMP client directly over `std::net::UdpSocket`.
