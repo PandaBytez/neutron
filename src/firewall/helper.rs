@@ -15,6 +15,7 @@ pub(super) const LOCK_PATH: &str = "/run/neutron-lockdown.lock";
 pub(super) const LOCK_DIR: &str = "/run/neutron-lockdown";
 pub(super) const PRIVATE_LOCK_PATH: &str = "/run/neutron-lockdown/lock";
 pub(super) const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const WARM_CHUNK_TUNNELS: usize = 4;
 const ACTION_ID: &str = "io.github.pandabytez.neutron.lockdown-refresh";
 const LEGACY_POLICY_PATH: &str = "/etc/polkit-1/rules.d/49-neutron-lockdown-refresh.rules";
 /// Action directory polkit only reads at startup (see [`action_directory`]).
@@ -279,9 +280,15 @@ pub(super) fn refresh(activating: Option<&str>) -> AppResult<()> {
     // matching rules until the next explicit enable installs the helper.
     if !std::path::Path::new(PATH).exists() {
         let tunnels = tunnels(activating)?;
-        let desired = lockdown_enable_batches(&tunnels);
-        if refresh_batches(&desired)?.is_empty() {
-            verify_protection(&desired)?;
+        let active: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
+        let required = if activating.is_some() {
+            lockdown_enable_batches(&active)
+        } else {
+            lockdown_enable_batches(&tunnels)
+        };
+        let allowed = lockdown_enable_batches(&tunnels);
+        if partial_refresh_batches(&required, &allowed)?.is_empty() {
+            verify_partial_protection(&required, &allowed)?;
             return Ok(());
         }
         return Err(AppError::Firewall(
@@ -347,21 +354,62 @@ pub fn run() -> AppResult<()> {
     if !is_valid_activation_uuid(&requested) {
         return Err(AppError::Firewall("Invalid activation UUID".into()));
     }
-    let _lock = acquire_lock(Path::new(LOCK_PATH), 0, LOCK_TIMEOUT)?;
-    secure_lock_directory(Path::new(LOCK_DIR), 0)?;
-    let _private_lock = acquire_lock(Path::new(PRIVATE_LOCK_PATH), 0, LOCK_TIMEOUT)?;
-    // Check while holding the same lock as authenticated toggles. A delayed
-    // refresh can never undo a disable, even when user config still says ON.
-    if marked_removal_batches()?.is_empty() {
-        return absent_protection_result(!requested.is_empty());
+    if !requested.is_empty() {
+        let _lock = acquire_lock(Path::new(LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        secure_lock_directory(Path::new(LOCK_DIR), 0)?;
+        let _private_lock = acquire_lock(Path::new(PRIVATE_LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        if marked_removal_batches()?.is_empty() {
+            return absent_protection_result(true);
+        }
+        let tunnels = tunnels(Some(requested.as_str()))?;
+        let active: Vec<_> = tunnels.iter().filter(|t| t.is_active).cloned().collect();
+        let required = lockdown_enable_batches(&active);
+        let allowed = lockdown_enable_batches(&tunnels);
+        let batches = partial_refresh_batches(&required, &allowed)?;
+        if !batches.is_empty() {
+            run_script(&build_firewall_script(&batches), false)?;
+        }
+        return verify_partial_protection(&required, &allowed);
     }
-    let tunnels = tunnels((!requested.is_empty()).then_some(requested.as_str()))?;
-    let desired = lockdown_enable_batches(&tunnels);
-    let batches = refresh_batches(&desired)?;
-    if !batches.is_empty() {
-        run_script(&build_firewall_script(&batches), false)?;
+
+    let mut warmed_inactive = WARM_CHUNK_TUNNELS;
+    loop {
+        let _lock = acquire_lock(Path::new(LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        secure_lock_directory(Path::new(LOCK_DIR), 0)?;
+        let _private_lock = acquire_lock(Path::new(PRIVATE_LOCK_PATH), 0, LOCK_TIMEOUT)?;
+        // Check while holding the same lock as authenticated toggles. A delayed
+        // refresh can never undo a disable, even when user config still says ON.
+        if marked_removal_batches()?.is_empty() {
+            return absent_protection_result(false);
+        }
+        let tunnels = tunnels(None)?;
+        let total_inactive = tunnels.iter().filter(|t| !t.is_active).count();
+        let mut remaining_inactive = warmed_inactive;
+        let chunk_tunnels: Vec<_> = tunnels
+            .iter()
+            .filter(|t| {
+                t.is_active || {
+                    let take = remaining_inactive > 0;
+                    remaining_inactive = remaining_inactive.saturating_sub(1);
+                    take
+                }
+            })
+            .cloned()
+            .collect();
+        let required = lockdown_enable_batches(&chunk_tunnels);
+        let allowed = lockdown_enable_batches(&tunnels);
+        let batches = partial_refresh_batches(&required, &allowed)?;
+        if !batches.is_empty() {
+            run_script(&build_firewall_script(&batches), false)?;
+        }
+        if warmed_inactive >= total_inactive
+            || (batches.is_empty() && verify_protection(&allowed).is_ok())
+        {
+            return verify_protection(&allowed);
+        }
+        verify_partial_protection(&required, &allowed)?;
+        warmed_inactive += WARM_CHUNK_TUNNELS;
     }
-    verify_protection(&desired)
 }
 
 fn absent_protection_result(activating: bool) -> AppResult<()> {
@@ -375,19 +423,36 @@ fn absent_protection_result(activating: bool) -> AppResult<()> {
 }
 
 fn verify_protection(desired: &[Vec<String>]) -> AppResult<()> {
-    verify_protection_with(
-        desired,
+    verify_partial_protection(desired, desired)
+}
+
+fn verify_partial_protection(required: &[Vec<String>], allowed: &[Vec<String>]) -> AppResult<()> {
+    verify_partial_protection_with(
+        required,
+        allowed,
         &marked_removal_batches()?,
         &normalized_runtime_removals()?,
     )
 }
 
+#[cfg(test)]
 fn verify_protection_with(
     desired: &[Vec<String>],
     permanent: &[Vec<String>],
     runtime: &[Vec<String>],
 ) -> AppResult<()> {
-    if rules_match(permanent, desired) && rules_match(runtime, desired) {
+    verify_partial_protection_with(desired, desired, permanent, runtime)
+}
+
+fn verify_partial_protection_with(
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+    permanent: &[Vec<String>],
+    runtime: &[Vec<String>],
+) -> AppResult<()> {
+    if partial_rules_match(permanent, required, allowed)
+        && partial_rules_match(runtime, required, allowed)
+    {
         Ok(())
     } else {
         Err(AppError::Firewall(
@@ -492,7 +557,7 @@ fn secure_lock_directory(path: &Path, owner: u32) -> AppResult<()> {
     Ok(())
 }
 
-fn normalized_runtime_removals() -> AppResult<Vec<Vec<String>>> {
+pub(super) fn normalized_runtime_removals() -> AppResult<Vec<Vec<String>>> {
     Ok(runtime_removal_batches()?
         .into_iter()
         .map(|mut batch| {
@@ -502,33 +567,47 @@ fn normalized_runtime_removals() -> AppResult<Vec<Vec<String>>> {
         .collect())
 }
 
-fn refresh_batches(desired: &[Vec<String>]) -> AppResult<Vec<Vec<String>>> {
-    Ok(refresh_batches_for(
+fn partial_refresh_batches(
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+) -> AppResult<Vec<Vec<String>>> {
+    Ok(partial_refresh_batches_for(
         marked_removal_batches()?,
         normalized_runtime_removals()?,
-        desired,
+        required,
+        allowed,
     ))
 }
 
+#[cfg(test)]
 fn refresh_batches_for(
     permanent: Vec<Vec<String>>,
     runtime: Vec<Vec<String>>,
     desired: &[Vec<String>],
 ) -> Vec<Vec<String>> {
+    partial_refresh_batches_for(permanent, runtime, desired, desired)
+}
+
+pub(super) fn partial_refresh_batches_for(
+    permanent: Vec<Vec<String>>,
+    runtime: Vec<Vec<String>>,
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+) -> Vec<Vec<String>> {
     let mut batches = Vec::new();
-    let desired_specs: std::collections::BTreeSet<_> = desired.iter().map(|b| &b[3..]).collect();
+    let allowed_specs: std::collections::BTreeSet<_> = allowed.iter().map(|b| &b[3..]).collect();
     for (current, is_permanent) in [(permanent, true), (runtime, false)] {
-        if rules_match(&current, desired) {
+        if partial_rules_match(&current, required, allowed) {
             continue;
         }
         let installed_specs: std::collections::BTreeSet<_> =
             current.iter().map(|b| &b[3..]).collect();
         let removals: Vec<_> = current
             .iter()
-            .filter(|b| !desired_specs.contains(&b[3..]))
+            .filter(|b| !allowed_specs.contains(&b[3..]))
             .cloned()
             .collect();
-        let additions: Vec<_> = desired
+        let additions: Vec<_> = required
             .iter()
             .filter(|b| !installed_specs.contains(&b[3..]))
             .cloned()
@@ -544,10 +623,20 @@ fn refresh_batches_for(
     batches
 }
 
+#[cfg(test)]
 fn rules_match(removals: &[Vec<String>], desired: &[Vec<String>]) -> bool {
+    partial_rules_match(removals, desired, desired)
+}
+
+fn partial_rules_match(
+    removals: &[Vec<String>],
+    required: &[Vec<String>],
+    allowed: &[Vec<String>],
+) -> bool {
     let installed: std::collections::BTreeSet<_> = removals.iter().map(|b| &b[3..]).collect();
-    let desired: std::collections::BTreeSet<_> = desired.iter().map(|b| &b[3..]).collect();
-    installed == desired
+    let required: std::collections::BTreeSet<_> = required.iter().map(|b| &b[3..]).collect();
+    let allowed: std::collections::BTreeSet<_> = allowed.iter().map(|b| &b[3..]).collect();
+    required.is_subset(&installed) && installed.is_subset(&allowed)
 }
 
 #[cfg(test)]
@@ -888,5 +977,55 @@ mod tests {
         restored.pop();
         assert!(!rules_match(&restored, &disconnected));
         assert!(!rules_match(&[], &disconnected));
+    }
+
+    #[test]
+    fn progressive_enable_and_preactivation_preserve_warmed_inactive_rules() {
+        let active = WireguardTunnel {
+            interface: Some("wg-active".into()),
+            is_active: true,
+            ..Default::default()
+        };
+        let inactive = WireguardTunnel {
+            interface: Some("wg-standby".into()),
+            is_active: false,
+            ..Default::default()
+        };
+        let required = lockdown_enable_batches(std::slice::from_ref(&active));
+        let allowed = lockdown_enable_batches(&[active.clone(), inactive.clone()]);
+
+        // Fresh blocking phase only installs base + active tunnel rules, not inactive ones.
+        let initial = partial_refresh_batches_for(Vec::new(), Vec::new(), &required, &allowed);
+        assert!(initial.iter().any(|b| b.contains(&"wg-active".to_string())));
+        assert!(
+            !initial
+                .iter()
+                .any(|b| b.contains(&"wg-standby".to_string())),
+            "inactive tunnels are deferred to background warming: {initial:?}"
+        );
+
+        // Once active rules (or full warmed rules) are installed, repeat enable is a 0-batch no-op.
+        let installed_full: Vec<_> = allowed
+            .iter()
+            .map(|b| {
+                let mut b = b.clone();
+                b[2] = "--remove-rule".into();
+                b
+            })
+            .collect();
+        assert!(
+            partial_refresh_batches_for(
+                installed_full.clone(),
+                installed_full.clone(),
+                &required,
+                &allowed
+            )
+            .is_empty(),
+            "repeat enable must not tear down already-warmed inactive rules"
+        );
+        assert!(
+            verify_partial_protection_with(&required, &allowed, &installed_full, &installed_full)
+                .is_ok()
+        );
     }
 }
