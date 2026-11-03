@@ -343,7 +343,7 @@ impl MockNmClient {
                     "ipv4.dns" => "10.2.0.1".into(),
                     "ipv6.dns" => String::new(),
                     "ipv4.dns-priority" | "ipv6.dns-priority" => "0".into(),
-                    _ => panic!("unexpected NM read: {args:?}"),
+                    _ => panic!("unexpected NM read in policy mock"),
                 }))
             }
             ["connection", "modify", ..] => {
@@ -353,7 +353,7 @@ impl MockNmClient {
                 self.apply_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
                 Ok(String::new())
             }
-            _ => panic!("unexpected policy command: {args:?}"),
+            _ => panic!("unexpected policy command in mock client"),
         }
     }
 
@@ -1217,6 +1217,30 @@ pub fn curl_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_policy_panics_do_not_dump_command_arguments() {
+        let client = MockNmClient::default();
+        for (args, expected) in [
+            (
+                &[
+                    "-g",
+                    "unexpected.property",
+                    "connection",
+                    "show",
+                    "fixture-profile",
+                ][..],
+                "unexpected NM read in policy mock",
+            ),
+            (
+                &["unexpected", "fixture-profile"][..],
+                "unexpected policy command in mock client",
+            ),
+        ] {
+            let panic = std::panic::catch_unwind(|| client.policy_command(args)).unwrap_err();
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+        }
+    }
 
     #[test]
     fn mock_policy_config_requires_explicit_injection() {

@@ -155,11 +155,11 @@ fn assert_every_profile_still_routes(client: &MockNmClient, context: &str) {
     for uuid in client.uuids() {
         for key in ROUTING_KEYS {
             let value = client.setting(&uuid, key).unwrap_or_else(|| {
-                panic!("{context}: {uuid} has no {key}; the tunnel would not route")
+                panic!("{context}: a profile has no {key}; the tunnel would not route")
             });
             assert_eq!(
                 value, "yes",
-                "{context}: {uuid} left {key}={value}, so the tunnel would carry no traffic \
+                "{context}: a profile left {key}={value}, so the tunnel would carry no traffic \
                  while the UI reports a working connection"
             );
         }
