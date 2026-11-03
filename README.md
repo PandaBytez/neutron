@@ -64,6 +64,10 @@ UDP/TCP DNS egress must select the tunnel or Neutron attempts disconnection and
 reports an error. Static linking does not remove
 the need for system tools and services; lockdown also needs firewalld and polkit.
 
+Split routes use a dedicated table so encrypted VPN transport cannot loop back
+into its own tunnel. See [split tunneling](docs/split-tunneling.md) for per-family
+routing and DNS behavior. After updating, reconnect to apply the repaired policy.
+
 ### 2. Import Profiles
 
 Neutron automatically pre-creates `~/.config/neutron/profiles/` with secure user-only permissions (`0700`). Simply place

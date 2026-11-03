@@ -426,6 +426,15 @@ impl NmPolicy for CliNmClient {
         let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
         apply_to_every_profile(&profiles, batches, |args| {
             let mut args = args.to_vec();
+            if mode.is_enabled() {
+                let method = run_nmcli(&["-g", "ipv6.method", "connection", "show", &args[2]])?;
+                let has_ipv6 = !matches!(method.trim(), "" | "--" | "disabled" | "ignore");
+                args.extend(
+                    tunnel_routing::set_args(&args[2], has_ipv6)
+                        .into_iter()
+                        .skip(3),
+                );
+            }
             if profile_dns_protected(&args[2], &mut run_nmcli)? {
                 let dns = checked_tunnel_dns(&args[2], &mut run_nmcli)?;
                 args.extend(dns_host_route_args(&dns));
@@ -1949,7 +1958,7 @@ mod tests {
                         ["wireguard.ip6-auto-default-route", "yes"],
                         ["ipv4.dns-priority", "-1500"],
                         ["ipv6.dns-priority", "-1500"],
-                        ["ipv4.routes", "10.0.0.0/8"],
+                        ["ipv4.routes", "10.0.0.0/8 table=1313166676"],
                     ] {
                         assert!(
                             settings.as_chunks::<2>().0.contains(&pair),

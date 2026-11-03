@@ -707,6 +707,16 @@ impl NmPolicy for MockNmClient {
         let mut batches = Vec::new();
         for uuid in self.uuids() {
             let mut args = crate::nm::split_tunnel::set_args(&uuid, mode, v4_routes, v6_routes);
+            if mode.is_enabled() {
+                let method =
+                    self.policy_command(&["-g", "ipv6.method", "connection", "show", &uuid])?;
+                let has_ipv6 = !matches!(method.trim(), "" | "--" | "disabled" | "ignore");
+                args.extend(
+                    crate::nm::tunnel_routing::set_args(&uuid, has_ipv6)
+                        .into_iter()
+                        .skip(3),
+                );
+            }
             if crate::nm::profile_dns_protected(&uuid, &mut |args| self.policy_command(args))? {
                 let dns =
                     crate::nm::checked_tunnel_dns(&uuid, &mut |args| self.policy_command(args))?;

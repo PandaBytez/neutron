@@ -3,10 +3,11 @@
 //! Split tunneling allows routing only specific traffic (or bypassing specific traffic)
 //! through the WireGuard VPN connection.
 //!
-//! Both active modes work the same way: `never-default = yes` stops
-//! NetworkManager pointing the default route at the tunnel, and `ipv4.routes` /
-//! `ipv6.routes` then name exactly what *does* go through it. Anything not
-//! covered by those routes falls back to the physical default route.
+//! Both active modes install `ipv4.routes` / `ipv6.routes` in a dedicated table
+//! matching the WireGuard fwmark. NetworkManager's automatic `not fwmark` rule
+//! selects those routes for application traffic, but not the encrypted packets
+//! sent to the VPN endpoint. Unmatched traffic uses the physical default route.
+//! `never-default = yes` suppresses peer defaults unless a whole family is tunneled.
 //!
 //! In **Include** mode the routes *are* the configured CIDRs and resolved
 //! domains: only that traffic enters the tunnel.
@@ -26,6 +27,9 @@ use std::sync::Mutex;
 
 use crate::config::SplitTunnelMode;
 use crate::error::{AppError, AppResult};
+
+// Neutron's table and mark must match NM's automatic not-fwmark lookup.
+const SPLIT_ROUTE_TABLE: u32 = 0x4e455554;
 
 /// Checked policy resolution with a caller-supplied resolver (no implicit DNS or cache).
 pub(crate) fn routes_for_checked_with(
@@ -394,31 +398,31 @@ pub fn routes_for(
 /// `v4_routes`/`v6_routes` are the routes that should enter the tunnel; build
 /// them with [`routes_for`] rather than passing the user's CIDRs directly, or
 /// Exclude mode will route the excluded ranges *into* the tunnel.
+/// Requires automatic default-route handling pinned by [`super::tunnel_routing`].
 pub fn set_args(
     uuid: &str,
     mode: SplitTunnelMode,
     v4_routes: &[String],
     v6_routes: &[String],
 ) -> Vec<String> {
-    // `never-default` is decided per address family, from whether that family
-    // actually has routes.
-    //
-    // Setting it for a family with an empty route list is a black hole: the
-    // tunnel is barred from carrying that family's default route *and* has no
-    // specific route to carry it instead, so the traffic has nowhere to go. It
-    // is not a theoretical case -- splitting on domains that resolve to IPv4
-    // only (github.com and friends) produced exactly that, and every IPv6
-    // destination stopped working the moment split tunneling was enabled.
-    //
-    // A family with no routes is simply not being split, so it keeps the
-    // ordinary full-tunnel default route.
-    let (v4, v6) = if mode.is_enabled() {
-        (v4_routes.join(", "), v6_routes.join(", "))
-    } else {
-        (String::new(), String::new())
+    let format_routes = |routes: &[String]| {
+        if mode.is_enabled() {
+            routes
+                .iter()
+                .map(|route| format!("{route} table={SPLIT_ROUTE_TABLE}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            String::new()
+        }
     };
     let v4_never_default = never_default_for(mode, v4_routes);
     let v6_never_default = never_default_for(mode, v6_routes);
+    let fwmark = if mode.is_enabled() {
+        format!("0x{SPLIT_ROUTE_TABLE:x}")
+    } else {
+        "0".to_string()
+    };
 
     vec![
         "connection".to_string(),
@@ -429,21 +433,25 @@ pub fn set_args(
         "ipv6.never-default".to_string(),
         v6_never_default.to_string(),
         "ipv4.routes".to_string(),
-        v4,
+        format_routes(v4_routes),
         "ipv6.routes".to_string(),
-        v6,
+        format_routes(v6_routes),
         "ipv4.routed-dns".to_string(),
         "yes".to_string(),
         "ipv6.routed-dns".to_string(),
         "yes".to_string(),
+        "wireguard.fwmark".to_string(),
+        fwmark,
     ]
 }
 
 /// Whether one address family should be barred from taking the tunnel's default
-/// route: in Exclude mode, always (an empty route list means the entire family
-/// was excluded and must exit via physical routing - BUG-009); in Include mode,
-/// only when routes are installed to carry that family instead of the default route.
+/// route. Whole-family tunnel routes need default-route eligibility; an empty
+/// Exclude list instead means the whole family must bypass the tunnel (BUG-009).
 fn never_default_for(mode: SplitTunnelMode, routes: &[String]) -> &'static str {
+    if routes.iter().any(|route| route.ends_with("/0")) {
+        return "no";
+    }
     match mode {
         SplitTunnelMode::Disabled => "no",
         SplitTunnelMode::Include => {
@@ -547,9 +555,38 @@ mod tests {
         assert_eq!(args[5], "ipv6.never-default");
         assert_eq!(args[6], "yes");
         assert_eq!(args[7], "ipv4.routes");
-        assert_eq!(args[8], "10.0.0.0/8, 192.168.0.0/16");
+        assert_eq!(
+            args[8],
+            "10.0.0.0/8 table=1313166676, 192.168.0.0/16 table=1313166676"
+        );
         assert_eq!(args[9], "ipv6.routes");
-        assert_eq!(args[10], "2001:db8::/32");
+        assert_eq!(args[10], "2001:db8::/32 table=1313166676");
+    }
+
+    #[test]
+    fn split_routes_use_the_fwmark_table_and_disabled_mode_resets_the_mark() {
+        for mode in [SplitTunnelMode::Include, SplitTunnelMode::Exclude] {
+            let args = set_args("uuid", mode, &["192.0.2.0/24".into()], &[]);
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["wireguard.fwmark", "0x4e455554"])
+            );
+            assert_eq!(args[8], "192.0.2.0/24 table=1313166676");
+        }
+        let args = set_args("uuid", SplitTunnelMode::Disabled, &[], &[]);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["wireguard.fwmark", "0"])
+        );
+    }
+
+    #[test]
+    fn whole_family_tunnel_routes_are_not_suppressed_by_never_default() {
+        for mode in [SplitTunnelMode::Include, SplitTunnelMode::Exclude] {
+            let args = set_args("uuid", mode, &["0.0.0.0/0".into()], &["::/0".into()]);
+            assert_eq!(args[4], "no");
+            assert_eq!(args[6], "no");
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use neutron::config::SplitTunnelMode;
-use neutron::nm::{CliNmClient, NmIntrospect, NmLifecycle};
+use neutron::nm::{CliNmClient, NmIntrospect, NmLifecycle, NmPolicy};
 use neutron::testing::{require_sandbox, sample_wireguard_config, sandbox_profile_name};
 
 #[test]
@@ -510,7 +510,7 @@ fn refreshed_routes_reach_the_active_device_without_reconnecting() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let output = std::process::Command::new("ip")
-                .args(["-4", "route", "show", "dev", &fixture.name])
+                .args(["-4", "route", "show", "table", "all", "dev", &fixture.name])
                 .output()
                 .unwrap();
             let routes = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -680,6 +680,91 @@ fn a_family_without_routes_is_not_barred_from_its_default_route() {
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
+fn exclude_routes_keep_encrypted_endpoint_packets_off_the_tunnel() {
+    require_sandbox();
+    let fixture = Fixture::import_config(
+        "exclroute",
+        &sample_wireguard_config("10.253.42.2/32, fd00:42::2/128", "10.253.42.1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    let (v4, v6) = neutron::nm::split_tunnel::routes_for(
+        SplitTunnelMode::Exclude,
+        &["198.18.42.1/32".into()],
+        &[],
+    );
+    assert!(
+        std::process::Command::new("nmcli")
+            .args([
+                "connection",
+                "modify",
+                &fixture.uuid,
+                "wireguard.ip4-auto-default-route",
+                "default",
+                "wireguard.ip6-auto-default-route",
+                "default",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    CliNmClient
+        .apply_split_tunnel_all(SplitTunnelMode::Exclude, &v4, &v6)
+        .unwrap();
+    assert!(
+        std::process::Command::new("nmcli")
+            .args(["connection", "up", &fixture.uuid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let assert_routes = |excluded: &str| {
+        let output = std::process::Command::new("wg")
+            .args(["show", &fixture.name, "fwmark"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mark = String::from_utf8(output.stdout).unwrap();
+        for (family, address, packet_mark, tunneled) in [
+            ("-4", "192.0.2.1", mark.trim(), false),
+            ("-6", "2001:db8::1", mark.trim(), false),
+            ("-4", excluded, "0", false),
+            ("-4", "10.253.42.1", "0", true),
+            ("-6", "2001:db8::1", "0", true),
+        ] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let output = std::process::Command::new("ip")
+                    .args([family, "-j", "route", "get", address, "mark", packet_mark])
+                    .output()
+                    .unwrap();
+                let routes: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                let uses_tunnel = routes[0]["dev"].as_str() == Some(&fixture.name);
+                if uses_tunnel == tunneled
+                    && (output.status.success() || (!tunneled && family == "-6"))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "wrong route for {address} mark {packet_mark}: {routes}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    assert_routes("198.18.42.1");
+    let path = neutron::testing::temp_toml_config_path("exclude-endpoint-refresh");
+    let mut cfg = neutron::config::AppConfig::default();
+    cfg.global_split_tunnel.mode = SplitTunnelMode::Exclude;
+    cfg.global_split_tunnel.domains = vec!["198.18.42.2".into()];
+    neutron::config::save(&path, &cfg).unwrap();
+    neutron::app::split_tunnel::refresh_active_domain_routes(&CliNmClient, &path).unwrap();
+    assert_routes("198.18.42.2");
+    neutron::testing::remove_temp_config(&path);
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
 fn split_tunnel_routes_survive_a_round_trip_through_networkmanager() {
     // Excluding scattered host addresses -- which is what domain-based rules
     // produce -- fragments the complement into ~100 CIDRs in one `ipv4.routes`
@@ -727,7 +812,9 @@ fn split_tunnel_routes_survive_a_round_trip_through_networkmanager() {
     );
     for excluded_cidr in &excluded {
         assert!(
-            !stored.split(", ").any(|route| route == excluded_cidr),
+            !stored
+                .split(',')
+                .any(|route| route.split_whitespace().next() == Some(excluded_cidr.as_str())),
             "the excluded range {excluded_cidr} must not be routed into the tunnel"
         );
     }

@@ -6,32 +6,42 @@ Neutron provides **Global Split Tunneling**, allowing users to specify exact sub
 
 ## Routing Modes
 
+Enabled modes put split routes in Neutron's table `1313166676` and set the
+WireGuard `fwmark` to the same value (`0x4e455554` in nmcli's hexadecimal syntax).
+With automatic default-route handling pinned on, NetworkManager's `not fwmark`
+rule uses this table for application traffic, but skips it for encrypted VPN
+transport. Keeping broad split routes
+out of the main table prevents them from routing the VPN endpoint back into its
+own tunnel and breaking all traffic, including DNS.
+
 ### 1. `Include` Mode (Per-Family Destination Selection)
 * **Behavior**: For each address family with a nonempty list of configured CIDRs and resolved domain IPs, only listed destinations route through the tunnel; other destinations in that family use the physical default route. An empty family retains default-route eligibility (`never-default = no`), not a guarantee of protection: it still needs a usable tunnel family and matching peer AllowedIPs. An IPv4-only Include list does not intentionally exclude IPv6, but cannot make an unsupported IPv6 family safe.
 * **NetworkManager Mechanism**:
   With nonempty lists for both families:
   ```bash
   nmcli connection modify <uuid> \
+      wireguard.fwmark 0x4e455554 \
       ipv4.never-default yes \
       ipv6.never-default yes \
-      ipv4.routes "10.0.0.0/8, 192.168.10.0/24" \
-      ipv6.routes "2001:db8::/32"
+      ipv4.routes "10.0.0.0/8 table=1313166676, 192.168.10.0/24 table=1313166676" \
+      ipv6.routes "2001:db8::/32 table=1313166676"
   ```
 * **Use Case**: Remote network access where corporate/homelab subnets must route through the WireGuard tunnel while streaming, gaming, and personal browsing remain on high-speed unthrottled physical internet.
 
 ### 2. `Exclude` Mode (Bypass Tunnel for Listed Destinations)
 * **Behavior**: The complement of listed destinations routes through the tunnel where its IP families and peer AllowedIPs support it; listed destinations intentionally bypass to the physical gateway. This is not a guarantee for unsupported families.
-* **NetworkManager Mechanism**: `never-default = yes` with the **complement** of the listed destinations installed as tunnel routes.
+* **NetworkManager Mechanism**: The **complement** of the listed destinations is installed as tunnel routes. `never-default = yes` suppresses peer defaults for a split or fully excluded family; a family without exclusions uses `no` so its full-tunnel `/0` route is not discarded.
 
   Adding an excluded range to `ipv4.routes` would route it *into* the tunnel — the opposite of excluding it. There is no "bypass route" to install, because every route on a WireGuard connection points at the WireGuard device. So Neutron inverts the selection instead: it computes every CIDR *except* the listed ones and routes those through the tunnel, leaving the excluded ranges to the physical default route.
 
   Excluding `10.0.0.0/8` therefore produces:
   ```bash
   nmcli connection modify <uuid> \
+      wireguard.fwmark 0x4e455554 \
       ipv4.never-default yes \
-      ipv6.never-default yes \
-      ipv4.routes "0.0.0.0/5, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, ..." \
-      ipv6.routes "::/0"
+      ipv6.never-default no \
+      ipv4.routes "0.0.0.0/5 table=1313166676, 8.0.0.0/7 table=1313166676, ..." \
+      ipv6.routes "::/0 table=1313166676"
   ```
   The complement is computed by `nm::split_tunnel::complement_routes`, which recursively splits the address space into the smallest set of aligned CIDRs that covers everything but the exclusions. Excluding nothing yields a full tunnel (`0.0.0.0/0`); excluding `0.0.0.0/0` yields no routes at all.
 * **Use Case**: Privacy browsing with exclusions for local services, banking portals, or gaming servers that block remote tunnel endpoints.
@@ -39,6 +49,8 @@ Neutron provides **Global Split Tunneling**, allowing users to specify exact sub
 ### 3. `Disabled` Mode (Standard Full-Tunnel)
 * Restores `never-default = no` and clears stale split routes, then merges the
   explicit resolver host routes required by kill-protected profiles.
+* Resets the split `fwmark` override to `0`, letting NetworkManager select it
+  automatically again.
 
 Changing to disabled applies stale-route cleanup before saving. Every activation
 also clears stale split properties when the saved mode is disabled. Default-route

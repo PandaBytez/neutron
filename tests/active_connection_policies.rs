@@ -355,7 +355,9 @@ fn exclude_mode_on_a_live_tunnel_does_not_route_the_excluded_range_into_it() {
         .setting("uuid-eu", "ipv4.routes")
         .expect("routes should be written");
     assert!(
-        !routes.split(", ").any(|route| route == "10.0.0.0/8"),
+        !routes
+            .split(", ")
+            .any(|route| route.split_whitespace().next() == Some("10.0.0.0/8")),
         "the excluded range must not be installed as a tunnel route: {routes}"
     );
     assert!(
@@ -531,11 +533,11 @@ fn mock_policy_replay_uses_only_supplied_domain_ips_on_every_lifecycle_path() {
     for uuid in ["uuid-fixture", "uuid-wg-imported"] {
         assert_eq!(
             client.setting(uuid, "ipv4.routes").as_deref(),
-            Some("10.0.0.0/8, 192.0.2.123/32")
+            Some("10.0.0.0/8 table=1313166676, 192.0.2.123/32 table=1313166676")
         );
         assert_eq!(
             client.setting(uuid, "ipv6.routes").as_deref(),
-            Some("2001:db8::123/128")
+            Some("2001:db8::123/128 table=1313166676")
         );
     }
 
