@@ -4,9 +4,10 @@
 //! through the WireGuard VPN connection.
 //!
 //! Both active modes install `ipv4.routes` / `ipv6.routes` in a dedicated table
-//! matching the WireGuard fwmark. NetworkManager's automatic `not fwmark` rule
-//! selects those routes for application traffic, but not the encrypted packets
-//! sent to the VPN endpoint. Unmatched traffic uses the physical default route.
+//! matching the WireGuard fwmark. An early `not fwmark` lookup selects specific
+//! split routes before physical routes, but skips encrypted VPN transport.
+//! NetworkManager's automatic rules handle full-tunnel defaults afterward.
+//! Unmatched traffic uses the physical default route.
 //! `never-default = yes` suppresses peer defaults unless a whole family is tunneled.
 //!
 //! In **Include** mode the routes *are* the configured CIDRs and resolved
@@ -399,6 +400,7 @@ pub fn routes_for(
 /// them with [`routes_for`] rather than passing the user's CIDRs directly, or
 /// Exclude mode will route the excluded ranges *into* the tunnel.
 /// Requires automatic default-route handling pinned by [`super::tunnel_routing`].
+/// When disabling, callers must clear the mark only if Neutron owns it.
 pub fn set_args(
     uuid: &str,
     mode: SplitTunnelMode,
@@ -418,13 +420,7 @@ pub fn set_args(
     };
     let v4_never_default = never_default_for(mode, v4_routes);
     let v6_never_default = never_default_for(mode, v6_routes);
-    let fwmark = if mode.is_enabled() {
-        format!("0x{SPLIT_ROUTE_TABLE:x}")
-    } else {
-        "0".to_string()
-    };
-
-    vec![
+    let mut args = vec![
         "connection".to_string(),
         "modify".to_string(),
         uuid.to_string(),
@@ -440,9 +436,47 @@ pub fn set_args(
         "yes".to_string(),
         "ipv6.routed-dns".to_string(),
         "yes".to_string(),
-        "wireguard.fwmark".to_string(),
-        fwmark,
-    ]
+    ];
+    if mode.is_enabled() {
+        args.extend([
+            "wireguard.fwmark".into(),
+            format!("0x{SPLIT_ROUTE_TABLE:x}"),
+        ]);
+    }
+    // NM's automatic main-table lookup wins otherwise, even against a split /32.
+    let rule = format!(
+        "priority 30000 not fwmark 0x{SPLIT_ROUTE_TABLE:x} table {SPLIT_ROUTE_TABLE} suppress_prefixlength 0"
+    );
+    for (family, routes) in [("ipv4", v4_routes), ("ipv6", v6_routes)] {
+        args.extend([format!("-{family}.routing-rules"), rule.clone()]);
+        if mode.is_enabled() && !routes.is_empty() {
+            args.extend([format!("+{family}.routing-rules"), rule.clone()]);
+        }
+    }
+    args
+}
+
+/// Preserve user-configured transport marks; only undo Neutron's split override.
+pub(crate) fn reset_owned_fwmark_args(
+    uuid: &str,
+    mode: SplitTunnelMode,
+    run: &mut impl FnMut(&[&str]) -> AppResult<String>,
+) -> AppResult<Vec<String>> {
+    if mode.is_enabled() {
+        return Ok(Vec::new());
+    }
+    let value = run(&["-g", "wireguard.fwmark", "connection", "show", uuid])?;
+    let value = value.trim();
+    let mark = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .or_else(|| value.parse::<u32>().ok());
+    Ok(if mark == Some(SPLIT_ROUTE_TABLE) {
+        vec!["wireguard.fwmark".into(), "0".into()]
+    } else {
+        Vec::new()
+    })
 }
 
 /// Whether one address family should be barred from taking the tunnel's default
@@ -564,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn split_routes_use_the_fwmark_table_and_disabled_mode_resets_the_mark() {
+    fn split_routes_use_the_fwmark_table_and_disabled_mode_does_not_overwrite_marks() {
         for mode in [SplitTunnelMode::Include, SplitTunnelMode::Exclude] {
             let args = set_args("uuid", mode, &["192.0.2.0/24".into()], &[]);
             assert!(
@@ -574,10 +608,74 @@ mod tests {
             assert_eq!(args[8], "192.0.2.0/24 table=1313166676");
         }
         let args = set_args("uuid", SplitTunnelMode::Disabled, &[], &[]);
+        assert!(!args.iter().any(|arg| arg == "wireguard.fwmark"));
+    }
+
+    #[test]
+    fn disabling_only_resets_neutrons_owned_fwmark() {
+        for value in ["0x4e455554", "0X4E455554", "1313166676"] {
+            assert_eq!(
+                reset_owned_fwmark_args("uuid", SplitTunnelMode::Disabled, &mut |_| {
+                    Ok(value.into())
+                })
+                .unwrap(),
+                ["wireguard.fwmark", "0"]
+            );
+        }
+        for value in ["0x2a", "42", "0x0", "0", "--"] {
+            assert!(
+                reset_owned_fwmark_args("uuid", SplitTunnelMode::Disabled, &mut |_| {
+                    Ok(value.into())
+                })
+                .unwrap()
+                .is_empty()
+            );
+        }
+        assert!(
+            reset_owned_fwmark_args("uuid", SplitTunnelMode::Include, &mut |_| {
+                panic!("enabling does not need to read the old mark")
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            reset_owned_fwmark_args("uuid", SplitTunnelMode::Disabled, &mut |_| {
+                Err(AppError::CommandFailed("read failed".into()))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn split_lookup_precedes_main_routes_without_capturing_transport_or_defaults() {
+        let rule = "priority 30000 not fwmark 0x4e455554 table 1313166676 suppress_prefixlength 0";
+        let args = set_args(
+            "uuid",
+            SplitTunnelMode::Include,
+            &["192.0.2.1/32".into()],
+            &[],
+        );
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["wireguard.fwmark", "0"])
+                .any(|pair| pair == ["+ipv4.routing-rules", rule])
         );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-ipv6.routing-rules", rule])
+        );
+        assert!(!args.iter().any(|arg| arg == "+ipv6.routing-rules"));
+        let args = set_args("uuid", SplitTunnelMode::Disabled, &[], &[]);
+        for family in ["ipv4", "ipv6"] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == format!("-{family}.routing-rules") && pair[1] == rule)
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == &format!("+{family}.routing-rules"))
+            );
+        }
     }
 
     #[test]

@@ -680,6 +680,199 @@ fn a_family_without_routes_is_not_barred_from_its_default_route() {
 
 #[test]
 #[ignore = "system test: requires the disposable sandbox"]
+fn split_routes_override_overlapping_physical_routes_without_capturing_transport() {
+    use std::process::Command;
+
+    require_sandbox();
+    struct PhysicalLink;
+    impl Drop for PhysicalLink {
+        fn drop(&mut self) {
+            let _ = Command::new("ip")
+                .args(["link", "del", "ns-overlap"])
+                .output();
+        }
+    }
+    assert!(
+        Command::new("ip")
+            .args(["link", "add", "ns-overlap", "type", "dummy"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _physical = PhysicalLink;
+    for args in [
+        vec!["address", "add", "192.168.42.1/24", "dev", "ns-overlap"],
+        vec![
+            "-6",
+            "address",
+            "add",
+            "2001:db8:42::1/64",
+            "dev",
+            "ns-overlap",
+            "nodad",
+        ],
+        vec!["link", "set", "ns-overlap", "up"],
+    ] {
+        assert!(Command::new("ip").args(args).status().unwrap().success());
+    }
+    let fixture = Fixture::import_config(
+        "overlap",
+        &sample_wireguard_config("10.253.43.2/32, fd00:43::2/128", "10.253.43.1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0")
+            .replace("192.0.2.1:51820", "192.168.42.50:51820"),
+    );
+    let foreign = "priority 10000 from 198.18.5.0/24 table 100";
+    assert!(
+        Command::new("nmcli")
+            .args([
+                "connection",
+                "modify",
+                &fixture.uuid,
+                "ipv4.routing-rules",
+                foreign
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    for (mode, targets) in [
+        (
+            SplitTunnelMode::Include,
+            vec!["192.168.42.50/32".into(), "2001:db8:42::50/128".into()],
+        ),
+        (
+            SplitTunnelMode::Exclude,
+            vec!["192.168.42.51/32".into(), "2001:db8:42::51/128".into()],
+        ),
+        (SplitTunnelMode::Disabled, vec![]),
+    ] {
+        let (v4, v6) = neutron::nm::split_tunnel::routes_for(mode, &targets, &[]);
+        CliNmClient.apply_split_tunnel_all(mode, &v4, &v6).unwrap();
+        if mode == SplitTunnelMode::Include {
+            assert!(
+                Command::new("nmcli")
+                    .args(["connection", "up", &fixture.uuid])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        } else {
+            CliNmClient.reapply_active_routes().unwrap();
+        }
+        let output = Command::new("wg")
+            .args(["show", &fixture.name, "fwmark"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mark = String::from_utf8(output.stdout).unwrap();
+        for (family, target, bypass) in [
+            ("-4", "192.168.42.50", "192.168.42.51"),
+            ("-6", "2001:db8:42::50", "2001:db8:42::51"),
+        ] {
+            let mut cases = vec![
+                (
+                    target,
+                    "0",
+                    if mode.is_enabled() {
+                        fixture.name.as_str()
+                    } else {
+                        "ns-overlap"
+                    },
+                ),
+                (target, mark.trim(), "ns-overlap"),
+            ];
+            if mode == SplitTunnelMode::Exclude {
+                cases.push((bypass, "0", "ns-overlap"));
+            }
+            for (address, mark, expected) in cases {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    let output = Command::new("ip")
+                        .args([family, "-j", "route", "get", address, "mark", mark])
+                        .output()
+                        .unwrap();
+                    let routes: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                    if output.status.success() && routes[0]["dev"].as_str() == Some(expected) {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "wrong route for {address} mark {mark}: {routes}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        assert!(fixture.get("ipv4.routing-rules").contains("priority 10000"));
+    }
+    for family in ["ipv4", "ipv6"] {
+        assert!(
+            !fixture
+                .get(&format!("{family}.routing-rules"))
+                .contains("priority 30000")
+        );
+    }
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
+fn disabled_split_policy_keeps_custom_marks_and_resets_only_neutrons_mark() {
+    use std::process::Command;
+
+    require_sandbox();
+    let fixture = Fixture::import_config(
+        "marks",
+        &sample_wireguard_config("10.253.44.2/32, fd00:44::2/128", "10.253.44.1")
+            .replace("PersistentKeepalive = 25", "PersistentKeepalive = 0"),
+    );
+    assert!(
+        Command::new("nmcli")
+            .args([
+                "connection",
+                "modify",
+                &fixture.uuid,
+                "wireguard.fwmark",
+                "0x2a"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    assert_eq!(fixture.get("wireguard.fwmark"), "0x2a");
+    CliNmClient.set_kill_switch_all(false).unwrap();
+    assert_eq!(fixture.get("wireguard.fwmark"), "0x2a");
+    CliNmClient
+        .apply_split_tunnel_all(SplitTunnelMode::Disabled, &[], &[])
+        .unwrap();
+    assert_eq!(fixture.get("wireguard.fwmark"), "0x2a");
+
+    assert!(
+        Command::new("nmcli")
+            .args(["connection", "down", &fixture.uuid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("nmcli")
+            .args([
+                "connection",
+                "modify",
+                &fixture.uuid,
+                "wireguard.fwmark",
+                "0x4e455554"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    CliNmClient.connect(&fixture.uuid).unwrap();
+    assert_eq!(fixture.get("wireguard.fwmark"), "0x0");
+}
+
+#[test]
+#[ignore = "system test: requires the disposable sandbox"]
 fn exclude_routes_keep_encrypted_endpoint_packets_off_the_tunnel() {
     require_sandbox();
     let fixture = Fixture::import_config(

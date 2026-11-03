@@ -23,6 +23,50 @@ const ROUTING_KEYS: [&str; 2] = [
 ];
 
 #[test]
+fn disabled_split_policy_preserves_custom_marks_and_foreign_rules() {
+    let (client, path) = connected_client();
+    let foreign = "priority 10000 from 198.18.5.0/24 table 100";
+    let client = client
+        .with_setting("uuid-eu", "wireguard.fwmark", "0x2a")
+        .with_setting("uuid-eu", "ipv4.routing-rules", foreign);
+    client.switch_to("uuid-eu").unwrap();
+    client.set_kill_switch_all(false).unwrap();
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Disabled, &[], &[])
+        .unwrap();
+    assert_eq!(
+        client.setting("uuid-eu", "wireguard.fwmark").as_deref(),
+        Some("0x2a")
+    );
+    assert_eq!(
+        client.setting("uuid-eu", "ipv4.routing-rules").as_deref(),
+        Some(foreign)
+    );
+
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Include, &["198.19.0.0/16".into()], &[])
+        .unwrap();
+    assert!(
+        client
+            .setting("uuid-eu", "ipv4.routing-rules")
+            .unwrap()
+            .contains("priority 30000")
+    );
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Disabled, &[], &[])
+        .unwrap();
+    assert_eq!(
+        client.setting("uuid-eu", "wireguard.fwmark").as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        client.setting("uuid-eu", "ipv4.routing-rules").as_deref(),
+        Some(foreign)
+    );
+    testing::remove_temp_config(&path);
+}
+
+#[test]
 fn activation_clears_stale_split_properties_even_when_saved_mode_is_disabled() {
     let (client, path) = connected_client();
     client

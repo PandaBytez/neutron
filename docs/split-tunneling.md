@@ -8,11 +8,14 @@ Neutron provides **Global Split Tunneling**, allowing users to specify exact sub
 
 Enabled modes put split routes in Neutron's table `1313166676` and set the
 WireGuard `fwmark` to the same value (`0x4e455554` in nmcli's hexadecimal syntax).
-With automatic default-route handling pinned on, NetworkManager's `not fwmark`
-rule uses this table for application traffic, but skips it for encrypted VPN
-transport. Keeping broad split routes
-out of the main table prevents them from routing the VPN endpoint back into its
-own tunnel and breaking all traffic, including DNS.
+An NM-managed `not fwmark` rule at priority `30000` checks specific split routes
+before NetworkManager's automatic main-table lookup. This lets an included host
+override an overlapping physical subnet without capturing encrypted VPN transport.
+The early lookup suppresses `/0` routes; full-family defaults retain NetworkManager's
+normal routing behavior. Keeping broad split routes out of the main table prevents
+them from routing the VPN endpoint back into its own tunnel and breaking all traffic,
+including DNS. Policy updates remove and re-add only Neutron's exact routing rule,
+preserving foreign rules.
 
 ### 1. `Include` Mode (Per-Family Destination Selection)
 * **Behavior**: For each address family with a nonempty list of configured CIDRs and resolved domain IPs, only listed destinations route through the tunnel; other destinations in that family use the physical default route. An empty family retains default-route eligibility (`never-default = no`), not a guarantee of protection: it still needs a usable tunnel family and matching peer AllowedIPs. An IPv4-only Include list does not intentionally exclude IPv6, but cannot make an unsupported IPv6 family safe.
@@ -24,7 +27,9 @@ own tunnel and breaking all traffic, including DNS.
       ipv4.never-default yes \
       ipv6.never-default yes \
       ipv4.routes "10.0.0.0/8 table=1313166676, 192.168.10.0/24 table=1313166676" \
-      ipv6.routes "2001:db8::/32 table=1313166676"
+      ipv6.routes "2001:db8::/32 table=1313166676" \
+      +ipv4.routing-rules "priority 30000 not fwmark 0x4e455554 table 1313166676 suppress_prefixlength 0" \
+      +ipv6.routing-rules "priority 30000 not fwmark 0x4e455554 table 1313166676 suppress_prefixlength 0"
   ```
 * **Use Case**: Remote network access where corporate/homelab subnets must route through the WireGuard tunnel while streaming, gaming, and personal browsing remain on high-speed unthrottled physical internet.
 
@@ -41,7 +46,9 @@ own tunnel and breaking all traffic, including DNS.
       ipv4.never-default yes \
       ipv6.never-default no \
       ipv4.routes "0.0.0.0/5 table=1313166676, 8.0.0.0/7 table=1313166676, ..." \
-      ipv6.routes "::/0 table=1313166676"
+      ipv6.routes "::/0 table=1313166676" \
+      +ipv4.routing-rules "priority 30000 not fwmark 0x4e455554 table 1313166676 suppress_prefixlength 0" \
+      +ipv6.routing-rules "priority 30000 not fwmark 0x4e455554 table 1313166676 suppress_prefixlength 0"
   ```
   The complement is computed by `nm::split_tunnel::complement_routes`, which recursively splits the address space into the smallest set of aligned CIDRs that covers everything but the exclusions. Excluding nothing yields a full tunnel (`0.0.0.0/0`); excluding `0.0.0.0/0` yields no routes at all.
 * **Use Case**: Privacy browsing with exclusions for local services, banking portals, or gaming servers that block remote tunnel endpoints.
@@ -49,8 +56,10 @@ own tunnel and breaking all traffic, including DNS.
 ### 3. `Disabled` Mode (Standard Full-Tunnel)
 * Restores `never-default = no` and clears stale split routes, then merges the
   explicit resolver host routes required by kill-protected profiles.
-* Resets the split `fwmark` override to `0`, letting NetworkManager select it
-  automatically again.
+* Removes Neutron's early split lookup rules without clearing foreign rules.
+* Resets `fwmark` to `0` only when its current value is Neutron's reserved
+  `0x4e455554` mark. Other custom marks are preserved during activation, import,
+  and policy sweeps.
 
 Changing to disabled applies stale-route cleanup before saving. Every activation
 also clears stale split properties when the saved mode is disabled. Default-route

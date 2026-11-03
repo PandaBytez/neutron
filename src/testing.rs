@@ -343,6 +343,7 @@ impl MockNmClient {
                     "ipv4.dns" => "10.2.0.1".into(),
                     "ipv6.dns" => String::new(),
                     "ipv4.dns-priority" | "ipv6.dns-priority" => "0".into(),
+                    "wireguard.fwmark" => "0x0".into(),
                     _ => panic!("unexpected NM read in policy mock"),
                 }))
             }
@@ -385,8 +386,12 @@ impl MockNmClient {
                     value.push_str(&pair[1]);
                 }
             } else if let Some(key) = pair[0].strip_prefix('-') {
-                if profile.get(key) == Some(&pair[1]) {
-                    profile.insert(key.into(), String::new());
+                if let Some(value) = profile.get_mut(key) {
+                    *value = value
+                        .split(", ")
+                        .filter(|entry| *entry != pair[1])
+                        .collect::<Vec<_>>()
+                        .join(", ");
                 }
             } else {
                 profile.insert(pair[0].clone(), pair[1].clone());
@@ -707,6 +712,11 @@ impl NmPolicy for MockNmClient {
         let mut batches = Vec::new();
         for uuid in self.uuids() {
             let mut args = crate::nm::split_tunnel::set_args(&uuid, mode, v4_routes, v6_routes);
+            args.extend(crate::nm::split_tunnel::reset_owned_fwmark_args(
+                &uuid,
+                mode,
+                &mut |args| self.policy_command(args),
+            )?);
             if mode.is_enabled() {
                 let method =
                     self.policy_command(&["-g", "ipv6.method", "connection", "show", &uuid])?;
