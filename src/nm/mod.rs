@@ -426,6 +426,20 @@ impl NmPolicy for CliNmClient {
         let batches = split_tunnel_arg_batches(&profiles, mode, v4_routes, v6_routes);
         apply_to_every_profile(&profiles, batches, |args| {
             let mut args = args.to_vec();
+            args.extend(split_tunnel::reset_owned_fwmark_args(
+                &args[2],
+                mode,
+                &mut run_nmcli,
+            )?);
+            if mode.is_enabled() {
+                let method = run_nmcli(&["-g", "ipv6.method", "connection", "show", &args[2]])?;
+                let has_ipv6 = !matches!(method.trim(), "" | "--" | "disabled" | "ignore");
+                args.extend(
+                    tunnel_routing::set_args(&args[2], has_ipv6)
+                        .into_iter()
+                        .skip(3),
+                );
+            }
             if profile_dns_protected(&args[2], &mut run_nmcli)? {
                 let dns = checked_tunnel_dns(&args[2], &mut run_nmcli)?;
                 args.extend(dns_host_route_args(&dns));
@@ -1286,6 +1300,9 @@ pub(crate) fn prepare_profile_with(
             .into_iter()
             .skip(3),
     );
+    args.extend(split_tunnel::reset_owned_fwmark_args(
+        uuid, split.mode, run,
+    )?);
     if config.kill_switch_enabled {
         let v4_method = run(&["-g", "ipv4.method", "connection", "show", uuid])?;
         let has_ipv4 = !matches!(v4_method.trim(), "" | "--" | "disabled" | "ignore");
@@ -1949,7 +1966,7 @@ mod tests {
                         ["wireguard.ip6-auto-default-route", "yes"],
                         ["ipv4.dns-priority", "-1500"],
                         ["ipv6.dns-priority", "-1500"],
-                        ["ipv4.routes", "10.0.0.0/8"],
+                        ["ipv4.routes", "10.0.0.0/8 table=1313166676"],
                     ] {
                         assert!(
                             settings.as_chunks::<2>().0.contains(&pair),
@@ -1984,6 +2001,7 @@ mod tests {
             let mut up = false;
             let error = activate_with("uuid", &path, &mut |args| match args {
                 ["-g", "ipv6.method", "connection", "show", "uuid"] => Ok("manual".into()),
+                ["-g", "wireguard.fwmark", "connection", "show", "uuid"] => Ok("0x0".into()),
                 ["connection", "modify", "uuid", ..] if !unsupported_readback => Err(
                     AppError::CommandFailed("unknown property routed-dns".into()),
                 ),

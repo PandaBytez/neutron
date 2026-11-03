@@ -68,7 +68,7 @@ Pressing **`t`** opens the side-by-side Split Tunneling manager:
 * **Deletion:** Select any entry in the list and press `Del` or `x`.
 * **Non-Blocking Apply:** Changes are submitted in the background. Backend or save failures are reported; saved profile routing changes require reconnect.
 * **Concurrent Edits:** If the captured split-settings snapshot conflicts with another writer, saving is rejected. Reload current settings before resubmitting, rather than retrying a stale snapshot.
-* **Lockdown Notice:** If the Lockdown Firewall is active, a clear banner reminds you that all non-tunnel traffic is dropped when disconnected.
+* **Lockdown Notice:** A wrapped banner explains that lockdown blocks public internet traffic outside the VPN, even while connected. **Exclude** is marked **locked** in matching warning colors and cannot be selected until lockdown is disabled; saved domains and CIDRs are preserved.
 
 Include mode is evaluated per address family: only a family with a nonempty
 destination list routes just those destinations through the tunnel. An empty

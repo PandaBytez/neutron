@@ -42,15 +42,16 @@ Install via [Homebrew](https://brew.sh/) (including tap trust so background auto
 brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron
 ```
 
-Or install the existing stable source tag with Cargo:
+Or install the latest source from the default branch with Cargo:
 
 ```bash
-cargo install --locked --git https://github.com/PandaBytez/neutron.git --tag v0.2.0
+cargo install --locked --git https://github.com/PandaBytez/neutron.git
 ```
 
-For fixes newer than that tag, use `--rev <reviewed-commit-sha>` instead of
-`--tag v0.2.0`. This documentation describes current source behavior, not a
-promise that the stable tag or published packages contain every fix. Homebrew,
+This command follows `main`, which may contain changes newer than the latest
+stable release. For a reproducible source install, add `--rev <reviewed-commit-sha>`.
+This documentation describes current source behavior, not a promise that
+published packages contain every fix. Homebrew,
 Cargo, and [static release binaries](https://github.com/PandaBytez/neutron/releases)
 are the supported installation channels.
 
@@ -63,6 +64,12 @@ alone is not a protection guarantee. After protected activation/reapply, kernel
 UDP/TCP DNS egress must select the tunnel or Neutron attempts disconnection and
 reports an error. Static linking does not remove
 the need for system tools and services; lockdown also needs firewalld and polkit.
+
+Split routes use a dedicated table so encrypted VPN transport cannot loop back
+into its own tunnel. Specific split routes take precedence over overlapping
+physical subnets; disabling split mode preserves unrelated custom transport marks.
+See [split tunneling](docs/split-tunneling.md) for per-family
+routing and DNS behavior. After updating, reconnect to apply the repaired policy.
 
 ### 2. Import Profiles
 
@@ -88,6 +95,13 @@ neutron
 
 Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles with `s`, configure split tunneling with
 `t`, toggle the kill switch with `k`, or press `Ctrl+P` for the command palette.
+
+#### Check installed version
+
+```bash
+neutron --version
+# Short form: neutron -V
+```
 
 #### Complete restart command
 

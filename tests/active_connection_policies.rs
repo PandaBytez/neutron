@@ -23,6 +23,50 @@ const ROUTING_KEYS: [&str; 2] = [
 ];
 
 #[test]
+fn disabled_split_policy_preserves_custom_marks_and_foreign_rules() {
+    let (client, path) = connected_client();
+    let foreign = "priority 10000 from 198.18.5.0/24 table 100";
+    let client = client
+        .with_setting("uuid-eu", "wireguard.fwmark", "0x2a")
+        .with_setting("uuid-eu", "ipv4.routing-rules", foreign);
+    client.switch_to("uuid-eu").unwrap();
+    client.set_kill_switch_all(false).unwrap();
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Disabled, &[], &[])
+        .unwrap();
+    assert_eq!(
+        client.setting("uuid-eu", "wireguard.fwmark").as_deref(),
+        Some("0x2a")
+    );
+    assert_eq!(
+        client.setting("uuid-eu", "ipv4.routing-rules").as_deref(),
+        Some(foreign)
+    );
+
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Include, &["198.19.0.0/16".into()], &[])
+        .unwrap();
+    assert!(
+        client
+            .setting("uuid-eu", "ipv4.routing-rules")
+            .unwrap()
+            .contains("priority 30000")
+    );
+    client
+        .apply_split_tunnel_all(SplitTunnelMode::Disabled, &[], &[])
+        .unwrap();
+    assert_eq!(
+        client.setting("uuid-eu", "wireguard.fwmark").as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        client.setting("uuid-eu", "ipv4.routing-rules").as_deref(),
+        Some(foreign)
+    );
+    testing::remove_temp_config(&path);
+}
+
+#[test]
 fn activation_clears_stale_split_properties_even_when_saved_mode_is_disabled() {
     let (client, path) = connected_client();
     client
@@ -155,11 +199,11 @@ fn assert_every_profile_still_routes(client: &MockNmClient, context: &str) {
     for uuid in client.uuids() {
         for key in ROUTING_KEYS {
             let value = client.setting(&uuid, key).unwrap_or_else(|| {
-                panic!("{context}: {uuid} has no {key}; the tunnel would not route")
+                panic!("{context}: a profile has no {key}; the tunnel would not route")
             });
             assert_eq!(
                 value, "yes",
-                "{context}: {uuid} left {key}={value}, so the tunnel would carry no traffic \
+                "{context}: a profile left {key}={value}, so the tunnel would carry no traffic \
                  while the UI reports a working connection"
             );
         }
@@ -355,7 +399,9 @@ fn exclude_mode_on_a_live_tunnel_does_not_route_the_excluded_range_into_it() {
         .setting("uuid-eu", "ipv4.routes")
         .expect("routes should be written");
     assert!(
-        !routes.split(", ").any(|route| route == "10.0.0.0/8"),
+        !routes
+            .split(", ")
+            .any(|route| route.split_whitespace().next() == Some("10.0.0.0/8")),
         "the excluded range must not be installed as a tunnel route: {routes}"
     );
     assert!(
@@ -531,11 +577,11 @@ fn mock_policy_replay_uses_only_supplied_domain_ips_on_every_lifecycle_path() {
     for uuid in ["uuid-fixture", "uuid-wg-imported"] {
         assert_eq!(
             client.setting(uuid, "ipv4.routes").as_deref(),
-            Some("10.0.0.0/8, 192.0.2.123/32")
+            Some("10.0.0.0/8 table=1313166676, 192.0.2.123/32 table=1313166676")
         );
         assert_eq!(
             client.setting(uuid, "ipv6.routes").as_deref(),
-            Some("2001:db8::123/128")
+            Some("2001:db8::123/128 table=1313166676")
         );
     }
 

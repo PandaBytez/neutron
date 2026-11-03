@@ -343,7 +343,8 @@ impl MockNmClient {
                     "ipv4.dns" => "10.2.0.1".into(),
                     "ipv6.dns" => String::new(),
                     "ipv4.dns-priority" | "ipv6.dns-priority" => "0".into(),
-                    _ => panic!("unexpected NM read: {args:?}"),
+                    "wireguard.fwmark" => "0x0".into(),
+                    _ => panic!("unexpected NM read in policy mock"),
                 }))
             }
             ["connection", "modify", ..] => {
@@ -353,7 +354,7 @@ impl MockNmClient {
                 self.apply_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
                 Ok(String::new())
             }
-            _ => panic!("unexpected policy command: {args:?}"),
+            _ => panic!("unexpected policy command in mock client"),
         }
     }
 
@@ -385,8 +386,12 @@ impl MockNmClient {
                     value.push_str(&pair[1]);
                 }
             } else if let Some(key) = pair[0].strip_prefix('-') {
-                if profile.get(key) == Some(&pair[1]) {
-                    profile.insert(key.into(), String::new());
+                if let Some(value) = profile.get_mut(key) {
+                    *value = value
+                        .split(", ")
+                        .filter(|entry| *entry != pair[1])
+                        .collect::<Vec<_>>()
+                        .join(", ");
                 }
             } else {
                 profile.insert(pair[0].clone(), pair[1].clone());
@@ -707,6 +712,21 @@ impl NmPolicy for MockNmClient {
         let mut batches = Vec::new();
         for uuid in self.uuids() {
             let mut args = crate::nm::split_tunnel::set_args(&uuid, mode, v4_routes, v6_routes);
+            args.extend(crate::nm::split_tunnel::reset_owned_fwmark_args(
+                &uuid,
+                mode,
+                &mut |args| self.policy_command(args),
+            )?);
+            if mode.is_enabled() {
+                let method =
+                    self.policy_command(&["-g", "ipv6.method", "connection", "show", &uuid])?;
+                let has_ipv6 = !matches!(method.trim(), "" | "--" | "disabled" | "ignore");
+                args.extend(
+                    crate::nm::tunnel_routing::set_args(&uuid, has_ipv6)
+                        .into_iter()
+                        .skip(3),
+                );
+            }
             if crate::nm::profile_dns_protected(&uuid, &mut |args| self.policy_command(args))? {
                 let dns =
                     crate::nm::checked_tunnel_dns(&uuid, &mut |args| self.policy_command(args))?;
@@ -1207,6 +1227,30 @@ pub fn curl_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_policy_panics_do_not_dump_command_arguments() {
+        let client = MockNmClient::default();
+        for (args, expected) in [
+            (
+                &[
+                    "-g",
+                    "unexpected.property",
+                    "connection",
+                    "show",
+                    "fixture-profile",
+                ][..],
+                "unexpected NM read in policy mock",
+            ),
+            (
+                &["unexpected", "fixture-profile"][..],
+                "unexpected policy command in mock client",
+            ),
+        ] {
+            let panic = std::panic::catch_unwind(|| client.policy_command(args)).unwrap_err();
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+        }
+    }
 
     #[test]
     fn mock_policy_config_requires_explicit_injection() {

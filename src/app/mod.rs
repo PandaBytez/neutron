@@ -17,7 +17,7 @@ use crate::process::terminal_safe;
 use crate::service;
 
 #[derive(Debug, Parser)]
-#[command(name = "neutron")]
+#[command(name = "neutron", version)]
 #[command(about = "Neutron - Fast WireGuard profile manager via NetworkManager")]
 pub struct Cli {
     #[command(subcommand)]
@@ -164,12 +164,6 @@ enum QbitCommands {
 pub fn run<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
     client: &C,
 ) -> AppResult<()> {
-    if let Ok(config_path) = config::default_config_path()
-        && let Ok(app_cfg) = config::load(&config_path)
-    {
-        let _ = sync::ensure_app_dirs(&app_cfg);
-    }
-
     let cli = Cli::try_parse().unwrap_or_else(|error| {
         let code = error.exit_code();
         // Clap may quote hostile argv in diagnostics. Help contains only trusted text.
@@ -180,6 +174,11 @@ pub fn run<C: NmClient + FirewallClient + Clone + Send + Sync + 'static>(
         }
         std::process::exit(code);
     });
+    if let Ok(config_path) = config::default_config_path()
+        && let Ok(app_cfg) = config::load(&config_path)
+    {
+        let _ = sync::ensure_app_dirs(&app_cfg);
+    }
     execute(client, cli)
 }
 

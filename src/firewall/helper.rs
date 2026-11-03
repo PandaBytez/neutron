@@ -1026,16 +1026,18 @@ mod tests {
     #[test]
     fn proc_executable_copy_survives_source_path_replacement() {
         let dir = crate::testing::scratch_dir("installer-executable");
-        let source = dir.join("installer");
+        let source = dir.join("sh");
         let destination = dir.join("helper");
-        std::fs::copy("/bin/sleep", &source).unwrap();
+        // A shell builtin can wait on stdin without relying on renamed coreutils binaries.
+        std::fs::copy("/bin/sh", &source).unwrap();
         let mut installer = std::process::Command::new(&source)
-            .arg("30")
+            .args(["-c", "read -r pending"])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let original = std::fs::metadata(&source).unwrap();
         let replacement = dir.join("replacement");
-        std::fs::copy("/bin/true", &replacement).unwrap();
+        std::fs::write(&replacement, b"replacement executable path").unwrap();
         std::fs::rename(&replacement, &source).unwrap();
         let script = format!(
             "set -e\nexec 8</proc/{}/exe\n\
@@ -1055,7 +1057,7 @@ mod tests {
         assert!(copied.success());
         assert_eq!(
             std::fs::read(&destination).unwrap(),
-            std::fs::read("/bin/sleep").unwrap()
+            std::fs::read("/bin/sh").unwrap()
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
