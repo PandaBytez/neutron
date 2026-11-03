@@ -42,15 +42,16 @@ Install via [Homebrew](https://brew.sh/) (including tap trust so background auto
 brew tap pandabytez/tap && brew trust pandabytez/tap && brew install neutron
 ```
 
-Or install the existing stable source tag with Cargo:
+Or install the latest source from the default branch with Cargo:
 
 ```bash
-cargo install --locked --git https://github.com/PandaBytez/neutron.git --tag v0.2.0
+cargo install --locked --git https://github.com/PandaBytez/neutron.git
 ```
 
-For fixes newer than that tag, use `--rev <reviewed-commit-sha>` instead of
-`--tag v0.2.0`. This documentation describes current source behavior, not a
-promise that the stable tag or published packages contain every fix. Homebrew,
+This command follows `main`, which may contain changes newer than the latest
+stable release. For a reproducible source install, add `--rev <reviewed-commit-sha>`.
+This documentation describes current source behavior, not a promise that
+published packages contain every fix. Homebrew,
 Cargo, and [static release binaries](https://github.com/PandaBytez/neutron/releases)
 are the supported installation channels.
 
@@ -92,6 +93,13 @@ neutron
 
 Browse profiles, connect/disconnect with `Space` or `Enter`, switch profiles with `s`, configure split tunneling with
 `t`, toggle the kill switch with `k`, or press `Ctrl+P` for the command palette.
+
+#### Check installed version
+
+```bash
+neutron --version
+# Short form: neutron -V
+```
 
 #### Complete restart command
 
