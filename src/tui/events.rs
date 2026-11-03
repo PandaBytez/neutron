@@ -622,6 +622,7 @@ fn handle_split_tunnel_key<C: NmClient>(
 ) -> AppResult<()> {
     let mut should_apply_cfg = None;
     let mut close_modal = false;
+    let mut blocked = false;
 
     if let ActiveModal::SplitTunnel(ref mut st) = state.modal {
         let typing = st.focus.is_text_input();
@@ -643,8 +644,13 @@ fn handle_split_tunnel_key<C: NmClient>(
             KeyCode::Up => st.move_up(),
             KeyCode::Down => st.move_down(),
             KeyCode::Char(' ') | KeyCode::Enter if st.focus == SplitTunnelFocus::Mode => {
-                st.mode = st.selected_highlighted_mode();
-                should_apply_cfg = Some(st.to_config());
+                let mode = st.selected_highlighted_mode();
+                if state.config.lockdown_enabled && mode == config::SplitTunnelMode::Exclude {
+                    blocked = true;
+                } else {
+                    st.mode = mode;
+                    should_apply_cfg = Some(st.to_config());
+                }
             }
             KeyCode::Enter => match st.focus {
                 SplitTunnelFocus::DomainInput => {
@@ -707,6 +713,12 @@ fn handle_split_tunnel_key<C: NmClient>(
 
     if close_modal {
         state.modal = ActiveModal::None;
+    }
+
+    if blocked {
+        state.set_error(&crate::error::AppError::Config(
+            "Exclude mode is unavailable while lockdown is active; use Disabled or Include".into(),
+        ));
     }
 
     if let Some(cfg) = should_apply_cfg {
@@ -1857,6 +1869,69 @@ mod tests {
         assert_eq!(state.modal, ActiveModal::None);
         assert!(state.status_message.contains("deleted"));
 
+        crate::testing::remove_temp_config(&path);
+    }
+
+    #[test]
+    fn lockdown_blocks_exclude_selection_without_losing_saved_rules() {
+        let client = crate::testing::MockNmClient::default();
+        let path = crate::testing::temp_config_path("split-exclude-locked");
+        let cfg = config::AppConfig {
+            lockdown_enabled: true,
+            global_split_tunnel: config::SplitTunnelConfig {
+                mode: SplitTunnelMode::Include,
+                cidrs: vec!["198.18.0.0/15".into()],
+                domains: vec!["saved.example".into()],
+            },
+            ..Default::default()
+        };
+        config::save(&path, &cfg).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let mut state = TuiState::new(path.clone(), cfg.clone());
+        state.modal = ActiveModal::SplitTunnel(
+            crate::tui::state::SplitTunnelModalState::from_config(&cfg.global_split_tunnel),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.split_tunnel_tx = Some(tx);
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+            handle_key_event(&mut state, &client, KeyEvent::new(key, KeyModifiers::NONE)).unwrap();
+            let ActiveModal::SplitTunnel(ref modal) = state.modal else {
+                panic!("a blocked mode must leave the editor open");
+            };
+            assert_eq!(modal.selected_highlighted_mode(), SplitTunnelMode::Exclude);
+            assert_eq!(modal.to_config(), cfg.global_split_tunnel);
+            assert_eq!(state.config.global_split_tunnel, cfg.global_split_tunnel);
+            assert!(state.config.lockdown_enabled);
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert!(state.status_is_error);
+            assert!(
+                state
+                    .status_message
+                    .contains("unavailable while lockdown is active")
+            );
+            assert!(state.pending_split.is_none());
+            assert!(rx.try_recv().is_err());
+            assert!(client.split_tunnel_calls().is_empty());
+        }
+
+        state.config.lockdown_enabled = false;
+        handle_key_event(
+            &mut state,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let (_, _, submitted) = rx.try_recv().unwrap();
+        assert_eq!(submitted.mode, SplitTunnelMode::Exclude);
+        assert_eq!(submitted.cidrs, cfg.global_split_tunnel.cidrs);
+        assert_eq!(submitted.domains, cfg.global_split_tunnel.domains);
         crate::testing::remove_temp_config(&path);
     }
 

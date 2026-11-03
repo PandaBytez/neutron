@@ -1381,7 +1381,18 @@ fn render_split_tunnel_modal(
         };
         let is_current = st.mode == *mode;
         let is_cursor = st.focus == SplitTunnelFocus::Mode && st.highlighted_mode == idx;
-        mode_spans.extend(mode_button(theme, label, is_current, is_cursor));
+        let mut button = mode_button(theme, label, is_current, is_cursor);
+        if has_lockdown_warning && *mode == SplitTunnelMode::Exclude {
+            button[0] = Span::styled(
+                " [ Exclude (locked) ] ",
+                if is_cursor {
+                    theme.status_pill_disconnected
+                } else {
+                    theme.status_disconnected
+                },
+            );
+        }
+        mode_spans.extend(button);
     }
 
     let mode_style = if st.focus == SplitTunnelFocus::Mode {
@@ -1404,13 +1415,13 @@ fn render_split_tunnel_modal(
     let (columns_chunk, footer_chunk) = if has_lockdown_warning {
         // Lockdown Warning
         let warn_line = Line::from(vec![
-            Span::styled(" ⚠ Lockdown Active: ", theme.warning),
+            Span::styled(" ⚠ Lockdown Active: ", theme.status_disconnected),
             Span::styled(
-                "All non-tunnel traffic is blocked while disconnected. Excluded traffic will not route without an active tunnel.",
+                "Exclude mode is unavailable. Public internet traffic outside the VPN is blocked, even while connected.",
                 theme.text_secondary,
             ),
         ]);
-        let warn_widget = Paragraph::new(warn_line);
+        let warn_widget = Paragraph::new(warn_line).wrap(Wrap { trim: true });
         frame.render_widget(warn_widget, chunks[1]);
         (chunks[2], chunks[3])
     } else {
@@ -1859,6 +1870,64 @@ mod render_tests {
             !render_with_lockdown(false).contains("Lockdown Active"),
             "the warning must not appear when lockdown is off"
         );
+        assert!(!render_with_lockdown(false).contains("Exclude (locked)"));
+    }
+
+    #[test]
+    fn lockdown_warning_wraps_completely_and_matches_the_locked_exclude_style() {
+        let mut config = AppConfig {
+            lockdown_enabled: true,
+            ..Default::default()
+        };
+        config.global_split_tunnel.mode = SplitTunnelMode::Exclude;
+        let state = TuiState::new("/tmp/x".into(), config);
+        let mut modal = SplitTunnelModalState::from_config(&state.config.global_split_tunnel);
+
+        for (width, height) in [(120, 30), (160, 40), (200, 50)] {
+            for highlighted_mode in [1, 2] {
+                modal.highlighted_mode = highlighted_mode;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_split_tunnel_modal(frame, frame.area(), &modal, &state);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let popup = centered_rect(75, 80, buffer.area);
+                let warning = (popup.y + 4..popup.y + 6)
+                    .map(|y| {
+                        (popup.x + 1..popup.right() - 1)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(
+                    warning.split_whitespace().collect::<Vec<_>>().join(" "),
+                    "⚠ Lockdown Active: Exclude mode is unavailable. Public internet traffic outside the VPN is blocked, even while connected.",
+                    "warning was clipped at {width}x{height}"
+                );
+                let locked_style = if highlighted_mode == 2 {
+                    state.theme.status_pill_disconnected
+                } else {
+                    state.theme.status_disconnected
+                };
+                let marked: String = buffer
+                    .content()
+                    .iter()
+                    .filter(|cell| {
+                        Some(cell.fg) == locked_style.fg
+                            && locked_style.bg.is_none_or(|bg| cell.bg == bg)
+                    })
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(marked.contains("Exclude (locked)"), "{marked}");
+                assert_eq!(
+                    Some(buffer[(popup.x + 1, popup.y + 4)].fg),
+                    state.theme.status_disconnected.fg
+                );
+            }
+        }
     }
 
     #[test]
